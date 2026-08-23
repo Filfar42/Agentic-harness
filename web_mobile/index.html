@@ -10,8 +10,10 @@
 <link rel="apple-touch-icon" href="/static/icons/apple-touch-icon.png">
 <meta name="apple-mobile-web-app-title" content="Harness">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-<!-- Manifest PWA: e' questo che Android/Desktop usano per l'icona dell'app installata. -->
-<link rel="manifest" href="/static/manifest.webmanifest">
+<!-- Manifest PWA: e' questo che Android/Desktop usano per l'icona dell'app
+     installata. Non e' un file statico: il server ci mette dentro start_url
+     con la chiave, senno' l'icona sulla schermata home aprirebbe un 401. -->
+<link rel="manifest" href="/manifest.webmanifest">
 <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>

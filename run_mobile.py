@@ -13,10 +13,15 @@ from __future__ import annotations
 
 import argparse
 import os
-import secrets
 import socket
 
 import uvicorn
+
+# Quanto uvicorn aspetta le risposte in corso prima di chiudere comunque. Le
+# rotte SSE non finiscono mai per mestiere: senza un tetto, Ctrl+C resta
+# appeso finche' c'e' un browser collegato. Cinque secondi bastano a lasciar
+# finire una richiesta normale e non fanno sembrare il server bloccato.
+TIMEOUT_SPEGNIMENTO = 5
 
 
 def ip_lan() -> str:
@@ -32,8 +37,15 @@ def ip_lan() -> str:
 
 
 def chiave() -> str:
-    """La chiave d'accesso del ponte: quella dell'ambiente, o una nuova."""
-    return os.environ.get("HARNESS_MOBILE_TOKEN") or secrets.token_urlsafe(9)
+    """La chiave d'accesso del ponte, stabile fra un avvio e l'altro.
+
+    Una sola implementazione, e sta nel ponte: qui c'e' solo il rimando, cosi'
+    ``run.py`` e ``run_mobile.py`` non possono divergere da quello che il
+    server considera valido.
+    """
+    from server.mobile import token
+
+    return token()
 
 
 def main() -> None:
@@ -63,6 +75,7 @@ def main() -> None:
         host=args.host,
         port=args.port,
         log_level="warning",
+        timeout_graceful_shutdown=TIMEOUT_SPEGNIMENTO,
     )
 
 

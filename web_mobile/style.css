@@ -164,6 +164,19 @@ html, body {
   border: 1px solid var(--accento);
 }
 
+/* Una domanda a cui si e' gia' risposto e' cronologia, non una richiesta
+   aperta: perde il bordo acceso e resta li' a dire cosa era stato chiesto. */
+.msg.pending.risposta-data {
+  background: rgba(77, 163, 255, 0.06);
+  border-color: var(--bordo);
+  color: var(--testo-dim);
+}
+
+.msg.user.risposta-scelta::before {
+  content: "↳ ";
+  opacity: 0.6;
+}
+
 .msg.live::after {
   content: "▍";
   animation: blink 1s steps(2) infinite;

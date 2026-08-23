@@ -327,6 +327,29 @@ function stripThink(text) {
   return String(text).replace(/<think>[\s\S]*?<\/think>/g, "").trim();
 }
 
+/** La risposta che l'utente ha dato a una domanda dell'agente.
+ *
+ *  Il risultato del tool ``ask_user_question`` e' un JSON con ``user_answer``,
+ *  che puo' essere una stringa (testo o scelta singola) o una lista (scelta
+ *  multipla). Se il formato non si riconosce, meglio niente che un JSON
+ *  crudo in mezzo alla conversazione. */
+function rispostaData(contenuto) {
+  try {
+    const data = JSON.parse(String(contenuto ?? "")).user_answer;
+    if (Array.isArray(data)) return data.join(", ");
+    return data == null ? "" : String(data);
+  } catch (_) {
+    return "";
+  }
+}
+
+/** Domanda dell'agente e risposta dell'utente, come scambio chiuso: la
+ *  domanda con la sua cornice, la risposta nella bolla di chi l'ha data. */
+function aggiungiScambio(domanda, risposta) {
+  if (domanda) addBubble("pending", `❓ ${domanda}`, "risposta-data");
+  if (risposta) addBubble("user", risposta, "risposta-scelta");
+}
+
 function addBubble(role, text, extraClass) {
   const div = document.createElement("div");
   div.className = `msg ${role}` + (extraClass ? ` ${extraClass}` : "");
@@ -391,9 +414,17 @@ function renderConversation(messages, pending, withCard) {
         addBubble("agent", clean);
       }
     } else if (m.role === "tool") {
+      if (m.name === "ask_user_question") {
+        // Una domanda gia' risposta non e' un passo: e' un pezzo di
+        // conversazione, e resta in chiaro come sul desktop. Prima spariva del
+        // tutto appena si rispondeva -- la card se ne andava e nella
+        // cronologia non restava traccia ne' della domanda ne' della scelta.
+        chiudiGruppoPassi();
+        aggiungiScambio((m.args || {}).question || "", rispostaData(m.content));
+        continue;
+      }
       // Del risultato entra in pagina una cosa sola: se e' andato male. Si
       // appende alla riga della sua chiamata, trovata per id.
-      if (m.name === "ask_user_question") continue;
       contaSecondi += Number(m.duration_s) || 0;
       const riga = rigaDellaChiamata(m.tool_call_id);
       if (riga && !toolAndatoBene(m.content, m.ok)) riga.classList.add("male");
@@ -677,15 +708,53 @@ function handleEvent(data) {
   }
 }
 
+// ------------------------------------------------------------ bus globale ----
+
+/** Le notizie larghe del server (`/api/events`), le stesse che ascolta il
+ *  desktop: e' partito un turno, e' finito, l'agente ha fatto una domanda,
+ *  l'elenco delle chat e' cambiato.
+ *
+ *  Senza questo, il telefono si accorgeva di un turno partito dal desktop solo
+ *  al giro di polling successivo, e -- peggio -- appena `running` diventava
+ *  vero il polling smetteva di rileggere la conversazione mentre nessuno
+ *  stream era attaccato: la chat restava ferma fino a un refresh a mano.
+ *  Succedeva soprattutto con `ask_user_question`, perche' li' il turno si
+ *  chiude subito e la novita' e' tutta nella domanda in sospeso. */
+function bindGlobalEvents() {
+  const bus = new EventSource("/api/events");
+  bus.onmessage = async (msg) => {
+    let event;
+    try { event = JSON.parse(msg.data); } catch (_) { return; }
+
+    if (event.type === "sessions") { loadSessions(); return; }
+    if (event.type !== "turn" && event.type !== "question") return;
+
+    loadSessions();
+    if (!currentId || event.session_id !== currentId) return;
+    // La chat aperta si rilegge dal disco: li' c'e' gia' il messaggio finale
+    // o la domanda in sospeso. Se il turno e' vivo e questa pagina non e'
+    // attaccata allo stream, ci si attacca adesso -- e' il caso del turno
+    // fatto partire dall'altro schermo.
+    await refreshChat(false);
+    if (running && !source) attachStream();
+  };
+}
+
 // ---------------------------------------------------------------- polling ----
 
 function startPolling() {
   stopPolling();
-  // Rete mobile o scheda bloccata: il polling tiene comunque le due UI
-  // allineate con quanto succede sul desktop.
+  // Rete mobile o scheda bloccata: il polling resta la rete di sicurezza sotto
+  // al bus globale, per quando la connessione SSE cade e nessuno se ne accorge.
   pollTimer = setInterval(async () => {
     if (document.hidden) return;
     loadSessions();
+    if (running && !source) {
+      // Turno vivo ma nessuno stream: e' la situazione in cui la chat
+      // rimaneva congelata. Riagganciarsi costa una connessione e sblocca.
+      attachStream();
+      return;
+    }
     if (!running && !source) {
       const prima = $("messages").childElementCount;
       await refreshChat(false);
@@ -745,3 +814,6 @@ promptInput.addEventListener("input", () => {
 });
 
 loadSessions();
+// Il bus resta attaccato per tutta la vita della pagina, anche nell'elenco:
+// e' cosi' che una chat aperta sul desktop compare qui senza toccare niente.
+bindGlobalEvents();

@@ -271,3 +271,21 @@ def test_la_barra_del_testo_fatto_non_cancella_la_riga():
     blocco = css[css.index(".plan-step.done .plan-text {"):]
     blocco = blocco[: blocco.index("}")]
     assert "text-decoration-color: var(--border-strong)" in blocco
+
+
+def test_la_pagina_smette_di_essere_la_fonte_viva_quando_lo_stream_finisce():
+    """Perche' la sincronizzazione fra desktop e telefono si bloccava.
+
+    Il bus globale ridisegna la conversazione solo se questa pagina non sta
+    gia' ricevendo un turno dal vivo -- giusto, senno' si cancellerebbe il
+    turno mentre scorre. Ma il controller dell'attacco non veniva mai
+    azzerato a fine stream: dopo il primo turno la pagina diceva per sempre
+    "sto disegnando io", e un messaggio scritto dal telefono non compariva
+    piu' fino a un ricaricamento a mano.
+    """
+    sorgente = (WEB / "app.js").read_text(encoding="utf-8")
+    assert "function attaccatoAUnoStream()" in sorgente
+    # Le due uscite di attachStream devono azzerarlo entrambe: quella normale
+    # e quella per stream irraggiungibile.
+    assert sorgente.count("if (state.attachAbort === controller) state.attachAbort = null;") == 2
+    assert "if (!attaccatoAUnoStream()) showSession(payload);" in sorgente

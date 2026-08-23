@@ -17,13 +17,41 @@ import os
 import threading
 import webbrowser
 from threading import Timer
+from types import FrameType
 
 import uvicorn
 
 # Una sola implementazione per l'indirizzo LAN e per la chiave: erano nate due
 # volte, qui e in run_mobile.py, e due copie della stessa funzione divergono
 # sempre -- di solito il giorno in cui una delle due viene corretta.
-from run_mobile import chiave, ip_lan
+from run_mobile import TIMEOUT_SPEGNIMENTO, chiave, ip_lan
+
+
+class ServerCheSiFermaDavvero(uvicorn.Server):
+    """Un uvicorn che a Ctrl+C chiude anche le risposte che non finiscono mai.
+
+    Il problema, in ordine di causa. Le rotte SSE (``/api/events`` per il bus
+    globale, ``/api/stream/{id}`` per il turno) sono risposte HTTP che per
+    mestiere non terminano. Uvicorn, ricevuto il segnale, smette di accettare
+    connessioni e poi **aspetta che le risposte in corso finiscano**: quelle
+    non finiscono, e il server resta li'. Dall'esterno sembra che Ctrl+C non
+    faccia niente e che serva chiudere la finestra del terminale -- e basta
+    una scheda del browser aperta sulla UI, perche' quella tiene sempre aperto
+    il bus.
+
+    Il gestore del segnale e' l'unico posto in cui si arriva **prima** di
+    quell'attesa: lo spegnimento della lifespan viene dopo, quando ormai si e'
+    gia' bloccati. Qui si avvisano gli stream, che chiudono da soli, e poi si
+    lascia fare a uvicorn quello che avrebbe fatto comunque.
+    """
+
+    def handle_exit(self, sig: int, frame: FrameType | None) -> None:
+        from server.runner import annuncia_spegnimento
+
+        annuncia_spegnimento()
+        for altro in getattr(self, "_compagni", ()):
+            altro.should_exit = True
+        super().handle_exit(sig, frame)
 
 
 def upstream_mobile(porta_principale: int) -> str:
@@ -57,6 +85,7 @@ def main() -> None:
     url = f"http://{args.host}:{args.port}"
     print(f"\n  Local Agent Harness  ->  {url}")
 
+    ponte = None
     if args.mobile:
         # Il ponte vive in un thread: resta il processo principale a fare da
         # riferimento (Ctrl+C chiude tutto). L'upstream segue la porta di
@@ -68,16 +97,7 @@ def main() -> None:
         # il ponte e' su e l'utente non sa come entrarci.
         token = chiave()
         os.environ["HARNESS_MOBILE_TOKEN"] = token
-        threading.Thread(
-            target=lambda: uvicorn.run(
-                "server.mobile:app",
-                host="0.0.0.0",
-                port=args.mobile_port,
-                log_level="warning",
-            ),
-            daemon=True,
-            name="interfaccia-mobile",
-        ).start()
+        ponte = avvia_ponte_mobile(args.mobile_port)
         print(
             f"  Interfaccia mobile   ->  http://{ip_lan()}:{args.mobile_port}/?k={token}"
         )
@@ -87,13 +107,57 @@ def main() -> None:
     if not args.no_browser and not args.reload:
         Timer(1.2, lambda: webbrowser.open(url)).start()
 
-    uvicorn.run(
-        "server.main:app",
-        host=args.host,
-        port=args.port,
-        reload=args.reload,
-        log_level="warning",
+    if args.reload:
+        # Con il ricaricamento automatico il server vero gira in un processo
+        # figlio, e il gestore del segnale non e' nostro: resta il tetto
+        # all'attesa, che e' la rete di sicurezza per gli stream aperti.
+        uvicorn.run(
+            "server.main:app",
+            host=args.host,
+            port=args.port,
+            reload=True,
+            log_level="warning",
+            timeout_graceful_shutdown=TIMEOUT_SPEGNIMENTO,
+        )
+        return
+
+    server = ServerCheSiFermaDavvero(
+        uvicorn.Config(
+            "server.main:app",
+            host=args.host,
+            port=args.port,
+            log_level="warning",
+            # Cintura, oltre alle bretelle di ``handle_exit``: se un domani
+            # qualcuno aggiunge un'altra risposta lunga e si scorda di
+            # ascoltare lo spegnimento, si aspetta questo e poi si chiude.
+            timeout_graceful_shutdown=TIMEOUT_SPEGNIMENTO,
+        )
     )
+    server._compagni = [ponte] if ponte is not None else []
+    server.run()
+
+
+def avvia_ponte_mobile(porta: int) -> uvicorn.Server:
+    """Solleva il ponte del telefono in un thread e ne ritorna il server.
+
+    Torna l'oggetto e non solo il thread perche' allo spegnimento gli si dice
+    ``should_exit``: un thread demone verrebbe ammazzato comunque all'uscita
+    dell'interprete, ma chiedere e' piu' pulito che tagliare.
+    """
+    server = uvicorn.Server(
+        uvicorn.Config(
+            "server.mobile:app",
+            host="0.0.0.0",
+            port=porta,
+            log_level="warning",
+            timeout_graceful_shutdown=TIMEOUT_SPEGNIMENTO,
+        )
+    )
+    # I gestori di segnale se li installa solo il thread principale (lo
+    # controlla uvicorn stesso): qui non ce ne sono, ed e' giusto cosi' --
+    # Ctrl+C lo raccoglie il server principale, che poi avvisa questo.
+    threading.Thread(target=server.run, daemon=True, name="interfaccia-mobile").start()
+    return server
 
 
 if __name__ == "__main__":

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -61,6 +62,16 @@ def client(fake_ollama, tmp_path, monkeypatch):
         test_client.workspace = workspace
         test_client.server = server_main
         yield test_client
+
+    # Nessun turno deve sopravvivere al test. I worker sono thread demoni e
+    # ``fake.SCRIPT`` e' una variabile globale: un turno rimasto in volo
+    # consuma le risposte finte preparate dal test successivo, che fallisce
+    # per un motivo che non ha niente a che vedere con quello che prova.
+    # E' il difetto che faceva cadere test_answer_flows_to_the_pending_question
+    # una volta ogni tanto, e mai da solo.
+    scadenza = time.monotonic() + 10
+    while server_main.RUNNERS.running_ids() and time.monotonic() < scadenza:
+        time.sleep(0.02)
 
 
 fake_ollama = fake.fake_ollama  # riesporta la fixture
@@ -1054,3 +1065,87 @@ def test_la_ricerca_non_viene_scambiata_per_un_id_di_conversazione(client):
     risposta = client.get("/api/sessions/search", params={"q": "niente"})
     assert risposta.status_code == 200
     assert "sessions" in risposta.json()
+
+
+# ---------------------------------------------------------------------------
+# Spegnimento: le risposte che non finiscono mai devono poter finire
+# ---------------------------------------------------------------------------
+
+
+def test_il_bus_globale_si_chiude_quando_il_processo_si_ferma():
+    """La ragione per cui Ctrl+C aveva smesso di funzionare.
+
+    ``/api/events`` e' una risposta HTTP che per mestiere non termina: ogni
+    scheda aperta sulla UI ne tiene una. Uvicorn, ricevuto il segnale, smette
+    di accettare connessioni e poi **aspetta che le risposte in corso
+    finiscano** -- e questa non finiva. Dall'esterno: Ctrl+C ignorato e la
+    finestra del terminale da chiudere a mano.
+    """
+    from server import runner as runner_mod
+    from server.main import EventBus
+
+    runner_mod.dimentica_spegnimento()
+    bus = EventBus()
+    flusso = bus.stream()
+    assert "hello" in next(flusso), "il saluto apre lo stream"
+
+    finito = threading.Event()
+
+    def consuma():
+        for _ in flusso:
+            pass
+        finito.set()
+
+    lettore = threading.Thread(target=consuma, daemon=True)
+    lettore.start()
+    # Prima dello spegnimento lo stream e' vivo: nessuno lo chiude.
+    assert not finito.wait(0.3)
+
+    runner_mod.annuncia_spegnimento()
+    try:
+        # E adesso finisce **subito**, non fra quindici secondi di keepalive.
+        assert finito.wait(2.0), "lo stream non si e' chiuso allo spegnimento"
+    finally:
+        runner_mod.dimentica_spegnimento()
+
+
+def test_anche_lo_stream_di_un_turno_si_stacca_allo_spegnimento():
+    """Stessa regola per ``/api/stream/{id}``: un turno lungo terrebbe aperta
+    la sua risposta, e uvicorn aspetterebbe lui invece del Ctrl+C. Il turno
+    non viene fermato -- vive nel suo thread -- si chiude la connessione."""
+    from server import runner as runner_mod
+
+    runner_mod.dimentica_spegnimento()
+    registro = runner_mod.RunnerRegistry()
+    partito = threading.Event()
+    libera = threading.Event()
+
+    def lavoro(runner):
+        runner.emit('data: {"type": "start"}\n\n')
+        partito.set()
+        libera.wait(5)
+
+    registro.start("sessione-di-prova", [], lavoro)
+    assert partito.wait(2)
+
+    runner = registro.get("sessione-di-prova")
+    flusso = runner.stream()
+    assert next(flusso)                       # l'arretrato c'e'
+
+    finito = threading.Event()
+
+    def consuma():
+        for _ in flusso:
+            pass
+        finito.set()
+
+    threading.Thread(target=consuma, daemon=True).start()
+    assert not finito.wait(0.3)
+
+    runner_mod.annuncia_spegnimento()
+    try:
+        assert finito.wait(2.0), "la risposta del turno non si e' chiusa"
+        assert not runner.finished.is_set(), "il turno non va fermato, solo scollegato"
+    finally:
+        libera.set()
+        runner_mod.dimentica_spegnimento()

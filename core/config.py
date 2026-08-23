@@ -20,9 +20,10 @@ APP_NAME = "Local Agent Harness"
 #
 # Il numero si muove cosi': terza cifra per una correzione, seconda per una
 # funzione nuova, prima per un cambio che rompe le sessioni salvate o le
-# preferenze. 2.31.0 e' stato il merge del fork Qwen; 2.32.0 aggiunge alla
-# sola interfaccia mobile i passi del turno e la striscia dell'attivita'.
-APP_VERSION = "2.32.0"
+# preferenze. 2.31.0 e' stato il merge del fork Qwen; 2.32.0 i passi del
+# turno sul telefono; 2.33.0 Ctrl+C che spegne davvero, la sincronizzazione
+# in diretta fra i due schermi e l'interfaccia mobile installabile.
+APP_VERSION = "2.33.0"
 
 # --- percorsi di persistenza ------------------------------------------------
 DATA_DIR = Path("chat_sessions")
@@ -265,6 +266,15 @@ DEFAULTS: dict[str, Any] = {
     # workspace. Lista di dict {path, nome}: il nome e' quello scelto
     # dall'utente, non la basename, perche' i vault si riconoscono dal tema.
     "vaults": [],
+    # Chiave d'accesso dell'interfaccia mobile. Vuota = non ancora generata:
+    # al primo avvio con --mobile se ne fa una e si scrive qui.
+    #
+    # Sta nelle preferenze, e non in una variabile d'ambiente creata ad ogni
+    # avvio, per una ragione sola: l'indirizzo del telefono contiene la chiave,
+    # e un indirizzo che cambia ogni volta non si puo' installare come app --
+    # l'icona sulla schermata home punterebbe a un link scaduto dal riavvio
+    # successivo. Una chiave stabile e' quello che rende il ponte una app.
+    "mobile_token": "",
     "confirm_commands": False,
     # Dove girano i comandi di run_command.
     #   docker = container che monta solo il workspace su /work (predefinito)

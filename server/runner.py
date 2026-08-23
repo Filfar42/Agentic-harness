@@ -30,6 +30,57 @@ _SUBSCRIBER_QUEUE_MAX = 2000
 _KEEPALIVE_S = 15.0
 
 
+# ---------------------------------------------------------------------------
+# Spegnimento
+# ---------------------------------------------------------------------------
+#
+# Una risposta SSE non finisce: e' il suo mestiere. Ma uvicorn, quando riceve
+# Ctrl+C, smette di accettare connessioni e poi **aspetta che le risposte in
+# corso finiscano** -- e quelle non finiscono mai. Il risultato visto
+# dall'utente e' che Ctrl+C non fa niente e bisogna chiudere la finestra del
+# terminale: basta una scheda del browser aperta sulla UI, che tiene sempre
+# aperto ``/api/events``.
+#
+# Qui c'e' il "sta chiudendo" che quelle risposte devono poter guardare. Chi
+# tiene code di abbonati registra una sveglia: al momento dello spegnimento le
+# code ricevono il colpetto che le fa uscire dal ``get()`` bloccante, invece di
+# aspettare i quindici secondi del keepalive.
+SPEGNIMENTO = threading.Event()
+_SVEGLIE: list[Callable[[], None]] = []
+_SVEGLIE_LOCK = threading.Lock()
+
+
+def al_spegnimento(sveglia: Callable[[], None]) -> None:
+    """Registra chi va svegliato quando il processo si ferma."""
+    with _SVEGLIE_LOCK:
+        _SVEGLIE.append(sveglia)
+
+
+def annuncia_spegnimento() -> None:
+    """Il processo si sta fermando: chi ha risposte aperte le chiuda.
+
+    La chiama ``run.py`` dal gestore del segnale, **prima** che uvicorn si
+    metta ad aspettare le connessioni. Deve essere veloce e non alzare mai
+    eccezioni: gira dentro un handler di segnale.
+    """
+    SPEGNIMENTO.set()
+    with _SVEGLIE_LOCK:
+        sveglie = list(_SVEGLIE)
+    for sveglia in sveglie:
+        try:
+            sveglia()
+        except Exception:  # noqa: BLE001 - in un handler di segnale non si alza niente
+            pass
+
+
+def dimentica_spegnimento() -> None:
+    """Riporta tutto a "non stiamo chiudendo". Serve ai test, che nello stesso
+    processo alzano e riabbassano la bandiera piu' volte."""
+    SPEGNIMENTO.clear()
+    with _SVEGLIE_LOCK:
+        _SVEGLIE.clear()
+
+
 class TurnRunner:
     """Un turno agentico in esecuzione per una conversazione.
 
@@ -68,6 +119,15 @@ class TurnRunner:
 
     def close(self) -> None:
         self.finished.set()
+        self.stacca_gli_abbonati()
+
+    def stacca_gli_abbonati(self) -> None:
+        """Chiude le risposte SSE aperte su questo turno, senza fermarlo.
+
+        Il turno vive nel suo thread e non c'entra con le connessioni: allo
+        spegnimento si chiudono le risposte -- che altrimenti terrebbero in
+        ostaggio uvicorn -- e il worker se ne accorge da solo.
+        """
         with self._lock:
             subscribers = list(self._subscribers)
         for sub in subscribers:
@@ -94,11 +154,11 @@ class TurnRunner:
             yield from backlog
             if self.finished.is_set():
                 return
-            while True:
+            while not SPEGNIMENTO.is_set():
                 try:
                     frame = sub.get(timeout=_KEEPALIVE_S)
                 except queue.Empty:
-                    if self.finished.is_set():
+                    if self.finished.is_set() or SPEGNIMENTO.is_set():
                         return
                     # Commento SSE: tiene viva la connessione senza toccare la UI.
                     yield ": keepalive\n\n"
@@ -116,6 +176,16 @@ class RunnerRegistry:
     def __init__(self) -> None:
         self._runners: dict[str, TurnRunner] = {}
         self._lock = threading.Lock()
+        # Allo spegnimento gli stream dei turni vanno chiusi come tutti gli
+        # altri: un turno lungo terrebbe aperta la sua risposta, e uvicorn
+        # aspetterebbe lui invece del Ctrl+C.
+        al_spegnimento(self._sveglia_gli_stream)
+
+    def _sveglia_gli_stream(self) -> None:
+        with self._lock:
+            runners = list(self._runners.values())
+        for runner in runners:
+            runner.stacca_gli_abbonati()
 
     def get(self, session_id: str) -> TurnRunner | None:
         with self._lock:

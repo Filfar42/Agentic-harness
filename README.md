@@ -337,7 +337,7 @@ generazione, ed e' li' che il controllo scatta piu' spesso.
 ## Test
 
 ```bash
-uv run pytest tests -q              # 664 verdi
+uv run pytest tests -q              # 674 verdi
 ```
 
 Va lanciato con l'interprete del progetto. Con un python di sistema si ottiene
@@ -360,6 +360,39 @@ del backend. La sandbox si prova con un finto `docker` messo sul PATH. Nessun
 modello richiesto.
 
 ## Storia delle revisioni
+
+**v2.33.0** — Ctrl+C, sincronizzazione in diretta, app installabile.
+
+**Ctrl+C non spegneva piu' niente.** Le rotte SSE (`/api/events`,
+`/api/stream/{id}`) sono risposte HTTP che per mestiere non finiscono;
+uvicorn, ricevuto il segnale, smette di accettare connessioni e poi *aspetta
+che le risposte in corso finiscano*. Bastava una scheda del browser aperta --
+cioe' sempre -- e l'unico modo di uscire era chiudere la finestra del
+terminale. Ora il gestore del segnale avvisa gli stream **prima** che
+l'attesa cominci (lo spegnimento della lifespan viene dopo, troppo tardi),
+e resta un tetto di 5 secondi come rete di sicurezza. C'e' un test che avvia
+un server vero, gli attacca un finto browser al bus e gli manda un SIGINT.
+
+**La sincronizzazione fra i due schermi si bloccava dopo il primo turno.** Il
+bus globale ridisegna la conversazione solo se la pagina non sta gia'
+ricevendo un turno dal vivo, ma il controller dell'attacco non veniva mai
+azzerato a fine stream: da li' in poi il desktop rispondeva "sto disegnando
+io" per sempre. Dal telefono era peggio: non ascoltava il bus affatto, e
+appena `running` diventava vero il polling smetteva di rileggere la
+conversazione mentre nessuno stream era attaccato. Si vedeva soprattutto con
+`ask_user_question`, dove il turno si chiude subito e la novita' e' tutta
+nella domanda in sospeso.
+
+**Sul telefono la domanda spariva dopo la risposta.** Ora lo scambio resta in
+chiaro come sul desktop: la domanda con la sua cornice, la scelta nella bolla
+di chi l'ha data.
+
+**L'interfaccia mobile si installa.** La chiave era nuova ad ogni avvio,
+quindi l'icona sulla schermata home apriva ogni giorno un link scaduto: ora
+si genera una volta e vive nelle preferenze, e il manifest -- servito dal
+processo, non dal disco -- se la porta dentro `start_url`. Icone rifatte: il
+robottino in terracotta, piu' piccolo e lontano dai bordi, dentro la zona
+sicura del ritaglio a cerchio di Android.
 
 **v2.32.0** — dal telefono si vede cosa sta facendo il modello.
 

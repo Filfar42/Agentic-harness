@@ -93,6 +93,7 @@ from core.tools import (  # noqa: E402
 )
 from server.nativedialog import DialogUnavailable, pick_folder  # noqa: E402
 from server.prep import Prep, image_needed  # noqa: E402
+from server import runner as runner_mod  # noqa: E402
 from server.runner import RunnerRegistry, TurnRunner  # noqa: E402
 
 WEB_DIR = Path(__file__).resolve().parents[1] / "web"
@@ -738,16 +739,28 @@ class EventBus:
     _KEEPALIVE_S = 15.0
 
     def __init__(self) -> None:
-        self._subscribers: list[queue.Queue[str]] = []
+        self._subscribers: list[queue.Queue[str | None]] = []
         self._lock = threading.Lock()
+        # Questa e' la risposta che non finisce mai per definizione: ogni
+        # scheda aperta sulla UI ne tiene una. Senza questa riga, Ctrl+C non
+        # spegne il server finche' c'e' un browser aperto -- uvicorn aspetta
+        # educatamente che ``/api/events`` finisca, e non finisce.
+        runner_mod.al_spegnimento(self.stacca_tutti)
 
-    def subscribe(self) -> queue.Queue[str]:
-        sub: queue.Queue[str] = queue.Queue()
+    def subscribe(self) -> queue.Queue[str | None]:
+        sub: queue.Queue[str | None] = queue.Queue()
         with self._lock:
             self._subscribers.append(sub)
         return sub
 
-    def unsubscribe(self, sub: queue.Queue[str]) -> None:
+    def stacca_tutti(self) -> None:
+        """Chiude tutte le connessioni al bus: un colpetto per ognuna."""
+        with self._lock:
+            subscribers = list(self._subscribers)
+        for sub in subscribers:
+            sub.put(None)
+
+    def unsubscribe(self, sub: queue.Queue[str | None]) -> None:
         with self._lock:
             if sub in self._subscribers:
                 self._subscribers.remove(sub)
@@ -761,16 +774,23 @@ class EventBus:
                 sub.put(frame)
 
     def stream(self) -> Iterator[str]:
-        """SSE: saluto, poi ogni evento finche' il client resta collegato."""
+        """SSE: saluto, poi ogni evento finche' il client resta collegato.
+
+        Finisce in due casi soli: il client se ne va (il generatore viene
+        chiuso), oppure il processo si sta spegnendo -- ed e' il secondo che
+        va detto, perche' e' l'unico modo che ha Ctrl+C di funzionare.
+        """
         sub = self.subscribe()
         try:
             yield sse("hello", {"ts": time.time()})
-            while True:
+            while not runner_mod.SPEGNIMENTO.is_set():
                 try:
                     frame = sub.get(timeout=self._KEEPALIVE_S)
                 except queue.Empty:
                     yield ": keepalive\n\n"
                     continue
+                if frame is None:      # il colpetto dello spegnimento
+                    return
                 yield frame
         finally:
             self.unsubscribe(sub)

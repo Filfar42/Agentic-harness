@@ -78,6 +78,16 @@ def mobile(fake_ollama, tmp_path, monkeypatch):
         test_client.server = server_main
         yield test_client
 
+    # Nessun turno deve sopravvivere al test. I worker sono thread demoni e
+    # ``fake.SCRIPT`` e' una variabile globale: un turno rimasto in volo
+    # consuma le risposte finte preparate dal test successivo, che fallisce
+    # per un motivo che non ha niente a che vedere con quello che prova.
+    # E' il difetto che faceva cadere test_answer_flows_to_the_pending_question
+    # una volta ogni tanto, e mai da solo.
+    scadenza = time.monotonic() + 10
+    while server_main.RUNNERS.running_ids() and time.monotonic() < scadenza:
+        time.sleep(0.02)
+
     # Il TestClient chiude il ponte (shutdown -> close_client): il client
     # sostituito va chiuso a mano perche' non e' quello gestito dal modulo.
     import asyncio
@@ -493,3 +503,51 @@ def test_la_chiave_nell_indirizzo_lascia_un_cookie(mobile):
     # Ora vale il cookie, anche con l'intestazione sbagliata.
     dopo = mobile.get("/api/sessions", headers={"X-Harness-Token": "sbagliata"})
     assert dopo.status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# Installabile: chiave stabile e manifest che se la porta dietro
+# ---------------------------------------------------------------------------
+
+
+def test_la_chiave_non_cambia_fra_un_avvio_e_l_altro(tmp_path, monkeypatch):
+    """Il difetto che rendeva l'app non installabile.
+
+    L'indirizzo che si apre dal telefono contiene la chiave. Se ne nasce una
+    nuova ad ogni avvio, l'icona aggiunta alla schermata home punta a un
+    indirizzo scaduto: si installa oggi e domani da 401. La chiave si genera
+    una volta sola e si salva nelle preferenze.
+    """
+    from core import settings as settings_mod
+    from server import mobile as mobile_mod
+
+    monkeypatch.delenv(mobile_mod.TOKEN_ENV, raising=False)
+    monkeypatch.setattr(settings_mod, "SETTINGS_FILE", tmp_path / "impostazioni.json")
+
+    prima = mobile_mod.token()
+    assert prima, "una chiave ci deve essere"
+    assert settings_mod.load_settings()["mobile_token"] == prima, "e va salvata"
+
+    # Riavvio: ambiente pulito, stesse preferenze -> stessa chiave.
+    monkeypatch.delenv(mobile_mod.TOKEN_ENV, raising=False)
+    assert mobile_mod.token() == prima
+
+
+def test_il_manifest_porta_la_chiave_nello_start_url(mobile):
+    """Quello che rende l'icona sulla schermata home un'app che si apre.
+
+    Il manifest e' servito dal processo, non dal disco: la chiave si sa solo a
+    server avviato, e senza di lei ``start_url`` aprirebbe un 401 ogni volta
+    che il cookie e' scaduto o e' stato ripulito.
+    """
+    risposta = mobile.get("/manifest.webmanifest")
+    assert risposta.status_code == 200
+    dati = risposta.json()
+    assert dati["start_url"] == f"/?k={CHIAVE}"
+    assert dati["scope"] == "/"
+    assert dati["display"] == "standalone"
+    # Le icone servono ad Android per l'installazione: se il ritaglio a cerchio
+    # le tocca, l'app nasce con l'icona tagliata.
+    for icona in dati["icons"]:
+        assert "maskable" in icona["purpose"]
+        assert mobile.get(icona["src"]).status_code == 200

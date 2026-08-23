@@ -21,13 +21,18 @@ variabile d'ambiente ``HARNESS_UPSTREAM``.
 agente che esegue comandi sul computer dell'utente: senza una chiave, il
 telefono del vicino di casa -- o qualunque cosa parli sul Wi-Fi
 dell'aeroporto -- avrebbe la stessa autorita' del padrone di casa. Il token
-si genera all'avvio, viaggia una volta sola nell'URL (``?k=...``) e poi vive
-in un cookie: un gesto solo, la prima volta che si apre il link.
+viaggia nell'URL (``?k=...``) e poi vive in un cookie: un gesto solo, la
+prima volta che si apre il link.
+
+E' **stabile**: si genera una volta e si salva nelle preferenze. Una chiave
+nuova ad ogni avvio renderebbe l'interfaccia non installabile -- l'icona sulla
+schermata home aprirebbe ogni giorno un indirizzo scaduto.
 """
 
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import secrets
 from pathlib import Path
@@ -97,21 +102,31 @@ COOKIE_MAX_AGE = 30 * 24 * 3600
 
 
 def token() -> str:
-    """La chiave d'accesso di questo ponte.
+    """La chiave d'accesso di questo ponte, la stessa ad ogni avvio.
 
-    Si legge dall'ambiente **alla chiamata**, non all'import: ``run.py`` la
-    imposta prima di sollevare il thread, e i test la sostituiscono con una
-    loro. Se non c'e', se ne genera una e la si stampa: mai nessun accesso
-    senza chiave, neppure quando qualcuno lancia ``uvicorn server.mobile:app``
-    a mano.
+    Si legge **alla chiamata**, non all'import: ``run.py`` la imposta prima di
+    sollevare il thread, e i test la sostituiscono con una loro.
+
+    L'ordine e' ambiente, preferenze, e solo in ultimo una chiave nuova --
+    che viene subito **salvata**. Generarne una diversa ad ogni avvio
+    renderebbe impossibile installare l'interfaccia sul telefono: l'icona
+    sulla schermata home aprirebbe un indirizzo con la chiave di ieri.
     """
     esistente = os.environ.get(TOKEN_ENV)
     if esistente:
         return esistente
-    nuovo = secrets.token_urlsafe(9)
-    os.environ[TOKEN_ENV] = nuovo
-    print(f"  Chiave dell'interfaccia mobile: {nuovo}  (aggiungi ?k={nuovo} all'indirizzo)")
-    return nuovo
+
+    from core import settings as settings_mod
+
+    preferenze = settings_mod.load_settings()
+    salvata = str(preferenze.get("mobile_token") or "").strip()
+    if not salvata:
+        salvata = secrets.token_urlsafe(9)
+        preferenze["mobile_token"] = salvata
+        settings_mod.save_settings(preferenze)
+        print(f"  Chiave dell'interfaccia mobile: {salvata}  (ora e' salvata: non cambiera' piu')")
+    os.environ[TOKEN_ENV] = salvata
+    return salvata
 
 
 @asynccontextmanager
@@ -271,6 +286,25 @@ def _asset_version() -> str:
         except OSError:
             imprint.update(nome.encode())
     return imprint.hexdigest()[:10]
+
+
+@app.get("/manifest.webmanifest")
+def manifest() -> Response:
+    """Il manifest, con la chiave dentro ``start_url``.
+
+    E' la riga che rende installabile l'interfaccia: quando si aggiunge alla
+    schermata home, il telefono si ricorda ``start_url``, e se li' non ci
+    fosse la chiave l'icona aprirebbe un 401 ogni volta che il cookie e'
+    scaduto o e' stato ripulito. Servito da qui e non come file statico
+    perche' la chiave si sa solo a processo avviato.
+    """
+    dati = json.loads((WEB_MOBILE_DIR / "manifest.webmanifest").read_text(encoding="utf-8"))
+    dati["start_url"] = f"/?k={token()}"
+    return Response(
+        json.dumps(dati, ensure_ascii=False, indent=2),
+        media_type="application/manifest+json",
+        headers={"Cache-Control": "no-cache"},
+    )
 
 
 @app.get("/")

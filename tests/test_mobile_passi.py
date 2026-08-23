@@ -47,6 +47,7 @@ def js() -> quickjs.Context:
         _funzione(sorgente, "descriviTool"),
         _funzione(sorgente, "toolAndatoBene"),
         _funzione(sorgente, "durataBreve"),
+        _funzione(sorgente, "rispostaData"),
     ]
     ctx = quickjs.Context()
     ctx.eval("\n".join(pezzi))
@@ -159,3 +160,42 @@ def test_i_passi_sono_piu_piccoli_e_piu_chiari_del_testo() -> None:
     misura = re.search(r"font-size:\s*([\d.]+)px", corpo)
     assert misura and float(misura.group(1)) < 15, "i passi devono essere piu' piccoli del testo"
     assert "var(--testo-dim)" in corpo, "i passi devono essere piu' chiari del testo"
+
+
+# ------------------------------------------- la domanda a cui si e' risposto
+
+
+def test_la_risposta_data_si_ricava_dal_risultato_del_tool(js) -> None:
+    """Sul mobile la card della domanda spariva dopo la risposta e non
+    restava traccia di niente: ne' di cosa era stato chiesto, ne' di cosa era
+    stato scelto. Sul desktop invece lo scambio resta in chiaro."""
+    import json as _json
+
+    singola = _json.dumps({"user_answer": "TOML"})
+    assert js.eval(f"rispostaData({_json.dumps(singola)})") == "TOML"
+
+    multipla = _json.dumps({"user_answer": ["TOML", "JSON"]})
+    assert js.eval(f"rispostaData({_json.dumps(multipla)})") == "TOML, JSON"
+
+    # Formati che non si riconoscono: meglio niente che un JSON crudo in
+    # mezzo alla conversazione.
+    assert js.eval('rispostaData("non e\' json")') == ""
+    assert js.eval('rispostaData(JSON.stringify({}))') == ""
+
+
+def test_il_telefono_ascolta_il_bus_globale() -> None:
+    """La sincronizzazione in diretta fra i due schermi.
+
+    Prima il telefono si accorgeva di un turno partito dal desktop solo al
+    giro di polling, e -- peggio -- appena ``running`` diventava vero il
+    polling smetteva di rileggere la conversazione mentre nessuno stream era
+    attaccato: restava ferma fino a un refresh a mano. Si vedeva soprattutto
+    con ``ask_user_question``, dove il turno si chiude subito e la novita' e'
+    tutta nella domanda in sospeso.
+    """
+    sorgente = APP_JS.read_text(encoding="utf-8")
+    assert "function bindGlobalEvents()" in sorgente
+    assert 'new EventSource("/api/events")' in sorgente
+    # Non basta ascoltare: alla notizia bisogna anche riattaccarsi allo stream,
+    # senno' si sa che un turno c'e' ma non lo si vede scorrere.
+    assert "if (running && !source) attachStream();" in sorgente

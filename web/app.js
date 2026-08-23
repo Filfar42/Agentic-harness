@@ -777,6 +777,9 @@ async function attachStream(sessionId) {
       turn.append(el('div', 'error-box', esc('Stream non raggiungibile: ' + error.message)));
       setRunning(sessionId, false);
     }
+    // Anche qui: nessuno stream aperto, quindi questa pagina non e' la fonte
+    // viva e il bus globale deve poter ridisegnare.
+    if (state.attachAbort === controller) state.attachAbort = null;
     return;
   }
 
@@ -813,8 +816,23 @@ async function attachStream(sessionId) {
   status.remove();
   turn.finish();
   if (turn.isEmpty() || sawIdle) turn.wrap.remove();
+  // Lo stream e' finito: da adesso questa pagina **non** e' piu' la fonte
+  // viva, e chi arriva dal bus globale puo' ridisegnare. Senza questa riga il
+  // controller restava li', mai abortito, e ``attaccatoAUnoStream()`` diceva
+  // "sto disegnando io" per sempre: dopo il primo turno, un messaggio scritto
+  // dal telefono non compariva piu' sul desktop fino a un ricaricamento.
+  if (state.attachAbort === controller) state.attachAbort = null;
   setRunning(sessionId, false);
   refreshSessions();
+}
+
+/** Questa pagina sta ricevendo un turno dal vivo?
+ *
+ *  E' la domanda che decide se un evento del bus globale puo' ridisegnare la
+ *  conversazione. Un controller esistente e non abortito significa che lo
+ *  stream e' aperto **adesso**; ``attachStream`` lo azzera quando finisce. */
+function attaccatoAUnoStream() {
+  return Boolean(state.attachAbort) && !state.attachAbort.signal.aborted;
 }
 
 function handleEvent(event, turn, status, setStatus) {
@@ -1801,7 +1819,7 @@ function bindGlobalEvents() {
           .then((payload) => {
             // Non tocco il turno che questa pagina sta gia' disegnando:
             // attachStream e' la fonte viva finche' lo stream non chiude.
-            if (!state.attachAbort || state.attachAbort.signal.aborted) showSession(payload);
+            if (!attaccatoAUnoStream()) showSession(payload);
           })
           .catch(() => {});
       }
