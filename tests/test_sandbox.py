@@ -12,6 +12,7 @@ ricrearlo ad ogni comando, e soprattutto che quando Docker manca l'harness
 from __future__ import annotations
 
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -38,7 +39,15 @@ cmd = args[0] if args else ""
 if cmd == "version":
     print("27.1.0"); sys.exit(0)
 if cmd == "ps":
-    print("abc123" if os.path.exists(state) else "", end=""); sys.exit(0)
+    if "--quiet" in args:
+        # _is_running: lo stato del nostro container.
+        print("abc123" if os.path.exists(state) else "", end="")
+    else:
+        # ps --format con --filter label=... (il filtro e' di docker; qui si
+        # simulano i contenitori etichettati altrui da una variabile d'ambiente).
+        for riga in os.environ.get("DOCKER_FOREIGN_PS", "").splitlines():
+            if riga.strip(): print(riga)
+    sys.exit(0)
 if cmd == "run":
     # Registra l'impronta con cui il container e' stato creato: e' quello che
     # 'docker inspect' rilegge per capire se gli argomenti sono cambiati.
@@ -73,15 +82,40 @@ sys.exit(0)
 
 @pytest.fixture()
 def fake_docker(tmp_path, monkeypatch):
-    """Mette un finto ``docker`` in testa al PATH e restituisce il log."""
+    """Mette un finto ``docker`` in testa al PATH e restituisce il log.
+
+    Su Windows non basta scrivere un file di nome ``docker`` con lo shebang:
+    ``CreateProcess`` non legge la prima riga di uno script, cerca un
+    eseguibile fra quelli elencati in ``PATHEXT``. Senza un ``docker.cmd``
+    ogni ``subprocess.run(["docker", ...])`` moriva con ``WinError 2``, e i
+    ventotto test della sandbox e delle anteprime risultavano rossi per un
+    motivo che con il codice del progetto non c'entra niente.
+
+    Anche il PATH va costruito con ``os.pathsep`` e conservando quello vero:
+    su Windows servono ``python.exe`` e le DLL di sistema, e sostituirlo con
+    ``/usr/bin:/bin`` significava lasciare il finto docker da solo in un PATH
+    che non contiene neppure l'interprete che deve eseguirlo.
+    """
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
-    stub = bin_dir / "docker"
-    stub.write_text(STUB, encoding="utf-8")
-    stub.chmod(0o755)
-
     log = tmp_path / "docker.log"
-    monkeypatch.setenv("PATH", f"{bin_dir}{':'}{Path('/usr/bin')}:{Path('/bin')}")
+
+    if os.name == "nt":
+        script = bin_dir / "docker_stub.py"
+        script.write_text(STUB, encoding="utf-8")
+        # %* passa gli argomenti cosi' come sono; le virgolette attorno ai due
+        # percorsi reggono gli spazi di "C:\Users\...\AppData\Local\Temp".
+        (bin_dir / "docker.cmd").write_text(
+            f'@echo off\r\n"{sys.executable}" "{script}" %*\r\n', encoding="utf-8"
+        )
+        percorso = os.pathsep.join([str(bin_dir), os.environ.get("PATH", "")])
+    else:
+        stub = bin_dir / "docker"
+        stub.write_text(STUB, encoding="utf-8")
+        stub.chmod(0o755)
+        percorso = os.pathsep.join([str(bin_dir), "/usr/bin", "/bin"])
+
+    monkeypatch.setenv("PATH", percorso)
     monkeypatch.setenv("DOCKER_LOG", str(log))
     monkeypatch.setenv("DOCKER_STATE", str(tmp_path / "container.up"))
 
@@ -324,6 +358,42 @@ def test_the_dockerfile_builds_even_without_a_requirements_file():
     sorgenti = copia.split()[1:-1]
     assert any("*" not in s for s in sorgenti), copia
     assert sandbox.SANDBOX_DOCKERFILE in copia
+
+
+# --- le porte non si litigano tra istanze -----------------------------------
+
+
+def test_other_workspaces_lets_go_of_the_ports_we_need(fake_docker, workspace, monkeypatch):
+    """Un'altra istanza dell'harness tiene le nostre porte: va via PRIMA del run.
+
+    Senza questo il bind fallisce con 'port is already allocated' e l'agente
+    resta appeso a un errore che non capisce (il proprio shell gira dentro un
+    container che proprio per quello non parte).
+    """
+    monkeypatch.setenv(
+        "DOCKER_FOREIGN_PS",
+        "fed456|agentic-harness-9c1d|127.0.0.1:8204-8207->8204-8207/tcp",
+    )
+    sandbox.ensure_container(workspace, ports=(8204, 8207))
+
+    calls = fake_docker()
+    idx_run = next(i for i, c in enumerate(calls) if c[0] == "run")
+    rimosse_prima_del_run = [c[-1] for c in calls[:idx_run] if c[0] == "rm"]
+    assert "agentic-harness-9c1d" in rimosse_prima_del_run
+
+
+def test_no_overlap_means_no_removals(fake_docker, workspace, monkeypatch):
+    """Nessun sovrapporsi di porte: non si rimuove nulla, neppure il contenitore altrui."""
+    nome_nostro = sandbox.container_name(workspace)
+    monkeypatch.setenv(
+        "DOCKER_FOREIGN_PS",
+        "fed456|agentic-harness-9c1d|0.0.0.0:9001->3000/tcp",
+    )
+    sandbox.ensure_container(workspace, ports=(8204, 8207))
+
+    calls = fake_docker()
+    estranee = [c for c in calls if c[0] == "rm" and c[-1] != nome_nostro]
+    assert not estranee, f"rimozione senza motivo: {estranee}"
 
 
 def test_a_command_starting_with_cd_is_not_broken_by_the_timeout(fake_docker, workspace):

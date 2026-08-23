@@ -22,6 +22,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from core import memory as memory_mod  # noqa: E402
 from core import settings as settings_mod  # noqa: E402
 
 
@@ -29,3 +30,12 @@ from core import settings as settings_mod  # noqa: E402
 def preferenze_isolate(tmp_path, monkeypatch):
     """Ogni test scrive le sue preferenze in una cartella temporanea."""
     monkeypatch.setattr(settings_mod, "SETTINGS_FILE", tmp_path / "impostazioni.json")
+    # Stessa regola per la memoria a lungo termine: senza questo i test di
+    # /api/memories leggevano e riscrivevano il file REALE del workspace.
+    monkeypatch.setattr(memory_mod, "MEMORY_FILE", tmp_path / "memorie.json")
+    # E per i marchi "c'e' un'app viva nella sandbox": vivono fuori dal
+    # workspace (il container li cancellerebbe) e finivano nella home vera,
+    # dove restavano. Non davano rossi solo perche' ogni test usa una
+    # tmp_path diversa, quindi un'impronta diversa: bastava un test che
+    # riusasse un percorso per portarsi dietro lo stato del run precedente.
+    monkeypatch.setenv("HARNESS_BG_LIVE", str(tmp_path / "sandbox-bg"))

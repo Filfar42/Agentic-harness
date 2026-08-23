@@ -59,6 +59,16 @@
     </div>
     <div id="sessions"></div>
 
+    <div class="section-label vaults-label">Vault <span class="section-hint">LLM Wiki</span></div>
+    <!-- I vault sono workspace organizzati come wiki LLM (raw/ immutabile,
+         wiki/ dell'agente, schema CLAUDE.md): aprirne uno mette l'agente in
+         modalita' manutentore. Dalle chat normali il tool vault_search li
+         interroga senza cambiare workspace. -->
+    <div class="vault-add">
+      <button class="vault-new" id="vault-new" title="Scegli la cartella con Esplora risorse">+ Nuovo vault</button>
+    </div>
+    <div id="vaults"></div>
+
     <div class="sidebar-foot">
       <button class="icon-btn" id="theme-toggle" title="Tema chiaro/scuro">☀</button>
       <button class="foot-btn" id="open-settings" title="Impostazioni">
@@ -152,6 +162,12 @@
         <div id="scroller"><div id="thread"></div></div>
 
         <div id="composer-wrap">
+          <div class="composer-toolbar" id="composer-toolbar" hidden>
+            <button type="button" class="quick-chip" id="btn-quick-continue" title="Invia subito 'continua' all'agente">
+              <span class="chip-icon">▶</span>
+              <span class="chip-label">continua</span>
+            </button>
+          </div>
           <div id="composer">
             <!-- Gli allegati in attesa stanno DENTRO il contenitore, sopra la
                  riga di scrittura: e' il posto in cui li mettono le app di
@@ -168,7 +184,21 @@
                 </svg>
               </button>
               <input type="file" id="attach-input" multiple hidden>
+              <!-- Goccia "Ricerca online": toggle di modalita', non un allegato.
+                   Ancorata a destra della riga, fra la casella e l'invio:
+                   cambia COME parte il messaggio. Spenta, il modello non sa
+                   nemmeno che il tool esiste: lo schema e la riga di prompt
+                   vengono appesi solo quando questa e' attiva. -->
               <textarea rows="1" placeholder="Chiedi all'agente di lavorare sul workspace…"></textarea>
+              <button type="button" id="toggle-web-search" class="goccia-web" aria-pressed="false"
+                      title="Ricerca online: permette al modello di cercare sul web">
+                <svg class="globo" width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round">
+                  <circle cx="8" cy="8" r="6.2"/>
+                  <ellipse cx="8" cy="8" rx="2.8" ry="6.2"/>
+                  <path d="M1.8 8h12.4M2.9 4.8h10.2M2.9 11.2h10.2"/>
+                </svg>
+                <span>Ricerca online</span>
+              </button>
               <button id="send" title="Invia (Invio)">
                 <svg id="icon-send" width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
                   <path d="M8 13V3M3.5 7.5L8 3l4.5 4.5"/>
@@ -292,9 +322,9 @@
         <div class="grid2">
           <div>
             <div class="field">
-              <label for="s-api-base">Endpoint</label>
-              <input type="text" id="s-api-base">
-              <div class="help">Radice del server, senza /v1. Es. http://localhost:11434 — oppure l'IP di un'altra macchina della rete.</div>
+              <label for="s-api-base">Endpoint API (api_base)</label>
+              <input type="text" id="s-api-base" placeholder="http://localhost:11434 o https://openrouter.ai/api/v1">
+              <div class="help">URL dell'endpoint LLM (chiave <code>api_base</code>). Es. <code>http://localhost:11434</code> per Ollama oppure <code>https://openrouter.ai/api/v1</code> per OpenRouter.</div>
             </div>
             <div class="field">
               <label for="s-gpu-vram">VRAM della scheda remota (MB)</label>
@@ -321,7 +351,9 @@
             </div>
             <div class="field">
               <label for="s-model">Modello</label>
-              <select id="s-model"></select>
+              <input type="text" id="s-model" list="s-model-list" placeholder="Es. Qwen3.8:27B-Q6_K o qwen/qwen-2.5-72b-instruct" autocomplete="off" spellcheck="false">
+              <datalist id="s-model-list"></datalist>
+              <div class="help">Digita il nome di qualsiasi modello (es. per OpenRouter/OpenAI) oppure sceglilo dai suggerimenti trovati sull'endpoint.</div>
             </div>
             <!-- Subito sotto al modello: sono le due scelte che definiscono
                  "chi lavora e su cosa", e finché stava in fondo alla colonna
@@ -452,6 +484,11 @@
               <label for="s-presence">presence_penalty — <span id="s-presence-val"></span></label>
               <input type="range" id="s-presence" min="0" max="2" step="0.1">
               <div class="help">Aiuta i modelli di pensiero a non girare in tondo. Sul codice tienila a 0: penalizza gli identificatori ripetuti, che devono restare uguali.</div>
+            </div>
+            <div class="field">
+              <label for="s-repetition">repetition_penalty — <span id="s-repetition-val"></span></label>
+              <input type="range" id="s-repetition" min="1" max="2" step="0.05">
+              <div class="help">Penalizza ogni ripetizione di un token già visto: 1 non fa niente (senza di lei Ollama lascerebbe il suo default 1.1), sopra 1.05 rischia di tagliare le parole comuni nel mezzo delle frasi.</div>
             </div>
             <div class="field">
               <label for="s-maxtok">Max token generati — <span id="s-maxtok-val"></span></label>

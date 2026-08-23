@@ -47,18 +47,22 @@ MAX_REFERTO_CHARS = 2_000
 # ha con chi parlare.
 TOOL_DELEGA = ("list_files", "read_file", "search_files")
 
-PROMPT_DELEGA = """\
-Sei un esploratore. Ricevi una domanda su un workspace e hai pochi passi per \
-rispondere, con soli tre strumenti: elencare file, leggerli, cercare dentro.
+PROMPT_DELEGA = f"""\
+Sei un esploratore. Ricevi una domanda su un workspace e hai al massimo \
+{MAX_PASSI_DELEGA} passi per rispondere, con soli tre strumenti: elencare file, \
+leggerli, cercare dentro.
 
 Non puoi scrivere niente e non puoi eseguire comandi: se la risposta \
 richiedesse di modificare qualcosa, dillo invece di provarci.
 
 Chi ti ha chiamato non vedra' niente di quello che leggi: vedra' **solo la tua \
-ultima risposta**. Quindi quella deve reggersi da sola -- percorsi completi, \
-numeri di riga, il frammento esatto quando serve. "Ho trovato la funzione" non \
-serve a nessuno; "``budgets_for`` sta in core/config.py:105 e viene usata in \
-core/agent.py:945 e core/tools.py:112" si'.
+ultima risposta**, e solo i suoi primi {MAX_REFERTO_CHARS} caratteri -- oltre si \
+tronca a meta' frase senza che nessuno lo sappia. Dimensiona quindi la risposta \
+alla domanda, non al lavoro fatto: per un elenco, una riga per voce con nome e \
+numero di riga; per una localizzazione, il percorso esatto con la riga. Percorsi \
+completi sempre: "Ho trovato la funzione" non serve a nessuno; "``budgets_for`` \
+sta in core/config.py:105 e viene usata in core/agent.py:945 e core/tools.py:112" \
+si'.
 
 Sii breve. Se la risposta non c'e', dillo con quello che hai escluso: e' \
 un'informazione anche quella.
@@ -135,11 +139,11 @@ def esegui(
         if type(evento).__name__ == "StepStarted":
             passi += 1
 
+    from .textutils import strip_think
+
     referto = ""
     for msg in reversed(messaggi):
         if msg.get("role") == "assistant":
-            from .textutils import strip_think
-
             testo = strip_think(str(msg.get("content") or "")).strip()
             if testo:
                 referto = testo
@@ -153,17 +157,53 @@ def esegui(
         }
         - {""}
     )
+    # L'esploratore si e' fermato perche' il tetto dei passi l'ha chiuso a
+    # meta': passi bruciati senza risposta, e la causa va detta al padre.
+    esaurito = passi >= MAX_PASSI_DELEGA
+
     if not referto:
         return {
-            "errore": "L'esplorazione non ha prodotto una risposta.",
+            "errore": (
+                "L'esplorazione non ha prodotto una risposta"
+                + (
+                    f" -- ha esaurito i {MAX_PASSI_DELEGA} passi a meta' lavoro."
+                    if esaurito
+                    else "."
+                )
+            ),
             "passi": passi,
-            "hint": "Riformula il compito in modo piu' stretto, o cerca da solo.",
+            # Qui servono soprattutto per riformulare dal punto in cui il figlio
+            # si e' fermato: la domanda successiva parte da dove era arrivata lui.
+            "file_letti": letti,
+            "esaurito": esaurito,
+            "hint": (
+                "Riformula il compito piu' stretto partendo da 'file_letti', o cerca da solo."
+                if esaurito
+                else "Riformula il compito in modo piu' stretto, o cerca da solo."
+            ),
         }
-    return {
-        "referto": referto[:MAX_REFERTO_CHARS],
+
+    # Il troncamento deve essere *visibile*: senza marker il padre non sa di
+    # avere informazioni incomplete e rifà da capo tutto il lavoro -- la delega
+    # costa due volte invece di una.
+    out = {
         "passi": passi,
         # Dire cosa ha guardato serve al padre per fidarsi -- o per non fidarsi:
         # un referto sicuro di se' prodotto senza aprire niente e' un referto
         # inventato, e questo campo e' l'unico modo di accorgersene.
         "file_letti": letti,
     }
+    if len(referto) > MAX_REFERTO_CHARS:
+        out["referto"] = (
+            referto[:MAX_REFERTO_CHARS]
+            + f"\n\n[referto troncato: era lungo {len(referto)} caratteri e si "
+              "chiude a meta' frase -- per il resto riformula la domanda piu' stretta]"
+        )
+        out["troncato"] = True
+    else:
+        out["referto"] = referto
+    if esaurito:
+        # Risposta c'e', ma e' arrivata col passo 6 gia' speso: il padre deve
+        # poterla leggere come "probabilmente incompleta" e riformulare.
+        out["esaurito"] = True
+    return out

@@ -45,7 +45,11 @@ def _normalise(raw: Any) -> list[dict[str, str]]:
     return out
 
 
-def load_memories(path: Path = MEMORY_FILE) -> list[dict[str, str]]:
+def load_memories(path: Path | None = None) -> list[dict[str, str]]:
+    # Risolto a chiamata, non a definizione di default: un test che punta il
+    # modulo su un altro file (conftest) deve poterlo fare davvero.
+    if path is None:
+        path = MEMORY_FILE
     if not path.exists():
         return []
     try:
@@ -55,7 +59,9 @@ def load_memories(path: Path = MEMORY_FILE) -> list[dict[str, str]]:
         return []
 
 
-def save_memories(memories: list[dict[str, str]], path: Path = MEMORY_FILE) -> None:
+def save_memories(memories: list[dict[str, str]], path: Path | None = None) -> None:
+    if path is None:
+        path = MEMORY_FILE
     tmp = path.with_suffix(".json.tmp")
     try:
         with open(tmp, "w", encoding="utf-8") as fh:

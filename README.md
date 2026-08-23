@@ -4,9 +4,16 @@ Harness agentico per modelli locali (Ollama / vLLM): workspace su disco, tool
 di lettura-scrittura-esecuzione, memoria a lungo termine, interfaccia web.
 
 ```bash
-pip install -r requirements.txt     # oppure: uv sync
-python run.py                       # apre http://127.0.0.1:8123
+uv sync --extra dev                 # oppure: pip install -r requirements.txt
+uv run python run.py                # apre http://127.0.0.1:8123
+uv run python run.py --mobile       # + interfaccia per il telefono, in LAN
 ```
+
+`--extra dev` non e' un dettaglio: senza, `pytest` non entra nel `.venv` e la
+suite non si puo' nemmeno lanciare. E il comando va dato **dentro l'ambiente
+del progetto** (`uv run`, o il python del `.venv`): un `python -m pytest` preso
+dal PATH di sistema trova un altro interprete, senza le dipendenze, e produce
+una schermata di errori che sembrano bug del codice e non lo sono.
 
 Serve un server Ollama attivo e un modello con capability `tools`:
 
@@ -17,12 +24,15 @@ ollama pull qwen3:8b
 ## Struttura
 
 ```
-run.py                 avvio (uvicorn + apertura del browser)
+run.py                 avvio (uvicorn + apertura del browser); --mobile solleva anche il ponte
+run_mobile.py          il solo ponte del telefono, se il principale gira gia' altrove
 server/main.py         API HTTP e streaming SSE degli eventi dell'agente
 server/runner.py       turni in background, slegati dalla connessione
 server/prep.py         lavori lunghi: avvio di Docker, build dell'immagine
 server/nativedialog.py selettore cartelle del sistema operativo
+server/mobile.py       ponte per il telefono: proxa /api/* sul principale, chiede la chiave
 web/                   frontend: index.html, style.css, app.js, logo (nessuna CDN)
+web_mobile/            frontend del telefono: elenco, conversazione, risposta alle domande
 core/
   config.py            default, GenParams, budget di contesto
   textutils.py         parser <think> incrementale, troncamento, stima token
@@ -36,7 +46,9 @@ core/
   plan.py              piano di lavoro della conversazione e sue regole
   sandbox.py           esecuzione dei comandi in container Docker
   settings.py          preferenze persistenti fra un avvio e l'altro
-tests/                 544 test, nessun modello reale richiesto
+  vault.py             vault LLM Wiki: struttura, schema, prompt del manutentore
+  vault_search.py      sotto-turno che interroga una wiki senza cambiare workspace
+tests/                 644 test, nessun modello reale richiesto
 ```
 
 `core/` non importa nulla del livello di presentazione: il ciclo agentico e' un
@@ -54,6 +66,8 @@ generatore di eventi guidabile da una CLI, da un test o da un frontend.
 | `run_command` | shell nel workspace, guard-rail sui comandi distruttivi |
 | `manage_memory` | memoria persistente fra le sessioni |
 | `ask_user_question` | **sospende il turno** e aspetta una scelta dell'utente |
+| `web_search` | ricerca sul web. **Compare solo** se la goccia "Ricerca online" e' accesa per quel messaggio |
+| `vault_search` | interroga un vault LLM Wiki registrato senza cambiare workspace. Compare solo se ce n'e' almeno uno |
 
 Tutti i percorsi sono confinati nel workspace da `resolve_path`, che usa
 `Path.is_relative_to` (non un confronto di stringhe).
@@ -323,8 +337,17 @@ generazione, ed e' li' che il controllo scatta piu' spesso.
 ## Test
 
 ```bash
-python -m pytest tests -q
+uv run pytest tests -q              # 643 verdi, 1 saltato
 ```
+
+Va lanciato con l'interprete del progetto. Con un python di sistema si ottiene
+`ModuleNotFoundError: No module named 'fastapi'` su una decina di file: e'
+l'ambiente sbagliato, non la suite rotta.
+
+La suite gira su Windows, Linux e macOS. I due punti in cui il sistema si
+sente: il finto `docker` e' un `docker.cmd` su Windows (`CreateProcess` non
+legge lo shebang) e un test di semantica della shell POSIX si salta da solo
+su `nt`, perche' `cmd.exe` non usa 127 per "comando inesistente".
 
 I test girano contro un finto server Ollama locale: streaming NDJSON, tag
 `<think>` spezzati fra chunk, esecuzione reale dei tool, sospensione e ripresa
@@ -334,6 +357,39 @@ del backend. La sandbox si prova con un finto `docker` messo sul PATH. Nessun
 modello richiesto.
 
 ## Storia delle revisioni
+
+**v2.31.0** — merge del fork sviluppato con modelli open-weight. Sette funzioni
+nuove e sette bug portati alla luce dalla revisione.
+
+*Le funzioni*: **ricerca online** con goccia nel composer (schema e riga di
+prompt appesi solo nei turni in cui e' accesa: spenta, il modello non sa che
+esiste); **interfaccia mobile** in LAN — un ponte che proxa tutto sul processo
+principale, quindi uno stato solo e due schermi sempre allineati — protetta da
+una chiave stampata all'avvio; **vault Obsidian** e modalita' `wiki_manager`
+sul pattern LLM Wiki di Karpathy, con `vault_search` che interroga una wiki
+senza cambiare workspace; **`ignore_red`** per chiudere un punto del piano
+quando la verifica rossa non riguarda il codice — con la nota obbligatoria e
+il conto dei rossi archiviati; **resilienza di rete** in chat; **bus globale**
+`/api/events` che tiene sincronizzate le interfacce senza polling;
+**`repetition_penalty`** fra i parametri di generazione.
+
+*I bug*, tutti silenziosi, tutti trovati leggendo il codice del fork:
+`repetition_penalty` viaggiava con il nome sbagliato e Ollama lo scartava
+senza dire niente (sul filo nativo l'opzione e' `repeat_penalty`);
+`web_search` non era in `TOOL_NAMES`, quindi le chiamate scritte come testo
+— cioe' quelle dei modelli senza tool call native — venivano buttate dal
+parser; `WorkspaceError` non accettava `hint` e il ramo "nessun risultato"
+della ricerca moriva di `TypeError`; `/api/answer` perdeva la goccia
+riprendendo un turno sospeso da una domanda; la ricarica di fine turno usava
+la POST `/open`, che ferma le anteprime, e le faceva sparire ad ogni turno
+(dal telefono, ogni cinque secondi); i marchi della sandbox finivano nella
+home vera anche durante i test; il ponte mobile ascoltava su `0.0.0.0` senza
+autenticazione, davanti a un agente che esegue comandi.
+
+Piu': fine-riga normalizzati a LF con `.gitattributes` (il fork era tutto
+CRLF: 2.700 righe di modifiche vere ne mostravano 30.500), versione unica fra
+`core/config.py` e `pyproject.toml` con un test che impedisce di separarle di
+nuovo, e suite portabile su Windows.
 
 **v2.27.1** — sei correzioni uscite da una sessione di prova lunga con
 `Qwen3.8:27b` a 98k di finestra (numeri e ragionamento in

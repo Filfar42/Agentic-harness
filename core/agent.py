@@ -32,6 +32,7 @@ from .compaction import (
     trascrizione,
 )
 from . import delega as delega_mod
+from . import vault_search as vault_search_mod
 from .notes import render_block as render_notes
 from .plan import render_block, render_summary
 from .prompts import (
@@ -1304,6 +1305,26 @@ def run_turn(
 
         tool_ctx.on_delega = _delega
 
+    # vault_search si monta come la delega: backend e parametri li conosce il
+    # ciclo, non i tool. Il cercatore non riceve ne' delega ne' vault_search
+    # (lo schema del figlio e' filtrato a tre tool di lettura), quindi non c'e'
+    # ricorsione possibile.
+    if tool_ctx.on_vault_search is None:
+        def _vault_search(vault: str, query: str) -> dict[str, Any]:
+            return vault_search_mod.cerca_nel_vault(
+                vault,
+                query,
+                backend=backend,
+                params=params,
+                tools_schema=tools_schema,
+                tool_ctx=tool_ctx,
+                env_header=env_header,
+                run_turn=run_turn,
+                registri=getattr(tool_ctx, "registri_vault", None),
+            )
+
+        tool_ctx.on_vault_search = _vault_search
+
     plan_nudged = False
     # Il cancello si apre una volta per turno: dopo che l'utente ha visto il
     # piano, ogni action='set' successiva e' una revisione fatta lavorando, e
@@ -1345,6 +1366,7 @@ def run_turn(
         # appena impostata dal modello e' esattamente cio' su cui deve tornare.
         reset_scratch(tool_ctx)
     verification = VerificationTracker()
+    tool_ctx.verification = verification
     tools_used = False
     total_usage: dict[str, Any] = {}
     stopped = should_stop or (lambda: False)
@@ -1509,10 +1531,6 @@ def run_turn(
             stream_error = f"{type(exc).__name__}: {exc}"
 
         parser.finish()
-        if parser.reasoning:
-            yield ReasoningDelta(parser.reasoning)
-        if parser.answer:
-            yield ContentDelta(parser.answer)
 
         if interrupted or stopped():
             yield from halt(step, parser.reasoning, parser.answer)
@@ -1544,6 +1562,11 @@ def run_turn(
             yield AgentError(stream_error)
             yield TurnFinished(reason="error", steps=step, usage=total_usage)
             return
+
+        if parser.reasoning:
+            yield ReasoningDelta(parser.reasoning)
+        if parser.answer:
+            yield ContentDelta(parser.answer)
 
         if watchdog_hit:
             watchdog_fires += 1
@@ -2082,6 +2105,7 @@ _ERRORI_RIPROVABILI = (
     re.compile(r"(remote ?protocol|read|write|connect|pool) ?error", re.I),
     re.compile(r"(peer closed connection|server disconnected|incomplete (read|chunked))", re.I),
     re.compile(r"\btemporarily unavailable\b", re.I),
+    re.compile(r"(apiconnectionerror|apitimeouterror|internalservererror|serviceunavailable|readtimeout|connecttimeout|writetimeout)", re.I),
 )
 # Due riprese e poi si dice com'e' andata. Oltre, si trasformerebbe un servizio
 # spento in un turno che gira a vuoto consumando passi senza dirlo a nessuno.
@@ -2144,6 +2168,17 @@ class VerificationTracker:
         # comando -> (numero di fallimenti consecutivi, ultimo exit code)
         self.failing: dict[str, tuple[int, int]] = {}
 
+    def clear(self) -> None:
+        """Dimentica tutte le verifiche rosse aperte.
+
+        La chiama ``ToolContext.clear_red_command`` quando l'utente-modello
+        chiude un punto del piano dichiarando la verifica non pertinente
+        (``ignore_red``) o lo salta: da quel momento quel rosso non deve piu'
+        far scattare i solleciti, o il turno resta appeso a un fallimento che
+        e' gia' stato giudicato.
+        """
+        self.failing.clear()
+
     def record(self, name: str, result: str) -> None:
         if name != "run_command":
             return
@@ -2153,6 +2188,13 @@ class VerificationTracker:
             return
         command = str(payload.get("command") or "").strip()
         if not command:
+            # Le buste d'errore (``{"error": ..., "hint": ...}``) non portano
+            # il comando, ed e' cosi' che i guasti d'ambiente -- Docker spento,
+            # binario fuori dal PATH, comando bloccato dal recinto -- restano
+            # fuori dal tracker: per struttura del dato, non riconoscendo il
+            # testo del messaggio. Il fork ci aveva aggiunto un
+            # ``"SandboxError" in result`` qui sotto, che non e' mai potuto
+            # scattare perche' questo ritorno viene prima.
             return
         if looks_like_server(command):
             # Un server non ha un "esito": non termina per progetto. Se compare

@@ -20,6 +20,7 @@ const state = {
   sessions: [],
   sessionId: null,
   memories: [],
+  vaults: [],
   backend: {},
   stats: {},
   attachments: [],
@@ -722,6 +723,8 @@ function setRunning(sessionId, running) {
   $('#composer textarea').placeholder = busyHere
     ? 'L\'agente sta lavorando in questa chat…'
     : "Chiedi all'agente di lavorare sul workspace…";
+  const btnContinue = $('#btn-quick-continue');
+  if (btnContinue) btnContinue.disabled = busyHere;
   renderSessions();
 }
 
@@ -866,7 +869,12 @@ function handleEvent(event, turn, status, setStatus) {
       scrollDown(true);
       break;
     case 'error':
-      turn.append(el('div', 'error-box', esc(event.message)));
+      if (event.message && event.message.includes('riprendo da dove eravamo')) {
+        turn.append(el('div', 'notice', esc(event.message)));
+        setStatus('Riconnessione al modello in corso…');
+      } else {
+        turn.append(el('div', 'error-box', esc(event.message)));
+      }
       break;
     case 'done':
       // Le gocce chiudono il ciclo: su una pausa per domanda il ciclo non e'
@@ -876,6 +884,8 @@ function handleEvent(event, turn, status, setStatus) {
       if (event.reason === 'max_steps') {
         turn.append(el('div', 'notice',
           `Limite di ${event.steps} passi raggiunto. Scrivi "continua" o alza il limite nelle impostazioni.`));
+        const tb = $('#composer-toolbar');
+        if (tb) tb.hidden = false;
       }
       if (event.usage) renderUsage(event.usage);
       break;
@@ -892,6 +902,8 @@ async function send() {
   const box = $('#composer textarea');
   const text = box.value.trim();
   if (!text) return;
+  const tb = $('#composer-toolbar');
+  if (tb) tb.hidden = true;
   if (state.pending) { toast('Rispondi prima alla domanda dell\'agente.'); return; }
   const sessionId = state.sessionId;
   // Gli allegati in attesa partono con questo messaggio e restano suoi: la
@@ -899,6 +911,13 @@ async function send() {
   // dietro. Se la chiamata fallisce li rimette applyStats, che li ritrova
   // ancora non agganciati.
   const allegati = state.attachments.slice();
+  // Modalita' ricerca online: lo stato della goccia vale per questo invio e
+  // RESTA com'e' per i prossimi: e' un interruttore, non un'opzione
+  // monouso. Spenderla sotto le mani dell'utente l'avrebbe costretto a
+  // riaccenderla a ogni messaggio, e un modello bloccato dalla guardia
+  // "modalita' non attiva" e' quello che sembra un bug.
+  const gocciaWeb = $('#toggle-web-search');
+  const webSearch = !!(gocciaWeb && gocciaWeb.classList.contains('on'));
   box.value = '';
   box.style.height = 'auto';
   addUser(text, allegati);
@@ -918,6 +937,7 @@ async function send() {
         session_id: sessionId,
         prompt: text,
         attachments: allegati.map((a) => a.name),
+        web_search: webSearch,
       }),
     });
     // Il consumo del contesto e l'elenco delle conversazioni si aggiornano
@@ -1380,6 +1400,11 @@ function previewUrl(payload) {
 function renderPreview(payload) {
   state.preview = payload || null;
   if (!payload) { closePreview(); return; }
+  // Cambio chat con anteprima identica a quella gia' mostrata: niente
+  // riapertura dell'iframe (flash bianco + refetch del file). Se nel frattempo
+  // da una goccia era stato aperto un altro file, il confronto qui sotto
+  // fallisce e l'anteprima della conversazione torna giustamente in primo piano.
+  if (JSON.stringify(state.previewShown || null) === JSON.stringify(payload)) return;
   openPreview(payload);
 }
 
@@ -1751,6 +1776,45 @@ async function refreshSessions() {
   } catch { /* la lista non e' critica */ }
 }
 
+/** Bus globale del server (SSE /api/events): le notizie larghe che non
+ *  appartengono al turno di questa pagina. E' il pezzo che tiene desktop e
+ *  telefono sincronizzati: un messaggio scritto dall'altro schermo, una chat
+ *  creata o cancellata, una domanda dell'agente arrivano qui e la pagina si
+ *  ridisegna da sola, senza refresh manuale. EventSource si ricollega da
+ *  solo se la connessione cade. */
+function bindGlobalEvents() {
+  const bus = new EventSource('/api/events');
+  bus.onmessage = (msg) => {
+    let event;
+    try { event = JSON.parse(msg.data); } catch { return; }
+    const suaChat = event.session_id && event.session_id === state.sessionId;
+
+    if (event.type === 'turn' || event.type === 'question') {
+      // Fine turno o domanda: la chat aperta si ricarica dal disco, dove il
+      // messaggio finale (o il pending_question) e' gia' stato salvato.
+      if (suaChat) {
+        // GET, non la POST /open: aprire una conversazione ferma le anteprime
+        // (libera le porte della chat da cui si veniva), e usarla come
+        // "ricarica" significava smontare il container ad ogni fine turno --
+        // con l'anteprima che l'utente stava guardando che spariva da sola.
+        api(`/api/sessions/${encodeURIComponent(state.sessionId)}`)
+          .then((payload) => {
+            // Non tocco il turno che questa pagina sta gia' disegnando:
+            // attachStream e' la fonte viva finche' lo stream non chiude.
+            if (!state.attachAbort || state.attachAbort.signal.aborted) showSession(payload);
+          })
+          .catch(() => {});
+      }
+      refreshSessions();
+    } else if (event.type === 'sessions') {
+      // Creazione, cancellazione o nuovo messaggio dall'altro lato: basta
+      // l'elenco. Se e' la chat che sto guardando, il 'turn' che segue si
+      // occupa di ricaricarne il contenuto.
+      refreshSessions();
+    }
+  };
+}
+
 /** Mostra una conversazione. Non ferma nulla: il turno eventualmente in
  *  corso continua sul server, e se e' proprio quello della chat che si apre
  *  ci si riattacca allo stream, ricostruendo pensiero e tool gia' eseguiti. */
@@ -1914,21 +1978,23 @@ function bindField(id, key, transform = (v) => v) {
 }
 
 function fillModels(models) {
-  const select = $('#s-model');
-  select.innerHTML = '';
-  const list = models && models.length ? models : [state.settings.model_name];
-  if (!list.includes(state.settings.model_name)) list.unshift(state.settings.model_name);
-  // Una lista sola per due punti dell'interfaccia: la tendina delle
-  // impostazioni e la goccia in alto devono elencare le stesse cose, o una
-  // delle due dirà il falso appena cambia l'endpoint.
+  const datalist = $('#s-model-list');
+  if (datalist) {
+    datalist.innerHTML = '';
+    (models || []).forEach((name) => {
+      const option = el('option');
+      option.value = name;
+      datalist.appendChild(option);
+    });
+  }
+  const input = $('#s-model');
+  if (input && state.settings.model_name && input.value !== state.settings.model_name && document.activeElement !== input) {
+    input.value = state.settings.model_name;
+  }
+  const list = models && models.length ? [...models] : (state.settings.model_name ? [state.settings.model_name] : []);
+  if (state.settings.model_name && !list.includes(state.settings.model_name)) list.unshift(state.settings.model_name);
   state.models = list;
   if (!$('#model-menu').hidden) renderModelMenu();
-  list.forEach((name) => {
-    const option = el('option');
-    option.value = name; option.textContent = name;
-    if (name === state.settings.model_name) option.selected = true;
-    select.appendChild(option);
-  });
 }
 
 // ---------------------------------------------------------------------------
@@ -2142,6 +2208,76 @@ function applyTheme(mode) {
 // Avvio
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Vault LLM Wiki
+// ---------------------------------------------------------------------------
+// I vault sono workspace organizzati come wiki LLM (raw/ immutabile, wiki/
+// dell'agente, schema CLAUDE.md). Aprirne uno cambia il workspace e mette
+// l'agente in modalita' manutentore; dalla chat normale il tool vault_search
+// li interroga senza spostarsi. La sezione sta in fondo alla colonna di
+// sinistra perche' e' un luogo, non un'impostazione: si apre raramente, ma
+// quando serve deve essere a portata di clic.
+
+async function refreshVaults() {
+  try {
+    const data = await api('/api/vaults');
+    state.vaults = data.vaults || [];
+    renderVaults();
+  } catch { /* la sezione resta com'e': non e' critica come le chat */ }
+}
+
+function renderVaults() {
+  const root = $('#vaults');
+  if (!root) return;
+  root.innerHTML = '';
+  if (!state.vaults.length) {
+    root.innerHTML = '<div class="vault-empty">Nessun vault registrato.</div>';
+    return;
+  }
+  state.vaults.forEach((v) => {
+    const row = el('button', 'vault' + (v.attivo ? ' active' : ''));
+    row.title = `${v.path}\n${v.pagine} pagine wiki · ${v.fonti} fonti in raw/`;
+    row.innerHTML =
+      `<span class="vault-name">${esc(v.nome)}</span>` +
+      `<span class="vault-meta">${v.pagine}p · ${v.fonti}s</span>`;
+    row.onclick = () => openVault({ nome: v.nome });
+    root.appendChild(row);
+  });
+}
+
+/** Apre il selettore nativo di cartelle (Esplora risorse su Windows): la
+ *  cartella scelta viene registrata e riceve subito la struttura LLM Wiki. */
+async function newVault() {
+  const btn = $('#vault-new');
+  if (btn) btn.disabled = true;
+  try {
+    const data = await api('/api/vaults/pick', { method: 'POST' });
+    if (data.cancelled) { toast('Nessuna cartella selezionata.'); return; }
+    await refreshVaults();
+    toast('Vault "' + data.vault.nome + '" registrato.');
+  } catch (error) { toast(error.message); }
+  finally { if (btn) btn.disabled = false; }
+}
+
+/** Apre un vault come workspace corrente: il server crea la struttura LLM Wiki
+ *  se manca e l'agente passa in modalita' manutentore. */
+async function openVault(criterio) {
+  try {
+    const data = await api('/api/vaults/open', {
+      method: 'POST',
+      body: JSON.stringify(criterio),
+    });
+    dopoIlCambio(data, 'Vault aperto: ' + nomeCartella(data.workspace_dir));
+    refreshVaults();
+  } catch (error) { toast(error.message); }
+}
+
+function bindVaultUI() {
+  const nuovo = $('#vault-new');
+  if (!nuovo) return;
+  nuovo.onclick = newVault;
+}
+
 async function boot() {
   const data = await api('/api/bootstrap');
   state.settings = data.settings;
@@ -2171,7 +2307,10 @@ async function boot() {
   }
 
   await showSession(data.session);
+  bindGlobalEvents();
   refreshSandbox();
+  refreshVaults();
+  bindVaultUI();
   // Scalda il modello mentre l'utente legge la pagina: i 4-15 s di
   // caricamento in VRAM li paghiamo adesso invece che sul primo messaggio.
   // Volutamente senza await: se Ollama e' spento non deve bloccare l'avvio.
@@ -2222,6 +2361,7 @@ async function boot() {
   bindField('#s-topp', 'top_p', Number);
   bindField('#s-topk', 'top_k', Number);
   bindField('#s-presence', 'presence_penalty', Number);
+  bindField('#s-repetition', 'repetition_penalty', Number);
   bindField('#s-maxtok', 'max_tokens', Number);
   bindField('#s-loops', 'max_agent_loops', Number);
   bindField('#s-strip', 'strip_think_from_context');
@@ -2355,6 +2495,25 @@ function wireUi() {
   });
 
   $('#send').onclick = send;
+  // Goccia "Ricerca online": toggle puro lato client. Lo stato vero vive nel
+  // flag che send() manda col messaggio: qui si accende e basta, cosi'
+  // l'utente puo' cambiar idea finche' non preme invio.
+  const gocciaWeb = $('#toggle-web-search');
+  if (gocciaWeb) {
+    gocciaWeb.onclick = () => {
+      const on = gocciaWeb.classList.toggle('on');
+      gocciaWeb.setAttribute('aria-pressed', on ? 'true' : 'false');
+    };
+  }
+  const quickContinue = $('#btn-quick-continue');
+  if (quickContinue) {
+    quickContinue.onclick = () => {
+      if (state.busy) return;
+      const box = $('#composer textarea');
+      box.value = 'continua';
+      send();
+    };
+  }
 
   // --- allegati ---
   const picker = $('#attach-input');

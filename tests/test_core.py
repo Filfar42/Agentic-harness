@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import sys
 from pathlib import Path
@@ -946,6 +947,14 @@ def test_with_everything_green_the_tests_are_editable_again(tmp_path):
     assert "test_y" in target.read_text(encoding="utf-8")
 
 
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason=(
+        "Semantica di shell POSIX: cmd.exe non usa 127 per 'comando "
+        "inesistente'. Su Windows la strada supportata e' la sandbox Docker, "
+        "dove la shell e' quella del container."
+    ),
+)
 def test_a_missing_command_is_not_reported_as_a_failed_verification(tmp_path):
     """127 dice che il comando non esiste, non che il codice e' rotto."""
     from core.tools import ToolContext, dispatch
@@ -966,7 +975,12 @@ def test_una_verifica_verde_porta_con_se_l_istruzione_di_chiudere(tmp_path):
     ctx = ToolContext(workspace=str(tmp_path), sandbox="host")
     (tmp_path / "test_x.py").write_text("def test_x():\n    assert True\n", encoding="utf-8")
 
-    out = json.loads(dispatch(ctx, "run_command", {"command": "python -m pytest -q"}))
+    # sys.executable e non "python": quale interprete risponda a quel nome
+    # dipende dal PATH della macchina, e sulla postazione Windows erano tre
+    # (3.10, 3.12 del venv, 3.14 di sistema) con pytest installato in uno solo.
+    out = json.loads(
+        dispatch(ctx, "run_command", {"command": f'"{sys.executable}" -m pytest -q'})
+    )
     assert out["esito"] == "ok"
     passo = out["next_step"].lower()
     assert "fatto:" in passo and "verifica:" in passo and "poi:" in passo
@@ -986,8 +1000,12 @@ def test_un_comando_che_ispeziona_non_e_una_verifica(tmp_path):
     assert not looks_like_verification("tail -5 telemetria.py")
     assert not looks_like_verification('grep -n "def analizza" telemetria.py')
 
+    # Un comando che ispeziona e basta, scritto nella lingua della shell che
+    # c'e': `ls` su Windows non esiste e tornava FALLITO, facendo sembrare
+    # rotto il codice invece del comando.
+    ispeziona = "cmd /c dir" if os.name == "nt" else "ls"
     ctx = ToolContext(workspace=str(tmp_path), sandbox="host")
-    out = json.loads(dispatch(ctx, "run_command", {"command": "ls"}))
+    out = json.loads(dispatch(ctx, "run_command", {"command": ispeziona}))
     assert out["esito"] == "ok"
     assert "next_step" not in out
 
@@ -1007,3 +1025,21 @@ def test_an_unrunnable_command_does_not_stay_red_forever():
         "command": "pytest -q", "returncode": 1, "esito": "FALLITO"}))
     assert tracker.unresolved is not None
     assert tracker.unresolved[0] == "pytest -q"
+
+
+def test_la_versione_e_la_stessa_in_pyproject():
+    """Le due fonti della versione devono dire lo stesso numero.
+
+    Non lo dicevano da un pezzo: ``core.config.APP_VERSION`` era arrivata a
+    2.27.2 (2.30.0 nel fork) mentre ``pyproject.toml`` era rimasto a 2.11.0,
+    sedici minori indietro. Nessuno se n'era accorto perche' niente le
+    confrontava, ed e' esattamente il tipo di cosa che un test scopre subito e
+    una persona non scopre mai.
+    """
+    from core.config import APP_VERSION
+
+    pyproject = Path(__file__).resolve().parents[1] / "pyproject.toml"
+    testo = pyproject.read_text(encoding="utf-8")
+    dichiarata = re.search(r'^version\s*=\s*"([^"]+)"', testo, re.M)
+    assert dichiarata, "pyproject.toml non dichiara nessuna version"
+    assert dichiarata.group(1) == APP_VERSION

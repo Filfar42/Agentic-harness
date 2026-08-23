@@ -230,6 +230,105 @@ def test_deleting_a_running_conversation_is_refused(client):
         handler.delay = 0.0
 
 
+def test_changing_chat_stops_previews_and_frees_the_ports(client, monkeypatch):
+    """Le anteprime di altre chat non devono tenere le porte al cambio conversazione.
+
+    ``ensure_container`` pubblica l'intero intervallo con un solo -p e Docker
+    tiene i proxy sulle porte dell'host per tutta la vita del container: se
+    cambiando chat il container resta in piedi, l'app della vecchia chat continua
+    a occupare le porte e il bind successivo fallisce. Qui si finge che lo stop
+    funzioni (niente docker reale nel test) e si verifica che venga chiamato e
+    che i pannelli di anteprima delle altre conversazioni vengano sgomberati,
+    altrimenti sarebbero link morti finche' non c'e' un altro serve.
+    """
+    stops = []
+
+    def _stop_background(*_args, **_kwargs):  # noqa: ARG002 - firma finta
+        return False      # niente processi in background: la catena arriva a stop()
+
+    def _stop(workspace):
+        stops.append(str(workspace))
+        return True
+
+    monkeypatch.setattr(client.server.sandbox_mod, "stop_background", _stop_background)
+    monkeypatch.setattr(client.server.sandbox_mod, "stop", _stop)
+
+    state = client.server.STATE
+    a = current_session(client)
+    state.store_preview(a, {"kind": "serve", "path": "app.py", "title": "App"})
+    assert state.preview(a) is not None      # su A c'è una anteprima viva
+
+    b = client.post("/api/sessions").json()["session_id"]   # il cambio innesca lo stop
+    assert b != a
+    client.post(f"/api/sessions/{b}/open")
+
+    assert stops, "cambiando chat le porte della sandbox non vengono liberate"
+    assert state.preview(a) is None          # A perde l'anteprima: link morto evitato
+
+
+def test_changing_chat_without_previews_does_not_probe_the_sandbox(client, monkeypatch):
+    """Senza app avviate, il cambio di conversazione non deve guardare nel container.
+
+    Il vecchio percorso chiamava ``stop_background`` a ogni cambio: senza
+    nulla da fermare ricreava la sandbox per intero solo per scoprirlo (secondi
+    in piu' al click, e il turno dopo pagava di nuovo la creazione). Ora, senza
+    marchi host-side, resta solo la spazzata leggera del container residuo.
+    """
+    bg_calls = []
+    stops = []
+
+    def _stop_background(*_args, **_kwargs):  # noqa: ARG002 - firma finta
+        bg_calls.append(1)
+        return False
+
+    def _stop(workspace):
+        stops.append(str(workspace))
+        return True
+
+    monkeypatch.setattr(client.server.sandbox_mod, "stop_background", _stop_background)
+    monkeypatch.setattr(client.server.sandbox_mod, "stop", _stop)
+    monkeypatch.setattr(client.server.sandbox_mod, "background_live", lambda _ws: False)
+
+    a = current_session(client)
+    b = client.post("/api/sessions").json()["session_id"]   # il cambio innesca la pulizia
+    assert b != a
+
+    assert bg_calls == [], "niente da fermare eppure si e' andati a guardare nel container"
+    assert stops, "la spazzata del container residuo deve restare"
+
+
+def test_chat_switch_with_live_mark_stops_the_app_per_slot(client, monkeypatch):
+    """Con un'app avviata dall'harness il cambio chat la ferma e spazza il container.
+
+    Comportamento confermato con l'utente: a ogni cambio di conversazione le app
+    si fermano e le porte si liberano (vedi test qui sopra). Il punto nuovo e'
+    che lo stato host-side guida il percorso: marchio presente -> si prova
+    prima l'kill per slot senza ricreare la sandbox a vuoto, e se quello non
+    basta passa comunque ``stop``.
+    """
+    calls_bg = []
+    stops = []
+
+    def _stop_background(*_args, **_kwargs):  # noqa: ARG002 - firma finta
+        calls_bg.append(1)
+        return False
+
+    def _stop(workspace):
+        stops.append(str(workspace))
+        return True
+
+    monkeypatch.setattr(client.server.sandbox_mod, "stop_background", _stop_background)
+    monkeypatch.setattr(client.server.sandbox_mod, "stop", _stop)
+    monkeypatch.setattr(client.server.sandbox_mod, "background_live", lambda _ws: True)
+
+    a = current_session(client)
+    b = client.post("/api/sessions").json()["session_id"]   # il cambio innesca la pulizia
+    assert b != a
+
+    assert calls_bg == [1], "con un'app viva si deve prendere il percorso per slot"
+    assert stops, "se l'kill dello slot non basta, la spazzata del container resta"
+
+
 # ---------------------------------------------------------------------------
 # Domande all'agente
 # ---------------------------------------------------------------------------
@@ -729,3 +828,229 @@ def test_a_non_image_attachment_never_becomes_an_image(client):
     state._vision = ((state.settings["api_base"], state.settings["model_name"]), True)
     images, _ = state.turn_images(session_id)
     assert images == []
+
+
+# ---------------------------------------------------------------------------
+# Bus eventi globale (/api/events): la sincronizzazione fra le due interfacce
+# ---------------------------------------------------------------------------
+
+
+def _frame(frame: str) -> dict:
+    assert frame.startswith("data: ")
+    return json.loads(frame[6:])
+
+
+def test_event_bus_delivers_to_every_subscriber_until_unsubscribed(client):
+    from server import main as server_main
+
+    bus = server_main.EVENTS
+    primo, secondo = bus.subscribe(), bus.subscribe()
+    try:
+        bus.publish("turn", session_id="s1", running=True)
+        atteso = {"type": "turn", "session_id": "s1", "running": True}
+        assert _frame(primo.get(timeout=2)) == atteso
+        assert _frame(secondo.get(timeout=2)) == atteso
+
+        bus.unsubscribe(primo)
+        bus.publish("sessions", reason="created", session_id="s2")
+        assert primo.empty() is True  # disiscritto: niente piu' copie per lui
+        assert _frame(secondo.get(timeout=2)) == {
+            "type": "sessions",
+            "reason": "created",
+            "session_id": "s2",
+        }
+    finally:
+        bus.unsubscribe(primo)
+        bus.unsubscribe(secondo)
+
+
+def test_event_bus_queue_cap_drops_instead_of_growing_forever(client):
+    from server import main as server_main
+
+    bus = server_main.EVENTS
+    sub = bus.subscribe()
+    try:
+        for n in range(bus._QUEUE_MAX + 100):
+            bus.publish("tick", n=n)
+        # Oltre il tetto gli eventi si buttano: un abbonato morto non deve
+        # poter gonfiare la memoria del server.
+        assert sub.qsize() <= bus._QUEUE_MAX
+    finally:
+        bus.unsubscribe(sub)
+
+
+def test_creating_a_chat_from_one_side_notifies_the_other(client):
+    from server import main as server_main
+
+    coda = server_main.EVENTS.subscribe()
+    try:
+        creata = client.post("/api/sessions").json()["session_id"]
+        assert _frame(coda.get(timeout=2)) == {
+            "type": "sessions",
+            "reason": "created",
+            "session_id": creata,
+        }
+    finally:
+        server_main.EVENTS.unsubscribe(coda)
+
+
+def test_deleting_a_session_notifies_the_bus(client):
+    from server import main as server_main
+
+    session_id = current_session(client)
+    coda = server_main.EVENTS.subscribe()
+    try:
+        client.delete(f"/api/sessions/{session_id}")
+        assert _frame(coda.get(timeout=2)) == {
+            "type": "sessions",
+            "reason": "deleted",
+            "session_id": session_id,
+        }
+    finally:
+        server_main.EVENTS.unsubscribe(coda)
+
+
+def test_turn_lifecycle_and_question_hit_the_global_bus(client):
+    """Il telefono vede domanda e fine turno senza agganciarsi allo stream."""
+    import threading
+
+    from server import main as server_main
+
+    original = fake.SCRIPT
+    fake.SCRIPT = [
+        [
+            {
+                "message": {
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "function": {
+                                "name": "ask_user_question",
+                                "arguments": {"question": "Formato?", "options": ["A"]},
+                            }
+                        }
+                    ],
+                }
+            }
+        ],
+        [{"message": {"content": "Fatto."}}],
+    ]
+    coda = server_main.EVENTS.subscribe()
+    try:
+        session_id = current_session(client)
+        client.post("/api/chat", json={"session_id": session_id, "prompt": "chiedimi"})
+
+        visti: list[dict] = []
+        finito = threading.Event()
+
+        def bevi():
+            while not finito.is_set():
+                try:
+                    visti.append(_frame(coda.get(timeout=0.5)))
+                except Exception:  # queue.Empty -- semplicemente niente ancora
+                    continue
+
+        lettore = threading.Thread(target=bevi, daemon=True)
+        lettore.start()
+        time.sleep(0.4)
+
+        client.post("/api/answer", json={"session_id": session_id, "answer": "A"})
+        # La risposta chiude il turno: l'ultimo evento deve essere turn=False.
+        scadenza = time.time() + 15
+        while time.time() < scadenza:
+            if any(
+                e.get("type") == "turn" and e.get("running") is False for e in visti
+            ):
+                break
+            time.sleep(0.2)
+        finito.set()
+        lettore.join(timeout=2)
+
+        tipi = [e["type"] for e in visti]
+        assert "question" in tipi                       # la domanda e' arrivata
+        domanda = next(e for e in visti if e["type"] == "question")
+        assert domanda["session_id"] == session_id      # della chat giusta
+        assert any(e.get("reason") == "answer" for e in visti)  # la risposta e' passata dal bus
+        assert tipi.count("turn") >= 2                  # avvio e chiusura turno
+        ultimo = next(e for e in reversed(visti) if e["type"] == "turn")
+        assert ultimo["running"] is False               # il turno e' finito
+    finally:
+        server_main.EVENTS.unsubscribe(coda)
+        fake.SCRIPT = original
+
+
+def test_events_stream_yields_hello_then_published_frames_and_unsubscribes(client):
+    """Il generatore del bus: saluto, eventi pubblicati, pulizia alla chiusura.
+
+    Non passa da HTTP perche' un SSE infinito con TestClient non ha una
+    chiusura netta; il cablaggio della rotta e' verificato nel test sotto.
+    """
+    import inspect
+
+    from server import main as server_main
+
+    bus = server_main.EVENTS
+    prima = len(bus._subscribers)
+    generatore = bus.stream()
+    try:
+        assert _frame(next(generatore))["type"] == "hello"
+        bus.publish("sessions", reason="created", session_id="sx")
+        frame = next(generatore)
+        assert _frame(frame) == {
+            "type": "sessions",
+            "reason": "created",
+            "session_id": "sx",
+        }
+    finally:
+        generatore.close()
+    # chiusura il generatore disiscrive davvero: nessun abbonato fantasma
+    assert len(bus._subscribers) == prima
+
+    # il keepalive deve esistere, senno' proxy e browser chiudono la connessione
+    sorgente = inspect.getsource(bus.stream)
+    assert ": keepalive" in sorgente
+
+
+def test_events_route_is_wired_to_the_bus(app_client=None):
+    """La rotta /api/events esiste ed e' collegata al flusso del bus."""
+    from fastapi.routing import APIRoute
+
+    from server import main as server_main
+
+    rotte = [r for r in server_main.app.routes if isinstance(r, APIRoute)]
+    eventi = [r for r in rotte if r.path == "/api/events"]
+    assert eventi, "la rotta /api/events manca dall'app"
+    assert "GET" in eventi[0].methods
+
+
+def test_rileggere_una_conversazione_non_ferma_le_anteprime(client, monkeypatch):
+    """Aprire e rileggere sono due verbi diversi, e ora due rotte diverse.
+
+    Il bus globale annuncia la fine di ogni turno e la pagina si riallinea.
+    Farlo con la POST ``/open`` -- come nel fork -- significava passare da
+    ``ferma_anteprime()`` ad ogni fine turno: container smontato e anteprima
+    che sparisce sotto gli occhi di chi la stava guardando. Dal telefono era
+    peggio: il polling la chiamava ogni cinque secondi.
+    """
+    session_id = client.post("/api/sessions", json={}).json()["session_id"]
+
+    fermate: list[int] = []
+    monkeypatch.setattr(
+        client.server.STATE, "ferma_anteprime", lambda: bool(fermate.append(1))
+    )
+
+    letta = client.get(f"/api/sessions/{session_id}")
+    assert letta.status_code == 200
+    assert letta.json()["session_id"] == session_id
+    assert fermate == [], "la rilettura non deve toccare la sandbox"
+
+    client.post(f"/api/sessions/{session_id}/open", json={})
+    assert fermate == [1], "aprire, invece, libera le porte della chat precedente"
+
+
+def test_la_ricerca_non_viene_scambiata_per_un_id_di_conversazione(client):
+    """``/api/sessions/search`` e ``/api/sessions/{id}`` hanno la stessa forma:
+    l'ordine di dichiarazione e' l'unica cosa che le tiene distinte."""
+    risposta = client.get("/api/sessions/search", params={"q": "niente"})
+    assert risposta.status_code == 200
+    assert "sessions" in risposta.json()

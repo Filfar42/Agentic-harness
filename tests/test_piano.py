@@ -16,6 +16,7 @@ watchdog (interrompe prima del tetto) e il rilevamento del troncamento
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
@@ -544,3 +545,70 @@ def test_il_piano_si_puo_pretendere_di_meno(fake_ollama, tmp_path):
     url, _ = fake_ollama
     ui, _ = esegui(url, tmp_path, prompt=MULTI, require_plan=False, max_steps=3)
     assert not any("manage_plan" in (m.get("content") or "") for m in ui)
+
+
+def test_skippare_uno_step_azzera_il_red_command(tmp_path):
+    ctx = ctx_vuoto(tmp_path)
+    dispatch(ctx, PLAN_TOOL, {"action": "set", "steps": ["step 1", "step 2"]})
+    dispatch(ctx, PLAN_TOOL, {"action": "start", "step_id": "1"})
+    ctx.red_command = "pytest -q"
+    assert ctx.red_command == "pytest -q"
+
+    dispatch(ctx, PLAN_TOOL, {"action": "skip", "step_id": "1", "note": "non risolvibile nell'ambiente"})
+    assert ctx.plan.get("1").status == "skipped"
+    assert ctx.red_command is None
+
+
+def test_completa_step_con_ignore_red(tmp_path):
+    ctx = ctx_vuoto(tmp_path)
+    dispatch(ctx, PLAN_TOOL, {"action": "set", "steps": ["step 1", "step 2"]})
+    dispatch(ctx, PLAN_TOOL, {"action": "start", "step_id": "1"})
+    ctx.red_command = "pytest -q"
+
+    # Senza ignore_red fallisce
+    risposta = dispatch(ctx, PLAN_TOOL, {"action": "complete", "step_id": "1"})
+    assert "rosso" in risposta
+    assert ctx.plan.get("1").status == DOING
+
+    # Con ignore_red=True si azzera e si completa
+    risposta_ignore = dispatch(ctx, PLAN_TOOL, {"action": "complete", "step_id": "1", "ignore_red": True, "note": "test non pertinente"})
+    assert "ok" in risposta_ignore
+    assert ctx.plan.get("1").status == "done"
+    assert ctx.red_command is None
+
+
+
+def test_ignore_red_senza_motivo_viene_respinto(tmp_path):
+    """L'uscita di sicurezza si paga con una frase.
+
+    Su questo progetto la differenza fra un rito e un invito e' misurata: il
+    ``complete`` che *pretende* la nota ne ha ottenute 23 su 24 in tre
+    sessioni, il ``manage_notes`` che la propone e' stato usato 0 volte su 42
+    conversazioni. Un ``ignore_red`` gratuito smetterebbe di essere un'uscita
+    e diventerebbe la strada per chiudere qualunque punto rosso.
+    """
+    ctx = ctx_vuoto(tmp_path)
+    dispatch(ctx, PLAN_TOOL, {"action": "set", "steps": ["step 1"]})
+    ctx.red_command = "pytest -q"
+
+    nudo = json.loads(dispatch(ctx, PLAN_TOOL, {"action": "complete", "step_id": "1", "ignore_red": True}))
+    assert "motivo" in nudo["error"]
+    assert ctx.plan.get("1").status == DOING
+    assert ctx.red_command == "pytest -q"
+
+    breve = json.loads(dispatch(
+        ctx, PLAN_TOOL, {"action": "complete", "step_id": "1", "ignore_red": True, "note": "boh"}
+    ))
+    assert "error" in breve
+
+    buono = json.loads(dispatch(
+        ctx, PLAN_TOOL,
+        {"action": "complete", "step_id": "1", "ignore_red": True,
+         "note": "Docker non disponibile in questo ambiente"},
+    ))
+    assert buono["status"] == "ok"
+    assert ctx.red_command is None
+    # Il rosso archiviato si conta e si vede: nel piano, dove l'utente legge.
+    assert buono["rossi_ignorati"] == 1
+    assert "verifica rossa ignorata" in ctx.plan.get("1").note
+    assert ctx.rossi_ignorati[0]["comando"] == "pytest -q"

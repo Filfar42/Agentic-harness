@@ -188,7 +188,21 @@ def motivo_del_blocco(command: str, *, sandbox: str, workdir: str) -> tuple[str,
 
 
 class WorkspaceError(Exception):
-    """Errore recuperabile: viene rimandato al modello come testo."""
+    """Errore recuperabile: viene rimandato al modello come testo.
+
+    Accetta lo stesso ``hint`` di ``_err``, perche' i tool alzano e ritornano
+    errori senza una regola fissa e il suggerimento e' la parte utile: dice al
+    modello cosa fare invece di riprovare uguale. Prima era una ``Exception``
+    nuda, e ``raise WorkspaceError(msg, hint=...)`` -- scritto in due punti di
+    ``web_search`` -- moriva con ``TypeError: takes no keyword arguments``:
+    il dispatcher lo prendeva per un errore di argomenti e al modello
+    arrivava "Argomenti non validi per 'web_search'", che e' falso e non
+    aiuta nessuno.
+    """
+
+    def __init__(self, message: str, *, hint: str = "") -> None:
+        super().__init__(message)
+        self.hint = hint
 
 
 @dataclass
@@ -224,6 +238,13 @@ class ToolContext:
     # backend e parametri: tenerli qui vorrebbe dire far conoscere il modello a
     # un modulo che si occupa di file.
     on_delega: Callable[[str], dict[str, Any]] | None = None
+    # Come si interroga un vault LLM Wiki senza cambiare workspace. La monta
+    # il ciclo agentico, come per ``on_delega``: anche qui servono backend e
+    # parametri del turno per far girare il sotto-turno del cercatore.
+    on_vault_search: Callable[..., dict[str, Any]] | None = None
+    # I vault noti (la chiave "vaults" delle impostazioni): servono al
+    # sotto-turno di vault_search per risolvere il nome in percorso.
+    registri_vault: list[dict[str, Any]] = field(default_factory=list)
     allow_dangerous_commands: bool = False
     # "docker" = i comandi girano in un container che monta solo il workspace.
     # "host" = esecuzione diretta sulla macchina, come prima: l'agente vede
@@ -261,15 +282,30 @@ class ToolContext:
     # Quante volte la guardia ha respinto una modifica, per file: dopo il
     # secondo tentativo il messaggio cambia tono e indica l'uscita.
     test_guard_refusals: dict[str, int] = field(default_factory=dict)
-    # La richiesta di questo turno chiede di capire, non di cambiare. Lo
-    # aggiorna il ciclo agentico a ogni turno: se e' vera, i tool di scrittura
-    # rifiutano. Si azzera quando l'utente risponde a un ask_user_question,
-    # perche' a quel punto ha parlato lui.
     readonly_request: bool = False
+    # La goccia "Ricerca online" era accesa quando il turno e' partito. Senza
+    # questo flag un modello che ricorda il tool da un turno precedente
+    # potrebbe scavalcare l'interruttore: qui, non nello schema, sta la
+    # garanzia che spento vuol dire anche non usabile.
+    web_search_enabled: bool = False
     # Simboli pubblici comparsi in questo turno: nome -> file che li definisce.
     # Servono a distinguere una verifica verde che misura il codice nuovo da
     # una che misura tutt'altro.
     new_symbols: dict[str, str] = field(default_factory=dict)
+    # Verifiche rosse chiuse dichiarandole non pertinenti (``ignore_red``):
+    # comando, punto del piano e motivo scritto dal modello. Sono l'uscita di
+    # sicurezza del guard-rail, quindi vanno **contate**: un turno che ne usa
+    # tre non e' un turno andato bene, e senza questo elenco la differenza fra
+    # "tutto verde" e "tre rossi archiviati" non si vedrebbe da nessuna parte.
+    rossi_ignorati: list[dict[str, str]] = field(default_factory=list)
+    # Tracker per le verifiche rosse, impostato da agent.py per permetterne
+    # l'azzeramento automatico o manuale quando un comando non e' pertinente.
+    verification: Any = None
+
+    def clear_red_command(self) -> None:
+        self.red_command = None
+        if self.verification is not None and hasattr(self.verification, "clear"):
+            self.verification.clear()
 
     @property
     def base(self) -> Path:
@@ -1854,6 +1890,7 @@ def tool_manage_plan(
     steps: Any = None,
     step_id: str = "",
     note: str = "",
+    ignore_red: bool = False,
 ) -> str:
     """Crea e aggiorna il piano di lavoro della conversazione.
 
@@ -1894,21 +1931,53 @@ def tool_manage_plan(
             # Il gancio con il ciclo di verifica. Senza, "fatto" significa
             # "credo di aver finito", e il piano diventerebbe il posto dove
             # dichiarare verde quello che verde non e'.
-            if ctx.red_command:
+            ignore_red = bool(ignore_red)
+            if ctx.red_command and not ignore_red:
                 return _err(
                     f"Non puoi dichiarare fatto il punto {step_id}: il comando "
                     f"`{ctx.red_command}` e' ancora rosso.",
                     hint=(
                         "Sistema l'errore e rilancia esattamente lo stesso "
-                        "comando. Se hai deciso di non risolverlo adesso, usa "
-                        "action='skip' e scrivi il perche' nella nota: e' una "
-                        "cosa diversa dall'averlo fatto."
+                        "comando. Se la verifica rossa non e' pertinente al codice "
+                        "del progetto (es. vincolo o dipendenza di ambiente come "
+                        "Docker non disponibile, test obsoleto), imposta "
+                        "ignore_red=True fornendo il motivo nella nota, "
+                        "oppure usa action='skip'."
                     ),
                 )
+            if ctx.red_command and ignore_red:
+                # L'uscita c'e', ma si paga con una frase. Su questo progetto
+                # la differenza fra un rito e un invito e' misurata: il
+                # `complete` che *pretende* la nota ne ha ottenute 23 su 24 in
+                # tre sessioni, il `manage_notes` che la propone e' stato usato
+                # 0 volte su 42 conversazioni. Un'uscita a costo zero da un
+                # guard-rail smette di essere un'uscita e diventa la strada.
+                motivo = str(note or "").strip()
+                if len(motivo) < 12:
+                    return _err(
+                        f"Per chiudere il punto {step_id} con ignore_red serve "
+                        f"il motivo: perche' `{ctx.red_command}` non riguarda "
+                        "il codice del progetto?",
+                        hint=(
+                            "Riprova con note='...' e una frase intera (es. "
+                            "'Docker non disponibile in questo ambiente, il "
+                            "test richiede il container'). La nota resta nel "
+                            "piano: e' quello che l'utente leggera' al posto "
+                            "di una verifica verde."
+                        ),
+                    )
+                # Il rosso ignorato resta scritto nel piano, dove si vede: un
+                # punto chiuso cosi' non deve somigliare a uno chiuso davvero.
+                note = f"[verifica rossa ignorata: {ctx.red_command}] {motivo}"
+                ctx.rossi_ignorati.append(
+                    {"step": str(step_id), "comando": ctx.red_command, "motivo": motivo}
+                )
+                ctx.clear_red_command()
             ctx.plan.complete(step_id, note)
             aperto = ctx.plan.avanza()
         elif action == "skip":
             ctx.plan.skip(step_id, note)
+            ctx.clear_red_command()
             aperto = ctx.plan.avanza()
         elif action == "show":
             return _ok({"plan": ctx.plan.to_list()})
@@ -1927,6 +1996,10 @@ def tool_manage_plan(
         "plan": ctx.plan.to_list(),
         "current": ctx.plan.current.id if ctx.plan.current else None,
     }
+    if ctx.rossi_ignorati:
+        # Torna al modello ad ogni operazione sul piano: se ne ha gia'
+        # archiviati due, deve saperlo prima di archiviarne un terzo.
+        esito["rossi_ignorati"] = len(ctx.rossi_ignorati)
     if aperto is not None:
         esito["aperto_in_automatico"] = {"id": aperto.id, "text": aperto.text}
         esito["next_step"] = (
@@ -1969,6 +2042,42 @@ def tool_esplora(ctx: ToolContext, compito: str = "") -> str:
     return _ok(ctx.on_delega(compito))
 
 
+VAULT_SEARCH_TOOL = "vault_search"
+
+
+def tool_vault_search(
+    ctx: ToolContext,
+    vault: str = "",
+    query: str = "",
+) -> str:
+    """Interroga la wiki di un vault tramite l'agente manutentore.
+
+    Il cercatore gira nel workspace del vault, non in quello corrente: legge
+    l'indice e le pagine, e torna solo il referto con i link alle pagine.
+    Non puo' scrivere -- una chat normale consulta il vault, non lo modifica;
+    la manutenzione si fa aprendo il vault come workspace.
+    """
+    if ctx.on_vault_search is None:
+        return _err(
+            "La ricerca nel vault non e' disponibile in questa sessione.",
+            hint="Nessun vault registrato: registralo dalla sezione Vault.",
+        )
+    if not str(vault or "").strip():
+        return _err(
+            "Manca il nome del vault.",
+            hint="Passa 'vault' col nome di uno dei vault registrati.",
+        )
+    if len(str(query or "").strip()) < 8:
+        return _err(
+            "La query e' troppo vaga per essere delegata.",
+            hint=(
+                "Scrivi una domanda chiusa e autosufficiente: il cercatore "
+                "non vede la conversazione, vede solo questa frase."
+            ),
+        )
+    return _ok(ctx.on_vault_search(vault=vault.strip(), query=query.strip()))
+
+
 NOTES_TOOL = "manage_notes"
 
 
@@ -2006,6 +2115,152 @@ def tool_manage_notes(ctx: ToolContext, action: str, text: str = "") -> str:
     # Non si rimandano indietro tutte le note: sono gia' nel blocco di coda ad
     # ogni passo, e ripeterle qui sarebbe pagarle due volte per niente.
     return _ok({**esito, "action": action, "count": len(ctx.notes)})
+
+
+# ---------------------------------------------------------------------------
+# Ricerca online
+# ---------------------------------------------------------------------------
+
+WEB_SEARCH_TOOL = "web_search"
+
+# L'endpoint HTML di DuckDuckGo non richiede chiavi ne' JavaScript: e' la
+# scelta piu' povera che funzioni. Un User-Agent da browser vero serve: senza,
+# l'endpoint risponde con una pagina di bot-check senza risultati.
+_DDG_ENDPOINT = "https://html.duckduckgo.com/html/"
+_DDG_UA = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+)
+_MAX_WEB_RESULTS = 10
+
+# I blocchi risultato dell'endpoint HTML: link, titolo e snippet. Regex e non
+# un parser HTML per non aggiungere una dipendenza al progetto: la struttura
+# di questa pagina e' stabile da anni e un eventuale cambio si vede subito
+# nel messaggio d'errore azionabile che il tool rimanda al modello.
+_RE_LINK = re.compile(
+    r'<a[^>]+class="[^"]*result__a[^"]*"[^>]*href="([^"]+)"[^>]*>(.*?)</a>',
+    re.DOTALL,
+)
+_RE_SNIPPET = re.compile(
+    r'<a[^>]+class="[^"]*result__snippet[^"]*"[^>]*>(.*?)</a>', re.DOTALL
+)
+_RE_TAG = re.compile(r"<[^>]+>")
+
+
+def _ddg_decode_url(href: str) -> str:
+    """Converte l'href in un URL diretto.
+
+    DuckDuckGo avvolge molti risultati in un redirect ``/l/?uddg=``: seguire
+    quel link costerebbe all'agente un passo in piu' per ogni pagina letta.
+    """
+    href = href.strip()
+    marker = "uddg="
+    if marker in href:
+        raw = href.split(marker, 1)[1].split("&", 1)[0]
+        from urllib.parse import unquote
+
+        return unquote(raw)
+    if href.startswith("//"):
+        return "https:" + href
+    return href
+
+
+def _strip_tags(html_fragment: str) -> str:
+    text = _RE_TAG.sub(" ", html_fragment)
+    text = (
+        text.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
+        .replace("&quot;", '"').replace("&#x27;", "'").replace("&#39;", "'")
+        .replace("&nbsp;", " ")
+    )
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def tool_web_search(
+    ctx: ToolContext, query: str, max_results: int = 5
+) -> str:
+    """Cerca su DuckDuckGo e restituisce titolo, URL e snippet dei risultati.
+
+    La richiesta parte dal **processo del server**, non dal container della
+    sandbox: e' il server ad avere la rete configurata, e cosi' la ricerca
+    funziona anche con le anteprime di rete disattivate.
+    """
+    # Guardia anti-scartocco: lo schema condizionale nasconde il tool al
+    # modello quando la goccia e' spenta, ma un modello che se lo ricorda da
+    # un turno precedente potrebbe comunque chiamarlo. Il perimetro vale qui.
+    if not getattr(ctx, "web_search_enabled", False):
+        raise WorkspaceError(
+            "Il tool web_search non e' disponibile in questo turno: la "
+            "modalita' ricerca online non era attiva per questo messaggio. "
+            "Rispondi con cio' che sai e non insistere."
+        )
+    import httpx
+
+    query = str(query or "").strip()
+    if not query:
+        raise WorkspaceError("Query vuota: passa il testo da cercare in 'query'.")
+    try:
+        max_results = int(max_results)
+    except (TypeError, ValueError):
+        max_results = 5
+    max_results = max(1, min(max_results, _MAX_WEB_RESULTS))
+
+    try:
+        response = httpx.post(
+            _DDG_ENDPOINT,
+            data={"q": query},
+            headers={
+                "User-Agent": _DDG_UA,
+                "Accept": "text/html,application/xhtml+xml",
+                "Accept-Language": "it,en;q=0.8",
+            },
+            timeout=min(float(ctx.timeout_s), 20.0),
+            follow_redirects=True,
+        )
+        response.raise_for_status()
+    except Exception as exc:  # rete, DNS, timeout: tutti recuperabili
+        raise WorkspaceError(
+            f"La ricerca online non ha risposto: {type(exc).__name__}: {exc}. "
+            "Riprovare puo' bastare (e' spesso un limite temporaneo); se "
+            "persiste, dillo all'utente invece di insistere."
+        ) from exc
+
+    page = response.text
+    titles = [(m.group(1), m.group(2)) for m in _RE_LINK.finditer(page)]
+    snippets = [m.group(1) for m in _RE_SNIPPET.finditer(page)]
+    if not titles:
+        raise WorkspaceError(
+            "Il motore di ricerca non ha restituito risultati interpretabili.",
+            hint="Riformula la query con parole piu' comuni e riprova.",
+        )
+
+    results: list[dict[str, str]] = []
+    for pos, (href, title) in enumerate(titles[: max_results * 2]):
+        url = _ddg_decode_url(href)
+        if not url.startswith("http"):
+            continue
+        snippet = _strip_tags(snippets[pos]) if pos < len(snippets) else ""
+        results.append(
+            {
+                "title": _strip_tags(title)[:200],
+                "url": url[:300],
+                "snippet": snippet[:400],
+            }
+        )
+        if len(results) >= max_results:
+            break
+
+    payload = {
+        "query": query,
+        "engine": "duckduckgo",
+        "count": len(results),
+        "results": results,
+        "nota": (
+            "Snippet del motore di ricerca: per il testo completo apri "
+            "l'URL con preview action='file' dopo averlo scaricato via "
+            "run_command (curl/python), oppure affidati allo snippet."
+        ),
+    }
+    return smart_truncate(_ok(payload), ctx.budgets.tool_result_max_chars)
 
 
 # ---------------------------------------------------------------------------
@@ -2054,6 +2309,7 @@ def normalise_question(args: dict[str, Any]) -> dict[str, Any]:
 
 TOOL_IMPLS: dict[str, Callable[..., str]] = {
     "list_files": tool_list_files,
+    "web_search": tool_web_search,
     "read_file": tool_read_file,
     "write_file": tool_write_file,
     "edit_file": tool_edit_file,
@@ -2063,6 +2319,7 @@ TOOL_IMPLS: dict[str, Callable[..., str]] = {
     PLAN_TOOL: tool_manage_plan,
     NOTES_TOOL: tool_manage_notes,
     DELEGA_TOOL: tool_esplora,
+    VAULT_SEARCH_TOOL: tool_vault_search,
     PREVIEW_TOOL: tool_preview,
 }
 
@@ -2076,11 +2333,13 @@ _ALLOWED_ARGS: dict[str, set[str]] = {
     "search_files": {"pattern", "glob", "subfolder", "output_mode", "context_lines"},
     "run_command": {"command", "timeout_sec"},
     "manage_memory": {"action", "content"},
-    PLAN_TOOL: {"action", "steps", "step_id", "note"},
+    PLAN_TOOL: {"action", "steps", "step_id", "note", "ignore_red"},
     NOTES_TOOL: {"action", "text"},
     DELEGA_TOOL: {"compito"},
+    VAULT_SEARCH_TOOL: {"vault", "query"},
     PREVIEW_TOOL: {"action", "path", "command", "port", "url_path", "wait_s"},
     ASK_USER_TOOL: {"question", "options", "allow_multiple"},
+    WEB_SEARCH_TOOL: {"query", "max_results"},
 }
 
 
@@ -2102,7 +2361,7 @@ def dispatch(ctx: ToolContext, name: str, args: dict[str, Any]) -> str:
             hint=f"Parametri ammessi: {sorted(allowed)}",
         )
     except WorkspaceError as exc:
-        return _err(str(exc))
+        return _err(str(exc), hint=getattr(exc, "hint", ""))
     except Exception as exc:  # pragma: no cover - rete di sicurezza
         return _err(f"Errore imprevisto in '{name}': {type(exc).__name__}: {exc}")
 
@@ -2471,6 +2730,14 @@ TOOLS_SCHEMA: list[dict[str, Any]] = [
                             "pytest-asyncio nella sandbox')."
                         ),
                     },
+                    "ignore_red": {
+                        "type": "boolean",
+                        "description": (
+                            "Solo per action='complete': imposta a true se la "
+                            "verifica rossa attuale non e' pertinente al codice "
+                            "(es. vincolo o dipendenza di ambiente non disponibile)."
+                        ),
+                    },
                 },
                 "required": ["action"],
             },
@@ -2539,6 +2806,42 @@ TOOLS_SCHEMA: list[dict[str, Any]] = [
                     },
                 },
                 "required": ["compito"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": VAULT_SEARCH_TOOL,
+            "description": (
+                "Interroga un vault LLM Wiki registrato: l'agente manutentore "
+                "della wiki cerca nelle sue pagine e ti torna solo la risposta "
+                "con i link alle pagine usate. USALO quando la domanda riguarda "
+                "il contenuto di un vault e tu non hai il vault aperto come "
+                "workspace. Il cercatore non vede questa conversazione e non "
+                "puo' scrivere: la manutenzione della wiki si fa aprendo il "
+                "vault come workspace."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "vault": {
+                        "type": "string",
+                        "description": (
+                            "Nome del vault in cui cercare, cosi' come compare "
+                            "nella sezione Vault."
+                        ),
+                    },
+                    "query": {
+                        "type": "string",
+                        "description": (
+                            "La domanda sulla wiki, chiusa e autosufficiente: "
+                            "il cercatore non sa niente di quello che vi siete "
+                            "detti. Di' anche in che forma vuoi la risposta."
+                        ),
+                    },
+                },
+                "required": ["vault", "query"],
             },
         },
     },
@@ -2625,8 +2928,64 @@ TOOLS_SCHEMA.append(
         },
     }
 )
+# La ricerca online NON sta in TOOLS_SCHEMA: finche' l'utente non accende la
+# modalita' dalla goccia nel composer, il modello non deve nemmeno sapere che
+# esiste. Il server aggiunge questo blocco agli schemi solo per i turni in cui
+# il flag e' attivo (vedi AppState.tools_schema in server/main.py).
+WEB_SEARCH_TOOLS: list[dict[str, Any]] = [
+    {
+        "type": "function",
+        "function": {
+            "name": WEB_SEARCH_TOOL,
+            "description": (
+                "Fa una ricerca sul web e restituisce i primi risultati "
+                "(titolo, URL, snippet). Usalo quando la risposta dipende da "
+                "fatti attuali o esterni al workspace: versioni recenti di una "
+                "libreria, notizie, documentazione non presente nel progetto, "
+                "prezzi o date. Non serve per cose che sai gia' o che sono nel "
+                "workspace: in quel caso e' solo tempo perso."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": (
+                            "Testo da cercare. Query brevi e specifiche "
+                            "funzionano meglio di domande intere."
+                        ),
+                    },
+                    "max_results": {
+                        "type": "integer",
+                        "description": (
+                            "Quanti risultati tornano, 1-10. Default 5: "
+                            "aumentalo solo se i primi non bastano."
+                        ),
+                    },
+                },
+                "required": ["query"],
+            },
+        },
+    }
+]
 
-TOOL_NAMES = frozenset(t["function"]["name"] for t in TOOLS_SCHEMA)
+# Tutti i tool che l'harness sa eseguire, schema condizionale compreso.
+#
+# Non e' la stessa cosa dello schema mandato al modello: quello e' il permesso
+# di *questo* turno, questo e' il vocabolario dell'harness. La distinzione non
+# e' accademica -- ``_as_tool_call`` scarta ogni chiamata il cui nome non stia
+# qui, ed e' la strada che percorrono i modelli che non emettono tool call
+# native e le scrivono come testo (qwen2.5-coder:7b fra questi). Costruendo
+# l'insieme dal solo ``TOOLS_SCHEMA``, ``web_search`` restava fuori: con la
+# goccia accesa il modello lo chiamava, il parser lo buttava via senza dire
+# niente, e la ricerca online semplicemente non succedeva.
+#
+# Il perimetro vero -- spento vuol dire inutilizzabile -- lo tiene
+# ``ToolContext.web_search_enabled`` dentro ``tool_web_search``, che e' il
+# posto dove un permesso si controlla.
+TOOL_NAMES = frozenset(
+    t["function"]["name"] for t in (*TOOLS_SCHEMA, *WEB_SEARCH_TOOLS)
+)
 
 
 # ---------------------------------------------------------------------------
@@ -2643,6 +3002,15 @@ TOOL_NAMES = frozenset(t["function"]["name"] for t in TOOLS_SCHEMA)
 # contratto, e accorciarli produrrebbe chiamate malformate. Si accorciano solo
 # le descrizioni in prosa.
 LEAN_TOOL_DESCRIPTIONS: dict[str, str] = {
+    DELEGA_TOOL: "Manda un esploratore a rispondere a una domanda sul workspace.",
+    WEB_SEARCH_TOOL: (
+        "Cerca sul web e torna titolo, URL e snippet dei primi risultati. "
+        "Per fatti attuali o esterni al workspace."
+    ),
+    VAULT_SEARCH_TOOL: (
+        "Interroga un vault LLM Wiki registrato: torna solo la risposta "
+        "dell'agente cercatore, coi link alle pagine usate."
+    ),
     "list_files": "Elenca file e cartelle di una sottocartella del workspace.",
     "read_file": (
         "Legge un file del workspace. Obbligatorio prima di modificarne uno "
@@ -2662,11 +3030,6 @@ LEAN_TOOL_DESCRIPTIONS: dict[str, str] = {
         "/work, e ne restituisce stdout, stderr ed exit code."
     ),
     "manage_memory": "Salva, elenca o rimuove un fatto stabile sul progetto.",
-    DELEGA_TOOL: (
-        "Manda un esploratore a rispondere a una domanda sul workspace. Torna "
-        "solo la sua risposta: quello che legge non entra nel tuo contesto. "
-        "Per 'dove sta X e chi la usa', non per un read_file solo."
-    ),
     NOTES_TOOL: (
         "Foglio di appunti del compito in corso. Scrivici quello che scopri "
         "mentre lavori e che non si ricava rileggendo un file: perche' un test "
@@ -2736,6 +3099,10 @@ def lean_tools_schema(schema: list[dict[str, Any]] | None = None) -> list[dict[s
 
 
 TOOLS_SCHEMA_LEAN = lean_tools_schema()
+# La versione snella del blocco condizionale: se il turno gira con gli schemi
+# ridotti, anche il tool appeso deve esserlo, senno' web_search sarebbe l'unica
+# voce con la descrizione lunga -- e la piu' verbosa dell'elenco.
+WEB_SEARCH_TOOLS_LEAN = lean_tools_schema(WEB_SEARCH_TOOLS)
 
 
 SNAPSHOT_DEPTH = 3

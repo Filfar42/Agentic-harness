@@ -166,13 +166,14 @@ def test_il_progetto_vince_sull_harness(tmp_path):
     assert len(tutte) == 1 and tutte[0].corpo == "regola del progetto"
 
 
-def test_le_skill_dormienti_restano_nominate(tmp_path):
-    """Una riga a testa: serve a far dire 'per questo c'e' una procedura'
-    invece di improvvisare."""
+def test_senza_skill_attive_il_blocco_e_vuoto(tmp_path):
+    """Senza skill attive il blocco e' vuoto: sul modello piccolo l'elenco
+    delle procedure dormienti finiva nel ragionamento invece che nelle mani."""
     scrivi_skill(tmp_path, "rilascio", "rilascio")
-    tutte = skills_mod.carica([(tmp_path, "harness")])
-    blocco = skills_mod.render_blocco([], tutte)
-    assert "rilascio" in blocco and "istruzioni" not in blocco
+    # Le skill esistono sul disco: e' proprio il caso interessante, perche'
+    # prima bastava che esistessero per farle comparire in coda al contesto.
+    assert skills_mod.carica([(tmp_path, "harness")])
+    assert skills_mod.render_blocco([]) == ""
 
 
 def test_il_numero_di_skill_attive_ha_un_tetto(tmp_path):

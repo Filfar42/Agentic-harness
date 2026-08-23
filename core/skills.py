@@ -156,33 +156,27 @@ def scegli(skills: list[Skill], richiesta: str) -> list[Skill]:
     return scelte
 
 
-def render_blocco(attive: list[Skill], tutte: list[Skill]) -> str:
+def render_blocco(attive: list[Skill]) -> str:
     """Il blocco da mettere in coda al contesto.
 
-    In coda e non nell'``<environment>`` per la solita ragione: il prefisso
-    (system + environment) e' byte-identico fra un passo e l'altro ed e' cio'
-    che rende riusabile il KV cache di Ollama. Le skill attive cambiano da una
-    richiesta all'altra.
+    Entra in contesto SOLO se ci sono skill attive, sollecitate dai termini
+    della richiesta dell'utente. Se nessuna combacia il blocco e' vuoto: sul
+    modello piccolo l'elenco delle procedure *non* caricate -- che questo
+    harness metteva in coda "perche' costa pochi token" -- si e' rivelato
+    rumore che gli entra nel ragionamento.
 
-    L'elenco di quelle *non* caricate ci sta lo stesso, una riga a testa: costa
-    pochi token e serve a far dire al modello "per quello che chiedi c'e' una
-    procedura, dimmi se la vuoi" invece di improvvisare.
+    In coda e non nell'``<environment>`` per la solita ragione: il prefisso
+    (system + environment) resta byte-identico fra un passo e l'altro ed e'
+    cio' che rende riusabile il KV cache di Ollama; le skill attive cambiano
+    da una richiesta all'altra.
+
+    Prende solo le attive: il secondo parametro (l'elenco completo) serviva
+    alle dormienti ed era rimasto in firma senza piu' un lettore.
     """
-    if not tutte:
+    if not attive:
         return ""
-    righe: list[str] = []
-    if attive:
-        righe.append("<istruzioni_per_questo_compito>")
-        for skill in attive:
-            righe += [f"## {skill.nome} — {skill.descrizione}", skill.corpo, ""]
-        righe.append("</istruzioni_per_questo_compito>")
-    dormienti = [s for s in tutte if s not in attive]
-    if dormienti:
-        righe.append("")
-        righe.append(
-            "Altre procedure disponibili, non caricate adesso: "
-            + "; ".join(f"{s.nome} ({s.descrizione})" for s in dormienti)
-            + ". Se una di queste riguarda quello che stai per fare, dillo "
-            "invece di improvvisare."
-        )
+    righe: list[str] = ["<istruzioni_per_questo_compito>"]
+    for skill in attive:
+        righe += [f"## {skill.nome} — {skill.descrizione}", skill.corpo, ""]
+    righe.append("</istruzioni_per_questo_compito>")
     return "\n".join(righe).strip()

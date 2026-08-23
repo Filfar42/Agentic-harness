@@ -1,6 +1,8 @@
 [project]
 name = "local-agent-harness"
-version = "2.11.0"
+# Tenuta uguale a core.config.APP_VERSION: le due si erano allontanate di
+# sedici versioni minori senza che niente le confrontasse. Ora lo fa un test.
+version = "2.31.0"
 description = "Harness agentico per modelli locali (Ollama/vLLM) con workspace, tool e interfaccia web"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -24,6 +26,11 @@ exclude = ["legacy"]
 [tool.ruff.lint]
 select = ["E4", "E7", "E9", "F", "B", "SIM", "UP", "C4", "RET", "ARG"]
 ignore = ["E501", "SIM105", "SIM102", "SIM108"]
+# Idiom pytest sistematico: fixture importate da test_server e ri-esposte come
+# argomenti (F811), parametri di fixture con solo effetto collaterale (ARG001).
+# Valgono per i test, non per il resto del progetto. Tabella inline TOML:
+# obbligatoria su una riga sola (le graffe multi-riga non sono sintassi valida).
+per-file-ignores = { "tests/*.py" = ["F811", "ARG001"] }
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

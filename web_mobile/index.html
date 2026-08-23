@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#101418">
+<title>Harness Mobile</title>
+<link rel="icon" type="image/png" sizes="192x192" href="/static/icons/icon-192.png">
+<!-- Icona per "Aggiungi a Home" su iOS: deve stare nella root servita. -->
+<link rel="apple-touch-icon" href="/static/icons/apple-touch-icon.png">
+<meta name="apple-mobile-web-app-title" content="Harness">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<!-- Manifest PWA: e' questo che Android/Desktop usano per l'icona dell'app installata. -->
+<link rel="manifest" href="/static/manifest.webmanifest">
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+<!-- Elenco conversazioni -->
+<div id="view-list" class="view">
+  <header class="topbar">
+    <h1>Chat</h1>
+    <button id="btn-new" class="icon-btn" title="Nuova chat">+</button>
+  </header>
+  <div id="conn-banner" class="banner hidden"></div>
+  <ul id="session-list" class="session-list"></ul>
+</div>
+
+<!-- Conversazione -->
+<div id="view-chat" class="view hidden">
+  <header class="topbar">
+    <button id="btn-back" class="icon-btn" title="Torna all'elenco">&#8592;</button>
+    <h1 id="chat-title">…</h1>
+    <button id="btn-refresh" class="icon-btn" title="Ricarica">&#8635;</button>
+  </header>
+
+  <main id="messages" class="messages"></main>
+
+  <!-- Card per rispondere a una domanda dell'agente (ask-user-question) -->
+  <div id="question-card" class="question-card hidden">
+    <div class="question-text" id="question-text"></div>
+    <div id="question-options" class="question-options"></div>
+    <textarea id="answer-input" rows="2" placeholder="La tua risposta…"></textarea>
+    <button id="btn-answer" class="primary">Rispondi</button>
+  </div>
+
+  <footer class="composer">
+    <textarea id="prompt-input" rows="1" placeholder="Messaggio al modello…"></textarea>
+    <button id="btn-send" class="send" title="Invia">&#10148;</button>
+    <button id="btn-stop" class="stop hidden" title="Ferma il turno">&#9632;</button>
+  </footer>
+</div>
+
+<div id="toast" class="toast hidden"></div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

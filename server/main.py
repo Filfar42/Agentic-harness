@@ -23,6 +23,7 @@ import json
 import mimetypes
 import os
 import platform
+import queue
 import subprocess
 import sys
 import threading
@@ -51,6 +52,7 @@ from core import profiles  # noqa: E402
 from core import sandbox as sandbox_mod  # noqa: E402
 from core import session as session_mod  # noqa: E402
 from core import settings as settings_mod  # noqa: E402
+from core import vault as vault_mod  # noqa: E402
 from core.backend import (  # noqa: E402
     build_backend,
     forget_model_info,
@@ -70,6 +72,7 @@ from core.prompts import (  # noqa: E402
     build_attachments_block,
     build_env_header,
     build_system_prompt,
+    append_web_search_clause,
     is_stock_prompt,
     pick_system_prompt,
 )
@@ -78,7 +81,10 @@ from core.tools import (  # noqa: E402
     ATTACHMENTS_DIR,
     TOOLS_SCHEMA,
     TOOLS_SCHEMA_LEAN,
+    VAULT_SEARCH_TOOL,
     ToolContext,
+    WEB_SEARCH_TOOLS,
+    WEB_SEARCH_TOOLS_LEAN,
     WorkspaceError,
     is_image,
     load_images_b64,
@@ -108,6 +114,11 @@ async def lifespan(_app: FastAPI):
     # nessuno: al primo avvio l'elenco e' vuoto, e una tendina "Recenti" che si
     # apre su niente sembra rotta.
     remember_workspace()
+    # I marchi "c'e' un'app viva nella sandbox" sopravvivono al processo che li
+    # ha scritti; i container no. Quelli rimasti da un riavvio precedente sono
+    # bugie che costano un giro di Docker al primo cambio di conversazione, per
+    # andare a fermare un processo che non esiste piu'.
+    sandbox_mod.dimentica_marchi_vivi()
     autostart_docker()
     yield
 
@@ -197,10 +208,41 @@ class AppState:
         self._env_header_for: tuple[str, str] | None = None
         self._think: tuple[tuple[Any, ...], bool] | None = None
         self._vision: tuple[tuple[Any, ...], bool] | None = None
-        bootstrap: dict[str, Any] = {}
-        session_mod.bootstrap_session(bootstrap)
-        self._sessions[bootstrap["current_session_id"]] = bootstrap
-        self.last_opened: str = bootstrap["current_session_id"]
+        # Bootstrap pigro: la sessione piu' recente si carica alla prima
+        # richiesta, non qui. Il file puo' pesare megabyte e veniva letto e
+        # parsato durante l'import del modulo, prima ancora che il server si
+        # mettese in ascolto; cosi' l'avvio non paga piu' il JSON piu' grande.
+        self._booted = False
+        self._last_opened: str = ""
+
+    def _ensure_bootstrap(self) -> None:
+        """Alla prima lettura di ``last_opened``: ripristina l'ultima sessione.
+
+        Doppio check sul flag: fuori dal lock per la via veloce, sotto il lock
+        per chi arriva mentre un altro sta ancora facendo il bootstrap.
+        """
+        if self._booted:
+            return
+        with self._lock:
+            if self._booted:
+                return
+            bootstrap: dict[str, Any] = {}
+            session_mod.bootstrap_session(bootstrap)
+            self._sessions[bootstrap["current_session_id"]] = bootstrap
+            self._last_opened = bootstrap["current_session_id"]
+            self._booted = True
+
+    @property
+    def last_opened(self) -> str:
+        self._ensure_bootstrap()
+        return self._last_opened
+
+    @last_opened.setter
+    def last_opened(self, value: str) -> None:
+        # Chi apre una conversazione la sta per usare subito: se il bootstrap
+        # non e' ancora avvenuto meglio farlo adesso, non rimandarlo.
+        self._ensure_bootstrap()
+        self._last_opened = value
 
     def persist(self) -> None:
         """Scrive le preferenze su disco. Va chiamata dopo ogni modifica.
@@ -273,6 +315,78 @@ class AppState:
 
     def store_preview(self, session_id: str, payload: dict[str, Any] | None) -> None:
         self.session(session_id)["preview"] = payload
+
+    def ricorda_web_search(self, session_id: str, acceso: bool) -> None:
+        """Stato della goccia con cui e' partito l'ultimo turno.
+
+        Vive in memoria e non sul disco di proposito: serve solo a riprendere
+        un turno sospeso da una domanda all'utente, che e' una cosa che comincia
+        e finisce dentro lo stesso processo. Se il server viene riavviato con
+        una domanda in sospeso, si riparte da spenta -- il verso giusto in cui
+        sbagliare per un permesso.
+        """
+        self.session(session_id)["web_search"] = bool(acceso)
+
+    def web_search_di(self, session_id: str) -> bool:
+        return bool(self.session(session_id).get("web_search"))
+
+    def ferma_anteprime(self) -> bool:
+        """Ferma i processi in background e poi smonta il container della sandbox.
+
+        La parte che conta e' la seconda: ``ensure_container`` pubblica
+        l'intero intervallo con un solo ``-p``, e Docker tiene i proxy sulle
+        porte dell'host per tutta la vita del container -- dentro ci sia una
+        preview o no. Un cambio chat mentre le app di un'altra conversazione
+        stanno girando non libera dunque niente, finche' il container vive;
+        e' anche per questo che ogni nuovo turno riprova ``-p`` sulle stesse
+        porte e puo' fallire al bind se un altro harness usa gia' la base.
+
+        Il container e' senza stato (il lavoro e' nel volume del workspace),
+        quindi non si perde niente, a parte i log dei processi in background.
+        Non deve mai alzare eccezione: un guasto qui non puo' bloccare l'apertura
+        di una conversazione.
+        """
+        fermato = False
+        try:
+            s = self.settings
+            if (
+                str(s.get("sandbox")) == "docker"
+                and s.get("sandbox_network")
+                and Path(self.settings["workspace_dir"]).is_dir()
+            ):
+                kwargs = {
+                    "image": str(self.settings["docker_image"]),
+                    "network": True,
+                    "ports": self.preview_ports(),
+                }
+                ws = str(self.settings["workspace_dir"])
+                if sandbox_mod.background_live(ws):
+                    # L'harness ha davvero avviato un'app in background: si
+                    # ferma per slot, come prima.
+                    fermato = (
+                        sandbox_mod.stop_background(ws, **kwargs)
+                        or bool(sandbox_mod.stop(ws))
+                    )
+                else:
+                    # Nessun marchio su disco: non esiste un processo da
+                    # uccidere e non si ricrea il container per verificarlo --
+                    # era la causa del cambio-chat lento. Resta una spazzata
+                    # leggera per eventuali container rimasti in piedi (es. da
+                    # prima di un riavvio): una sola verifica se c'e' gia' tutto pulito.
+                    fermato = bool(sandbox_mod.stop(ws))
+                if fermato:
+                    # I pannelli di anteprima delle altre conversazioni puntano
+                    # a porte che non esistono piu': senza questo passo restereb-
+                    # bero link morti fino al prossimo serve.
+                    for sessione in list(self._sessions.values()):
+                        sessione.pop("preview", None)
+        except Exception:  # noqa: BLE001 - mai bloccare il cambio chat
+            # Nessun canale per l'errore: chi chiama questa funzione sta
+            # aprendo una conversazione, e non c'e' niente che possa fare con
+            # un guasto di Docker. Il fork aveva un parametro ``eccezione`` per
+            # raccoglierlo, che nessuno dei tre chiamanti passava mai.
+            return fermato
+        return fermato
 
     def plan(self, session_id: str) -> plan_mod.Plan:
         """Piano di lavoro della conversazione, ricostruito dal disco."""
@@ -357,6 +471,7 @@ class AppState:
             keep_alive=str(s["keep_alive"]),
             top_k=int(s["top_k"]),
             presence_penalty=float(s["presence_penalty"]),
+            repetition_penalty=float(s["repetition_penalty"]),
             # Il livello ('high', 'max', ...) sopravvive fino alla richiesta:
             # thinking_enabled() lo schiaccia a booleano solo per scegliere il
             # system prompt, dove un livello non cambierebbe nulla.
@@ -417,9 +532,9 @@ class AppState:
 
     def skills_block(self, richiesta: str) -> str:
         tutte = self.skills()
-        return skills_mod.render_blocco(skills_mod.scegli(tutte, richiesta), tutte)
+        return skills_mod.render_blocco(skills_mod.scegli(tutte, richiesta))
 
-    def system_prompt(self) -> str:
+    def system_prompt(self, web_search: bool = False) -> str:
         """Prompt di sistema effettivo per il modello in uso.
 
         Finche' il testo e' uno dei nostri, lo sceglie l'harness in base alle
@@ -430,10 +545,20 @@ class AppState:
         thinking = self.thinking_enabled()
         base = self.settings["system_prompt"]
         if is_stock_prompt(base):
-            base = pick_system_prompt(thinking=thinking)
-        return build_system_prompt(
-            base, native_think=thinking
-        ) + memory_mod.format_for_prompt(self.memories)
+            if vault_mod.is_modalita_vault(self.settings["workspace_dir"]):
+                # Il workspace e' un vault LLM Wiki: qui l'agente non e' un
+                # ingegnere generico, e' il manutentore della wiki. Il testo
+                # personalizzato dell'utente, se c'e', vince sempre.
+                base = vault_mod.VAULT_SYSTEM_PROMPT
+            else:
+                base = pick_system_prompt(thinking=thinking)
+        prompt = append_web_search_clause(
+            build_system_prompt(base, native_think=thinking),
+            enabled=web_search,
+        )
+        if vault_mod.is_modalita_vault(self.settings["workspace_dir"]):
+            prompt += vault_mod.blocco_manutenzione(self.settings["workspace_dir"])
+        return prompt + memory_mod.format_for_prompt(self.memories)
 
     def env_header(self, *, fresh: bool = False) -> str | None:
         """Albero del workspace da mettere in testa al contesto.
@@ -490,7 +615,7 @@ class AppState:
             self.settings["workspace_dir"], self.attachments(session_id)
         )
 
-    def tools_schema(self) -> list[dict[str, Any]]:
+    def tools_schema(self, web_search: bool = False) -> list[dict[str, Any]]:
         """Schemi completi o snelli, con la stessa regola del system prompt.
 
         Da quando il prompt snello occupa 612 token, gli schemi dei tool sono
@@ -499,7 +624,22 @@ class AppState:
         fatica a collegare la richiesta al tool; a uno che ragiona sono 617
         token buttati per passo.
         """
-        return TOOLS_SCHEMA_LEAN if self.thinking_enabled() else TOOLS_SCHEMA
+        snello = self.thinking_enabled()
+        base = TOOLS_SCHEMA_LEAN if snello else TOOLS_SCHEMA
+        if not self.settings.get("vaults"):
+            # Stessa regola della ricerca online, applicata al vault: senza
+            # nessun vault registrato, ``vault_search`` e' un tool che puo'
+            # solo fallire. Descriverlo ad ogni passo costa token per far
+            # sapere al modello che esiste una porta chiusa a chiave.
+            base = [
+                t for t in base if t["function"]["name"] != VAULT_SEARCH_TOOL
+            ]
+        if not web_search:
+            # Goccia "Ricerca online" spenta -> web_search non esiste per il
+            # modello: nessuno schema, nessun token pagato per un tool che non
+            # potrebbe usare.
+            return base
+        return base + (WEB_SEARCH_TOOLS_LEAN if snello else WEB_SEARCH_TOOLS)
 
     def tool_schema_tokens(self) -> int:
         return (
@@ -514,7 +654,7 @@ class AppState:
             return base
         return f"{base}\n\n{block}" if base else block
 
-    def tool_ctx(self, session_id: str) -> ToolContext:
+    def tool_ctx(self, session_id: str, web_search: bool = False) -> ToolContext:
         def persist(memories: list[dict[str, str]]) -> None:
             self.memories = memories
             memory_mod.save_memories(memories)
@@ -528,6 +668,10 @@ class AppState:
         return ToolContext(
             workspace=self.settings["workspace_dir"],
             timeout_s=int(self.settings["timeout_seconds"]),
+            # La goccia era accesa quando il turno e' partito: senza questo
+            # campo la guardia del tool rifiutava ogni chiamata anche col
+            # flag vero (bug della sessione 20260822_211656_cdda).
+            web_search_enabled=bool(web_search),
             memories=self.memories,
             touched_files=self.touched(session_id),
             known_files=self.known(session_id),
@@ -539,6 +683,7 @@ class AppState:
             on_plan_changed=persist_plan,
             on_notes_changed=persist_notes,
             allow_dangerous_commands=bool(self.settings["confirm_commands"]),
+            registri_vault=list(self.settings.get("vaults") or []),
             sandbox=str(self.settings["sandbox"]),
             docker_image=str(self.settings["docker_image"]),
             sandbox_network=bool(self.settings["sandbox_network"]),
@@ -577,6 +722,61 @@ def event_to_sse(event: Any) -> str:
     name = _EVENT_NAMES.get(type(event), "unknown")
     payload = asdict(event) if is_dataclass(event) else {"value": str(event)}
     return sse(name, payload)
+
+
+class EventBus:
+    """Eventi di *processo*: "qualcosa e' cambiato", per chi ascolta.
+
+    ``/api/stream/{id}`` racconta un solo turno a chi lo sta guardando; qui
+    passa la notizia larga: e' partito un turno, e' finito, l'agente ha fatto
+    una domanda, l'elenco delle chat e' cambiato. Le due interfacce (desktop
+    e telefono) se lo sottoscrivono e si ridisegnano da sole, senza polling
+    ne' refresh manuale.
+    """
+
+    _QUEUE_MAX = 500
+    _KEEPALIVE_S = 15.0
+
+    def __init__(self) -> None:
+        self._subscribers: list[queue.Queue[str]] = []
+        self._lock = threading.Lock()
+
+    def subscribe(self) -> queue.Queue[str]:
+        sub: queue.Queue[str] = queue.Queue()
+        with self._lock:
+            self._subscribers.append(sub)
+        return sub
+
+    def unsubscribe(self, sub: queue.Queue[str]) -> None:
+        with self._lock:
+            if sub in self._subscribers:
+                self._subscribers.remove(sub)
+
+    def publish(self, event_type: str, **payload: Any) -> None:
+        frame = sse(event_type, payload)
+        with self._lock:
+            subscribers = list(self._subscribers)
+        for sub in subscribers:
+            if sub.qsize() < self._QUEUE_MAX:
+                sub.put(frame)
+
+    def stream(self) -> Iterator[str]:
+        """SSE: saluto, poi ogni evento finche' il client resta collegato."""
+        sub = self.subscribe()
+        try:
+            yield sse("hello", {"ts": time.time()})
+            while True:
+                try:
+                    frame = sub.get(timeout=self._KEEPALIVE_S)
+                except queue.Empty:
+                    yield ": keepalive\n\n"
+                    continue
+                yield frame
+        finally:
+            self.unsubscribe(sub)
+
+
+EVENTS = EventBus()
 
 
 def anchored_names(messages: list[dict[str, Any]]) -> set[str]:
@@ -671,8 +871,16 @@ def ultima_richiesta(messages: list[dict[str, Any]]) -> str:
     return ""
 
 
-def start_turn(session_id: str) -> TurnRunner:
-    """Avvia il turno in background per la conversazione indicata."""
+def start_turn(session_id: str, web_search: bool = False) -> TurnRunner:
+    """Avvia il turno in background per la conversazione indicata.
+
+    ``web_search`` e' lo stato della goccia al momento dell'invio: viene
+    letto qui una volta sola, perche' il worker gira dopo che la richiesta
+    HTTP e' finita e l'oggetto request non esiste piu'. Viene anche ricordato
+    sulla sessione, cosi' una ripresa dopo ``ask_user_question`` riparte con
+    lo stesso permesso invece di perderlo per strada.
+    """
+    STATE.ricorda_web_search(session_id, web_search)
     messages = STATE.messages(session_id)
     snapshot = [dict(m) for m in messages]
 
@@ -684,10 +892,10 @@ def start_turn(session_id: str) -> TurnRunner:
             events = agent_mod.run_turn(
                 backend=STATE.backend(),
                 params=STATE.gen_params(),
-                tools_schema=STATE.tools_schema(),
-                tool_ctx=STATE.tool_ctx(session_id),
+                tools_schema=STATE.tools_schema(web_search),
+                tool_ctx=STATE.tool_ctx(session_id, web_search),
                 ui_messages=messages,
-                system_prompt=STATE.system_prompt(),
+                system_prompt=STATE.system_prompt(web_search),
                 # Il turno rilegge il disco: e' qui che l'agente deve vedere
                 # il workspace com'e' adesso, non com'era all'ultimo click.
                 env_header=STATE.context_header(session_id, fresh=True),
@@ -708,6 +916,8 @@ def start_turn(session_id: str) -> TurnRunner:
                 think_watchdog=bool(STATE.settings["think_watchdog"]),
             )
             for event in events:
+                if isinstance(event, agent_mod.AgentError):
+                    STATE.forget_backend()
                 if isinstance(event, agent_mod.PreviewUpdated):
                     STATE.store_preview(session_id, event.payload)
                 runner.emit(event_to_sse(event))
@@ -723,12 +933,22 @@ def start_turn(session_id: str) -> TurnRunner:
                     ),
                 ):
                     STATE.save(session_id)
+                # La domanda dell'agente vale anche per chi non sta guardando
+                # questo turno: sul telefono deve spuntare il riquadro di
+                # risposta senza refresh, come sul desktop.
+                if isinstance(event, agent_mod.AwaitingUserInput):
+                    EVENTS.publish("question", session_id=session_id)
         except Exception as exc:  # noqa: BLE001 - l'errore va mostrato, non nascosto
             runner.emit(sse("error", {"message": f"{type(exc).__name__}: {exc}"}))
         finally:
             STATE.save(session_id)
             runner.emit(sse("state", session_stats(session_id)))
+            # Fine turno su TUTTE le interfacce: chi ha la chat aperta la
+            # ricarica dal disco (ora c'e' il messaggio finale), gli altri
+            # aggiornano solo l'elenco.
+            EVENTS.publish("turn", session_id=session_id, running=False)
 
+    EVENTS.publish("turn", session_id=session_id, running=True)
     return RUNNERS.start(session_id, snapshot, work)
 
 
@@ -760,6 +980,11 @@ class ChatRequest(BaseModel):
     # chat lunga "quale messaggio portava quel CSV?" e' una domanda che si
     # risponde da sola solo se il file sta nella riga giusta.
     attachments: list[str] = []
+    # Modalita' "Ricerca online" della goccia nel composer: vale per questo
+    # messaggio soltanto. Vero -> il turno vede lo schema di web_search e la
+    # riga di prompt che lo descrive; falso -> il modello non sa nemmeno che
+    # esiste (nessun token pagato per un tool spento).
+    web_search: bool = False
 
 
 class AnswerRequest(BaseModel):
@@ -949,14 +1174,48 @@ def search_sessions(q: str = "", limit: int = 40) -> dict[str, Any]:
 
 @app.post("/api/sessions")
 def create_session() -> dict[str, Any]:
-    return open_payload(STATE.new_session())
+    if not RUNNERS.running_ids():
+        # Cambio conversazione: le anteprime della precedente tengono tutto
+        # l'intervallo di porte pubblicato finche' vive il container. Si
+        # smonta qui; se in qualche chat ci fosse un turno davvero in corso
+        # la sandbox e' occupata per buono e si lascia toccare.
+        STATE.ferma_anteprime()
+    nuovo = STATE.new_session()
+    # Una chat creata dal telefono (o da un'altra finestra) deve comparire
+    # nell'elenco delle altre senza refresh manuale.
+    EVENTS.publish("sessions", reason="created", session_id=nuovo)
+    return open_payload(nuovo)
 
 
 @app.post("/api/sessions/{session_id}/open")
 def open_session(session_id: str) -> dict[str, Any]:
+    if not RUNNERS.running_ids():
+        # Stessa regola della creazione: si liberano le porte delle app che
+        # restavano in piedi nella conversazione da cui venivamo. Senza questo
+        # un nuovo turno riproverebbe a pubblicare le stesse porte e fallirebbe
+        # al bind con "port is already allocated".
+        STATE.ferma_anteprime()
     payload = open_payload(session_id)
     STATE.last_opened = session_id
     return payload
+
+
+@app.get("/api/sessions/{session_id}")
+def read_session(session_id: str) -> dict[str, Any]:
+    """Lo stesso payload di ``/open``, ma senza toccare niente.
+
+    Serve a chi si sta solo **riallineando**: il bus globale annuncia la fine
+    di un turno e la pagina rilegge la conversazione dal disco, dove ora c'e'
+    il messaggio finale. Farlo con la POST ``/open`` -- come faceva il fork --
+    significa passare da ``ferma_anteprime()`` ad ogni fine turno: il
+    container viene smontato e l'anteprima che l'utente stava guardando
+    sparisce da sola, qualche millisecondo dopo che il turno e' finito.
+    Aprire e' un gesto, rileggere e' un'altra cosa: due verbi, due rotte.
+
+    Dichiarata dopo ``/api/sessions/search`` di proposito: FastAPI prova le
+    rotte in ordine e ``{session_id}`` catturerebbe anche "search".
+    """
+    return open_payload(session_id)
 
 
 @app.delete("/api/sessions/{session_id}")
@@ -967,6 +1226,11 @@ def delete_session(session_id: str) -> dict[str, Any]:
     STATE.drop(session_id)
     if STATE.last_opened == session_id:
         STATE.new_session()
+    EVENTS.publish("sessions", reason="deleted", session_id=session_id)
+    if not RUNNERS.running_ids():
+        # Una chat cancellata non deve lasciare le sue anteprime a tenere le
+        # porte fino al riavvio dell'app.
+        STATE.ferma_anteprime()
     return open_payload(STATE.last_opened)
 
 
@@ -993,7 +1257,11 @@ def chat(request: ChatRequest) -> dict[str, Any]:
         entry["attachments"] = agganciati
     messages.append(entry)
     STATE.save(session_id)
-    start_turn(session_id)
+    start_turn(session_id, web_search=bool(request.web_search))
+    # Il messaggio e' gia' in cronologia e il turno e' partito (start_turn ha
+    # gia' avvertito tutti con ``turn``): qui avviso solo che l'elenco chat e'
+    # cambiato, per titolo e numero di messaggi.
+    EVENTS.publish("sessions", reason="message", session_id=session_id)
     # Le statistiche tornano **subito**, non a fine turno. Prima l'unico
     # ``state`` lo emetteva il ``finally`` del worker: fino ad allora il
     # misuratore del contesto restava al valore precedente al messaggio appena
@@ -1013,7 +1281,16 @@ def answer(request: AnswerRequest) -> dict[str, Any]:
     if not agent_mod.resume_with_answer(messages, request.answer):
         raise HTTPException(409, "Nessuna domanda in attesa.")
     STATE.save(session_id)
-    start_turn(session_id)
+    # La ricerca online era accesa quando il turno si e' fermato per fare la
+    # domanda: riprendendo deve restare accesa. Senza questo, un compito che
+    # passava da ``ask_user_question`` perdeva il permesso a meta' strada, e
+    # il modello si prendeva un "modalita' non attiva" dalla guardia del tool
+    # subito dopo che l'utente gli aveva risposto -- cioe' nel punto in cui
+    # sembra di piu' un bug.
+    start_turn(session_id, web_search=STATE.web_search_di(session_id))
+    # La risposta e' partita: l'altro schermo chiude il riquadro della
+    # domanda e vede il nuovo turno senza refresh.
+    EVENTS.publish("sessions", reason="answer", session_id=session_id)
     # Stesso motivo di ``/api/chat``: la risposta dell'utente e' gia' in
     # cronologia, e il consumo che si legge nel pannello deve tenerne conto
     # adesso, non quando il ragionamento sara' finito.
@@ -1564,6 +1841,18 @@ def stream(session_id: str) -> StreamingResponse:
     return sse_response(runner.stream())
 
 
+@app.get("/api/events")
+def global_events() -> StreamingResponse:
+    """Bus globale di processo: notizie larghe per tutte le interfacce.
+
+    Desktop e telefono si collegano qui all'avvio: quando l'altro schermo
+    manda un messaggio, fa partire un turno o l'agente fa una domanda,
+    l'evento arriva a entrambi e le pagine si ridisegnano da sole, senza
+    polling ne' refresh manuale.
+    """
+    return sse_response(EVENTS.stream())
+
+
 # ---------------------------------------------------------------------------
 # Rotte: impostazioni, memoria, workspace
 # ---------------------------------------------------------------------------
@@ -1721,6 +2010,144 @@ def pick_workspace() -> dict[str, Any]:
     maybe_prepare_workspace()
     return {
         "cancelled": False,
+        "workspace_dir": STATE.settings["workspace_dir"],
+        "recent_workspaces": STATE.settings["recent_workspaces"],
+        "stats": session_stats(STATE.last_opened),
+        "jobs": PREP.snapshot(),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Rotte: vault LLM Wiki
+# ---------------------------------------------------------------------------
+
+
+class VaultRequest(BaseModel):
+    # ``path`` e' la cartella del vault; se non ha ancora la struttura
+    # LLM Wiki viene creata al volo (raw/, wiki/, schema, indici).
+    path: str
+    # Nome breve mostrato nella colonna di sinistra e usato dal tool
+    # vault_search per riferirsi al vault.
+    nome: str = ""
+
+
+class VaultOpenRequest(BaseModel):
+    # Si apre per nome (quello del registro) o, in mancanza, per percorso.
+    nome: str = ""
+    path: str = ""
+
+
+def _registro_vault() -> list[dict[str, Any]]:
+    return [v for v in (STATE.settings.get("vaults") or []) if str(v.get("path", "")).strip()]
+
+
+@app.get("/api/vaults")
+def lista_vault() -> dict[str, Any]:
+    """Elenco dei vault registrati, con le statistiche economiche."""
+    corrente = os.path.normcase(os.path.normpath(str(STATE.settings["workspace_dir"])))
+    voci: list[dict[str, Any]] = []
+    for v in _registro_vault():
+        path = str(v.get("path"))
+        if not os.path.isdir(path):
+            # Come per i recent_workspaces: un vault cancellato non deve
+            # restare nella tendina a suggerire errori.
+            continue
+        info = vault_mod.info_vault(path, str(v.get("nome") or ""))
+        voce = info.as_dict()
+        voce["attivo"] = os.path.normcase(os.path.normpath(path)) == corrente
+        voci.append(voce)
+    return {"vaults": voci}
+
+
+@app.post("/api/vaults")
+def registra_vault(request: VaultRequest) -> dict[str, Any]:
+    """Registra un vault (creando la struttura se manca) nel registro."""
+    path = Path(request.path).expanduser()
+    if not path.is_dir():
+        raise HTTPException(400, f"'{request.path}' non e' una cartella esistente.")
+    path = path.resolve()
+    nome = request.nome.strip() or path.name
+    registro = _registro_vault()
+    chiave = os.path.normcase(os.path.normpath(str(path)))
+    if not any(os.path.normcase(os.path.normpath(v["path"])) == chiave for v in registro):
+        registro.append({"path": str(path), "nome": nome})
+        STATE.settings["vaults"] = registro
+        STATE.persist()
+    return {"vault": vault_mod.info_vault(path, nome).as_dict()}
+
+
+@app.post("/api/vaults/pick")
+def scegli_vault_con_dialogo() -> dict[str, Any]:
+    """Apre il selettore nativo di cartelle e registra il vault scelto.
+
+    Stampa di ``/api/workspace/pick``: su Windows e' Esplora risorse, la
+    chiamata resta appesa finche' l'utente non sceglie o annulla (richiesta
+    sincrona servita dal threadpool, quindi senza bloccare il resto).
+    La registrazione riusa ``registra_vault``, cosi' validazione, dedupe e
+    creazione della struttura LLM Wiki hanno una sola implementazione.
+    """
+    try:
+        scelto = pick_folder(STATE.settings["workspace_dir"])
+    except DialogUnavailable as exc:
+        raise HTTPException(
+            501,
+            f"Selettore di sistema non disponibile: {exc}. "
+            "Registra il percorso da Impostazioni.",
+        ) from exc
+
+    if not scelto:
+        return {"cancelled": True}
+
+    # Qui, diversamente che da /api/vaults, la cartella scelta e' dichiarata
+    # come "nuovo vault": la struttura LLM Wiki si crea subito, cosi' la voce
+    # che torna alla UI mostra gia' indice e log e il vault e' interrogabile.
+    vault_mod.ensure_vault(Path(scelto).expanduser())
+    voce = registra_vault(VaultRequest(path=scelto))
+    return {"cancelled": False, "vault": voce["vault"]}
+
+
+@app.post("/api/vaults/remove")
+def rimuovi_vault(request: VaultOpenRequest) -> dict[str, Any]:
+    """Toglie un vault dal registro: la cartella su disco non si tocca."""
+    registro = _registro_vault()
+    chiave = ""
+    if request.path:
+        chiave = os.path.normcase(os.path.normpath(request.path))
+    elif request.nome:
+        match = [v for v in registro if v.get("nome") == request.nome]
+        if match:
+            chiave = os.path.normcase(os.path.normpath(match[0]["path"]))
+    tenuti = [
+        v for v in registro
+        if os.path.normcase(os.path.normpath(v["path"])) != chiave
+    ] if chiave else registro
+    STATE.settings["vaults"] = tenuti
+    STATE.persist()
+    return {"rimossi": len(registro) - len(tenuti), "vaults": tenuti}
+
+
+@app.post("/api/vaults/open")
+def apri_vault(request: VaultOpenRequest) -> dict[str, Any]:
+    """Apre un vault come workspace corrente, creandolo se non esiste ancora."""
+    bersaglio = ""
+    if request.nome:
+        match = [
+            v for v in _registro_vault()
+            if v.get("nome") == request.nome and os.path.isdir(v["path"])
+        ]
+        if match:
+            bersaglio = match[0]["path"]
+    if not bersaglio and request.path:
+        bersaglio = request.path
+    if not bersaglio or not Path(bersaglio).is_dir():
+        raise HTTPException(400, f"Vault '{request.nome or request.path}' non trovato.")
+
+    radice = vault_mod.ensure_vault(Path(bersaglio).expanduser())
+    STATE.settings["workspace_dir"] = str(radice)
+    remember_workspace()
+    STATE.persist()
+    maybe_prepare_workspace()
+    return {
         "workspace_dir": STATE.settings["workspace_dir"],
         "recent_workspaces": STATE.settings["recent_workspaces"],
         "stats": session_stats(STATE.last_opened),

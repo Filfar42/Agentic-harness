@@ -1,0 +1,18 @@
+# Fine-riga: LF nel repository, sempre.
+#
+# Il fork Qwen era stato salvato interamente in CRLF. Il contenuto cambiato
+# erano 2.700 righe; `diff` ne mostrava 30.500, perche' ogni riga di ogni file
+# risultava diversa. Un merge fatto in quelle condizioni non e' rivedibile: si
+# perde il segnale nel rumore, e ogni conflitto e' l'intero file.
+#
+# `text=auto` lascia a git il riconoscimento di cosa e' testo; `eol=lf` fissa
+# come sta scritto nel repository. Sul disco di Windows i file restano
+# leggibili da qualunque editor: nessuno di quelli in uso ha problemi con LF.
+* text=auto eol=lf
+
+# I binari non si toccano: senza queste righe git proverebbe a "correggere"
+# i byte 0x0D dentro le PNG.
+*.png binary
+*.jpg binary
+*.ico binary
+*.zip binary

@@ -51,6 +51,28 @@ def test_presence_penalty_is_sent_only_when_set():
     assert GenParams(presence_penalty=1.5).ollama_options()["presence_penalty"] == 1.5
 
 
+def test_repetition_penalty_defaults_to_neutral_and_is_sent_when_changed():
+    """Il neutro e' 1.0, non il default Ollama (1.1): a riposo non va nel payload,
+    appena l'impostazione si muove va."""
+    assert GenParams().repetition_penalty == 1.0
+    assert "repeat_penalty" not in GenParams().ollama_options()
+    opts = GenParams(repetition_penalty=1.2).ollama_options()
+    assert opts["repeat_penalty"] == 1.2
+
+
+def test_la_penalita_di_ripetizione_viaggia_col_nome_che_ollama_conosce():
+    """Il bug piu' silenzioso del fork: la manopola girava e non faceva niente.
+
+    Sul transport nativo l'opzione si chiama ``repeat_penalty``; il nome della
+    letteratura (``repetition_penalty``, vLLM/HF) Ollama non lo conosce e --
+    come tutte le opzioni sconosciute -- lo scarta senza dire niente. Nessun
+    errore, nessun avviso: solo un'impostazione che sembra funzionare.
+    """
+    opts = GenParams(repetition_penalty=1.15).ollama_options()
+    assert "repetition_penalty" not in opts
+    assert opts["repeat_penalty"] == 1.15
+
+
 # --- livelli di pensiero ----------------------------------------------------
 
 

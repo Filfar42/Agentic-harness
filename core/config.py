@@ -13,7 +13,16 @@ from pathlib import Path
 from typing import Any
 
 APP_NAME = "Local Agent Harness"
-APP_VERSION = "2.27.2"
+# Unica fonte di verita' della versione. ``pyproject.toml`` deve riportare la
+# stessa stringa: era rimasto a 2.11.0 mentre qui si era arrivati a 2.27, e
+# nessuno se n'era accorto perche' niente li confrontava. Adesso lo fa un test
+# (``tests/test_core.py::test_la_versione_e_la_stessa_in_pyproject``).
+#
+# Il numero si muove cosi': terza cifra per una correzione, seconda per una
+# funzione nuova, prima per un cambio che rompe le sessioni salvate o le
+# preferenze. 2.31.0 e' il merge del fork Qwen: sette funzioni nuove, nessun
+# formato su disco cambiato.
+APP_VERSION = "2.31.0"
 
 # --- percorsi di persistenza ------------------------------------------------
 DATA_DIR = Path("chat_sessions")
@@ -139,6 +148,18 @@ class GenParams:
     # MoE con canale di pensiero sono un'altra cosa.
     top_k: int = 40
     presence_penalty: float = 0.0
+    # Il default di Ollama e' 1.1: a quel valore penalizza ogni ripetizione,
+    # comprese quelle delle parole comuni e degli identificatori. 1.0 e' il
+    # neutro e non viene inviato, come presence_penalty: un'opzione in meno
+    # nel payload e' un prefisso in meno da invalidare.
+    #
+    # Il campo si chiama repetition_penalty perche' e' cosi' che lo chiamano
+    # l'impostazione, l'interfaccia e la letteratura (vLLM, HF). Sul filo
+    # nativo di Ollama la chiave e' un'altra -- ``repeat_penalty`` -- e
+    # sbagliarla non da' errore: Ollama scarta in silenzio le opzioni che non
+    # conosce, e la manopola sembra funzionare senza fare niente. La
+    # traduzione avviene in ``ollama_options`` ed e' coperta da un test.
+    repetition_penalty: float = 1.0
     max_tokens: int = 2048
     num_ctx: int = 16384
     num_gpu: int = 999
@@ -166,6 +187,10 @@ class GenParams:
         }
         if self.presence_penalty:
             opts["presence_penalty"] = float(self.presence_penalty)
+        # Qui il nome cambia: fuori e' repetition_penalty, sul filo di Ollama
+        # e' repeat_penalty. Vedi il commento sul campo.
+        if self.repetition_penalty != 1.0:
+            opts["repeat_penalty"] = float(self.repetition_penalty)
         if self.seed is not None:
             opts["seed"] = int(self.seed)
         if self.stop:
@@ -204,6 +229,9 @@ DEFAULTS: dict[str, Any] = {
     # Qwen 3.x raccomanda top_k 20; 40 e' il default di Ollama.
     "top_k": 40,
     "presence_penalty": 0.0,
+    # 1.0 e' il neutro: Ollama da solo lascierebbe il suo default (1.1), che
+    # penalizza anche le ripetizioni delle parole comuni.
+    "repetition_penalty": 1.0,
     "max_tokens": 2048,
     "num_ctx": 16384,
     "num_gpu": 999,
@@ -231,6 +259,12 @@ DEFAULTS: dict[str, Any] = {
     # indietro. Tenuta corta di proposito -- oltre la mezza dozzina non e' piu'
     # un elenco di scorciatoie ma una cronologia da leggere.
     "recent_workspaces": [],
+    # Vault LLM Wiki registrati: percorsi di workspace che contengono una wiki
+    # mantenuta dall'agente (raw/ + wiki/). La sezione "Vault" della colonna
+    # sinistra li elenca; il tool vault_search li interroga senza cambiare
+    # workspace. Lista di dict {path, nome}: il nome e' quello scelto
+    # dall'utente, non la basename, perche' i vault si riconoscono dal tema.
+    "vaults": [],
     "confirm_commands": False,
     # Dove girano i comandi di run_command.
     #   docker = container che monta solo il workspace su /work (predefinito)

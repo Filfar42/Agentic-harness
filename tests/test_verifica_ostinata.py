@@ -121,14 +121,21 @@ def test_il_contatore_si_azzera_quando_torna_verde(tmp_path):
     diverso partirebbe gia' con il sospetto addosso."""
     from core.tools import tool_run_command
 
+    # L'interprete che sta girando i test, non il nome "python3": su Windows
+    # quel nome non esiste e il comando tornava FALLITO per il motivo
+    # sbagliato, facendo fallire un test che parla d'altro.
+    py = sys.executable
+    rosso = f'"{py}" -c "raise SystemExit(1)"'
+    verde = f'"{py}" -c "pass"'
+
     ctx = ToolContext(workspace=str(tmp_path), sandbox="host", timeout_s=20)
     for _ in range(ROSSI_PRIMA_DI_DUBITARE):
-        tool_run_command(ctx, "python3 -c \"raise SystemExit(1)\"")
-    assert ctx.comandi_falliti["python3 -c \"raise SystemExit(1)\""] == ROSSI_PRIMA_DI_DUBITARE
+        tool_run_command(ctx, rosso)
+    assert ctx.comandi_falliti[rosso] == ROSSI_PRIMA_DI_DUBITARE
 
-    esito = json.loads(tool_run_command(ctx, "python3 -c \"pass\""))
+    esito = json.loads(tool_run_command(ctx, verde))
     assert esito["esito"] == "ok"
-    assert "python3 -c \"pass\"" not in ctx.comandi_falliti
+    assert verde not in ctx.comandi_falliti
 
 
 # ---------------------------------------------------------------------------

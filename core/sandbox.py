@@ -32,6 +32,7 @@ Scelte di progetto
 from __future__ import annotations
 
 import hashlib
+import os
 import platform
 import shlex
 import shutil
@@ -212,6 +213,51 @@ def _remove(name: str) -> None:
     _run_docker(["rm", "--force", name], timeout=30)
 
 
+def _porta_host(spec: str) -> tuple[int, int] | None:
+    """Estremi (inclusi) delle porte host in una voce di ``{{.Ports}}`` di docker ps."""
+    lato = spec.split("->", 1)[0].strip()
+    if not lato:
+        return None
+    # Con IP esplicito ("127.0.0.1:8204-8207") l'ultima parte dopo ':' e' la/o
+    # le porte host; senza (raro) tutto il lato e' gia' la specifica di porta.
+    cand = lato.rsplit(":", 1)[-1] if ":" in lato else lato
+    try:
+        lo, hi = (int(x) for x in cand.split("-", 1)) if "-" in cand else (int(cand), int(cand))
+    except ValueError:
+        return None
+    return lo, hi
+
+
+def _port_bind_conflittuali(nostra: str, lo: int, hi: int) -> list[str]:
+    """Nomi dei contenitori dell'harness di un ALTRO workspace che pubblicano una nostra porta.
+
+    Solo quelli con la nostra etichetta (il resto non ci riguarda) e solo in
+    esecuzione: un container fermo non tiene proxy sull'host, quindi non puo'
+    occupare nessuna porta. Il nostro stesso contenitore e' escluso per nome:
+    se va ricreato per impronta diversa, ``ensure_container`` lo fa da se'.
+    """
+    proc = _run_docker(
+        ["ps", "--format", "{{.ID}}|{{.Names}}|{{.Ports}}", f"--filter=label={LABEL}=1"],
+        timeout=20,
+    )
+    if proc.returncode != 0:
+        return []
+    trovati = []
+    for riga in proc.stdout.splitlines():
+        parti = riga.split("|")
+        if len(parti) < 3:
+            continue
+        nome = parti[1].strip()
+        if not nome or nome == nostra:
+            continue
+        for voce in (v.strip() for v in parti[2].split(",")):
+            estremi = _porta_host(voce)
+            if estremi and estremi[0] <= hi and estremi[1] >= lo:
+                trovati.append(nome)
+                break
+    return trovati
+
+
 def _fingerprint(*parts: Any) -> str:
     return hashlib.sha256("|".join(str(p) for p in parts).encode()).hexdigest()[:12]
 
@@ -299,6 +345,18 @@ def ensure_container(
         args += ["--network", "none"]
     args += [image, "sleep", "infinity"]
 
+    if ports and network:
+        lo, hi = ports
+        for ostacolo in _port_bind_conflittuali(name, lo, hi):
+            # Un container dell'harness di un ALTRO workspace tiene le nostre
+            # porte (il suo server non e' mai stato fermato). Senza questo
+            # passaggio ``docker run`` fallisce con "port is already allocated"
+            # e l'agente resta appeso a un errore che non capisce: da qui non
+            # si puo' neppure vedere chi ce l'ha, perche' il proprio shell gira
+            # dentro un container che non parte. Si rimuovono solo quelli con
+            # la nostra etichetta: mai i contenitori di qualcun altro.
+            _remove(ostacolo)
+
     proc = _run_docker(args, timeout=300)     # il primo avvio puo' scaricare l'immagine
     if proc.returncode != 0:
         detail = (proc.stderr or proc.stdout).strip()
@@ -383,6 +441,88 @@ _BG_DIR = "/tmp/harness-preview"
 
 def _bg_paths(slot: str) -> tuple[str, str]:
     return f"{_BG_DIR}/{slot}.log", f"{_BG_DIR}/{slot}.pid"
+
+
+# Marchi di "processo in background vivo", sul lato host e fuori dal
+# workspace. Servono a rispondere alla domanda "c'e' qualcosa da fermare?" con
+# uno sguardo a un file invece che con un exec dentro il container: era quella
+# la voce che costava secondi a ogni cambio di conversazione, e quando non
+# c'era niente da fermare si ricreava per intero la sandbox solo per verificare.
+# Scrive ``start_background``; cancella chi scopre che lo slot e' davvero vuoto.
+def _live_dir() -> Path:
+    """Dove vivono i marchi. ``HARNESS_BG_LIVE`` vince: e' cosi' che la suite
+    li tiene nella propria ``tmp_path`` invece che nella home dell'utente.
+
+    Il posto giusto dipende dal sistema: su Windows e' ``%LOCALAPPDATA%``,
+    non un ``~/.local/share`` preso in prestito da POSIX -- che li' e' solo
+    una cartella nascosta che nessuno pulisce mai.
+    """
+    personalizzato = os.environ.get("HARNESS_BG_LIVE")
+    if personalizzato:
+        return Path(personalizzato)
+    if os.name == "nt":
+        base = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
+        return Path(base) / "harness-sandbox-bg"
+    return Path.home() / ".local" / "share" / "harness-sandbox-bg"
+
+
+def dimentica_marchi_vivi() -> int:
+    """Cancella tutti i marchi. Ritorna quanti ne ha tolti.
+
+    La chiama il server all'avvio: un marchio sopravvive al processo che l'ha
+    scritto, ma i container no. Dopo un riavvio -- o dopo un crash -- ogni
+    marchio rimasto e' una bugia che costa un giro di Docker al primo cambio
+    di conversazione, per andare a fermare un processo che non esiste piu'.
+    """
+    tolti = 0
+    try:
+        for marchio in _live_dir().glob("*.live"):
+            try:
+                marchio.unlink()
+                tolti += 1
+            except OSError:
+                pass
+    except OSError:
+        return tolti
+    return tolti
+
+
+def _ws_digest(workspace: str | Path) -> str:
+    return hashlib.sha256(str(Path(workspace).resolve()).encode("utf-8")).hexdigest()[:16]
+
+
+def _mark_file(workspace: str | Path, slot: str) -> Path:
+    return _live_dir() / f"{_ws_digest(workspace)}-{slot}.live"
+
+
+def _set_live_mark(workspace: str | Path, slot: str) -> None:
+    try:
+        percorso = _mark_file(workspace, slot)
+        percorso.parent.mkdir(parents=True, exist_ok=True)
+        percorso.write_text("1", encoding="utf-8")
+    except OSError:
+        pass  # il marchio e' solo un'ottimizzazione: perderlo non deve rompere l'avvio
+
+
+def _clear_live_mark(workspace: str | Path, slot: str) -> None:
+    try:
+        _mark_file(workspace, slot).unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def background_live(workspace: str | Path) -> bool:
+    """Almeno un'app lanciata dall'harness e' marcata viva nella sandbox.
+
+    Zero costo, nessun docker: serve a decidere se un cambio di chat ha davvero
+    qualcosa da fermare. Un container residuo (riavvio del server) non lo vede
+    qui, ma il chiamante puo' ancora spazzarlo con ``stop``, che costa una sola
+    verifica quando c'e' gia' tutto pulito.
+    """
+    try:
+        return bool(list(_live_dir().glob(f"{_ws_digest(workspace)}-*.live")))
+    except OSError:
+        return False
 
 
 # --- schermo e terminale ------------------------------------------------------
@@ -521,7 +661,12 @@ def start_background(
         raise SandboxError(f"Avvio in background fallito: {detail}")
 
     letto = _run_docker(["exec", name, "/bin/sh", "-lc", f"cat {pid_path}"], timeout=15)
-    return letto.stdout.strip()
+    pid = letto.stdout.strip()
+    if pid:
+        # Da questo momento un cambio di chat sa che c'e' qualcosa da fermare
+        # senza doverlo andarsi a cercare dentro il container.
+        _set_live_mark(workspace, slot)
+    return pid
 
 
 def background_log(
@@ -692,11 +837,26 @@ def stop_background(
     `uvicorn --reload` avviano figli, e ammazzare il padre lascerebbe la porta
     occupata da un orfano -- con l'avvio successivo che fallisce con "address
     already in use" per un motivo invisibile.
+
+    Si agisce solo se ``start_background`` ha lasciato un marchio sul lato host
+    (o se il container risulta gia' vivo, come rete di sicurezza): altrimenti si
+    tornerebbe a ricreare la sandbox da zero solo per verificare l'assenza, che
+    era proprio la voce che rallentava ogni cambio di conversazione.
     """
-    try:
-        name = ensure_container(workspace, image=image, network=network, ports=ports)
-    except SandboxError:
-        return False
+    if not _mark_file(workspace, slot).exists():
+        if not _is_running(container_name(workspace)):
+            # Nessun marchio e nessun container: niente da fermare, zero docker.
+            return False
+        # Container senza marchio (versione precedente che non lo lasciava): si
+        # uccide l'app con il solo exec e si spazzera' il contenitore a parte.
+        name = container_name(workspace)
+    else:
+        try:
+            name = ensure_container(
+                workspace, image=image, network=network, ports=ports
+            )
+        except SandboxError:
+            return False
     _, pid_path = _bg_paths(slot)
     proc = _run_docker(
         [
@@ -710,6 +870,12 @@ def stop_background(
         ],
         timeout=20,
     )
+    if proc.returncode in (0, 3):
+        # Slot vuoto: kill eseguito oppure pidfile assente. Si cancella il
+        # marchio affinche' i cambi di chat successivi non rifacciano questa
+        # verifica a vuoto; con altri codi si conserva -- meglio ritentare una
+        # volta in piu' che perdere un'app.
+        _clear_live_mark(workspace, slot)
     return proc.returncode == 0
 
 
