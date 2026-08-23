@@ -1149,3 +1149,91 @@ def test_anche_lo_stream_di_un_turno_si_stacca_allo_spegnimento():
     finally:
         libera.set()
         runner_mod.dimentica_spegnimento()
+
+
+# ---------------------------------------------------------------------------
+# Il workspace segue la conversazione
+# ---------------------------------------------------------------------------
+
+
+def test_riaprire_una_chat_riporta_l_harness_sulla_sua_cartella(client, tmp_path):
+    """Il workspace e' della conversazione, non dell'applicazione.
+
+    Aprire una chat di ieri e trovarsi puntati sul progetto di un'altra e' il
+    modo piu' rapido di far scrivere l'agente nel posto sbagliato: la
+    cronologia parla di *quei* file, e il primo comando andrebbe altrove.
+    """
+    stato = client.server.STATE
+    primo = tmp_path / "progetto-uno"
+    secondo = tmp_path / "progetto-due"
+    primo.mkdir()
+    secondo.mkdir()
+
+    # Una chat sul primo progetto, con un messaggio: cosi' finisce su disco.
+    chat_uno = client.post("/api/sessions", json={}).json()["session_id"]
+    client.post("/api/workspace", json={"path": str(primo)})
+    client.post("/api/chat", json={"session_id": chat_uno, "prompt": "ciao"})
+    assert wait_until(lambda: not client.server.RUNNERS.is_running(chat_uno))
+    assert stato.workspace_di(chat_uno) == str(primo.resolve())
+
+    # Una seconda chat su un altro progetto.
+    chat_due = client.post("/api/sessions", json={}).json()["session_id"]
+    client.post("/api/workspace", json={"path": str(secondo)})
+    assert stato.settings["workspace_dir"] == str(secondo.resolve())
+
+    # Si torna alla prima: l'harness deve tornarci anche lui.
+    payload = client.post(f"/api/sessions/{chat_uno}/open", json={}).json()
+    assert stato.settings["workspace_dir"] == str(primo.resolve())
+    # E il client lo sa dal payload, senza una seconda chiamata.
+    assert payload["workspace_dir"] == str(primo.resolve())
+
+    # E avanti e indietro regge.
+    client.post(f"/api/sessions/{chat_due}/open", json={})
+    assert stato.settings["workspace_dir"] == str(secondo.resolve())
+
+
+def test_una_cartella_sparita_non_impedisce_di_aprire_la_chat(client, tmp_path):
+    """Meglio restare dove si e' che rifiutare di aprire una conversazione:
+    la cronologia si legge lo stesso, e il progetto puo' essere solo stato
+    spostato."""
+    stato = client.server.STATE
+    sparita = tmp_path / "cartella-che-sparisce"
+    sparita.mkdir()
+    resta = tmp_path / "cartella-che-resta"
+    resta.mkdir()
+
+    chat = client.post("/api/sessions", json={}).json()["session_id"]
+    client.post("/api/workspace", json={"path": str(sparita)})
+    client.post("/api/chat", json={"session_id": chat, "prompt": "ciao"})
+    assert wait_until(lambda: not client.server.RUNNERS.is_running(chat))
+
+    client.post("/api/workspace", json={"path": str(resta)})
+    sparita.rmdir()
+
+    risposta = client.post(f"/api/sessions/{chat}/open", json={})
+    assert risposta.status_code == 200
+    assert stato.settings["workspace_dir"] == str(resta.resolve())
+
+
+def test_a_turno_in_corso_la_cartella_non_si_sposta(client, tmp_path):
+    """Il workspace e' uno per processo: una sandbox, un albero
+    nell'environment header, un intervallo di porte. Cambiarlo sotto un turno
+    vivo vorrebbe dire cambiargli il pavimento sotto i piedi."""
+    stato = client.server.STATE
+    altrove = tmp_path / "altrove"
+    altrove.mkdir()
+
+    lavora = client.post("/api/sessions", json={}).json()["session_id"]
+    ferma = client.post("/api/sessions", json={}).json()["session_id"]
+    stato.session(ferma)["workspace_dir"] = str(altrove.resolve())
+    prima = stato.settings["workspace_dir"]
+
+    client.post("/api/chat", json={"session_id": lavora, "prompt": "lavora"})
+    # Mentre il turno gira, aprire l'altra chat non deve spostare niente.
+    client.post(f"/api/sessions/{ferma}/open", json={})
+    assert stato.settings["workspace_dir"] == prima
+
+    assert wait_until(lambda: not client.server.RUNNERS.is_running(lavora))
+    # A turno finito, invece, si sposta.
+    client.post(f"/api/sessions/{ferma}/open", json={})
+    assert stato.settings["workspace_dir"] == str(altrove.resolve())

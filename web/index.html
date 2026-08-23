@@ -586,7 +586,18 @@
       <section class="tab-panel" id="tab-prompt">
         <div class="field">
           <label for="s-prompt">System prompt</label>
-          <textarea id="s-prompt" rows="22"></textarea>
+          <textarea id="s-prompt" rows="22" placeholder="Vuoto: lo sceglie l'harness in base al modello."></textarea>
+          <!-- Il testo qui dentro vince SEMPRE su quello del codice, e una
+               copia vecchia rimasta nel campo e' il modo silenzioso di non
+               ricevere piu' nessuna modifica al prompt: succede da solo,
+               perche' basta che il testo di riferimento cambi perche' la copia
+               smetta di combaciare e passi per "personalizzato". -->
+          <div class="help">
+            Quello che scrivi qui vince sempre e blocca la scelta automatica fra
+            prompt esteso (modelli senza canale di pensiero) e snello. Svuota il
+            campo per tornare automatico:
+            <button type="button" class="btn" id="s-prompt-reset">Ripristina</button>
+          </div>
         </div>
       </section>
 

@@ -418,9 +418,22 @@ class AppState:
             session["workspace_dir"] = self.settings["workspace_dir"]
             session_mod.save_session(session, force=True)
 
+    def workspace_di(self, session_id: str) -> str:
+        """La cartella su cui questa conversazione ha lavorato.
+
+        E' registrata ad ogni salvataggio. Riaprendo una chat di ieri e' il
+        dato che permette di rimettere l'harness dov'era: una conversazione
+        parla di *quel* progetto, e ritrovarsela puntata su un altro workspace
+        significa che il primo comando lavora sui file sbagliati.
+        """
+        return str(self.session(session_id).get("workspace_dir") or "")
+
     def new_session(self) -> str:
         fresh: dict[str, Any] = {}
         session_id = session_mod.new_session(fresh)
+        # La chat nuova nasce sulla cartella aperta adesso: cosi' il legame
+        # esiste dal primo istante, non dal primo salvataggio.
+        fresh["workspace_dir"] = self.settings["workspace_dir"]
         with self._lock:
             self._sessions[session_id] = fresh
         self.last_opened = session_id
@@ -1163,6 +1176,12 @@ def open_payload(session_id: str) -> dict[str, Any]:
         "notes": STATE.notes(session_id).to_list(),
         "preview": STATE.preview(session_id),
         "stats": session_stats(session_id),
+        # La cartella di **questa** conversazione. Viaggia nel payload perche'
+        # aprire una chat puo' spostare l'harness, e il client deve
+        # accorgersene senza una seconda chiamata: il percorso in testa, la
+        # scheda della sandbox e i recenti si aggiornano da qui.
+        "workspace_dir": STATE.settings["workspace_dir"],
+        "recent_workspaces": STATE.settings["recent_workspaces"],
     }
 
 
@@ -1209,15 +1228,51 @@ def create_session() -> dict[str, Any]:
 
 @app.post("/api/sessions/{session_id}/open")
 def open_session(session_id: str) -> dict[str, Any]:
+    # Prima di tutto: la conversazione esiste? Senza questa riga una richiesta
+    # con un id sbagliato fermerebbe le anteprime e sposterebbe la cartella
+    # *prima* di rispondere 404.
+    STATE.session(session_id)
+    # E da qui in poi la corrente e' questa. L'ordine conta: cambiare cartella
+    # la lega alla chat aperta, e se ``last_opened`` puntasse ancora a quella
+    # di prima le scriverebbe addosso il workspace di questa -- cioe' aprire
+    # una chat cancellerebbe il ricordo della chat da cui vieni.
+    STATE.last_opened = session_id
     if not RUNNERS.running_ids():
         # Stessa regola della creazione: si liberano le porte delle app che
         # restavano in piedi nella conversazione da cui venivamo. Senza questo
         # un nuovo turno riproverebbe a pubblicare le stesse porte e fallirebbe
         # al bind con "port is already allocated".
         STATE.ferma_anteprime()
-    payload = open_payload(session_id)
-    STATE.last_opened = session_id
-    return payload
+        ripristina_workspace(session_id)
+    return open_payload(session_id)
+
+
+def ripristina_workspace(session_id: str) -> bool:
+    """Rimette l'harness sulla cartella di questa conversazione.
+
+    Aprire una chat vecchia e trovarsi puntati sul progetto di un'altra e' il
+    modo piu' rapido di far scrivere l'agente nel posto sbagliato: la
+    cronologia parla di *quei* file, e il primo comando andrebbe altrove.
+
+    Si sposta solo a turni fermi -- il workspace e' uno per processo (una
+    sandbox, un albero nell'environment header, un intervallo di porte) e
+    cambiarlo sotto un turno vivo vorrebbe dire cambiargli il pavimento sotto
+    i piedi. Una cartella sparita nel frattempo si ignora: meglio restare dove
+    si e' che rifiutare di aprire una conversazione.
+    """
+    registrato = STATE.workspace_di(session_id)
+    if not registrato:
+        return False
+    corrente = str(STATE.settings["workspace_dir"])
+    if os.path.normcase(os.path.normpath(registrato)) == os.path.normcase(
+        os.path.normpath(corrente)
+    ):
+        return False
+    percorso = Path(registrato).expanduser()
+    if not percorso.is_dir():
+        return False
+    applica_workspace(percorso)
+    return True
 
 
 @app.get("/api/sessions/{session_id}")
@@ -1899,11 +1954,11 @@ def update_settings(request: SettingsRequest) -> dict[str, Any]:
             pass
     if touched:
         STATE.persist()
-    # Il workspace si puo' cambiare anche da qui, non solo dal selettore.
+    # Il workspace si puo' cambiare anche da qui, non solo dal selettore: e
+    # allora passa dalla stessa porta, senno' questa strada si dimenticherebbe
+    # di legare la cartella alla conversazione aperta.
     if "workspace_dir" in touched:
-        remember_workspace()
-        STATE.persist()
-        maybe_prepare_workspace()
+        applica_workspace(Path(str(STATE.settings["workspace_dir"])).expanduser())
     return {"settings": STATE.settings, "stats": session_stats(STATE.last_opened)}
 
 
@@ -1927,15 +1982,47 @@ def remove_memory(memory_id: str) -> dict[str, Any]:
     return {"memories": STATE.memories}
 
 
+def applica_workspace(path: Path) -> str:
+    """Sposta l'harness su una cartella e prepara quello che va preparato.
+
+    Un solo posto per il cambio: lo usano la scelta a mano, l'apertura di un
+    vault e il ripristino della cartella di una conversazione riaperta. Tre
+    gesti diversi che devono avere lo stesso effetto, senno' uno dei tre si
+    dimentica di ricostruire l'immagine o di aggiornare i recenti.
+    """
+    STATE.settings["workspace_dir"] = str(path.resolve())
+    remember_workspace()
+    STATE.persist()
+    maybe_prepare_workspace()
+    lega_workspace_alla_chat_aperta()
+    return STATE.settings["workspace_dir"]
+
+
+def lega_workspace_alla_chat_aperta() -> None:
+    """Segna sulla conversazione aperta la cartella su cui si lavora adesso.
+
+    Il legame nascerebbe comunque al primo salvataggio, cioe' al primo
+    messaggio: farlo qui vuol dire che vale anche per una chat aperta e
+    lasciata li' -- ed e' proprio quella che, riaperta domani, deve ritrovarsi
+    dove l'avevi messa.
+
+    Non puo' far fallire il cambio di cartella: la conversazione corrente
+    potrebbe non essere caricabile (appena cancellata dall'altro schermo, file
+    sparito). In quel caso il legame salta e si riformera' al primo
+    salvataggio.
+    """
+    try:
+        STATE.session(STATE.last_opened)["workspace_dir"] = STATE.settings["workspace_dir"]
+    except HTTPException:
+        pass
+
+
 @app.post("/api/workspace")
 def set_workspace(request: WorkspaceRequest) -> dict[str, Any]:
     path = Path(request.path).expanduser()
     if not path.is_dir():
         raise HTTPException(400, f"'{request.path}' non e' una cartella esistente.")
-    STATE.settings["workspace_dir"] = str(path.resolve())
-    remember_workspace()
-    STATE.persist()
-    maybe_prepare_workspace()
+    applica_workspace(path)
     return {
         "workspace_dir": STATE.settings["workspace_dir"],
         "recent_workspaces": STATE.settings["recent_workspaces"],
@@ -2021,13 +2108,11 @@ def pick_workspace() -> dict[str, Any]:
     path = Path(chosen).expanduser()
     if not path.is_dir():
         raise HTTPException(400, f"'{chosen}' non e' una cartella.")
-    STATE.settings["workspace_dir"] = str(path.resolve())
-    remember_workspace()
-    STATE.persist()
-    # La cartella appena scelta e' il momento giusto per costruire l'immagine:
-    # l'utente ha appena dichiarato su cosa vuole lavorare, e la build parte
-    # mentre scrive il primo messaggio invece che dopo.
-    maybe_prepare_workspace()
+    # La cartella appena scelta e' anche il momento giusto per costruire
+    # l'immagine: l'utente ha appena dichiarato su cosa vuole lavorare, e la
+    # build parte mentre scrive il primo messaggio invece che dopo. Lo fa
+    # ``applica_workspace``, che e' l'unica strada per cambiare cartella.
+    applica_workspace(path)
     return {
         "cancelled": False,
         "workspace_dir": STATE.settings["workspace_dir"],
@@ -2163,10 +2248,7 @@ def apri_vault(request: VaultOpenRequest) -> dict[str, Any]:
         raise HTTPException(400, f"Vault '{request.nome or request.path}' non trovato.")
 
     radice = vault_mod.ensure_vault(Path(bersaglio).expanduser())
-    STATE.settings["workspace_dir"] = str(radice)
-    remember_workspace()
-    STATE.persist()
-    maybe_prepare_workspace()
+    applica_workspace(radice)
     return {
         "workspace_dir": STATE.settings["workspace_dir"],
         "recent_workspaces": STATE.settings["recent_workspaces"],

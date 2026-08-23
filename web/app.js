@@ -1838,6 +1838,17 @@ function bindGlobalEvents() {
  *  ci si riattacca allo stream, ricostruendo pensiero e tool gia' eseguiti. */
 async function showSession(payload) {
   state.sessionId = payload.session_id;
+  // Il workspace segue la conversazione: aprendo una chat di ieri il server
+  // ci rimette sulla cartella su cui era stata fatta, e qui se ne prende
+  // atto -- percorso in testa, scheda della sandbox, cartelle recenti.
+  // Solo se e' davvero cambiato: showSession gira anche ad ogni evento del
+  // bus, e un avviso per ogni fine turno sarebbe rumore.
+  if (payload.workspace_dir && payload.workspace_dir !== state.settings.workspace_dir) {
+    // "Ora si lavora in" e non "workspace della chat": la cartella e' una per
+    // processo, e questo messaggio dice dov'e' finito l'harness -- vale anche
+    // quando a spostarlo e' stato l'altro schermo.
+    dopoIlCambio(payload, 'Ora si lavora in: ' + nomeCartella(payload.workspace_dir));
+  }
   // I numeri dell'ultima esecuzione sono di **quella** conversazione: cambiando
   // chat vanno via subito, prima ancora di disegnare la nuova.
   resetUsage();
@@ -2464,6 +2475,21 @@ async function boot() {
     button.textContent = 'Ricrea il container';
   };
   bindField('#s-prompt', 'system_prompt');
+  // Svuotare il campo e' il gesto che rimette la scelta automatica: il server
+  // legge il vuoto come "scegli tu". Il bottone esiste perche' cancellare a
+  // mano ventidue righe di testo non sembra una funzione, sembra un incidente.
+  const resetPrompt = $('#s-prompt-reset');
+  if (resetPrompt) {
+    resetPrompt.onclick = async () => {
+      const campo = $('#s-prompt');
+      campo.value = '';
+      try {
+        await saveSettings({ system_prompt: '' });
+        state.settings.system_prompt = '';
+        toast('Prompt automatico: lo sceglie l\'harness in base al modello.');
+      } catch (error) { toast(error.message); }
+    };
+  }
 }
 
 function wireUi() {

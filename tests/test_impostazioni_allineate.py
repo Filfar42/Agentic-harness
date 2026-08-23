@@ -87,3 +87,43 @@ def test_il_modello_scelto_dal_server_arriva_fino_ai_widget():
     corpo = corpo[: corpo.index("};")]
     assert "state.settings.model_name = data.model_name" in corpo
     assert "renderHeader();" in corpo
+
+
+# ---------------------------------------------------------------------------
+# Il prompt: quando lo sceglie l'harness e quando vince l'utente
+# ---------------------------------------------------------------------------
+
+
+def test_il_campo_vuoto_vuol_dire_scegli_tu():
+    """Svuotare il prompt e' il gesto di ripristino, e deve funzionare.
+
+    Senza questo, un campo vuoto sarebbe un prompt di sistema vuoto: il
+    modello partirebbe senza istruzioni e nessuno capirebbe perche'.
+    """
+    from core.prompts import SYSTEM_PROMPT, SYSTEM_PROMPT_LEAN, is_stock_prompt
+
+    assert is_stock_prompt("")
+    assert is_stock_prompt("   \n ")
+    assert is_stock_prompt(SYSTEM_PROMPT)
+    assert is_stock_prompt(SYSTEM_PROMPT_LEAN)
+    assert not is_stock_prompt("Sei un pirata.")
+
+
+def test_una_copia_vecchia_nel_campo_blocca_le_modifiche_al_prompt():
+    """La trappola silenziosa, messa nero su bianco.
+
+    Il testo salvato nelle preferenze vince sempre. Quando il nostro prompt
+    cambia, una copia della versione precedente rimasta nel campo smette di
+    combaciare e passa per "personalizzato": da quel momento l'harness non
+    sceglie piu' fra esteso e snello, e nessuna modifica fatta in prompts.py
+    arriva piu' al modello. Il rimedio e' svuotare il campo -- il test qui
+    sopra -- e questo serve a ricordare *perche'* serva un rimedio.
+    """
+    from core.prompts import SYSTEM_PROMPT, is_stock_prompt
+
+    copia_vecchia = SYSTEM_PROMPT.replace("Coding Agent", "Senior Software Engineer")
+    assert copia_vecchia != SYSTEM_PROMPT
+    assert not is_stock_prompt(copia_vecchia), (
+        "una copia di un nostro prompt vecchio passa per personalizzata: "
+        "e' voluto, ma per questo il campo deve poter tornare vuoto"
+    )

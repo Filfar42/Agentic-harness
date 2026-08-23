@@ -337,7 +337,7 @@ generazione, ed e' li' che il controllo scatta piu' spesso.
 ## Test
 
 ```bash
-uv run pytest tests -q              # 674 verdi
+uv run pytest tests -q              # 679 verdi
 ```
 
 Va lanciato con l'interprete del progetto. Con un python di sistema si ottiene
@@ -360,6 +360,31 @@ del backend. La sandbox si prova con un finto `docker` messo sul PATH. Nessun
 modello richiesto.
 
 ## Storia delle revisioni
+
+**v2.34.0** — il workspace e' della conversazione, non dell'applicazione.
+
+Ogni chat ricorda su quale cartella e' stata fatta (il campo era salvato da
+sempre) e **riaprendola l'harness ci torna**: la cronologia parla di *quei*
+file, e ritrovarsi puntati su un altro progetto e' il modo piu' rapido di far
+scrivere l'agente nel posto sbagliato. Lo spostamento passa da un solo punto
+(`applica_workspace`), avviene solo a turni fermi -- la cartella e' una per
+processo: una sandbox, un albero nell'`<environment>`, un intervallo di porte
+-- e una cartella sparita nel frattempo si ignora invece di impedire
+l'apertura. Il percorso viaggia nel payload, quindi intestazione, scheda della
+sandbox e cartelle recenti si aggiornano senza una seconda chiamata.
+
+Rivisto il paragrafo sull'efficienza nei due system prompt: *i passi sono un
+tetto, non un budget*; le richieste indipendenti vanno **nello stesso passo**
+(le tool call di un passo vengono eseguite tutte prima che il modello torni a
+decidere); e un ragionamento che si ripete e' un'azione non fatta.
+
+E una trappola tolta di mezzo: il testo salvato in **Impostazioni → System
+prompt** vince sempre su quello del codice. Quando il nostro prompt cambia,
+una copia della versione precedente rimasta li' dentro smette di combaciare e
+passa per "personalizzata": da quel momento l'harness non sceglie piu' fra
+prompt esteso e snello, e nessuna modifica a `core/prompts.py` arriva piu' al
+modello. Ora il campo vuoto vale "scegli tu", c'e' un bottone **Ripristina**, e
+la spiegazione sta sotto al campo.
 
 **v2.33.0** — Ctrl+C, sincronizzazione in diretta, app installabile.
 

@@ -43,8 +43,18 @@ dell'utente usando i tool a tua disposizione.
 Agisci. Quando una richiesta riguarda file, codice, comandi o lo stato del \
 progetto, rispondi chiamando un tool. Il testo che scrivi non tocca il disco: \
 solo le chiamate ai tool lo fanno.
-Sii efficiente, non devi usare necessariamente tutti i passi agentici a disposizione.
-Il pensiero serve a pianificare: quando il piano c'e', chiama i tool.
+
+Il numero di passi e' un tetto, non un budget da spendere: un compito chiuso \
+in tre passi e' fatto meglio dello stesso compito chiuso in dieci. Le cose che \
+non dipendono l'una dall'altra chiedile **nello stesso passo**: le tool call \
+di uno stesso passo vengono eseguite tutte prima che tu torni a decidere, \
+quindi tre file che ti servono comunque sono un passo solo, non tre.
+
+Il pensiero serve a scegliere la mossa, non a ripeterla. Se ti accorgi di star \
+riscrivendo una conclusione a cui eri gia' arrivato, quella conclusione e' \
+un'azione che non hai ancora fatto: falla. E quando una cosa si puo' guardare \
+invece che dedurre, guardala -- leggere il file costa meno che ragionare su \
+cosa ci sia dentro, e non sbaglia.
 
 # Quale tool chiamare
 - "cosa c'e' nel progetto", "guarda il repo", non conosci un percorso -> list_files
@@ -216,6 +226,21 @@ E' la cosa che va storta piu' spesso, e va storta in silenzio: pianifichi \
 tutto, esaurisci i token generabili a meta' del ragionamento, il turno si \
 chiude e all'utente non arriva niente. Non hai sbagliato a pensare, hai \
 pensato tutto insieme.
+
+Il numero di passi e' un tetto, non un budget da spendere: un compito chiuso \
+in tre passi e' fatto meglio dello stesso compito chiuso in dieci. Due cose \
+lo accorciano piu' di ogni altra.
+
+**Chiedi insieme quello che non dipende l'uno dall'altro.** Le tool call di \
+uno stesso passo vengono eseguite tutte prima che tu torni a decidere: tre \
+read_file di tre file che ti servono comunque sono un passo, non tre. Vale \
+per le letture, per le ricerche, per i comandi indipendenti.
+
+**Non ripensare quello che hai gia' deciso.** Se ti accorgi di star \
+riscrivendo una conclusione a cui eri gia' arrivato, quella conclusione e' \
+un'azione che non hai ancora fatto: falla. E quando una cosa si puo' guardare \
+invece che dedurre, guardala -- leggere il file costa meno che ragionare su \
+cosa ci sia dentro, e non sbaglia.
 
 Se la richiesta ha piu' di una azione -- un elenco numerato, degli "step", \
 piu' verbi all'imperativo -- **la prima cosa che fai e' il piano**, con \
@@ -397,12 +422,25 @@ def pick_system_prompt(*, thinking: bool) -> str:
 
 
 def is_stock_prompt(text: str) -> bool:
-    """True se il prompt e' ancora uno dei nostri, non riscritto dall'utente.
+    """True se l'harness puo' scegliere il prompt da solo.
 
-    Serve a decidere se l'harness puo' sceglierlo da solo: appena l'utente lo
-    modifica, la scelta automatica si fa da parte e vince il suo testo.
+    Due casi: il testo e' **vuoto** -- cioe' nessuno ha chiesto niente di
+    particolare -- oppure e' esattamente uno dei nostri.
+
+    Il vuoto vale come "scegli tu" ed e' il gesto di ripristino: svuotare il
+    campo nelle impostazioni rimette la scelta automatica. Serve, perche' qui
+    c'e' una trappola silenziosa: il testo salvato nelle preferenze **vince
+    sempre**, anche quando e' una copia di un nostro prompt di sei versioni
+    fa. Quando il testo di riferimento cambia, quella copia smette di
+    combaciare e diventa "personalizzato" senza che nessuno l'abbia
+    personalizzato: da quel momento l'harness non sceglie piu' fra prompt
+    esteso e snello, e ogni modifica fatta qui in ``prompts.py`` non arriva
+    piu' al modello. Se ne accorge solo chi va a rileggere il campo.
     """
-    return (text or "").strip() in {SYSTEM_PROMPT.strip(), SYSTEM_PROMPT_LEAN.strip()}
+    testo = (text or "").strip()
+    if not testo:
+        return True
+    return testo in {SYSTEM_PROMPT.strip(), SYSTEM_PROMPT_LEAN.strip()}
 
 
 # Clausola sul ragionamento, aggiunta SOLO quando il canale thinking nativo e'
