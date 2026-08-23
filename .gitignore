@@ -1,0 +1,20 @@
+__pycache__/
+*.py[oc]
+build/
+dist/
+*.egg-info
+.pytest_cache/
+.ruff_cache/
+.venv
+venv/
+
+# stato runtime dell'harness
+chat_sessions/
+agent_memories.json
+
+# preferenze utente
+agent_settings.json
+
+# archivi e istantanee: pesano e si rigenerano
+*.zip
+ziln0aV3

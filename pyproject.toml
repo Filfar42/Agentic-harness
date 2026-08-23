@@ -1,0 +1,29 @@
+[project]
+name = "local-agent-harness"
+version = "2.11.0"
+description = "Harness agentico per modelli locali (Ollama/vLLM) con workspace, tool e interfaccia web"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    "httpx>=0.27",
+    "openai>=1.60",
+    # Upload degli allegati: FastAPI ne ha bisogno per i form multipart.
+    "python-multipart>=0.0.9",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "ruff>=0.6"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+exclude = ["legacy"]
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "B", "SIM", "UP", "C4", "RET", "ARG"]
+ignore = ["E501", "SIM105", "SIM102", "SIM108"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
