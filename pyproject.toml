@@ -2,7 +2,7 @@
 name = "local-agent-harness"
 # Tenuta uguale a core.config.APP_VERSION: le due si erano allontanate di
 # sedici versioni minori senza che niente le confrontasse. Ora lo fa un test.
-version = "2.34.0"
+version = "2.34.1"
 description = "Harness agentico per modelli locali (Ollama/vLLM) con workspace, tool e interfaccia web"
 readme = "README.md"
 requires-python = ">=3.12"

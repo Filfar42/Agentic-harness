@@ -20,6 +20,7 @@ from threading import Timer
 from types import FrameType
 
 import uvicorn
+from uvicorn.main import STARTUP_FAILURE
 
 # Una sola implementazione per l'indirizzo LAN e per la chiave: erano nate due
 # volte, qui e in run_mobile.py, e due copie della stessa funzione divergono
@@ -134,7 +135,32 @@ def main() -> None:
         )
     )
     server._compagni = [ponte] if ponte is not None else []
-    server.run()
+    corri(server)
+
+
+def corri(server: uvicorn.Server) -> None:
+    """Fa girare il server e ne gestisce l'uscita come farebbe ``uvicorn.run``.
+
+    Costruire il ``Server`` a mano -- serve per agganciare ``handle_exit`` --
+    fa perdere due cose che ``uvicorn.run()`` faceva per noi, e si sono viste
+    tutte e due:
+
+    1. **Il KeyboardInterrupt finale.** A spegnimento avvenuto uvicorn
+       ri-solleva il segnale che aveva intercettato, per lasciar succedere
+       quello che sarebbe successo senza il suo gestore. ``uvicorn.run()`` lo
+       assorbe; senza, un Ctrl+C andato **a buon fine** stampava sette righe
+       di traceback e sembrava un crash.
+    2. **Il codice di uscita quando l'avvio fallisce.** Porta occupata o app
+       che non importa: il server non parte, ``run()`` torna lo stesso, e il
+       processo uscirebbe con zero -- cioe' dicendo "tutto bene" a chiunque lo
+       stia lanciando da uno script.
+    """
+    try:
+        server.run()
+    except KeyboardInterrupt:
+        pass
+    if not server.started:
+        raise SystemExit(STARTUP_FAILURE)
 
 
 def avvia_ponte_mobile(porta: int) -> uvicorn.Server:
@@ -156,7 +182,15 @@ def avvia_ponte_mobile(porta: int) -> uvicorn.Server:
     # I gestori di segnale se li installa solo il thread principale (lo
     # controlla uvicorn stesso): qui non ce ne sono, ed e' giusto cosi' --
     # Ctrl+C lo raccoglie il server principale, che poi avvisa questo.
-    threading.Thread(target=server.run, daemon=True, name="interfaccia-mobile").start()
+    def in_silenzio() -> None:
+        # Un'eccezione in un thread demone stampa un traceback e basta: qui
+        # non c'e' niente da salvare, e a spegnimento in corso e' rumore.
+        try:
+            server.run()
+        except (KeyboardInterrupt, SystemExit):
+            pass
+
+    threading.Thread(target=in_silenzio, daemon=True, name="interfaccia-mobile").start()
     return server
 
 

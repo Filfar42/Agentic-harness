@@ -30,9 +30,9 @@ import threading
 import time
 from collections.abc import Iterator
 from contextlib import asynccontextmanager
-from dataclasses import asdict, is_dataclass
+from dataclasses import asdict, is_dataclass, replace
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import urlparse
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
@@ -328,6 +328,18 @@ class AppState:
         """
         self.session(session_id)["web_search"] = bool(acceso)
 
+    def ricorda_think_level(self, session_id: str, livello: str | None) -> None:
+        """Livello di pensiero della goccia con cui e' partito il turno.
+
+        Stessa vita effimera di ``web_search``: serve solo alla ripresa dopo
+        ``ask_user_question``, che resta nello stesso processo.
+        """
+        self.session(session_id)["think_level"] = livello
+
+    def think_level_di(self, session_id: str) -> str | None:
+        """Livello di pensiero scelto dal composer per il turno in corso."""
+        return self.session(session_id).get("think_level")
+
     def web_search_di(self, session_id: str) -> bool:
         return bool(self.session(session_id).get("web_search"))
 
@@ -548,15 +560,24 @@ class AppState:
         tutte = self.skills()
         return skills_mod.render_blocco(skills_mod.scegli(tutte, richiesta))
 
-    def system_prompt(self, web_search: bool = False) -> str:
+    def system_prompt(
+        self,
+        web_search: bool = False,
+        *,
+        pensiero: bool | None = None,
+    ) -> str:
         """Prompt di sistema effettivo per il modello in uso.
 
         Finche' il testo e' uno dei nostri, lo sceglie l'harness in base alle
         capability: snello per i modelli che ragionano, esteso per quelli che
         hanno bisogno delle stampelle. Appena l'utente lo riscrive, la scelta
         automatica si fa da parte -- il suo testo vince sempre.
+
+        ``pensiero`` e' l'override della goccia del composer: True/False
+        forza la descrizione del canale di pensiero per questo turno, None
+        lascia la decisione a ``thinking_enabled()`` (impostazioni).
         """
-        thinking = self.thinking_enabled()
+        thinking = self.thinking_enabled() if pensiero is None else pensiero
         base = self.settings["system_prompt"]
         if is_stock_prompt(base):
             if vault_mod.is_modalita_vault(self.settings["workspace_dir"]):
@@ -904,7 +925,11 @@ def ultima_richiesta(messages: list[dict[str, Any]]) -> str:
     return ""
 
 
-def start_turn(session_id: str, web_search: bool = False) -> TurnRunner:
+def start_turn(
+    session_id: str,
+    web_search: bool = False,
+    think_level: str | None = None,
+) -> TurnRunner:
     """Avvia il turno in background per la conversazione indicata.
 
     ``web_search`` e' lo stato della goccia al momento dell'invio: viene
@@ -912,8 +937,14 @@ def start_turn(session_id: str, web_search: bool = False) -> TurnRunner:
     HTTP e' finita e l'oggetto request non esiste piu'. Viene anche ricordato
     sulla sessione, cosi' una ripresa dopo ``ask_user_question`` riparte con
     lo stesso permesso invece di perderlo per strada.
+
+    ``think_level`` e' il livello di pensiero scelto dalla goccia accanto
+    all'invio ("low" | "medium" | "high"), o None/"auto" per non avere
+    override: vale cio' che le impostazioni hanno deciso per ``native_think``.
+    Come ``web_search`` viene ricordato sulla sessione per la ripresa.
     """
     STATE.ricorda_web_search(session_id, web_search)
+    STATE.ricorda_think_level(session_id, think_level)
     messages = STATE.messages(session_id)
     snapshot = [dict(m) for m in messages]
 
@@ -922,13 +953,24 @@ def start_turn(session_id: str, web_search: bool = False) -> TurnRunner:
     def work(runner: TurnRunner) -> None:
         runner.emit(sse("start", {"session_id": session_id}))
         try:
+            # Il livello della goccia e' un override puntuale: sostituisce
+            # ``native_think`` per questo turno soltanto, senza toccare le
+            # impostazioni, che restano quelle salvate.
+            params_turno = STATE.gen_params()
+            pensiero_forzato = None
+            if think_level in ("low", "medium", "high"):
+                params_turno = replace(params_turno, think=think_level)
+                # Con un livello esplicito il canale di pensiero c'e': anche
+                # il system prompt deve descriverlo, altrimenti dice al
+                # modello di non usarlo mentre il backend lo chiede.
+                pensiero_forzato = True
             events = agent_mod.run_turn(
                 backend=STATE.backend(),
-                params=STATE.gen_params(),
+                params=params_turno,
                 tools_schema=STATE.tools_schema(web_search),
                 tool_ctx=STATE.tool_ctx(session_id, web_search),
                 ui_messages=messages,
-                system_prompt=STATE.system_prompt(web_search),
+                system_prompt=STATE.system_prompt(web_search, pensiero=pensiero_forzato),
                 # Il turno rilegge il disco: e' qui che l'agente deve vedere
                 # il workspace com'e' adesso, non com'era all'ultimo click.
                 env_header=STATE.context_header(session_id, fresh=True),
@@ -1018,6 +1060,11 @@ class ChatRequest(BaseModel):
     # riga di prompt che lo descrive; falso -> il modello non sa nemmeno che
     # esiste (nessun token pagato per un tool spento).
     web_search: bool = False
+    # Livello di pensiero scelto dalla goccia del composer per QUESTO turno.
+    # Solo tre valori ammessi: qualunque altra stringa e' un errore del
+    # client (422 di pydantic), non qualcosa da ignorare in silenzio.
+    # "auto" NON viaggia sulla rete: l'assenza del campo vale come auto.
+    think_level: Literal["low", "medium", "high"] | None = None
 
 
 class AnswerRequest(BaseModel):
@@ -1182,6 +1229,14 @@ def open_payload(session_id: str) -> dict[str, Any]:
         # scheda della sandbox e i recenti si aggiornano da qui.
         "workspace_dir": STATE.settings["workspace_dir"],
         "recent_workspaces": STATE.settings["recent_workspaces"],
+        # Barra superiore mobile: modello in uso e cartella di QUESTA
+        # conversazione, entrambi di sola lettura. Campo nuovo e separato da
+        # ``workspace_dir`` perche' quello resta lo stato globale dell'harness
+        # (il desktop lo usa per la testa del pannello): qui invece vale la
+        # chat che si sta guardando, anche se l'apertura di un'altra sessione
+        # ha spostato altrove il container.
+        "model": STATE.settings["model_name"],
+        "session_workspace": STATE.workspace_di(session_id),
     }
 
 
@@ -1332,7 +1387,11 @@ def chat(request: ChatRequest) -> dict[str, Any]:
         entry["attachments"] = agganciati
     messages.append(entry)
     STATE.save(session_id)
-    start_turn(session_id, web_search=bool(request.web_search))
+    start_turn(
+        session_id,
+        web_search=bool(request.web_search),
+        think_level=request.think_level,
+    )
     # Il messaggio e' gia' in cronologia e il turno e' partito (start_turn ha
     # gia' avvertito tutti con ``turn``): qui avviso solo che l'elenco chat e'
     # cambiato, per titolo e numero di messaggi.
@@ -1362,7 +1421,11 @@ def answer(request: AnswerRequest) -> dict[str, Any]:
     # il modello si prendeva un "modalita' non attiva" dalla guardia del tool
     # subito dopo che l'utente gli aveva risposto -- cioe' nel punto in cui
     # sembra di piu' un bug.
-    start_turn(session_id, web_search=STATE.web_search_di(session_id))
+    start_turn(
+        session_id,
+        web_search=STATE.web_search_di(session_id),
+        think_level=STATE.think_level_di(session_id),
+    )
     # La risposta e' partita: l'altro schermo chiude il riquadro della
     # domanda e vede il nuovo turno senza refresh.
     EVENTS.publish("sessions", reason="answer", session_id=session_id)

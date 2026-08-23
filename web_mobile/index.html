@@ -32,7 +32,16 @@
 <div id="view-chat" class="view hidden">
   <header class="topbar">
     <button id="btn-back" class="icon-btn" title="Torna all'elenco">&#8592;</button>
-    <h1 id="chat-title">…</h1>
+    <div class="chat-head">
+      <h1 id="chat-title">…</h1>
+      <!-- Modello e workspace della chat: solo lettura. Su un telefono non
+           c'e' posto per dei selettori, e la scelta resta al desktop. -->
+      <div class="chat-meta">
+        <span id="chat-model"></span>
+        <span class="meta-sep" hidden>·</span>
+        <span id="chat-workspace"></span>
+      </div>
+    </div>
     <button id="btn-refresh" class="icon-btn" title="Ricarica">&#8635;</button>
   </header>
 

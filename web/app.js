@@ -25,6 +25,10 @@ const state = {
   stats: {},
   attachments: [],
   busy: false,
+  // Livello di pensiero scelto nella goccia del composer: resta selezionato
+  // fra i messaggi (e' un'impostazione del pannello, non un'opzione monouso)
+  // e viaggia solo sull'invio, come ``web_search``.
+  thinkLevel: 'auto',
   pending: null,
   autoScroll: true,
   // Conversazioni con un turno in corso sul server. Il lavoro non e' legato
@@ -956,6 +960,9 @@ async function send() {
         prompt: text,
         attachments: allegati.map((a) => a.name),
         web_search: webSearch,
+        // "auto" non viaggia: e' l'assenza di override, il server fa come
+        // da impostazioni. Low/Medium/High sono il livello di QUESTO turno.
+        think_level: state.thinkLevel === 'auto' ? undefined : state.thinkLevel,
       }),
     });
     // Il consumo del contesto e l'elenco delle conversazioni si aggiornano
@@ -2548,6 +2555,62 @@ function wireUi() {
       const on = gocciaWeb.classList.toggle('on');
       gocciaWeb.setAttribute('aria-pressed', on ? 'true' : 'false');
     };
+  }
+  // Goccia "Pensiero": tendina Low/Medium/High/Auto. Lo stato vive in
+  // state.thinkLevel e viaggia solo sull'invio, come web_search; "auto" non
+  // parte nemmeno sulla rete perche' non e' un override, e' l'assenza di uno.
+  const LIVELLI_THINK = [
+    { v: 'low', nome: 'Low', desc: 'ragionamento breve' },
+    { v: 'medium', nome: 'Medium', desc: 'ragionamento medio' },
+    { v: 'high', nome: 'High', desc: 'ragionamento esteso' },
+    { v: 'auto', nome: 'Auto', desc: 'come da impostazioni' },
+  ];
+  const gocciaThink = $('#toggle-think');
+  const thinkMenu = $('#think-menu');
+  const thinkLabel = $('#think-label');
+  function toggleThinkMenu(aprire) {
+    const visibile = typeof aprire === 'boolean' ? aprire : thinkMenu.hidden;
+    thinkMenu.hidden = !visibile;
+    gocciaThink.setAttribute('aria-expanded', visibile ? 'true' : 'false');
+  }
+  if (gocciaThink && thinkMenu && thinkLabel) {
+    thinkMenu.innerHTML = LIVELLI_THINK.map((livello) =>
+      `<button class="model-opt" role="option" type="button" data-think="${livello.v}">` +
+      `<span class="model-tick"></span><span class="model-name">${livello.nome}</span>` +
+      `<span class="menu-desc">${livello.desc}</span></button>`
+    ).join('');
+    const segnaSelezionato = () => {
+      $$('#think-menu .model-opt').forEach((b) =>
+        b.classList.toggle('on', b.dataset.think === state.thinkLevel));
+    };
+    segnaSelezionato();
+    thinkLabel.textContent =
+      (LIVELLI_THINK.find((l) => l.v === state.thinkLevel) || LIVELLI_THINK[3]).nome;
+    gocciaThink.onclick = (event) => {
+      event.stopPropagation();
+      // Due tendine aperte insieme si coprirebbero: chiudi le altre due.
+      const menuModelli = $('#model-menu');
+      const menuWs = $('#ws-menu');
+      if (menuModelli && !menuModelli.hidden) toggleModelMenu(false);
+      if (menuWs && !menuWs.hidden) toggleWsMenu(false);
+      segnaSelezionato();
+      toggleThinkMenu();
+    };
+    thinkMenu.onclick = (event) => {
+      const scelta = event.target.closest('[data-think]');
+      if (!scelta) return;
+      state.thinkLevel = scelta.dataset.think;
+      thinkLabel.textContent = scelta.querySelector('.model-name').textContent;
+      segnaSelezionato();
+      toggleThinkMenu(false);
+    };
+    document.addEventListener('click', (event) => {
+      if (!thinkMenu.hidden && !thinkMenu.contains(event.target) &&
+          event.target !== gocciaThink) toggleThinkMenu(false);
+    });
+    document.addEventListener('keydown', (event) => {
+      if (event.key === 'Escape') toggleThinkMenu(false);
+    });
   }
   const quickContinue = $('#btn-quick-continue');
   if (quickContinue) {

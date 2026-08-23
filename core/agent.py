@@ -1241,6 +1241,7 @@ def run_turn(
     max_steps: int = 12,
     strip_thinking: bool = True,
     compact_old_tools: bool = True,
+    budgets: Any | None = None,
     enable_nudge: bool = True,
     require_summary: bool = True,
     require_plan: bool = True,
@@ -1285,7 +1286,10 @@ def run_turn(
     # I budget di troncamento seguono la finestra reale del modello, non le
     # costanti tarate su 16k. Vanno messi nel ToolContext *prima* del primo
     # passo: sono i tool a doverli rispettare, e li leggono da li'.
-    budgets = budgets_for(int(getattr(params, "num_ctx", 0) or 0))
+    # Chi chiama puo' imporne uno suo (la delega passa al figlio i budget
+    # stretti): se non arriva, si ricalcola dalla finestra come sempre.
+    if budgets is None:
+        budgets = budgets_for(int(getattr(params, "num_ctx", 0) or 0))
     tool_ctx.budgets = budgets
 
     # La delega si monta qui e non nel ToolContext perche' backend e parametri

@@ -337,7 +337,7 @@ generazione, ed e' li' che il controllo scatta piu' spesso.
 ## Test
 
 ```bash
-uv run pytest tests -q              # 679 verdi
+uv run pytest tests -q              # 681 verdi
 ```
 
 Va lanciato con l'interprete del progetto. Con un python di sistema si ottiene
@@ -360,6 +360,17 @@ del backend. La sandbox si prova con un finto `docker` messo sul PATH. Nessun
 modello richiesto.
 
 ## Storia delle revisioni
+
+**v2.34.1** — un Ctrl+C riuscito non stampa piu' un traceback.
+
+Coda della v2.33.0: per agganciare `handle_exit` il `Server` viene costruito a
+mano, e cosi' si perdono due cose che `uvicorn.run()` faceva da solo. La prima
+si vedeva: a spegnimento avvenuto uvicorn **ri-solleva** il segnale che aveva
+intercettato -- per lasciar succedere quello che sarebbe successo senza il suo
+gestore -- e senza nessuno che lo assorba, un Ctrl+C andato a buon fine
+chiudeva con sette righe di `KeyboardInterrupt`. La seconda no: con l'avvio
+fallito (porta occupata, app che non importa) il processo usciva con **zero**,
+cioe' diceva "tutto bene" a chi lo lancia da uno script.
 
 **v2.34.0** — il workspace e' della conversazione, non dell'applicazione.
 

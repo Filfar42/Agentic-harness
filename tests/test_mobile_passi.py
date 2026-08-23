@@ -199,3 +199,114 @@ def test_il_telefono_ascolta_il_bus_globale() -> None:
     # Non basta ascoltare: alla notizia bisogna anche riattaccarsi allo stream,
     # senno' si sa che un turno c'e' ma non lo si vede scorrere.
     assert "if (running && !source) attachStream();" in sorgente
+
+
+# --------------------------------------- il sommario dei passi mentre lavora
+
+
+@pytest.fixture()
+def js_sommario() -> quickjs.Context:
+    """La sola funzione sommarioPassi piu' le variabili che legge."""
+    sorgente = APP_JS.read_text(encoding="utf-8")
+    ctx = quickjs.Context()
+    ctx.eval(_funzione(sorgente, "sommarioPassi"))
+    ctx.eval(_funzione(sorgente, "durataBreve"))
+    return ctx
+
+
+def test_il_sommario_vivo_dice_passo_e_strumenti_del_passo(js_sommario) -> None:
+    """Il testo era 'x passi | y strumenti' col totale del turno: a meta'
+    lavoro quel numero non torna con le righe aperte sotto. Ora e' 'passo N
+    · M strumenti' e M conta i tool del SOLO passo corrente."""
+    import json as _json
+
+    ctx = js_sommario
+    ctx.eval("""
+var sum = { textContent: "" };
+gruppoPassi = { querySelector: function (sel) {
+  return sel === ".passi-sommario" ? sum : null; } };
+contaTool = 0; inizioTurno = null; contaSecondi = 0;
+""")
+    scenari = [(2, 3), (1, 1), (4, 0), (0, 0)]
+    visti = []
+    for passi, tool in scenari:
+        ctx.eval(f"contaPassi = {passi}; contaToolPasso = {tool}; sum.textContent = '';")
+        ctx.eval("sommarioPassi(false)")
+        visti.append(ctx.eval("sum.textContent"))
+
+    attesi = [
+        "passo 2 · 3 strumenti",
+        "passo 1 · 1 strumento",  # il singolare: uno strumento si vede
+        "passo 4",                # passo senza tool: niente coda vuota
+        "sta lavorando…",         # nessun passo ancora: resta generico
+    ]
+    assert visti == attesi
+
+
+def test_il_sommario_chiuso_parla_per_l_intero_turno(js_sommario) -> None:
+    """A turno finito la riga resta un riepilogo: totale passi, totale
+    strumenti e durata. La modifica tocca solo la riga VIVA."""
+    ctx = js_sommario
+    ctx.eval("""
+var sum = { textContent: "" };
+gruppoPassi = { querySelector: function (sel) {
+  return sel === ".passi-sommario" ? sum : null; } };
+contaPassi = 5; contaTool = 9; contaToolPasso = 0;
+inizioTurno = Date.now() - 95000; contaSecondi = 95;
+sommarioPassi(true);
+""")
+    assert ctx.eval("sum.textContent").startswith("5 passi")
+    assert "9 strumenti" in ctx.eval("sum.textContent")
+
+
+def test_il_contatore_per_passo_si_resetta_al_giro_nuovo() -> None:
+    """Se contaToolPasso non riparte da zero a ogni evento step, il numero
+    cresce per sempre ed e' di nuovo il totale del turno -- il bug di prima."""
+    sorgente = APP_JS.read_text(encoding="utf-8")
+    codice = "\n".join(
+        riga for riga in sorgente.splitlines() if not riga.lstrip().startswith("//")
+    )
+    # Nasce, si azzera allo start del turno...
+    assert "let contaToolPasso = 0;" in codice
+    # ...si azzera a ogni nuovo passo (il caso 'step' dell'event stream)...
+    assert re.search(r'case\s*"step":[\s\S]{0,200}contaToolPasso = 0', codice)
+    # ...e cresce solo quando parte davvero un tool.
+    assert re.search(r'case\s*"tool_start":\s*\{[\s\S]{0,120}contaToolPasso \+= 1', codice)
+
+
+# ------------------------------------- modello e workspace nella barra mobile
+
+
+def test_la_barra_superiore_mostra_modello_e_workspace_sola_lettura() -> None:
+    """Nella topbar della chat devono stare modello e workspace: informativi,
+    non pulsanti -- niente cursor:pointer, niente onclick nel cablaggio."""
+    html = (WEB_MOBILE / "index.html").read_text(encoding="utf-8")
+    for pezzo in ('class="chat-meta"', 'id="chat-model"', 'id="chat-workspace"'):
+        assert pezzo in html, pezzo
+
+    css = (WEB_MOBILE / "style.css").read_text(encoding="utf-8")
+    assert ".chat-meta" in css
+
+    app_js = (Path(__file__).resolve().parents[1] / "web_mobile" / "app.js").read_text(
+        encoding="utf-8"
+    )
+    # Popolati dal payload della sessione, mai modificabili dall'utente.
+    assert '$("chat-model")' in app_js
+    assert '$("chat-workspace")' in app_js
+    blocco_meta = app_js.split('$("chat-model")', 1)[1][:400]
+    assert "textContent" in blocco_meta
+    assert "onclick" not in blocco_meta
+
+
+def test_il_payload_della_sessione_porta_modello_e_workspace_di_chat() -> None:
+    """I due valori arrivano da open_payload: il modello e' quello selezionato
+    ora, il workspace e' quello DELLA CHAT (workspace_di), non il globale."""
+    main_py = (
+        Path(__file__).resolve().parents[1] / "server" / "main.py"
+    ).read_text(encoding="utf-8")
+    inizio = main_py.index("def open_payload")
+    fine = main_py.index("\ndef ", inizio + 10)
+    corpo = main_py[inizio:fine]
+    assert '"model"' in corpo
+    assert '"session_workspace"' in corpo
+    assert "workspace_di(" in corpo, "il workspace deve essere quello della chat"

@@ -100,3 +100,101 @@ def test_il_prompt_del_figlio_dichiara_il_budget():
 
     assert f"al massimo {MAX_PASSI_DELEGA} passi" in PROMPT_DELEGA
     assert f"primi {MAX_REFERTO_CHARS} caratteri" in PROMPT_DELEGA   # 2000, come si vede al figlio
+
+
+# ---------------------------------------------------------------------------
+# I budget del sotto-turno: la strettata deve arrivare davvero al figlio.
+# ---------------------------------------------------------------------------
+
+def test_parametri_figlio_allarga_la_finestra_e_spegne_think():
+    """num_ctx x1.5 come margine, think spento, il resto del padre invariato."""
+    from core.delega import parametri_figlio
+
+    padre = GenParams(model="m", num_ctx=16384, max_tokens=4096, think="low", temperature=0.4)
+    figlio = parametri_figlio(padre)
+    assert figlio.num_ctx == 24576
+    assert figlio.think is False
+    assert figlio.max_tokens == 4096 and figlio.temperature == 0.4 and figlio.model == "m"
+
+
+def test_budget_stretti_dimezza_e_garantisce_i_minimi():
+    from core.config import budgets_for
+    from core.delega import budget_stretti
+
+    larghi = budgets_for(16384)
+    stretti = budget_stretti(larghi)
+    assert stretti.read_file_max_chars < larghi.read_file_max_chars
+    assert stretti.search_max_matches < larghi.search_max_matches
+    # La finestra integrale non cresce mai: a 16k il padre e' gia' al minimo 3.
+    assert stretti.tool_result_full_window <= larghi.tool_result_full_window
+    # Dai minimi non si scende mai, nemmeno restringendo una finestra povera.
+    stretti_poveri = budget_stretti(budgets_for(4096))
+    assert stretti_poveri.read_file_max_chars >= 2500   # MIN_READ_FILE_CHARS
+    assert stretti_poveri.search_max_matches >= 10
+    assert stretti_poveri.tool_result_full_window == 3
+
+
+def test_esegui_passa_al_figlio_budget_stretti_e_finestra_larga(tmp_path):
+    """La strettata arriva a run_turn *e* resta nel ToolContext dopo il primo passo."""
+    visti: dict[str, object] = {}
+
+    def _run(**kw):
+        visti["budgets"] = kw["budgets"]
+        visti["params"] = kw["params"]
+        visti["tool_ctx"] = kw["tool_ctx"]
+        msg = kw["ui_messages"]
+        msg.append({"role": "tool", "name": "read_file", "args": {"filepath": "core/config.py"}})
+        yield StepStarted(step=1, total=1)
+        msg.append({"role": "assistant", "content": "referto"})
+
+    ctx = ToolContext(workspace=str(tmp_path), sandbox="host")
+    out = esegui(
+        "dove sta budgets_for?",
+        backend=object(),
+        params=GenParams(model="fake"),
+        tools_schema=[],
+        tool_ctx=ctx,
+        env_header=None,
+        run_turn=_run,
+    )
+    assert out["referto"] == "referto"
+
+    from core.config import budgets_for
+    from core.delega import budget_stretti
+
+    larghi = budgets_for(16384)
+    stretti = visti["budgets"]
+    assert stretti.read_file_max_chars < larghi.read_file_max_chars
+    assert stretti == budget_stretti(larghi)
+    # run_turn sovrascrive tool_ctx.budgets al primo passo: se lo facesse con
+    # budgets_for(num_ctx_figlio), qui troveremmo i budget larghi.
+    assert visti["tool_ctx"].budgets == stretti
+    # La finestra del sotto-turno e' quella allargata, non quella del padre.
+    assert visti["params"].num_ctx == 24576
+
+
+def test_budget_riferimento_valori_attesi_e_coerenza_col_prompt():
+    """Le costanti del prompt derivano dal riferimento base, con valori fissi."""
+    from core.config import BASE_NUM_CTX, budgets_for
+    from core.delega import (
+        MAX_LETTURA_FIGLIO,
+        MAX_MATCHES_FIGLIO,
+        PROMPT_DELEGA,
+        budget_riferimento,
+        budget_stretti,
+    )
+
+    rif = budget_riferimento()
+    # Valori attesi espliciti alla taratura base (padre 16k -> figlio x1.5).
+    assert BASE_NUM_CTX == 16384
+    assert rif.read_file_max_chars == 6000
+    assert rif.search_max_matches == 40
+    # Le due costanti sono la proiezione del riferimento, e il prompt le cita.
+    assert MAX_LETTURA_FIGLIO == rif.read_file_max_chars == 6000
+    assert MAX_MATCHES_FIGLIO == rif.search_max_matches == 40
+    assert f"ai primi {MAX_LETTURA_FIGLIO} caratteri" in PROMPT_DELEGA
+    assert f"a {MAX_MATCHES_FIGLIO} corrispondenze" in PROMPT_DELEGA
+    # Il riferimento e' esattamente il budget stretto sulla finestra base...
+    assert rif == budget_stretti(budgets_for(BASE_NUM_CTX))
+    # ...ed e' memoizzato: chiamate successive restituiscono lo stesso oggetto.
+    assert budget_riferimento() is rif

@@ -47,12 +47,34 @@ html, body {
   flex: 0 0 auto;
 }
 
-.topbar h1 {
+/* Titolo + sottoriga modello/workspace: il blocco prende tutto lo spazio
+   fra i due bottoni, la sottoriga sta sotto il titolo. */
+.chat-head {
   flex: 1;
+  min-width: 0;
+}
+
+.topbar h1 {
   margin: 0;
   font-size: 17px;
   font-weight: 600;
   white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.chat-meta {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 2px;
+  font-size: 11px;
+  color: var(--testo-dim);
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+.chat-meta span {
   overflow: hidden;
   text-overflow: ellipsis;
 }

@@ -23,7 +23,7 @@ APP_NAME = "Local Agent Harness"
 # preferenze. 2.31.0 e' stato il merge del fork Qwen; 2.32.0 i passi del
 # turno sul telefono; 2.33.0 Ctrl+C che spegne davvero e la sincronizzazione
 # in diretta; 2.34.0 il workspace legato alla conversazione.
-APP_VERSION = "2.34.0"
+APP_VERSION = "2.34.1"
 
 # --- percorsi di persistenza ------------------------------------------------
 DATA_DIR = Path("chat_sessions")

@@ -22,6 +22,10 @@ let running = false;
 let gruppoPassi = null;
 let contaPassi = 0;
 let contaTool = 0;
+// Strumenti del SOLO passo corrente: il sommario vivo dice "passo N · M
+// strumenti" e quel M deve tornare con le righe visibili sotto, non col
+// totale del turno che a metà lavoro non c'entra con quello che si vede.
+let contaToolPasso = 0;
 // Quanto e' durato: dall'orologio mentre il turno e' vivo, dalla somma delle
 // durate dei tool quando si ridisegna una conversazione salvata -- li' il
 // tempo di parete non esiste piu', e inventarlo sarebbe peggio che tacerlo.
@@ -74,6 +78,13 @@ function troncaTesto(valore, quanti) {
   // trimEnd prima dei puntini: "configura il …" con lo spazio in mezzo
   // sembra un errore di stampa, non un troncamento.
   return `${testo.slice(0, quanti - 1).trimEnd()}…`;
+}
+
+/** L'ultima cartella di un percorso, per la sottoriga della topbar mobile:
+ *  "/work/progetto" -> "progetto". Il percorso intero sta nel title. */
+function nomeCartella(percorso) {
+  const pezzi = String(percorso ?? "").split(/[\\/]/).filter(Boolean);
+  return pezzi[pezzi.length - 1] || "";
 }
 
 function nomeFile(percorso) {
@@ -178,7 +189,16 @@ function sommarioPassi(chiuso) {
   const sum = gruppoPassi.querySelector(".passi-sommario");
   if (!sum) return;
   if (!chiuso) {
-    sum.textContent = contaPassi ? `sta lavorando · passo ${contaPassi}` : "sta lavorando…";
+    // "passo N · M strumenti": M e' quello che il passo corrente sta usando,
+    // non il totale del turno -- deve tornare con le righe aperte sotto.
+    if (!contaPassi) {
+      sum.textContent = "sta lavorando…";
+    } else {
+      const strumenti = contaToolPasso
+        ? ` · ${contaToolPasso} ${contaToolPasso === 1 ? "strumento" : "strumenti"}`
+        : "";
+      sum.textContent = `passo ${contaPassi}${strumenti}`;
+    }
     return;
   }
   const pezzi = [`${contaPassi || 1} ${contaPassi === 1 ? "passo" : "passi"}`];
@@ -317,6 +337,18 @@ async function refreshChat(attachQuestionCard) {
     }
     running = Boolean(payload.running);
     updateComposer();
+    // Sottoriga della barra: modello e workspace di QUESTA chat. Solo
+    // lettura: si aggiornano a ogni rilettura (il polling li tiene freschi
+    // se un'apertura da desktop ha cambiato il modello), ma niente clic.
+    const modello = String(payload.model || "").trim();
+    const ws = String(payload.session_workspace || "").trim();
+    $("chat-model").textContent = modello;
+    $("chat-workspace").textContent = ws ? nomeCartella(ws) : "";
+    $("chat-workspace").title = ws;
+    // Il separatore compare solo se le due informazioni ci sono tutte e due.
+    // Qui serve querySelector: $ e' getElementById, non prende le classi.
+    const sep = document.querySelector(".chat-meta .meta-sep");
+    if (sep) sep.hidden = !(modello && ws);
   } catch (err) {
     toast(`Lettura fallita: ${err.message}`);
   }
@@ -613,6 +645,7 @@ function handleEvent(data) {
       inizioTurno = Date.now();
       contaPassi = 0;
       contaTool = 0;
+      contaToolPasso = 0;
       contaSecondi = 0;
       updateComposer();
       apriGruppoPassi();
@@ -620,6 +653,7 @@ function handleEvent(data) {
       break;
     case "step":
       contaPassi = Number(data.step) || contaPassi + 1;
+      contaToolPasso = 0; // nuovo passo: il contatore per-passo riparte
       sommarioPassi(false);
       mostraAttivita("sta ragionando");
       break;
@@ -636,6 +670,7 @@ function handleEvent(data) {
     }
     case "tool_start": {
       contaTool += 1;
+      contaToolPasso += 1;
       const riga = rigaPasso(descriviTool(data.name, data.args), "tool corso");
       if (data.call_id) riga.dataset.call = data.call_id;
       gruppoPassi?.querySelectorAll(".passo.pensiero.corso")

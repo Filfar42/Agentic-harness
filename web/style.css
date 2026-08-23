@@ -643,6 +643,16 @@ details.drawer.failed { border-color: color-mix(in srgb, var(--err) 40%, var(--b
 .goccia-web .globo { display: block; flex: none; }
 .goccia-web:hover { color: var(--accent); background: var(--accent-soft); }
 .goccia-web.on { color: var(--accent); background: var(--accent-soft); border-color: var(--accent); }
+
+/* Tendina del livello di pensiero: stessa grammatica del menu modelli
+   (.chip-anchor + .model-menu), ma stretta — quattro voci, non un catalogo. */
+.think-anchor { position: relative; }
+.think-menu { min-width: 200px; max-width: 260px; left: 0; bottom: calc(100% + 4px); top: auto; }
+.think-menu .menu-desc {
+  margin-left: auto; font-size: 11px; color: var(--text-faint);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.think-menu .model-opt.on .model-tick::after { content: '✓'; }
 #composer.dragging { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft), var(--shadow); }
 .composer-hint {
   max-width: 780px; margin: 6px auto 0;

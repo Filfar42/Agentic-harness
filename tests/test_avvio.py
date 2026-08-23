@@ -56,6 +56,10 @@ def _intercetta_avvii(run_harness, avvii, ambiente=None):
 
     def finto_run(self, *args, **kwargs):
         avvii.append((self.config.app, self.config.port))
+        # ``started`` e' quello che distingue "il server e' partito" da "la
+        # porta era occupata": senza, ``corri`` uscirebbe con il codice di
+        # fallimento anche qui.
+        self.started = True
         if ambiente is not None and self.config.app == "server.mobile:app":
             ambiente["al_avvio_del_ponte"] = os.environ.get("HARNESS_UPSTREAM")
 
@@ -170,6 +174,7 @@ def test_il_tetto_all_attesa_e_impostato_su_entrambi_i_server():
 
     def finto_run(self, *args, **kwargs):
         configurazioni.append(self.config)
+        self.started = True
 
     argv_prima = sys.argv
     sys.argv = ["run.py", "--mobile", "--no-browser"]
@@ -262,3 +267,41 @@ def test_ctrl_c_spegne_il_server_anche_con_un_browser_attaccato():
         if processo.poll() is None:
             processo.kill()
             processo.wait(timeout=10)
+
+
+def test_un_ctrl_c_riuscito_non_stampa_un_traceback():
+    """Il difetto che restava dopo aver fatto funzionare Ctrl+C.
+
+    A spegnimento avvenuto uvicorn ri-solleva il segnale che aveva
+    intercettato, per lasciar succedere quello che sarebbe successo senza il
+    suo gestore. ``uvicorn.run()`` lo assorbe, ma noi il ``Server`` lo
+    costruiamo a mano -- serve per agganciare ``handle_exit`` -- e quel pezzo
+    era rimasto scoperto: il Ctrl+C funzionava e stampava sette righe di
+    traceback, cioe' sembrava un crash.
+    """
+    run_harness = _run()
+
+    class FintoServer:
+        started = True
+
+        def run(self):
+            raise KeyboardInterrupt
+
+    run_harness.corri(FintoServer())  # non deve alzare niente
+
+
+def test_un_avvio_fallito_esce_con_un_codice_diverso_da_zero():
+    """Porta occupata o app che non importa: il server non parte e ``run()``
+    torna lo stesso. Uscire con zero direbbe "tutto bene" a chi lancia
+    l'harness da uno script."""
+    run_harness = _run()
+
+    class ServerCheNonParte:
+        started = False
+
+        def run(self):
+            return None
+
+    with pytest.raises(SystemExit) as uscita:
+        run_harness.corri(ServerCheNonParte())
+    assert uscita.value.code != 0
