@@ -36,6 +36,16 @@
 
   <main id="messages" class="messages"></main>
 
+  <!-- Sta lavorando: una riga sola, animata, appiccicata sopra il composer.
+       E' la risposta alla domanda che ci si fa guardando il telefono ("sta
+       ancora lavorando o si e' piantato?"), e per questo dice anche da quanto.
+       aria-live: chi usa VoiceOver sente cambiare l'attivita' senza toccare. -->
+  <div id="attivita" class="attivita hidden" aria-live="polite">
+    <span class="battito" aria-hidden="true"></span>
+    <span id="attivita-testo" class="attivita-testo">sta lavorando</span>
+    <span id="attivita-tempo" class="attivita-tempo"></span>
+  </div>
+
   <!-- Card per rispondere a una domanda dell'agente (ask-user-question) -->
   <div id="question-card" class="question-card hidden">
     <div class="question-text" id="question-text"></div>

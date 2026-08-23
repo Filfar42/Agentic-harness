@@ -337,12 +337,15 @@ generazione, ed e' li' che il controllo scatta piu' spesso.
 ## Test
 
 ```bash
-uv run pytest tests -q              # 643 verdi, 1 saltato
+uv run pytest tests -q              # 664 verdi
 ```
 
 Va lanciato con l'interprete del progetto. Con un python di sistema si ottiene
 `ModuleNotFoundError: No module named 'fastapi'` su una decina di file: e'
 l'ambiente sbagliato, non la suite rotta.
+
+I test dell'interfaccia mobile eseguono il JavaScript vero in QuickJS e si
+saltano da soli se manca (`pip install quickjs`).
 
 La suite gira su Windows, Linux e macOS. I due punti in cui il sistema si
 sente: il finto `docker` e' un `docker.cmd` su Windows (`CreateProcess` non
@@ -357,6 +360,25 @@ del backend. La sandbox si prova con un finto `docker` messo sul PATH. Nessun
 modello richiesto.
 
 ## Storia delle revisioni
+
+**v2.32.0** — dal telefono si vede cosa sta facendo il modello.
+
+Il difetto sotto tutto: il client mobile leggeva `data.delta` sugli eventi
+`content`, e quel campo non esiste — si chiama `text` ed e' cumulativo, come
+sa la UI desktop. La risposta restava invisibile fino a turno finito, ed era
+il motivo principale per cui dal telefono sembrava non stesse succedendo
+niente.
+
+Sopra, due livelli nuovi, e nessuno dei due mostra contenuto. La **striscia
+dell'attivita'** sta sopra il composer: una riga animata che dice cosa sta
+facendo e da quanto, accesa gia' al tocco di invio (fra l'invio e il primo
+token passano secondi, caricamento in VRAM compreso). Le **righe dei passi**
+stanno in una tendina, piu' piccole e piu' chiare del testo: un verbo e il suo
+oggetto — "legge tools.py", "esegue pytest -q" — mai il pensiero, mai il
+risultato; del risultato entra in pagina una cosa sola, se e' andato male.
+Quando il messaggio comincia ad arrivare la tendina **si richiude** da sola e
+resta un riassunto contato ("7 passi · 4 strumenti · 21s"). La cronologia si
+ridisegna con le stesse righe, quindi la tendina sopravvive a un ricaricamento.
 
 **v2.31.0** — merge del fork sviluppato con modelli open-weight. Sette funzioni
 nuove e sette bug portati alla luce dalla revisione.

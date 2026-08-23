@@ -20,9 +20,9 @@ APP_NAME = "Local Agent Harness"
 #
 # Il numero si muove cosi': terza cifra per una correzione, seconda per una
 # funzione nuova, prima per un cambio che rompe le sessioni salvate o le
-# preferenze. 2.31.0 e' il merge del fork Qwen: sette funzioni nuove, nessun
-# formato su disco cambiato.
-APP_VERSION = "2.31.0"
+# preferenze. 2.31.0 e' stato il merge del fork Qwen; 2.32.0 aggiunge alla
+# sola interfaccia mobile i passi del turno e la striscia dell'attivita'.
+APP_VERSION = "2.32.0"
 
 # --- percorsi di persistenza ------------------------------------------------
 DATA_DIR = Path("chat_sessions")
