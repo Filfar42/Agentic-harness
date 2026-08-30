@@ -287,25 +287,128 @@ def test_senza_docker_non_si_costruisce_niente(tmp_path, monkeypatch):
     assert prep_mod.image_needed(str(tmp_path), sandbox_mod.DEFAULT_IMAGE) is False
 
 
-def test_scegliere_una_cartella_avvia_la_build(client, monkeypatch, tmp_path):
+def _finito(job, secondi: float = 5.0):
+    """Aspetta che un lavoro di preparazione smetta di girare."""
+    import time as _t
+
+    scadenza = _t.time() + secondi
+    while job.running and _t.time() < scadenza:
+        _t.sleep(0.01)
+    return job.snapshot()
+
+
+def _docker_finto(monkeypatch, *, immagine_c_e: bool) -> dict:
+    """Docker acceso, senza toccare la macchina."""
+    fatti: dict = {"build": 0, "container": []}
+    monkeypatch.setattr(sandbox_mod, "docker_available", lambda: (True, "Engine 27"))
+    monkeypatch.setattr(sandbox_mod, "image_exists", lambda _tag: immagine_c_e)
+    monkeypatch.setattr(sandbox_mod, "write_dockerfile", lambda _w: None)
+
+    def _build(w):
+        fatti["build"] += 1
+        return sandbox_mod.image_tag(w), "log"
+
+    def _container(w, **kw):
+        fatti["container"].append((str(w), kw.get("image")))
+        return "harness-fake"
+
+    monkeypatch.setattr(sandbox_mod, "build_image", _build)
+    monkeypatch.setattr(sandbox_mod, "ensure_container", _container)
+    return fatti
+
+
+def test_scegliere_una_cartella_prepara_l_ambiente(client, monkeypatch, tmp_path):
     """È il momento giusto: l'utente ha appena dichiarato su cosa lavorare, e
-    la build parte mentre scrive il primo messaggio invece che dopo."""
+    immagine e container si preparano mentre scrive il primo messaggio.
+
+    L'ordine non è quello in cui si nominano le due cose: il container si crea
+    *dall'*immagine, quindi prima quella."""
     nuova = tmp_path / "progetto"
     nuova.mkdir()
     client.server.STATE.settings["image_autobuild"] = True
-    monkeypatch.setattr(sandbox_mod, "docker_available", lambda: (True, "Engine 27"))
-    monkeypatch.setattr(sandbox_mod, "image_exists", lambda _tag: False)
-    monkeypatch.setattr(
-        sandbox_mod, "build_image",
-        lambda w: (sandbox_mod.image_tag(w), "log"),
-    )
+    fatti = _docker_finto(monkeypatch, immagine_c_e=False)
+
     risposta = client.post("/api/workspace", json={"path": str(nuova)}).json()
-    assert risposta["jobs"]["image"]["state"] in {"running", "ok"}
+    # Il lavoro è già partito quando la risposta esce: `Job.start` marca lo
+    # stato sul filo della richiesta e poi apre il thread. Coi finti qui sopra
+    # può anche aver già finito -- quello che non deve mai essere è 'idle',
+    # cioè "non ci ha nemmeno provato".
+    assert risposta["jobs"]["container"]["state"] in {"running", "ok"}
+
+    esito = _finito(client.server.PREP.container)
+    assert esito["state"] == "ok", esito["detail"]
+    assert fatti["build"] == 1
+    # ...e il container nasce dall'immagine appena costruita, non da quella di
+    # serie: costruirla e non usarla sarebbe il peggio dei due mondi.
+    atteso = sandbox_mod.image_tag(str(nuova.resolve()))
+    assert fatti["container"] == [(str(nuova.resolve()), atteso)]
+    # Lo stato dell'immagine si legge dov'è sempre stato, anche se a costruirla
+    # è stato il thread del container.
+    assert client.server.PREP.image.snapshot()["state"] == "ok"
 
 
-def test_senza_l_automatismo_scegliere_una_cartella_non_costruisce(client, tmp_path):
+def test_l_immagine_che_c_e_gia_non_si_ricostruisce(client, monkeypatch, tmp_path):
+    """Una build dura minuti: rifarla ad ogni cambio di cartella sarebbe il
+    modo più caro di non fare niente."""
+    nuova = tmp_path / "progetto3"
+    nuova.mkdir()
+    client.server.STATE.settings["image_autobuild"] = True
+    fatti = _docker_finto(monkeypatch, immagine_c_e=True)
+
+    client.post("/api/workspace", json={"path": str(nuova)})
+    _finito(client.server.PREP.container)
+    assert fatti["build"] == 0
+    assert len(fatti["container"]) == 1, "il container si prepara lo stesso"
+
+
+def test_senza_l_automatismo_scegliere_una_cartella_non_costruisce(
+    client, monkeypatch, tmp_path
+):
+    """L'interruttore vale per l'immagine, non per il container: senza
+    container l'agente non ha dove eseguire, e crearlo quando manca non
+    scavalca nessuna scelta dell'utente."""
     nuova = tmp_path / "progetto2"
     nuova.mkdir()
     client.server.STATE.settings["image_autobuild"] = False
-    risposta = client.post("/api/workspace", json={"path": str(nuova)}).json()
-    assert risposta["jobs"]["image"]["state"] == "idle"
+    fatti = _docker_finto(monkeypatch, immagine_c_e=False)
+
+    client.post("/api/workspace", json={"path": str(nuova)})
+    _finito(client.server.PREP.container)
+    assert fatti["build"] == 0
+    assert client.server.PREP.image.snapshot()["state"] == "idle"
+    assert len(fatti["container"]) == 1
+
+
+def test_cambiare_cartella_non_chiama_docker_sul_filo_della_richiesta(
+    client, monkeypatch, tmp_path
+):
+    """Il costo che si voleva togliere: due sottoprocessi (`docker version` e
+    `docker images`) dentro l'apertura di una conversazione, per scoprire
+    quasi sempre che non c'era niente da fare.
+
+    Qui si prova che la richiesta HTTP non li fa più: la decisione la prende il
+    thread di preparazione."""
+    import threading
+
+    nuova = tmp_path / "progetto4"
+    nuova.mkdir()
+    client.server.STATE.settings["image_autobuild"] = True
+    filo_http = threading.get_ident()
+    visto: list[str] = []
+
+    def _spia(nome, ritorno):
+        def _f(*_a, **_kw):
+            if threading.get_ident() == filo_http:
+                visto.append(nome)
+            return ritorno
+
+        return _f
+
+    monkeypatch.setattr(
+        sandbox_mod, "docker_available", _spia("docker_available", (True, "x"))
+    )
+    monkeypatch.setattr(sandbox_mod, "image_exists", _spia("image_exists", True))
+    monkeypatch.setattr(sandbox_mod, "ensure_container", lambda _w, **_kw: "c")
+
+    client.post("/api/workspace", json={"path": str(nuova)})
+    assert visto == [], f"chiamate a docker sul filo della richiesta: {visto}"

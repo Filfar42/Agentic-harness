@@ -9,9 +9,14 @@ il fake lo muta proprio come farebbe il vero ciclo.
 
 from __future__ import annotations
 
+import tests.test_agent_loop as fake
 from core.config import GenParams
 from core.delega import MAX_PASSI_DELEGA, MAX_REFERTO_CHARS, esegui
 from core.tools import ToolContext
+
+# Il finto server Ollama sta li' e ci gira il ciclo vero: il sollecito alla
+# delega vive nel loop, non in questo modulo, e va provato dove vive.
+fake_ollama = fake.fake_ollama
 
 
 class StepStarted:  # noqa: N801 -- il loop conta solo ``type(evento).__name__``
@@ -35,7 +40,10 @@ def _fake_run_turn(*, referto=None, passi=1, legge=("core/config.py",), con_asis
     return _run
 
 
-def _esegui(tmp_path, **kw_fake):
+def _esegui(tmp_path, *, _run=None, _registra=True, **kw_fake):
+    """``_run`` permette di sostituire il finto ciclo per intero (serve a
+    guardare cosa riceve il figlio); ``_registra`` spegne la scrittura dei
+    fatti, come fa l'impostazione ``spec_delega``."""
     ctx = ToolContext(workspace=str(tmp_path), sandbox="host")
     return esegui(
         "dove sta budgets_for?",
@@ -44,7 +52,8 @@ def _esegui(tmp_path, **kw_fake):
         tools_schema=[],
         tool_ctx=ctx,
         env_header=None,
-        run_turn=_fake_run_turn(**kw_fake),
+        run_turn=_run or _fake_run_turn(**kw_fake),
+        registra_esiti=_registra,
     )
 
 
@@ -92,6 +101,201 @@ def test_senza_risposta_ma_con_margine_non_e_esaurimento(tmp_path):
     out = _esegui(tmp_path, referto=None, con_asistente=False, passi=1)
     assert "errore" in out and "referto" not in out
     assert out["esaurito"] is False
+
+
+# ---------------------------------------------------------------------------
+# La rete: sei passi di letture non si buttano perche' manca l'ultima frase
+# ---------------------------------------------------------------------------
+
+
+class BackendDiChiusura:
+    """Un backend che risponde una volta sola, come la chiamata di chiusura."""
+
+    def __init__(self, testo="core/config.py:105 budgets_for; resta da vedere agent.py"):
+        self.testo = testo
+        self.chiamate: list[list[dict]] = []
+
+    def stream(self, messages, tools, params):
+        self.chiamate.append(messages)
+        assert tools is None, "il referto di chiusura non deve avere tool"
+        assert params.think is False, "ne' pensiero: c'e' solo da scrivere"
+
+        class _Ev:
+            kind = "content"
+            text = self.testo
+
+        yield _Ev()
+
+
+def test_i_passi_bruciati_diventano_un_referto_parziale(tmp_path):
+    """Il caso misurato: 3 esplorazioni su 17 hanno letto sei file e restituito
+    niente. Quel contenuto era ancora nel contesto del figlio."""
+    from core.agent import build_api_messages
+
+    be = BackendDiChiusura()
+    ctx = ToolContext(workspace=str(tmp_path), sandbox="host")
+    out = esegui(
+        "dove sta budgets_for?",
+        backend=be,
+        params=GenParams(model="fake"),
+        tools_schema=[],
+        tool_ctx=ctx,
+        env_header=None,
+        run_turn=_fake_run_turn(referto=None, con_asistente=False, passi=MAX_PASSI_DELEGA),
+        build_messages=build_api_messages,
+    )
+    assert "errore" not in out
+    assert out["referto"] == be.testo
+    assert out["chiuso_a_forza"] is True
+    assert out["esaurito"] is True
+    # Il padre deve poterlo leggere come recupero, non come conclusione.
+    assert "parziale" in out["nota"]
+    assert len(be.chiamate) == 1
+
+
+def test_senza_niente_di_letto_non_si_paga_una_generazione(tmp_path):
+    """Un figlio che non ha aperto niente non ha niente da riferire: chiedergli
+    un referto sarebbe una generazione per farsi inventare una risposta."""
+    from core.agent import build_api_messages
+
+    be = BackendDiChiusura()
+    ctx = ToolContext(workspace=str(tmp_path), sandbox="host")
+    out = esegui(
+        "dove sta budgets_for?",
+        backend=be,
+        params=GenParams(model="fake"),
+        tools_schema=[],
+        tool_ctx=ctx,
+        env_header=None,
+        run_turn=_fake_run_turn(referto=None, con_asistente=False, passi=2, legge=()),
+        build_messages=build_api_messages,
+    )
+    assert "errore" in out
+    assert be.chiamate == [], "nessuna generazione di chiusura senza letture"
+
+
+def test_l_hint_non_manda_piu_il_padre_a_leggere_da_solo(tmp_path):
+    """'o cerca da solo' era l'uscita che il modello prendeva sempre -- ed e' la
+    strada che riporta l'esplorazione dentro il contesto del padre."""
+    out = _esegui(tmp_path, referto=None, con_asistente=False, passi=1)
+    assert "da solo" not in out["hint"]
+    assert "piu' stretta" in out["hint"]
+
+
+def test_dopo_troppe_letture_di_fila_l_harness_nomina_esplora(fake_ollama, tmp_path):
+    """Il tool c'e' e funziona; quello che mancava era nominarlo al momento giusto.
+
+    Misurato il 23/08/2026: `esplora` compare in 4 sessioni su 24, mentre
+    l'esplorazione fatta a mano vale il 46% dei token di risultato -- token che
+    restano in contesto per tutto il resto del lavoro.
+    """
+    import tests.test_agent_loop as fake
+    from core import agent as agent_mod
+    from core.backend import OllamaBackend
+    from core.tools import TOOLS_SCHEMA
+
+    (tmp_path / "uno.py").write_text("a = 1\n", encoding="utf-8")
+
+    def lettura(nome):
+        return [
+            {
+                "message": {
+                    "content": "",
+                    "tool_calls": [
+                        {"function": {"name": "read_file", "arguments": {"filepath": nome}}}
+                    ],
+                }
+            }
+        ]
+
+    url, _ = fake_ollama
+    originale = fake.SCRIPT
+    # Sei passi di sola lettura: il quinto deve far scattare il sollecito.
+    fake.SCRIPT = [lettura("uno.py") for _ in range(6)]
+    try:
+        ui_messages = [{"role": "user", "content": "guarda un po' in giro"}]
+        list(
+            agent_mod.run_turn(
+                backend=OllamaBackend(url, timeout_s=20),
+                params=GenParams(model="fake:latest"),
+                tools_schema=TOOLS_SCHEMA,
+                tool_ctx=ToolContext(workspace=str(tmp_path), sandbox="host"),
+                ui_messages=ui_messages,
+                system_prompt="SYS",
+                env_header=None,
+                max_steps=6,
+                require_plan=False,
+                require_summary=False,
+            )
+        )
+    finally:
+        fake.SCRIPT = originale
+
+    solleciti = [
+        m for m in ui_messages
+        if m.get("hidden") and "esplora" in str(m.get("content") or "")
+    ]
+    assert len(solleciti) == 1, "una volta per turno, non ad ogni lettura"
+    # E deve arrivare dopo i risultati dei tool, mai fra una tool_call e il suo
+    # risultato: e' l'invariante di tutti i solleciti di questo ciclo.
+    posizione = ui_messages.index(solleciti[0])
+    assert ui_messages[posizione - 1].get("role") == "tool"
+
+
+def test_il_sollecito_non_scatta_se_il_modello_sta_lavorando(fake_ollama, tmp_path):
+    """Un read_file dentro un passo che scrive e' il ciclo leggi-modifica, non
+    esplorazione: sollecitare li' sarebbe rumore."""
+    import tests.test_agent_loop as fake
+    from core import agent as agent_mod
+    from core.backend import OllamaBackend
+    from core.tools import TOOLS_SCHEMA
+
+    (tmp_path / "uno.py").write_text("a = 1\n", encoding="utf-8")
+
+    def legge_e_scrive(i):
+        return [
+            {
+                "message": {
+                    "content": "",
+                    "tool_calls": [
+                        {"function": {"name": "read_file", "arguments": {"filepath": "uno.py"}}},
+                        {
+                            "function": {
+                                "name": "write_file",
+                                "arguments": {"filepath": f"nuovo{i}.py", "content": "x = 1\n"},
+                            }
+                        },
+                    ],
+                }
+            }
+        ]
+
+    url, _ = fake_ollama
+    originale = fake.SCRIPT
+    fake.SCRIPT = [legge_e_scrive(i) for i in range(6)]
+    try:
+        ui_messages = [{"role": "user", "content": "sistema i file"}]
+        list(
+            agent_mod.run_turn(
+                backend=OllamaBackend(url, timeout_s=20),
+                params=GenParams(model="fake:latest"),
+                tools_schema=TOOLS_SCHEMA,
+                tool_ctx=ToolContext(workspace=str(tmp_path), sandbox="host"),
+                ui_messages=ui_messages,
+                system_prompt="SYS",
+                env_header=None,
+                max_steps=6,
+                require_plan=False,
+                require_summary=False,
+            )
+        )
+    finally:
+        fake.SCRIPT = originale
+
+    assert not [
+        m for m in ui_messages
+        if m.get("hidden") and "stai esplorando" in str(m.get("content") or "")
+    ]
 
 
 def test_il_prompt_del_figlio_dichiara_il_budget():

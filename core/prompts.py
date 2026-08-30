@@ -726,6 +726,61 @@ PLAN_NUDGE = (
     "-- una chiamata in piu' in quel passo, non un passo in piu'."
 )
 
+# Iniettato quando il modello sta esplorando a mano da parecchi passi senza
+# aver mai delegato. Misurato il 23/08/2026: l'esplorazione fatta dal padre --
+# read_file, search_files, list_files -- vale il 46% dei token di risultato che
+# restano in contesto per sempre, mentre `esplora` compare in 4 sessioni su 24.
+# Il tool c'e' e funziona: quello che manca e' che qualcuno lo nomini nel
+# momento in cui servirebbe.
+# Il turno ha esaurito i passi senza scrivere una parola. Non e' un sollecito:
+# e' il prompt di sistema di **una chiamata sola e senza tool**, perche' un
+# sollecito avrebbe bisogno di un passo successivo e non ce n'e' piu' uno.
+#
+# Perche' serve: `SUMMARY_NUDGE` copre il turno che si chiude da solo, e ha in
+# guardia `step < max_steps` — cioe' non copre il turno esaurito, che e'
+# esattamente quello lungo e faticoso in cui l'utente ha piu' bisogno di sapere
+# cos'e' successo. Misurato il 23/08/2026: la sessione 20260820_112642 ha
+# prodotto 21 passi, 46 risultati di tool, 124.877 caratteri di ragionamento e
+# **zero caratteri di risposta**, mai. L'utente ha visto delle tendine aprirsi
+# e chiudersi, e nient'altro.
+PROMPT_RIEPILOGO_FINALE = """\
+I passi a disposizione per questo turno sono finiti. Non puoi piu' chiamare \
+tool: quello che hai davanti e' tutto quello che avrai.
+
+Scrivi ORA all'utente, in italiano, cosa e' successo. E' l'unica cosa che \
+vedra' di questo turno: senza, resta davanti a delle tendine chiuse.
+
+Tre cose, brevi, in questo ordine:
+1. **Cosa hai fatto davvero**, con i file toccati. Solo azioni riuscite: se un \
+comando e' fallito dillo con l'errore, non contarlo fra le cose fatte.
+2. **Dove ti sei fermato** e perche' -- i passi finiti non sono una scusa, \
+sono un fatto: di' a che punto era il lavoro.
+3. **La prossima mossa**, una riga: cosa dovresti fare al turno dopo.
+
+Niente preamboli, niente scuse, niente elenchi di intenzioni. Non promettere \
+di fare qualcosa adesso: adesso e' finita.\
+"""
+
+DELEGA_NUDGE = (
+    "Sono {quante} letture di fila senza scrivere niente: stai esplorando. "
+    "Ogni file che apri resta nel tuo contesto per tutto il resto del lavoro, "
+    "anche quando ti e' servito una volta sola.\n"
+    "Se quello che ti manca e' ancora una domanda -- 'dove sta X', 'chi usa "
+    "Y', 'come si lancia Z' -- passala a `esplora`: legge lui, e a te torna "
+    "solo la risposta. Se invece hai gia' trovato quello che cercavi, vai "
+    "avanti e ignora questo messaggio."
+)
+
+# Coda al sollecito quando in questo workspace una delega ha gia' funzionato.
+# Un esempio vero vale piu' di tre righe di istruzioni sulla forma giusta, e
+# costa venti token nel punto in cui il modello sta gia' leggendo il sollecito:
+# fuori di qui sarebbe un elenco in coda al contesto pagato a ogni passo per
+# essere letto una volta ogni tanto. Il testo si ricava dai fatti al momento
+# (vedi ``core/spec_delega.py``): se l'evidenza sparisce, la frase sparisce.
+DELEGA_ESEMPIO = (
+    "\nIn questo workspace ha funzionato una domanda cosi': «{domanda}»."
+)
+
 # Variante del riepilogo quando c'e' un piano: il riassunto non si fa a
 # memoria, si legge da quello che e' stato dichiarato punto per punto.
 PLAN_SUMMARY_NUDGE = (
@@ -737,3 +792,48 @@ PLAN_SUMMARY_NUDGE = (
     "Non dichiarare fatto un punto che nel piano non risulta chiuso. "
     "Solo testo, nessuna nuova chiamata a tool."
 )
+
+
+# ---------------------------------------------------------------------------
+# Estratto del pensiero alla chiusura di un punto di piano
+# ---------------------------------------------------------------------------
+# Misurato il 23/08/2026 su quattro sessioni qwen3.8: 2.427.071 caratteri
+# pensati contro 108.970 di risposte -- 22 a 1 -- e tutto buttato a fine passo
+# (`strip_think_from_context`). Dentro non c'e' ripetizione (8-grammi ripetuti
+# 0,5%, somiglianza fra blocchi consecutivi 0,15): il modello **delibera**, e
+# quella deliberazione contiene fatti verificati che nessun altro posto
+# registra. Il 10,1% e' ripensamento ('wait', 'actually') e il 5,9%
+# auto-istruzioni: e' quello che va lasciato indietro.
+#
+# Perche' alla chiusura di un punto e non ad ogni passo: `manage_plan
+# action='complete'` **pretende** gia' una nota e ne ha ottenute 23 su 24 in
+# tre sessioni, mentre `manage_notes`, che la propone e basta, e' stato usato 0
+# volte su 42 conversazioni. Il rito batte l'invito: l'estratto si attacca al
+# rito che gia' funziona, e costa una chiamata per punto invece che per passo.
+#
+# In italiano, e non e' un dettaglio di gusto: 344 blocchi su 350 pensano in
+# inglese mentre i punti di piano sono in italiano, e `libreria.precarico`
+# ripesca incrociando **lessicalmente** le parole del punto aperto con i titoli
+# delle voci. Un estratto in inglese scriverebbe una libreria che nessun
+# precarico sa piu' ritrovare.
+PROMPT_ESTRATTO_PENSIERO = """\
+Ricevi il ragionamento grezzo di un agente di programmazione lungo un solo \
+punto di lavoro, che adesso e' chiuso. Quel ragionamento sta per essere \
+cancellato: e' l'unico posto in cui sono passati certi fatti.
+
+Tieni solo cio' che sarebbe costoso riscoprire. In italiano, senza preamboli, \
+in punti elenco brevi, sotto queste due voci (salta quella vuota):
+SCOPERTO: fatti tecnici verificati -- errori veri con il loro testo, versioni, \
+percorsi, firme di funzione, comandi che funzionano, vincoli dell'ambiente.
+SCARTATO: strade provate che non hanno funzionato, e perche'. Servono a non \
+rifarle.
+
+Butta senza pieta': i ripensamenti ('aspetta', 'in realta''), le \
+auto-istruzioni ('dovrei...'), i piani su cosa fare dopo, le riformulazioni \
+della richiesta, e tutto cio' che e' gia' evidente dal testo del punto.
+
+Regole: solo cose presenti nel ragionamento, mai dedotte e mai completate a \
+intuito. Un'ipotesi che il ragionamento non ha verificato non e' uno SCOPERTO: \
+o la ometti, o scrivi che era un'ipotesi. Se non resta niente che valga la \
+pena conservare, rispondi esattamente NIENTE e nient'altro.\
+"""

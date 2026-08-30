@@ -31,10 +31,12 @@ from typing import Any
 from collections.abc import Callable
 
 from . import sandbox as sandbox_mod
+from . import vault as vault_mod
 from .config import Budgets
 from .memory import add_memory, remove_memory
 from .notes import NoteError, Notes
-from .plan import Plan, PlanError
+from . import deposito as deposito_mod
+from .plan import DONE, SKIPPED, Plan, PlanError
 from .textutils import smart_truncate, truncate_lines
 
 # Cartelle che non hanno mai valore informativo per l'agente e che, se listate,
@@ -245,6 +247,15 @@ class ToolContext:
     # I vault noti (la chiave "vaults" delle impostazioni): servono al
     # sotto-turno di vault_search per risolvere il nome in percorso.
     registri_vault: list[dict[str, Any]] = field(default_factory=list)
+    # Il vault in cui si sta lavorando, se il workspace ne e' uno. Vuoto
+    # altrove: e' quello che rende ``manage_notes ambito='vault'`` possibile
+    # qui e un errore pulito altrove.
+    vault_dir: str = ""
+    # La memoria del vault, caricata all'inizio del turno. Sta nel contesto e
+    # non si rilegge da disco ad ogni passo: cambia solo quando la cambia il
+    # modello, e in quel caso la riscrive il tool.
+    vault_notes: list[str] = field(default_factory=list)
+    on_vault_notes_changed: Callable[[list[str]], None] | None = None
     allow_dangerous_commands: bool = False
     # "docker" = i comandi girano in un container che monta solo il workspace.
     # "host" = esecuzione diretta sulla macchina, come prima: l'agente vede
@@ -256,6 +267,10 @@ class ToolContext:
     # vedere nel browser quello che l'agente avvia. None = anteprime di
     # applicazioni disattivate; i file si vedono lo stesso.
     preview_ports: tuple[int, int] | None = None
+    # Se una pagina appartiene a un progetto con un backend riconoscibile,
+    # l'harness lo avvia da solo prima di mostrarla. Si puo' spegnere: e' un
+    # processo che parte senza che nessuno l'abbia chiesto esplicitamente.
+    preview_autostart_backend: bool = True
     # Cosa l'utente sta gia' guardando nel pannello di anteprima. Serve al
     # contesto, non ai tool: senza, il modello non ha modo di sapere che
     # l'anteprima e' gia' aperta e prova a riaprirla.
@@ -298,6 +313,20 @@ class ToolContext:
     # tre non e' un turno andato bene, e senza questo elenco la differenza fra
     # "tutto verde" e "tre rossi archiviati" non si vedrebbe da nessuna parte.
     rossi_ignorati: list[dict[str, str]] = field(default_factory=list)
+    # Punti di piano chiusi in questo passo, in attesa che ``agent`` ne
+    # distilli il ragionamento. E' una **casella postale, non una callback**:
+    # l'estrazione e' una chiamata al modello, e il modello qui dentro non si
+    # conosce (stessa ragione per cui ``on_delega`` e ``on_vault_search``
+    # esistono). Farla dentro il tool bloccherebbe il passo a meta' e non
+    # comparirebbe in nessun evento; ``agent`` la svuota a tool finiti, quando
+    # ha backend, parametri e cronologia sotto mano.
+    punti_chiusi: list[dict[str, Any]] = field(default_factory=list)
+    # Il testo intero dei risultati troppo lunghi finisce su disco prima di
+    # essere troncato, e il risultato ne porta il percorso. Non cambia di un
+    # token quello che entra in contesto: cambia che la coda tagliata smette di
+    # essere perduta. Vedi ``core/deposito.py``.
+    deposito_attivo: bool = True
+    deposito_max_mb: int = deposito_mod.MAX_MB_DEFAULT
     # Tracker per le verifiche rosse, impostato da agent.py per permetterne
     # l'azzeramento automatico o manuale quando un comando non e' pertinente.
     verification: Any = None
@@ -333,6 +362,10 @@ class ToolContext:
     def notes_changed(self) -> None:
         if self.on_notes_changed:
             self.on_notes_changed(self.notes)
+
+    def vault_notes_changed(self) -> None:
+        if self.on_vault_notes_changed:
+            self.on_vault_notes_changed(self.vault_notes)
 
 
 # ---------------------------------------------------------------------------
@@ -1216,6 +1249,11 @@ def tool_edit_file(
 # tanto vale leggere il file: il contesto serve a capire *se* la corrispondenza
 # e' quella giusta, non a sostituire read_file.
 MAX_CONTESTO = 4
+# Quante corrispondenze oltre il tetto si raccolgono per il deposito. Non e'
+# un budget di contesto -- quelle in contesto restano `search_max_matches` --
+# ma il punto in cui si smette di leggere il disco per una ricerca che il
+# modello ha comunque posto troppo larga.
+MAX_OLTRE_TETTO = 20_000
 
 
 def tool_search_files(
@@ -1263,9 +1301,16 @@ def tool_search_files(
     tetto = ctx.budgets.search_max_matches
 
     matches: list[str] = []
+    # Le corrispondenze oltre il tetto. Si raccolgono **solo** con il deposito
+    # acceso: senza, continuare il walk dopo il tetto sarebbe I/O pagato per
+    # buttare via il risultato. Con il deposito acceso invece il walk prosegue,
+    # e quello che oggi il tetto fa sparire finisce su disco.
+    oltre: list[str] = []
     per_file: dict[str, int] = {}
     files_scanned = 0
     troncato = False
+    continua = bool(ctx.deposito_attivo)
+    stop = False
 
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames[:] = [d for d in dirnames if d not in IGNORED_DIRS and not d.startswith(".")]
@@ -1285,26 +1330,35 @@ def tool_search_files(
                 if not regex.search(line):
                     continue
                 per_file[rel] = per_file.get(rel, 0) + 1
-                if modo == "content" and len(matches) < tetto:
+                if modo == "content":
                     if contesto:
                         inizio = max(0, i - contesto)
                         fine = min(len(righe), i + contesto + 1)
-                        blocco = [
+                        voce = "\n".join(
                             f"{rel}:{n + 1}:{'>' if n == i else ' '} {righe[n].rstrip()[:200]}"
                             for n in range(inizio, fine)
-                        ]
-                        matches.append("\n".join(blocco))
+                        )
                     else:
-                        matches.append(f"{rel}:{i + 1}: {line.rstrip()[:200]}")
+                        voce = f"{rel}:{i + 1}: {line.rstrip()[:200]}"
+                    if len(matches) < tetto:
+                        matches.append(voce)
+                    elif continua and len(oltre) < MAX_OLTRE_TETTO:
+                        oltre.append(voce)
                 if modo == "files":
                     break  # basta sapere che il file contiene qualcosa
             if modo == "content" and len(matches) >= tetto:
                 troncato = True
-                break
+                # Senza deposito ci si ferma qui, come si e' sempre fatto. Con
+                # il deposito si prosegue, ma non all'infinito: oltre il tetto
+                # del deposito ci si ferma e **lo si dice**, perche' un file
+                # che finisce a meta' senza avvisare e' una frase falsa in piu'.
+                stop = not continua or len(oltre) >= MAX_OLTRE_TETTO
             if modo != "content" and len(per_file) >= tetto:
                 troncato = True
+                stop = not continua or len(per_file) >= tetto + MAX_OLTRE_TETTO
+            if stop:
                 break
-        if troncato:
+        if stop:
             break
 
     comune = {
@@ -1314,20 +1368,50 @@ def tool_search_files(
         "file_count": len(per_file),
         "truncated": troncato,
     }
+
+    def _deposita_ricerca(righe_intere: list[str]) -> None:
+        """Il risultato intero su disco, e il percorso nel referto.
+
+        Qui la perdita e' meno grave che su ``run_command`` -- una ricerca si
+        rilancia, e' deterministica -- ma il costo di rilanciarla su un
+        progetto grosso lo paga il modello in un round-trip, e la porzione
+        tagliata e' proprio quella che non ha ancora visto.
+        """
+        # Il taglio e' gia' accertato da ``troncato``: qui non si ricontrolla
+        # contro un budget, si deposita e basta. (Passare per
+        # ``_deposita_se_tagliato`` con un tetto finto avrebbe funzionato solo
+        # per caso, ed e' la specie di trucco che fra sei mesi non si rilegge.)
+        if not troncato or not ctx.deposito_attivo:
+            return
+        percorso = deposito_mod.deposita(
+            ctx.base,
+            "\n".join(righe_intere),
+            etichetta=f"search {pattern}",
+            intestazione=(
+                f"search_files: pattern={pattern!r} glob={glob!r} modo={modo} "
+                f"-- {len(righe_intere):,} righe, {len(per_file):,} file"
+            ),
+        )
+        if percorso:
+            comune["deposito"] = percorso
+            comune["nota"] = (
+                f"In contesto ci sono le prime {tetto}. L'elenco intero e' in "
+                f"`{percorso}`: leggilo con read_file o restringi la ricerca."
+            )
+
     if modo == "files":
         # Niente match_count qui: in questa modalita' si smette di contare alla
         # prima corrispondenza di ogni file, e un totale ricavato cosi' sarebbe
         # un numero sbagliato spacciato per una misura.
-        return _ok({**comune, "files": sorted(per_file) or ["(nessuna corrispondenza)"]})
+        tutti = sorted(per_file)
+        _deposita_ricerca(tutti)
+        return _ok({**comune, "files": tutti[:tetto] or ["(nessuna corrispondenza)"]})
     comune["match_count"] = sum(per_file.values())
     if modo == "count":
-        return _ok(
-            {
-                **comune,
-                "counts": [f"{f}: {n}" for f, n in sorted(per_file.items())]
-                or ["(nessuna corrispondenza)"],
-            }
-        )
+        conteggi = [f"{f}: {n}" for f, n in sorted(per_file.items())]
+        _deposita_ricerca(conteggi)
+        return _ok({**comune, "counts": conteggi[:tetto] or ["(nessuna corrispondenza)"]})
+    _deposita_ricerca(matches + oltre)
     return _ok({**comune, "matches": matches or ["(nessuna corrispondenza)"]})
 
 
@@ -1536,14 +1620,46 @@ def tool_run_command(ctx: ToolContext, command: str, timeout_sec: int | None = N
             "successiva che proponi. Se invece manca ancora qualcosa di quello "
             "che ti e' stato chiesto, prosegui senza riepilogare."
         )
+    # Il testo intero su disco **prima** del taglio. Qui, e non su read_file,
+    # perche' qui la perdita e' irreversibile: un file si rilegge a righe, uno
+    # stdout tagliato si recupera solo rilanciando il comando -- che costa e
+    # non sempre e' ripetibile. E' anche il 32,7% dei token di risultato dei
+    # tool, secondo solo a read_file.
+    out_intero = proc.stdout or ""
+    err_intero = proc.stderr or ""
+    dep_out = _deposita_se_tagliato(
+        ctx,
+        out_intero,
+        tetto=ctx.budgets.command_stdout_max_chars,
+        etichetta=f"stdout {command}",
+        intestazione=f"run_command: {command} -- stdout, {len(out_intero):,} caratteri",
+    )
+    dep_err = _deposita_se_tagliato(
+        ctx,
+        err_intero,
+        tetto=ctx.budgets.command_stderr_max_chars,
+        etichetta=f"stderr {command}",
+        intestazione=f"run_command: {command} -- stderr, {len(err_intero):,} caratteri",
+    )
+    if dep_out:
+        payload["stdout_deposito"] = dep_out
+    if dep_err:
+        payload["stderr_deposito"] = dep_err
     return _ok(
         {
             **payload,
             "stdout": smart_truncate(
-                proc.stdout or "", ctx.budgets.command_stdout_max_chars, label="stdout"
+                out_intero,
+                ctx.budgets.command_stdout_max_chars,
+                label="stdout",
+                consiglio=_consiglio_deposito(dep_out),
             ),
             "stderr": smart_truncate(
-                proc.stderr or "", ctx.budgets.command_stderr_max_chars, head_ratio=0.35, label="stderr"
+                err_intero,
+                ctx.budgets.command_stderr_max_chars,
+                head_ratio=0.35,
+                label="stderr",
+                consiglio=_consiglio_deposito(dep_err),
             ),
         }
     )
@@ -1640,6 +1756,336 @@ def _attendi_stato(
     return stato
 
 
+# ---------------------------------------------------------------------------
+# La radice: quale cartella si serve, non quale file
+# ---------------------------------------------------------------------------
+#
+# Un file HTML da solo non e' una pagina: senza il suo foglio di stile, i suoi
+# script e le sue immagini si vede un'altra cosa. Percio' l'anteprima di una
+# pagina serve una **cartella**, e la scelta di quale cartella decide due cose
+# insieme: cosa funziona (i percorsi assoluti come `/css/app.css` si risolvono
+# li') e cosa il browser puo' leggere (niente sopra quella cartella).
+#
+# I marcatori "forti" segnano il confine di un progetto; `index.html` e' un
+# indizio debole, buono solo quando non c'e' nient'altro.
+_ROOT_MARKERS = ("package.json", "pyproject.toml", ".git", "requirements.txt")
+
+
+def _rel_dir(base: Path, cartella: Path) -> str:
+    rel = cartella.relative_to(base).as_posix()
+    return "" if rel == "." else rel
+
+
+def preview_root(workspace: str | Path, path: str) -> str:
+    """La cartella da servire per mostrare ``path``, relativa al workspace.
+
+    Stringa vuota = la radice del workspace. La regola, dal file verso l'alto:
+
+    1. il **primo** confine di progetto che si incontra salendo vince. Nearest,
+       non highest: in un monorepo con ``.git`` in cima e ``package.json`` nel
+       sito, la radice giusta e' il sito;
+    2. se non ce n'e' nessuno, la **piu' alta** cartella della catena che
+       contiene un ``index.html`` -- cosi' ``sito/pagine/chi-siamo.html`` viene
+       servito da ``sito/`` e il suo ``../css/`` esiste davvero;
+    3. altrimenti la cartella del file, che e' sempre meglio del workspace
+       intero: quello che non serve, non si espone.
+
+    Non si esce mai dal workspace, perche' la catena si ferma li'.
+    """
+    base = Path(workspace).resolve()
+    try:
+        target = resolve_path(base, path)
+    except WorkspaceError:
+        return ""
+
+    corrente = target if target.is_dir() else target.parent
+    catena: list[Path] = []
+    while True:
+        catena.append(corrente)
+        if corrente == base or not corrente.is_relative_to(base):
+            break
+        corrente = corrente.parent
+
+    for cartella in catena:
+        if any((cartella / marcatore).exists() for marcatore in _ROOT_MARKERS):
+            return _rel_dir(base, cartella)
+    for cartella in reversed(catena):
+        if (cartella / "index.html").is_file():
+            return _rel_dir(base, cartella)
+    return _rel_dir(base, catena[0])
+
+
+# ---------------------------------------------------------------------------
+# Il backend: riconoscerlo, non chiederlo
+# ---------------------------------------------------------------------------
+#
+# "Un HTML senza il backend avviato non funziona come dovrebbe" e' il secondo
+# modo in cui l'anteprima mentiva: la pagina si vedeva, ma ogni fetch verso
+# l'API del progetto tornava un errore, e la pagina sembrava rotta.
+#
+# L'informazione per capirlo ce l'abbiamo gia' sul disco -- e' il principio di
+# questo harness: quello che si puo' sapere gratis non si chiede al modello.
+
+_BACKEND_FILES = ("app.py", "main.py", "server.py", "api.py", "asgi.py", "wsgi.py")
+_RE_FASTAPI = re.compile(r"^\s*(\w+)\s*=\s*FastAPI\s*\(", re.M)
+_RE_FLASK = re.compile(r"^\s*(\w+)\s*=\s*Flask\s*\(", re.M)
+
+
+def _leggi_un_po(path: Path, limite: int = 40_000) -> str:
+    try:
+        return path.read_text(encoding="utf-8", errors="replace")[:limite]
+    except OSError:
+        return ""
+
+
+def preview_backend(root: str | Path, port: int) -> dict[str, str] | None:
+    """Il comando che fa vivere questo progetto, se se ne riconosce uno.
+
+    Volutamente conservativo: un riconoscimento sbagliato costa un avvio
+    fallito e un ripiego sullo statico (rumore), mentre un riconoscimento
+    mancato costa solo quello che si aveva prima. Nel dubbio, None.
+    """
+    root = Path(root)
+    porta = int(port)
+
+    manage = root / "manage.py"
+    if manage.is_file() and "django" in _leggi_un_po(manage).lower():
+        return {
+            "command": f"python manage.py runserver 0.0.0.0:{porta}",
+            "kind": "django",
+            "why": "manage.py di Django",
+        }
+
+    for nome in _BACKEND_FILES:
+        sorgente = root / nome
+        if not sorgente.is_file():
+            continue
+        testo = _leggi_un_po(sorgente)
+        trovato = _RE_FASTAPI.search(testo)
+        if trovato:
+            return {
+                "command": (
+                    f"uvicorn {sorgente.stem}:{trovato.group(1)} "
+                    f"--host 0.0.0.0 --port {porta}"
+                ),
+                "kind": "fastapi",
+                "why": f"{nome} dichiara un'app FastAPI",
+            }
+        trovato = _RE_FLASK.search(testo)
+        if trovato:
+            return {
+                # La CLI di Flask e non `python app.py`: qui la porta la
+                # decidiamo noi, mentre un `app.run()` scritto nel file la
+                # fissa a 5000 e si lega a 127.0.0.1 -- che dentro un
+                # container vuol dire invisibile.
+                "command": (
+                    f"python -m flask --app {sorgente.stem}:{trovato.group(1)} "
+                    f"run --host 0.0.0.0 --port {porta}"
+                ),
+                "kind": "flask",
+                "why": f"{nome} dichiara un'app Flask",
+            }
+
+    pacchetto = root / "package.json"
+    if pacchetto.is_file():
+        try:
+            dati = json.loads(_leggi_un_po(pacchetto) or "{}")
+        except json.JSONDecodeError:
+            dati = {}
+        scripts = dati.get("scripts") or {}
+        deps = {**(dati.get("dependencies") or {}), **(dati.get("devDependencies") or {})}
+        if "vite" in deps and "dev" in scripts:
+            return {
+                "command": f"npm run dev -- --host 0.0.0.0 --port {porta}",
+                "kind": "vite",
+                "why": "package.json con Vite",
+            }
+        for script in ("dev", "start"):
+            if script in scripts:
+                return {
+                    # PORT e HOST sono la convenzione che rispettano express,
+                    # next e quasi tutto il resto. Se questo progetto non la
+                    # rispetta, la porta resta chiusa e si ripiega sullo
+                    # statico: il modo giusto in cui sbagliare.
+                    "command": f"PORT={porta} HOST=0.0.0.0 npm run {script}",
+                    "kind": "node",
+                    "why": f"package.json con lo script '{script}'",
+                }
+    return None
+
+
+def _libera_la_porta(ctx: ToolContext, porta: int) -> bool:
+    """Prova a liberare ``porta`` dentro il container. True se ci riesce.
+
+    Partire su una porta occupata significa vedere il server morire con
+    "address already in use" e un traceback che non dice quasi niente. Il
+    tentativo e' mirato -- prima l'anteprima precedente, poi un eventuale
+    orfano rimasto -- e sta dentro l'intervallo pubblicato, che esiste solo
+    per questo.
+    """
+    if _stato_porta(ctx, porta) == sandbox_mod.PORT_FREE:
+        return True
+    sandbox_mod.stop_background(
+        ctx.workspace, image=ctx.docker_image,
+        network=ctx.sandbox_network, ports=ctx.preview_ports,
+    )
+    if _stato_porta(ctx, porta) != sandbox_mod.PORT_FREE:
+        sandbox_mod.kill_port_listener(
+            ctx.workspace, porta, image=ctx.docker_image,
+            network=ctx.sandbox_network, ports=ctx.preview_ports,
+        )
+    return _attendi_stato(
+        ctx, porta, (sandbox_mod.PORT_FREE,), 3.0
+    ) == sandbox_mod.PORT_FREE
+
+
+def _avvia_sulla_porta(
+    ctx: ToolContext, comando: str, porta: int, wait_s: int
+) -> tuple[str, str]:
+    """Avvia ``comando`` e aspetta la porta. Ritorna ``(stato, log)``.
+
+    Lo stato e' uno di ``sandbox.PORT_*``, oppure ``"morto"`` se l'avvio stesso
+    e' fallito. Chi chiama decide cosa farne: il tool ``serve`` lo racconta
+    come errore, l'avvio automatico del backend ci ripiega sullo statico.
+    """
+    try:
+        sandbox_mod.start_background(
+            comando, ctx.workspace, image=ctx.docker_image,
+            network=ctx.sandbox_network, ports=ctx.preview_ports,
+        )
+    except sandbox_mod.SandboxError as exc:
+        # Un avvio fallito a meta' puo' aver comunque lasciato un processo in
+        # piedi: si ripulisce prima di raccontarlo, o il tentativo successivo
+        # trovera' la porta occupata senza capire da chi.
+        sandbox_mod.stop_background(
+            ctx.workspace, image=ctx.docker_image,
+            network=ctx.sandbox_network, ports=ctx.preview_ports,
+        )
+        sandbox_mod.kill_port_listener(
+            ctx.workspace, porta, image=ctx.docker_image,
+            network=ctx.sandbox_network, ports=ctx.preview_ports,
+        )
+        return "morto", f"Avvio fallito: {exc}"
+
+    stato = _attendi_stato(
+        ctx, porta,
+        (sandbox_mod.PORT_OPEN, sandbox_mod.PORT_LOCAL_ONLY),
+        max(1, min(int(wait_s or 12), 60)),
+    )
+    log = sandbox_mod.background_log(
+        ctx.workspace, image=ctx.docker_image,
+        network=ctx.sandbox_network, ports=ctx.preview_ports,
+    )
+    return stato, log
+
+
+def _diagnosi_porta(ctx: ToolContext, porta: int, stato: str) -> str:
+    """Perche' non risponde. Non e' piu' un'ipotesi: ``/proc/net/tcp`` dice su
+    quale indirizzo il processo si e' legato, quindi i due casi si distinguono
+    invece di doverli indovinare dal fatto che sia vivo."""
+    if stato == sandbox_mod.PORT_LOCAL_ONLY:
+        return (
+            f"Il processo e' in ascolto sulla porta {porta}, ma solo su "
+            "127.0.0.1: dentro un container quello e' un indirizzo privato "
+            "e dal browser non lo raggiunge nessuno. Rilancialo legandolo "
+            f"a 0.0.0.0 (`--host 0.0.0.0`, `--bind 0.0.0.0`, o "
+            f"`-b 0.0.0.0:{porta}`)."
+        )
+    if sandbox_mod.background_alive(
+        ctx.workspace, image=ctx.docker_image,
+        network=ctx.sandbox_network, ports=ctx.preview_ports,
+    ):
+        return (
+            f"Il processo e' vivo ma non si e' legato alla porta {porta}: "
+            "controlla che il comando usi davvero quella porta, e leggi il "
+            "log qui sotto."
+        )
+    return (
+        "Il processo e' gia' morto: leggi il log qui sotto, di solito "
+        "e' un import mancante o un errore di sintassi."
+    )
+
+
+def _anteprima_statica(ctx: ToolContext, rel: str) -> dict[str, Any]:
+    """Il payload di un file mostrato dal server statico dell'anteprima."""
+    return {
+        "kind": preview_kind(rel),
+        "path": rel,
+        # La cartella servita su `/`: la calcola l'harness, una volta sola,
+        # e il client la usa per sapere quali salvataggi lo riguardano.
+        "root": preview_root(ctx.workspace, rel),
+        "title": Path(rel).name,
+    }
+
+
+def _prova_il_backend(
+    ctx: ToolContext, rel: str, wait_s: int
+) -> tuple[dict[str, Any] | None, str]:
+    """Se il progetto di ``rel`` ha un backend, prova ad avviarlo.
+
+    Ritorna ``(payload, nota)``: il payload c'e' solo se il backend risponde
+    davvero. In tutti gli altri casi si ripiega sullo statico -- una pagina
+    senza dati e' meno peggio di un pannello vuoto -- e la nota racconta al
+    modello cos'e' successo, che e' l'unico modo perche' possa rimediare.
+    """
+    if not ctx.preview_autostart_backend:
+        return None, ""
+    if ctx.sandbox != "docker" or not ctx.preview_ports:
+        return None, ""
+    lo, _hi = ctx.preview_ports
+    try:
+        radice = resolve_path(ctx.workspace, preview_root(ctx.workspace, rel))
+    except WorkspaceError:
+        return None, ""
+    spia = preview_backend(radice, lo)
+    if not spia:
+        return None, ""
+
+    if not _libera_la_porta(ctx, lo):
+        return None, (
+            f"Questo progetto ha un backend ({spia['why']}), ma la porta {lo} "
+            "e' occupata da qualcosa che non riesco a fermare: la pagina e' "
+            "mostrata come file statico."
+        )
+
+    stato, log = _avvia_sulla_porta(ctx, spia["command"], lo, wait_s)
+    if stato == sandbox_mod.PORT_OPEN:
+        return (
+            {
+                "kind": "app",
+                "port": lo,
+                # Un backend decide da se' i propri indirizzi: il percorso del
+                # file sul disco non e' l'URL della pagina (in Flask sta in
+                # templates/, in Vite viene generata). Quindi si apre la
+                # radice e si lascia decidere a lui.
+                "url_path": "/",
+                "title": f"{Path(rel).name} — {spia['kind']} su :{lo}",
+                "command": spia["command"],
+                "mode": "serve",
+                "auto_backend": True,
+            },
+            f"Avviato da solo il backend di questo progetto ({spia['why']}): "
+            f"`{spia['command']}`. E' gia' in esecuzione e gia' sullo schermo "
+            "dell'utente: non riavviarlo. Per fermarlo, preview action='stop'.",
+        )
+
+    # Non ha risposto: si smonta quello che e' rimasto in piedi, senno' il
+    # prossimo tentativo trova la porta occupata senza capire da chi.
+    sandbox_mod.stop_background(
+        ctx.workspace, image=ctx.docker_image,
+        network=ctx.sandbox_network, ports=ctx.preview_ports,
+    )
+    coda = f"\n--- log ---\n{smart_truncate(log, 1200, label='log')}" if log.strip() else ""
+    return None, (
+        f"Questo progetto ha un backend ({spia['why']}) e ho provato ad "
+        f"avviarlo con `{spia['command']}`, ma non risponde sulla porta {lo}: "
+        "la pagina e' mostrata come file statico, quindi tutto cio' che "
+        "chiede al server non funzionera'. Spesso mancano le dipendenze "
+        "(installale con run_command), poi riprova con preview action='serve'."
+        + coda
+    )
+
+
 def tool_preview(
     ctx: ToolContext,
     action: str,
@@ -1674,12 +2120,24 @@ def tool_preview(
                     "immagini) e mostra come testo i file di codice."
                 ),
             )
-        return _ok(
-            {
+
+        # Una pagina si mostra viva: cartella servita su un'origine vera, e --
+        # se il progetto ne dichiara uno -- il suo backend in esecuzione.
+        # L'utente non deve chiedere due volte la stessa cosa, e il modello non
+        # deve ricordarsi di una procedura in due passi.
+        if Path(rel).suffix.lower() in {".html", ".htm"}:
+            payload, nota = _prova_il_backend(ctx, rel, wait_s)
+            if payload is not None:
+                return _ok({"status": "ok", "preview": payload, "note": nota})
+            risposta: dict[str, Any] = {
                 "status": "ok",
-                "preview": {"kind": kind, "path": rel, "title": Path(rel).name},
+                "preview": _anteprima_statica(ctx, rel),
             }
-        )
+            if nota:
+                risposta["note"] = nota
+            return _ok(risposta)
+
+        return _ok({"status": "ok", "preview": _anteprima_statica(ctx, rel)})
 
     if action in {"serve", "stop", "logs", "terminal", "gui"}:
         if ctx.sandbox != "docker":
@@ -1772,63 +2230,21 @@ def tool_preview(
                 ),
             )
 
-        # La porta e' gia' occupata? Partire lo stesso significa vedere il
-        # server morire con "address already in use" e un traceback che non
-        # dice quasi niente. Il tentativo di liberarla e' mirato -- prima
-        # l'anteprima precedente, poi un eventuale orfano rimasto nel container
-        # -- e sta dentro l'intervallo pubblicato, che esiste solo per questo.
-        if _stato_porta(ctx, porta) != sandbox_mod.PORT_FREE:
-            sandbox_mod.stop_background(
-                ctx.workspace, image=ctx.docker_image,
-                network=ctx.sandbox_network, ports=ctx.preview_ports,
+        if not _libera_la_porta(ctx, porta):
+            return _err(
+                f"La porta {porta} e' occupata da un processo che non "
+                "riesco a fermare.",
+                hint=(
+                    f"Usa un'altra porta fra {lo} e {hi}. Se sono tutte "
+                    "occupate, l'utente puo' premere 'Ricrea il container' "
+                    "in Impostazioni -> Sandbox: butta via il container con "
+                    "tutto quello che ci gira dentro."
+                ),
             )
-            if _stato_porta(ctx, porta) != sandbox_mod.PORT_FREE:
-                sandbox_mod.kill_port_listener(
-                    ctx.workspace, porta, image=ctx.docker_image,
-                    network=ctx.sandbox_network, ports=ctx.preview_ports,
-                )
-            if _attendi_stato(
-                ctx, porta, (sandbox_mod.PORT_FREE,), 3.0
-            ) != sandbox_mod.PORT_FREE:
-                return _err(
-                    f"La porta {porta} e' occupata da un processo che non "
-                    "riesco a fermare.",
-                    hint=(
-                        f"Usa un'altra porta fra {lo} e {hi}. Se sono tutte "
-                        "occupate, l'utente puo' premere 'Ricrea il container' "
-                        "in Impostazioni -> Sandbox: butta via il container con "
-                        "tutto quello che ci gira dentro."
-                    ),
-                )
 
-        try:
-            sandbox_mod.start_background(
-                comando, ctx.workspace, image=ctx.docker_image,
-                network=ctx.sandbox_network, ports=ctx.preview_ports,
-            )
-        except sandbox_mod.SandboxError as exc:
-            # Un avvio fallito a meta' puo' aver comunque lasciato un processo
-            # in piedi: si ripulisce prima di raccontarlo, o il tentativo
-            # successivo trovera' la porta occupata senza capire da chi.
-            sandbox_mod.stop_background(
-                ctx.workspace, image=ctx.docker_image,
-                network=ctx.sandbox_network, ports=ctx.preview_ports,
-            )
-            sandbox_mod.kill_port_listener(
-                ctx.workspace, porta, image=ctx.docker_image,
-                network=ctx.sandbox_network, ports=ctx.preview_ports,
-            )
-            return _err(f"Avvio dell'anteprima fallito: {exc}")
-
-        stato = _attendi_stato(
-            ctx, porta,
-            (sandbox_mod.PORT_OPEN, sandbox_mod.PORT_LOCAL_ONLY),
-            max(1, min(int(wait_s or 12), 60)),
-        )
-        log = sandbox_mod.background_log(
-            ctx.workspace, image=ctx.docker_image,
-            network=ctx.sandbox_network, ports=ctx.preview_ports,
-        )
+        stato, log = _avvia_sulla_porta(ctx, comando, porta, wait_s)
+        if stato == "morto":
+            return _err(f"Avvio dell'anteprima fallito: {log}")
         if stato == sandbox_mod.PORT_OPEN:
             return _ok(
                 {
@@ -1845,31 +2261,7 @@ def tool_preview(
                 }
             )
 
-        # La diagnosi non e' piu' un'ipotesi: /proc/net/tcp dice **su quale
-        # indirizzo** il processo si e' legato, quindi i due casi si
-        # distinguono invece di doverli indovinare dal fatto che sia vivo.
-        if stato == sandbox_mod.PORT_LOCAL_ONLY:
-            suggerimento = (
-                f"Il processo e' in ascolto sulla porta {porta}, ma solo su "
-                "127.0.0.1: dentro un container quello e' un indirizzo privato "
-                "e dal browser non lo raggiunge nessuno. Rilancialo legandolo "
-                f"a 0.0.0.0 (`--host 0.0.0.0`, `--bind 0.0.0.0`, o "
-                f"`-b 0.0.0.0:{porta}`)."
-            )
-        elif sandbox_mod.background_alive(
-            ctx.workspace, image=ctx.docker_image,
-            network=ctx.sandbox_network, ports=ctx.preview_ports,
-        ):
-            suggerimento = (
-                f"Il processo e' vivo ma non si e' legato alla porta {porta}: "
-                "controlla che il comando usi davvero quella porta, e leggi il "
-                "log qui sotto."
-            )
-        else:
-            suggerimento = (
-                "Il processo e' gia' morto: leggi il log qui sotto, di solito "
-                "e' un import mancante o un errore di sintassi."
-            )
+        suggerimento = _diagnosi_porta(ctx, porta, stato)
         return _err(
             f"L'applicazione non risponde sulla porta {porta}.",
             hint=suggerimento + (f"\n--- log ---\n{smart_truncate(log, 1500, label='log')}" if log.strip() else ""),
@@ -1882,6 +2274,69 @@ def tool_preview(
 
 
 PLAN_TOOL = "manage_plan"
+
+
+def _deposita_se_tagliato(
+    ctx: ToolContext,
+    testo: str,
+    *,
+    tetto: int,
+    etichetta: str,
+    intestazione: str = "",
+) -> str | None:
+    """Deposita il testo intero **solo se** il troncamento lo taglierebbe.
+
+    Sotto il budget non si scrive niente: la sessione mediana non ha un
+    problema di contesto (picco 8.059 token, misura del 23/08/2026) e non deve
+    pagare una scrittura su disco per turno in cambio di niente.
+    """
+    if not ctx.deposito_attivo or tetto <= 0 or len(testo or "") <= tetto:
+        return None
+    return deposito_mod.deposita(
+        ctx.base, testo, etichetta=etichetta, intestazione=intestazione
+    )
+
+
+def _consiglio_deposito(percorso: str | None) -> str | None:
+    """La frase che sostituisce quella falsa dentro il marcatore di taglio."""
+    if not percorso:
+        return None
+    return (
+        f"il testo intero e' in `{percorso}`: leggilo con read_file "
+        "o cercaci dentro con search_files"
+    )
+
+
+def _annota_chiusura(
+    ctx: ToolContext, step: Any, *, saltato: bool, era_gia_chiuso: bool
+) -> None:
+    """Imbuca un punto appena chiuso perche' ``agent`` ne distilli il pensiero.
+
+    Vale anche sui punti **saltati**: e' li' che nasce piu' spesso uno
+    ``SCARTATO``, cioe' il fatto che serve a non rifare una strada gia' provata.
+    ``saltato`` viaggia insieme perche' finisce scritto nella voce archiviata:
+    un punto abbandonato dopo una verifica rossa non deve rileggersi, fra dieci
+    sessioni, come una conclusione raggiunta.
+
+    ``complete`` su un punto gia' chiuso e' permesso -- ``Plan.complete`` non
+    guarda lo stato di partenza, e va bene cosi': e' una mossa idempotente e
+    rifiutarla costerebbe un round-trip per niente. Ma **archiviarla** due
+    volte no: la libreria e' append-only, quindi un secondo estratto non
+    correggerebbe il primo, gli si affiancherebbe, e l'indice che il modello
+    rilegge ad ogni passo si riempirebbe di doppioni. Idempotente sul piano
+    deve voler dire idempotente anche in archivio.
+    """
+    if era_gia_chiuso:
+        return
+    ctx.punti_chiusi.append(
+        {"id": step.id, "text": step.text, "saltato": bool(saltato)}
+    )
+
+
+def _e_chiuso(ctx: ToolContext, step_id: str) -> bool:
+    """Lo stato del punto **prima** della mossa: dopo, sono tutti chiusi."""
+    step = ctx.plan.get(str(step_id))
+    return step is not None and step.status in (DONE, SKIPPED)
 
 
 def tool_manage_plan(
@@ -1973,10 +2428,14 @@ def tool_manage_plan(
                     {"step": str(step_id), "comando": ctx.red_command, "motivo": motivo}
                 )
                 ctx.clear_red_command()
-            ctx.plan.complete(step_id, note)
+            gia_chiuso = _e_chiuso(ctx, step_id)
+            chiuso = ctx.plan.complete(step_id, note)
+            _annota_chiusura(ctx, chiuso, saltato=False, era_gia_chiuso=gia_chiuso)
             aperto = ctx.plan.avanza()
         elif action == "skip":
-            ctx.plan.skip(step_id, note)
+            gia_chiuso = _e_chiuso(ctx, step_id)
+            chiuso = ctx.plan.skip(step_id, note)
+            _annota_chiusura(ctx, chiuso, saltato=True, era_gia_chiuso=gia_chiuso)
             ctx.clear_red_command()
             aperto = ctx.plan.avanza()
         elif action == "show":
@@ -1990,10 +2449,21 @@ def tool_manage_plan(
         return _err(str(exc))
 
     ctx.plan_changed()
+    # Il piano **non** torna qui dentro. Sta gia' nel blocco di coda, rispedito
+    # integrale ad ogni passo da ``plan.render_block``: rimandarlo anche nel
+    # risultato del tool significa scrivere la stessa cosa due volte nella
+    # stessa richiesta. Misurato il 23/08/2026 sulle sessioni salvate:
+    # ``manage_plan`` valeva il **13,5% di tutti i token di risultato dei
+    # tool**, terzo dopo read_file e run_command, per un'informazione che il
+    # modello aveva gia' davanti.
+    #
+    # Quello che resta e' cio' che il blocco di coda **non** dice: che
+    # l'operazione e' riuscita, e cosa e' cambiato adesso -- ``current`` e
+    # ``aperto_in_automatico`` vanno letti in questo passo, non al prossimo.
     esito: dict[str, Any] = {
         "status": "ok",
         "action": action,
-        "plan": ctx.plan.to_list(),
+        "punti": len(ctx.plan.steps),
         "current": ctx.plan.current.id if ctx.plan.current else None,
     }
     if ctx.rossi_ignorati:
@@ -2081,8 +2551,10 @@ def tool_vault_search(
 NOTES_TOOL = "manage_notes"
 
 
-def tool_manage_notes(ctx: ToolContext, action: str, text: str = "") -> str:
-    """Foglio di note del compito in corso.
+def tool_manage_notes(
+    ctx: ToolContext, action: str, text: str = "", ambito: str = "chat"
+) -> str:
+    """Foglio di note del compito in corso, o memoria del vault.
 
     Separato da ``manage_plan`` di proposito: il piano dice a che punto sei,
     le note dicono cosa hai capito. Mescolarli riempirebbe il piano di scoperte
@@ -2090,8 +2562,15 @@ def tool_manage_notes(ctx: ToolContext, action: str, text: str = "") -> str:
 
     Separato anche da ``manage_memory``: quella vale per il progetto e
     sopravvive a tutte le sessioni, questa muore con il compito.
+
+    ``ambito='vault'`` scrive invece nella memoria del vault: stesso gesto,
+    altra durata. Non e' un terzo tool perche' la differenza fra i tre fogli
+    e' **quanto vivono**, non cosa ci si scrive -- e uno schema in piu' si
+    paga in finestra ad ogni passo di ogni turno.
     """
     action = (action or "").strip().lower()
+    if (ambito or "chat").strip().lower() == "vault":
+        return _note_del_vault(ctx, action, text)
     try:
         if action == "add":
             nota = ctx.notes.add(text)
@@ -2115,6 +2594,48 @@ def tool_manage_notes(ctx: ToolContext, action: str, text: str = "") -> str:
     # Non si rimandano indietro tutte le note: sono gia' nel blocco di coda ad
     # ogni passo, e ripeterle qui sarebbe pagarle due volte per niente.
     return _ok({**esito, "action": action, "count": len(ctx.notes)})
+
+
+def _note_del_vault(ctx: ToolContext, action: str, text: str) -> str:
+    """La memoria del vault: quello che si e' capito **del posto**.
+
+    Vale per tutte le conversazioni della cartella e non muore con nessuna di
+    esse. Vive in ``.vault.json``, cioe' dentro il vault: la memoria segue la
+    cartella, come il suo nome.
+    """
+    if not ctx.vault_dir:
+        return _err(
+            "Qui non c'e' nessun vault: questa cartella non ne fa parte.",
+            hint="Senza ambito='vault' la nota va nel foglio di questa chat.",
+        )
+    try:
+        if action == "add":
+            config = vault_mod.aggiungi_nota(ctx.vault_dir, text)
+            esito: dict[str, Any] = {"status": "ok", "added": text}
+        elif action == "remove":
+            config = vault_mod.togli_nota(ctx.vault_dir, text)
+            esito = {"status": "ok", "removed": text}
+        elif action == "show":
+            return _ok({"notes": list(vault_mod.leggi_config(ctx.vault_dir).note)})
+        elif action == "clear":
+            # Niente svuotamento in blocco della memoria del vault. Il foglio
+            # di una chat si butta perche' muore con lei comunque; questa e'
+            # il lavoro di mesi, e una `clear` per sbaglio non ha un annulla.
+            return _err(
+                "La memoria del vault non si svuota in blocco.",
+                hint="Togli le note superate una per una con action='remove'.",
+            )
+        else:
+            return _err(
+                f"Azione '{action}' non supportata.",
+                hint="Valori ammessi con ambito='vault': add, remove, show.",
+            )
+    except vault_mod.NotaVaultError as exc:
+        return _err(str(exc))
+
+    ctx.vault_notes = list(config.note)
+    ctx.vault_notes_changed()
+    return _ok({**esito, "action": action, "ambito": "vault", "count": len(config.note)})
 
 
 # ---------------------------------------------------------------------------
@@ -2175,6 +2696,44 @@ def _strip_tags(html_fragment: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
+# Segnali che la pagina non e' un risultato vuoto ma una porta in faccia.
+#
+# Servono perche' i due casi arrivavano al modello con la stessa frase, e il
+# suggerimento allegato -- "riformula con parole piu' comuni" -- e' il consiglio
+# giusto per uno e disastroso per l'altro. Nella sessione del 29/08 la prima
+# ricerca e' passata, la seconda ha trovato il limite di frequenza, e da li'
+# il modello ha speso venti passi ad accorciare la query ("Endress+Hauser
+# trasmettitore di pressione" -> "Endress Hauser" -> "Burkert") contro una
+# pagina che non conteneva risultati per nessuna query.
+_DDG_RIFIUTO = (
+    "anomaly",
+    "unusual traffic",
+    "are you a robot",
+    "bots use duckduckgo",
+    "rate limit",
+    "too many requests",
+    "captcha",
+    "challenge-platform",
+)
+
+
+def _ddg_rifiuta(page: str) -> bool:
+    """La pagina e' un rifiuto del motore, non un elenco vuoto?
+
+    Due indizi, e basta uno. Il primo sono le parole del controllo anti-bot.
+    Il secondo e' la taglia: la pagina dei risultati -- anche quando i
+    risultati sono zero -- porta con se' l'intero guscio del sito, decine di
+    migliaia di caratteri. Un rifiuto e' una paginetta.
+
+    Non e' una diagnosi certa e non deve esserlo: il costo di sbagliarla e'
+    un consiglio meno preciso, il costo di non farla e' quello gia' pagato.
+    """
+    basso = page.lower()
+    if any(segnale in basso for segnale in _DDG_RIFIUTO):
+        return True
+    return len(page) < 4000
+
+
 def tool_web_search(
     ctx: ToolContext, query: str, max_results: int = 5
 ) -> str:
@@ -2228,6 +2787,20 @@ def tool_web_search(
     titles = [(m.group(1), m.group(2)) for m in _RE_LINK.finditer(page)]
     snippets = [m.group(1) for m in _RE_SNIPPET.finditer(page)]
     if not titles:
+        # Pagina senza risultati: due cause diversissime, e il consiglio giusto
+        # e' opposto. Vedi ``_ddg_rifiuta``.
+        if _ddg_rifiuta(page):
+            raise WorkspaceError(
+                "Il motore di ricerca ha rifiutato la richiesta (limite di "
+                "frequenza o controllo anti-bot), non ha detto che non ci sono "
+                "risultati.",
+                hint=(
+                    "Non riformulare: la query non c'entra, e riprovare subito "
+                    "verra' rifiutato di nuovo. Vai avanti con quello che sai, "
+                    "o di' all'utente che la ricerca online e' momentaneamente "
+                    "bloccata."
+                ),
+            )
         raise WorkspaceError(
             "Il motore di ricerca non ha restituito risultati interpretabili.",
             hint="Riformula la query con parole piu' comuni e riprova.",
@@ -2334,7 +2907,7 @@ _ALLOWED_ARGS: dict[str, set[str]] = {
     "run_command": {"command", "timeout_sec"},
     "manage_memory": {"action", "content"},
     PLAN_TOOL: {"action", "steps", "step_id", "note", "ignore_red"},
-    NOTES_TOOL: {"action", "text"},
+    NOTES_TOOL: {"action", "text", "ambito"},
     DELEGA_TOOL: {"compito"},
     VAULT_SEARCH_TOOL: {"vault", "query"},
     PREVIEW_TOOL: {"action", "path", "command", "port", "url_path", "wait_s"},
@@ -2605,7 +3178,12 @@ TOOLS_SCHEMA: list[dict[str, Any]] = [
                 "action='file' con path per far vedere un documento del "
                 "workspace (markdown, HTML, SVG, PDF, immagini, o codice come "
                 "testo): utile quando quello che hai prodotto si capisce meglio "
-                "guardandolo che leggendone il nome. "
+                "guardandolo che leggendone il nome. Su una pagina HTML basta "
+                "questo e basta una volta: l'harness serve tutta la sua "
+                "cartella (quindi CSS, script e immagini si vedono) e, se il "
+                "progetto dichiara un backend (Flask, FastAPI, Django, Vite, "
+                "package.json), lo avvia da solo -- non serve un action='serve' "
+                "dopo. "
                 "action='serve' per avviare un'applicazione o uno script che "
                 "resta in esecuzione (server web, dashboard, demo) e mostrarla "
                 "dal vivo: USA QUESTO E NON run_command, perche' run_command ha "
@@ -2879,6 +3457,20 @@ TOOLS_SCHEMA: list[dict[str, Any]] = [
                             "numero della nota."
                         ),
                     },
+                    "ambito": {
+                        "type": "string",
+                        "enum": ["chat", "vault"],
+                        "description": (
+                            "Dove scrivere. 'chat' (di serie) e' il foglio di "
+                            "questa conversazione: muore con lei. 'vault' e' la "
+                            "memoria della cartella: vale in TUTTE le chat di "
+                            "questo vault e non muore mai. Usa 'vault' per "
+                            "quello che varra' ancora fra un mese -- una "
+                            "convenzione concordata, dove stanno le cose, una "
+                            "strada scartata e perche'. Fuori da un vault non "
+                            "esiste e torna errore."
+                        ),
+                    },
                 },
                 "required": ["action"],
             },
@@ -3042,7 +3634,9 @@ LEAN_TOOL_DESCRIPTIONS: dict[str, str] = {
 
     PREVIEW_TOOL: (
         "Mostra qualcosa all'utente. action='file' con path per un documento "
-        "del workspace; action='serve' con command e port per un'applicazione "
+        "del workspace: se e' una pagina HTML l'harness ne serve tutta la "
+        "cartella e avvia da solo il backend del progetto, se ne riconosce "
+        "uno. action='serve' con command e port per un'applicazione "
         "che resta in esecuzione -- non usare run_command per quelle, il "
         "timeout le uccide, e lega il processo a 0.0.0.0 o dal browser non si "
         "raggiunge. action='gui' con command per un programma con una finestra "

@@ -159,13 +159,20 @@ def test_le_maniglie_stanno_fuori_dalle_colonne():
 
 
 def test_un_solo_meccanismo_di_trascinamento():
-    """Anteprima, sidebar e pannello usano lo stesso divisorio: tre copie della
-    stessa logica volevano dire correggerla in tre posti."""
+    """Anteprima, sidebar, pannello e il confine fra i due elenchi usano lo
+    stesso divisorio: quattro copie della stessa logica vorrebbero dire
+    correggerla in quattro posti.
+
+    L'ultimo arrivato e' orizzontale, ma la differenza sta tutta in due
+    parametri (da dove si ricava la misura, quale classe va sul body): se un
+    giorno il conto qui sotto cresce senza che ``bindGrip`` resti uno solo,
+    e' il segno che qualcuno ne ha riscritta una copia.
+    """
     js = (WEB / "app.js").read_text(encoding="utf-8")
     assert js.count("function bindGrip(") == 1
     assert js.count("setPointerCapture") == 1
-    # e tutti e tre passano di li'
-    assert js.count("bindGrip($('#") == 3
+    # e tutti e quattro passano di li'
+    assert js.count("bindGrip($('#") == 4
 
 
 def test_l_interruttore_del_pannello_e_nella_barra_in_alto():
@@ -285,7 +292,48 @@ def test_la_pagina_smette_di_essere_la_fonte_viva_quando_lo_stream_finisce():
     """
     sorgente = (WEB / "app.js").read_text(encoding="utf-8")
     assert "function attaccatoAUnoStream()" in sorgente
-    # Le due uscite di attachStream devono azzerarlo entrambe: quella normale
-    # e quella per stream irraggiungibile.
-    assert sorgente.count("if (state.attachAbort === controller) state.attachAbort = null;") == 2
-    assert "if (!attaccatoAUnoStream()) showSession(payload);" in sorgente
+    # Da quando una caduta e' un riattacco e non una fine, l'uscita di
+    # ``attachStream`` e' **una sola** -- il ciclo finisce quando lo stream si
+    # chiude davvero -- ed e' li' che il controller si azzera. L'altra strada
+    # (``mio = false``) e' il caso in cui un altro attach ha gia' preso il
+    # posto di questo: azzerarlo li' cancellerebbe il controller di qualcun
+    # altro, ed e' il motivo per cui non lo fa.
+    assert sorgente.count("if (state.attachAbort === controller) state.attachAbort = null;") == 1
+    corpo = sorgente[sorgente.index("async function attachStream(") :]
+    corpo = corpo[: corpo.index("\n}\n")]
+    assert "if (!mio) {" in corpo
+    # E la domanda "posso ridisegnare?" resta una sola, dentro la rilettura.
+    riallinea = sorgente[sorgente.index("async function riallinea(") :]
+    riallinea = riallinea[: riallinea.index("\n}\n")]
+    assert "attaccatoAUnoStream()) return;" in riallinea
+    assert "showSession(payload);" in riallinea
+
+
+def test_il_confine_fra_conversazioni_e_vault_si_trascina():
+    """Quanto spazio meritino i vault dipende da quanti ne hai.
+
+    Con le chat annidate sotto ogni vault la meta' fissa e' una scelta che va
+    bene a nessuno: chi ha un vault solo vuole vedere le conversazioni, chi ne
+    ha sei vuole il contrario. La maniglia e' la ``.col-grip`` girata di 90
+    gradi -- un solo gesto da imparare per tutti e quattro i divisori.
+    """
+    html = (WEB / "index.html").read_text(encoding="utf-8")
+    css = (WEB / "style.css").read_text(encoding="utf-8")
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+
+    # Sta **fra** i due elenchi, non sopra o sotto entrambi.
+    assert html.index('id="sessions"') < html.index('id="vaults-grip"')
+    assert html.index('id="vaults-grip"') < html.index('id="vaults-sec"')
+
+    assert "cursor: ns-resize" in css
+    assert "flex: 0 0 var(--vaults-h" in css
+    # Il cursore non torna freccia uscendo dagli 8px della maniglia.
+    assert "body.resizing-rows" in css
+
+    # Nessuno dei due lati si puo' annullare: un divisorio che puo' far
+    # sparire una meta' e' un interruttore travestito.
+    corpo = js[js.index("function setVaultsHeight("):]
+    corpo = corpo[: corpo.index("\n}")]
+    assert "VAULTS_H_MIN" in corpo and "CONVERSAZIONI_H_MIN" in corpo
+    # E la misura sopravvive al ricaricamento.
+    assert "localStorage.setItem(VAULTS_H_KEY" in corpo

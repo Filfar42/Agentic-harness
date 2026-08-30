@@ -514,3 +514,90 @@ def test_si_puo_spegnere(tmp_path):
         )
     )
     assert be.riassunti == 0
+
+
+# ---------------------------------------------------------------------------
+# Il tetto assoluto: la percentuale da sola ha smesso di funzionare
+# ---------------------------------------------------------------------------
+
+
+def test_la_finestra_efficace_non_supera_il_tetto():
+    """Con finestre grandi la soglia in percentuale non e' raggiungibile.
+
+    Misurato sulle 61 sessioni salvate: a 131k il picco piu' alto mai
+    raggiunto (90.018 token) e' il 68,7%, sotto lo 0,75. Il tetto riporta la
+    decisione su un numero assoluto.
+    """
+    # Finestra piccola: il tetto non c'entra, decide num_ctx.
+    assert compaction.finestra_efficace(16_384, 32_768) == 16_384
+    # Finestra grande: decide il tetto, e la soglia ci cade sopra esatta.
+    efficace = compaction.finestra_efficace(131_072, 32_768)
+    assert efficace < 131_072
+    # La soglia in percentuale, applicata alla finestra efficace, ricade sul
+    # tetto: e' tutto il senso dell'operazione.
+    assert abs(efficace * compaction.SOGLIA_DEFAULT - 32_768) < 1
+    # Tetto spento: si torna al comportamento di prima, senza sorprese.
+    assert compaction.finestra_efficace(131_072, 0) == 131_072
+
+
+def test_la_coda_tenuta_sta_sotto_la_soglia_che_ha_fatto_compattare():
+    """La trappola della correzione fatta a meta'.
+
+    Se si abbassasse solo la soglia lasciando la coda sul num_ctx vero, la
+    coda tenuta (0,35 x 131k = 45k) sarebbe **piu' grande** della soglia che
+    ha fatto scattare la compattazione (32k): si compatterebbe per ritrovarsi
+    sopra soglia al passo successivo, per sempre.
+    """
+    efficace = compaction.finestra_efficace(131_072, 32_768)
+    coda = efficace * compaction.CODA_DEFAULT
+    assert coda < 32_768, "la coda tenuta deve stare sotto il tetto"
+
+
+def test_su_finestra_larga_si_compatta_lo_stesso(tmp_path):
+    """Il caso reale: 131k di finestra, e la compattazione deve scattare."""
+    from core import agent as agent_mod
+
+    be = BackendDiTurno()
+    eventi = list(
+        agent_mod.run_turn(
+            backend=be,
+            params=GenParams(model="fake", num_ctx=131_072),
+            tools_schema=[],
+            tool_ctx=ToolContext(workspace=str(tmp_path), sandbox="host"),
+            ui_messages=cronologia(14),
+            system_prompt="SYS",
+            env_header="ENV",
+            max_steps=1,
+            require_summary=False,
+            require_plan=False,
+            # Tetto basso quanto la finestra stretta del test qui sopra: e' lo
+            # stesso contesto, ed e' il tetto -- non la percentuale -- a doverlo
+            # riconoscere come troppo.
+            compact_max_tokens=int(4096 * compaction.SOGLIA_DEFAULT),
+        )
+    )
+    assert [e for e in eventi if isinstance(e, agent_mod.HistoryCompacted)]
+    assert be.riassunti == 1
+
+
+def test_senza_tetto_la_finestra_larga_non_compatta_piu(tmp_path):
+    """La prova che il difetto c'era: stesso contesto, tetto spento, niente."""
+    from core import agent as agent_mod
+
+    be = BackendDiTurno()
+    list(
+        agent_mod.run_turn(
+            backend=be,
+            params=GenParams(model="fake", num_ctx=131_072),
+            tools_schema=[],
+            tool_ctx=ToolContext(workspace=str(tmp_path), sandbox="host"),
+            ui_messages=cronologia(14),
+            system_prompt="SYS",
+            env_header="ENV",
+            max_steps=1,
+            require_summary=False,
+            require_plan=False,
+            compact_max_tokens=0,
+        )
+    )
+    assert be.riassunti == 0

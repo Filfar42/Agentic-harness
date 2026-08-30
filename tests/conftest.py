@@ -22,8 +22,10 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from core import config as config_mod  # noqa: E402
 from core import memory as memory_mod  # noqa: E402
 from core import settings as settings_mod  # noqa: E402
+from server import previewhost  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
@@ -39,3 +41,10 @@ def preferenze_isolate(tmp_path, monkeypatch):
     # tmp_path diversa, quindi un'impronta diversa: bastava un test che
     # riusasse un percorso per portarsi dietro lo stato del run precedente.
     monkeypatch.setenv("HARNESS_BG_LIVE", str(tmp_path / "sandbox-bg"))
+    # Il server delle anteprime si accende alla prima pagina mostrata e apre
+    # una porta vera in ascolto. Un test non deve mai farlo per sbaglio: qui
+    # nasce spento, e chi lo prova lo accende da se' e lo spegne dopo.
+    monkeypatch.setitem(config_mod.DEFAULTS, "preview_host_port", 0)
+    yield
+    previewhost.shutdown()
+    previewhost.set_root(tmp_path)

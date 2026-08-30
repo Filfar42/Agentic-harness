@@ -33,7 +33,7 @@ from contextlib import asynccontextmanager
 from dataclasses import asdict, is_dataclass, replace
 from pathlib import Path
 from typing import Any, Literal
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
@@ -53,6 +53,7 @@ from core import sandbox as sandbox_mod  # noqa: E402
 from core import session as session_mod  # noqa: E402
 from core import settings as settings_mod  # noqa: E402
 from core import vault as vault_mod  # noqa: E402
+from server import previewhost  # noqa: E402
 from core.backend import (  # noqa: E402
     build_backend,
     forget_model_info,
@@ -63,6 +64,7 @@ from core.config import (  # noqa: E402
     SKILLS_SUBDIR_WORKSPACE,
     APP_NAME,
     APP_VERSION,
+    THINK_AUTO_LEVEL,
     GenParams,
     resolve_think,
     resolve_tristate,
@@ -88,11 +90,12 @@ from core.tools import (  # noqa: E402
     WorkspaceError,
     is_image,
     load_images_b64,
+    preview_root,
     resolve_path,
     store_attachment,
 )
 from server.nativedialog import DialogUnavailable, pick_folder  # noqa: E402
-from server.prep import Prep, image_needed  # noqa: E402
+from server.prep import Prep  # noqa: E402
 from server import runner as runner_mod  # noqa: E402
 from server.runner import RunnerRegistry, TurnRunner  # noqa: E402
 
@@ -122,6 +125,10 @@ async def lifespan(_app: FastAPI):
     sandbox_mod.dimentica_marchi_vivi()
     autostart_docker()
     yield
+    # Il server delle anteprime si e' acceso alla prima pagina mostrata, in un
+    # thread demone: un demone morirebbe comunque all'uscita, ma chiedere e'
+    # piu' pulito che tagliare -- e con --reload il processo non esce affatto.
+    previewhost.shutdown()
 
 
 app = FastAPI(title=APP_NAME, version=APP_VERSION, lifespan=lifespan)
@@ -209,6 +216,9 @@ class AppState:
         self._env_header_for: tuple[str, str] | None = None
         self._think: tuple[tuple[Any, ...], bool] | None = None
         self._vision: tuple[tuple[Any, ...], bool] | None = None
+        # Cartelle gia' spazzate dai container rimasti in piedi da prima di un
+        # riavvio: una volta per cartella e per avvio. Vedi ``smonta_se_serve``.
+        self._spazzate: set[str] = set()
         # Bootstrap pigro: la sessione piu' recente si carica alla prima
         # richiesta, non qui. Il file puo' pesare megabyte e veniva letto e
         # parsato durante l'import del modulo, prima ancora che il server si
@@ -416,7 +426,7 @@ class AppState:
     def store_notes(self, session_id: str, notes: notes_mod.Notes) -> None:
         self.session(session_id)["notes"] = notes.to_list()
 
-    def save(self, session_id: str) -> None:
+    def save(self, session_id: str, *, riscrivi: bool = False) -> None:
         session = self._sessions.get(session_id)
         if session is not None:
             # Con cosa e' stata fatta questa conversazione. ``save_session``
@@ -428,7 +438,7 @@ class AppState:
             # l'informazione che mancava.
             session["model_name"] = self.settings["model_name"]
             session["workspace_dir"] = self.settings["workspace_dir"]
-            session_mod.save_session(session, force=True)
+            session_mod.save_session(session, force=True, riscrivi=riscrivi)
 
     def workspace_di(self, session_id: str) -> str:
         """La cartella su cui questa conversazione ha lavorato.
@@ -487,7 +497,7 @@ class AppState:
 
     def gen_params(self) -> GenParams:
         s = self.settings
-        return GenParams(
+        params = GenParams(
             model=s["model_name"],
             temperature=float(s["temperature"]),
             top_p=float(s["top_p"]),
@@ -503,6 +513,15 @@ class AppState:
             # system prompt, dove un livello non cambierebbe nulla.
             think=self.think_setting(),
         )
+        # Il server vince sull'impostazione. Su llama-server la finestra la
+        # fissa -c al lancio: chiederne una piu' grande non la allarga, fa solo
+        # credere all'harness uno spazio che non c'e' -- e i budget di
+        # troncamento (budgets_for) si tarerebbero su un numero falso, mentre
+        # il server taglia o fa context shift senza dire niente.
+        limite = getattr(self.backend(), "clamp_num_ctx", None)
+        if callable(limite):
+            params.num_ctx = int(limite(params.num_ctx))
+        return params
 
     def backend(self):
         """Backend riusato finche' non cambiano i parametri di connessione.
@@ -593,6 +612,14 @@ class AppState:
         )
         if vault_mod.is_modalita_vault(self.settings["workspace_dir"]):
             prompt += vault_mod.blocco_manutenzione(self.settings["workspace_dir"])
+        # Le istruzioni del vault valgono anche fuori dalla modalita' wiki: e'
+        # il senso di averle separate dalla descrizione. Vanno dopo il blocco
+        # del manutentore perche' sono dell'utente, e l'ultima parola su come
+        # si lavora in una cartella e' di chi ci lavora.
+        if vault_mod.is_registrato(self.settings["workspace_dir"]):
+            prompt += vault_mod.blocco_istruzioni(
+                vault_mod.leggi_config(self.settings["workspace_dir"])
+            )
         return prompt + memory_mod.format_for_prompt(self.memories)
 
     def env_header(self, *, fresh: bool = False) -> str | None:
@@ -621,10 +648,27 @@ class AppState:
         return header
 
     def think_setting(self) -> bool | str:
-        """Valore di ``think`` da mandare a Ollama: booleano o livello."""
+        """Valore di ``think`` da mandare al modello: un livello, o False.
+
+        Con ``auto`` si ritorna il **livello** ``THINK_AUTO_LEVEL`` invece di
+        ``True``, e non e' un dettaglio di forma: ``agent.think_for_step``
+        abbassa il pensiero di uno scalino col punto di piano aperto e di due
+        dal terzo passo, ma sa farlo solo su una scala -- davanti a un booleano
+        restituisce il valore intatto. Con ``auto`` (che e' il default) tutta
+        quella modulazione era quindi **inerte**, e non si vedeva da nessuna
+        parte: misurato il 23/08/2026 sulle quattro sessioni qwen3.8, il
+        pensiero non si accorciava mai col passo (mediana 3.327 caratteri al
+        passo 1, 3.452 al passo 8+).
+
+        Il costo: i livelli li accettano solo le versioni recenti di Ollama.
+        Non e' un rischio nuovo -- la tendina delle impostazioni offre gia'
+        ``low|medium|high|max`` e li manda sul filo allo stesso modo -- e il
+        backend impara dal rifiuto e ripiega sul booleano (vedi
+        ``OllamaBackend._livello_rifiutato``).
+        """
         setting = self.settings["native_think"]
         if isinstance(setting, str) and setting.strip().lower() == "auto":
-            return self.thinking_enabled()
+            return THINK_AUTO_LEVEL if self.thinking_enabled() else False
         return resolve_think(setting, None)
 
     def vision_enabled(self) -> bool:
@@ -700,6 +744,12 @@ class AppState:
         def persist_notes(notes: notes_mod.Notes) -> None:
             self.store_notes(session_id, notes)
 
+        # Il vault in cui si sta lavorando, se il workspace ne e' uno. Vuoto
+        # altrove: e' cio' che rende ``manage_notes ambito='vault'`` possibile
+        # qui e un errore pulito da tutte le altre parti.
+        workspace = str(self.settings["workspace_dir"])
+        vault_corrente = workspace if vault_mod.is_registrato(workspace) else ""
+
         return ToolContext(
             workspace=self.settings["workspace_dir"],
             timeout_s=int(self.settings["timeout_seconds"]),
@@ -714,14 +764,26 @@ class AppState:
             notes=self.notes(session_id),
             preview=self.preview(session_id),
             preview_ports=self.preview_ports(),
+            preview_autostart_backend=bool(
+                self.settings.get("preview_autostart_backend")
+            ),
             on_memories_changed=persist,
             on_plan_changed=persist_plan,
             on_notes_changed=persist_notes,
             allow_dangerous_commands=bool(self.settings["confirm_commands"]),
             registri_vault=list(self.settings.get("vaults") or []),
+            # La memoria del vault si carica una volta per turno e vive nel
+            # contesto: cambia solo quando la cambia il modello, e in quel caso
+            # e' il tool a riscrivere sia il file sia questa lista.
+            vault_dir=vault_corrente,
+            vault_notes=(
+                list(vault_mod.leggi_config(vault_corrente).note) if vault_corrente else []
+            ),
             sandbox=str(self.settings["sandbox"]),
             docker_image=str(self.settings["docker_image"]),
             sandbox_network=bool(self.settings["sandbox_network"]),
+            deposito_attivo=bool(self.settings["deposito_risultati"]),
+            deposito_max_mb=int(self.settings["deposito_max_mb"]),
         )
 
 
@@ -878,17 +940,45 @@ def pending_attachments(session_id: str) -> list[dict[str, Any]]:
     ]
 
 
-def session_stats(session_id: str) -> dict[str, Any]:
+def contesto_usato(session_id: str) -> int:
+    """Quanti token occupa la conversazione, ricalcolati solo se serve.
+
+    Ricostruire i messaggi per l'API e stimarli costa quanto **tutta** la
+    cronologia: su una chat da cinquecento messaggi sono decine di
+    millisecondi, e ``session_stats`` viene chiamata a ogni apertura, a ogni
+    fine turno, a ogni invio e a ogni riallineamento. Il numero pero' cambia
+    solo quando cambia uno dei suoi ingredienti, e sono tutti a portata di
+    mano: quanti messaggi ci sono, e le due manopole che decidono cosa entra
+    in contesto. L'intestazione dell'ambiente e il system prompt entrano per
+    lunghezza -- basta a distinguerli, e non costa una copia.
+    """
     messages = STATE.messages(session_id)
+    prompt = STATE.system_prompt()
+    header = STATE.context_header(session_id)
+    strip = bool(STATE.settings["strip_think_from_context"])
+    compatta = bool(STATE.settings["compact_old_tool_results"])
+    chiave = (len(messages), len(prompt), len(header), strip, compatta)
+
+    sessione = STATE.session(session_id)
+    memo = sessione.get("_contesto_memo")
+    if isinstance(memo, tuple) and memo[0] == chiave:
+        return memo[1]
+
     api_messages = agent_mod.build_api_messages(
         messages,
-        system_prompt=STATE.system_prompt(),
-        env_header=STATE.context_header(session_id),
-        strip_thinking=bool(STATE.settings["strip_think_from_context"]),
-        compact_old_tools=bool(STATE.settings["compact_old_tool_results"]),
+        system_prompt=prompt,
+        env_header=header,
+        strip_thinking=strip,
+        compact_old_tools=compatta,
     )
+    usato = estimate_messages_tokens(api_messages) + STATE.tool_schema_tokens()
+    sessione["_contesto_memo"] = (chiave, usato)
+    return usato
+
+
+def session_stats(session_id: str) -> dict[str, Any]:
     return {
-        "context_used": estimate_messages_tokens(api_messages) + STATE.tool_schema_tokens(),
+        "context_used": contesto_usato(session_id),
         "context_window": int(STATE.settings["num_ctx"]),
         "touched_files": sorted(STATE.touched(session_id)),
         # Solo quelli ancora in attesa di partire: gli altri stanno gia'
@@ -899,17 +989,41 @@ def session_stats(session_id: str) -> dict[str, Any]:
         "attachments": pending_attachments(session_id),
         "vision": STATE.vision_enabled(),
         "memories": len(STATE.memories),
-        "sessions": session_list(),
+        "sessions": elenco_corrente(),
         "session_id": session_id,
     }
 
 
-def session_list() -> list[dict[str, Any]]:
+def session_list(*, cartella: str = "", solo_libere: bool = False) -> list[dict[str, Any]]:
+    """Elenco di conversazioni, con lo stato "sta girando" gia' dentro.
+
+    ``cartella`` -> le chat di quel vault. ``solo_libere`` -> l'elenco
+    generale, da cui le chat dei vault sono escluse: si arriva a quelle
+    aprendo il vault, e vederle anche qui vorrebbe dire lo stesso posto in due
+    elenchi diversi.
+    """
     running = RUNNERS.running_ids()
-    sessions = session_mod.list_sessions()
+    sessions = session_mod.list_sessions(
+        cartella=cartella,
+        escludi=[v["path"] for v in _registro_vault()] if solo_libere else (),
+    )
     for item in sessions:
         item["running"] = item["id"] in running
     return sessions
+
+
+def elenco_corrente() -> list[dict[str, Any]]:
+    """L'elenco che va nella colonna di sinistra: le conversazioni **libere**.
+
+    Prima cambiava sotto i piedi -- dentro un vault diventava l'elenco di quel
+    vault -- e le conversazioni recenti sparivano finche' non si usciva. Ma
+    aprire un vault non e' andarsene: si apre un posto di lavoro, e le chat di
+    quel posto ora stanno **sotto di lui**, annidate nella sezione Vault (vedi
+    ``/api/vaults/home``). Cosi' i due elenchi sono visibili insieme e nessuno
+    dei due copre l'altro; l'unico posto in cui una chat compare due volte non
+    esiste, perche' qui i vault restano esclusi come sempre.
+    """
+    return session_list(solo_libere=True)
 
 
 # ---------------------------------------------------------------------------
@@ -987,6 +1101,10 @@ def start_turn(
                 skills_block=STATE.skills_block(ultima_richiesta(messages)),
                 compact_history=bool(STATE.settings["compact_history"]),
                 soglia=float(STATE.settings["compact_threshold"]),
+                compact_max_tokens=int(STATE.settings["compact_max_tokens"]),
+                libreria_attiva=bool(STATE.settings["libreria_concetti"]),
+                estratto_pensiero=bool(STATE.settings["estratto_pensiero"]),
+                spec_delega=bool(STATE.settings["spec_delega"]),
                 auto_preview=bool(STATE.settings["preview_enabled"]),
                 think_watchdog=bool(STATE.settings["think_watchdog"]),
             )
@@ -1016,7 +1134,12 @@ def start_turn(
         except Exception as exc:  # noqa: BLE001 - l'errore va mostrato, non nascosto
             runner.emit(sse("error", {"message": f"{type(exc).__name__}: {exc}"}))
         finally:
-            STATE.save(session_id)
+            # Riscrittura completa della coda, una volta per turno: durante il
+            # turno si accoda, e l'accodamento non vede le modifiche fatte a
+            # messaggi gia' scritti (la traccia del pensiero che si attacca
+            # all'assistente del passo prima, una compattazione). Qui la
+            # cronologia e' ferma, ed e' il posto giusto per rimetterla in pari.
+            STATE.save(session_id, riscrivi=True)
             runner.emit(sse("state", session_stats(session_id)))
             # Fine turno su TUTTE le interfacce: chi ha la chat aperta la
             # ricarica dal disco (ora c'e' il messaggio finale), gli altri
@@ -1162,6 +1285,49 @@ def index() -> Response:
 
 @app.get("/api/bootstrap")
 def bootstrap() -> dict[str, Any]:
+    """Tutto quello che serve a disegnare la pagina, e **niente di remoto**.
+
+    Qui dentro si facevano tre viaggi di rete verso il server del modello --
+    ``status()``, ``version()``, ``streams_tool_calls()`` -- prima di
+    rispondere. Con il modello su un'altra macchina spenta erano fino a una
+    decina di secondi di **pagina bianca**: non un'interfaccia lenta, proprio
+    nessuna interfaccia, mentre tutto cio' che serviva a disegnarla (le
+    impostazioni, la conversazione, le memorie) era gia' su questo disco.
+
+    Adesso la pagina si disegna con ``online: null`` -- la goccia dice
+    "controllo..." -- e la sonda va per conto suo su ``/api/backend``. Chi ha
+    il modello acceso non se ne accorge: e' un giro di rete in piu' su una
+    pagina gia' viva.
+    """
+    session_id = STATE.last_opened
+    backend = STATE.backend()
+    return {
+        "app": {"name": APP_NAME, "version": APP_VERSION},
+        "settings": STATE.settings,
+        "session": open_payload(session_id),
+        "memories": STATE.memories,
+        "backend": {
+            "name": backend.name,
+            # None = non ancora chiesto. La goccia sa gia' disegnare i tre
+            # stati (in attesa, online, offline).
+            "online": None,
+            "detail": "",
+            "url": normalise_base_url(STATE.settings["api_base"]),
+            "version": "",
+            "models": [],
+            "streams_tools": None,
+        },
+    }
+
+
+@app.get("/api/backend")
+def backend_info() -> dict[str, Any]:
+    """La sonda che il bootstrap non fa piu': stato, versione, modelli.
+
+    Tre domande al server del modello in una richiesta sola, perche' sono tre
+    round-trip e farne tre richieste separate dal client vorrebbe dire tre
+    attese in fila invece di una.
+    """
     backend = STATE.backend()
     if hasattr(backend, "status"):
         online, detail, models = backend.status()
@@ -1179,30 +1345,46 @@ def bootstrap() -> dict[str, Any]:
         STATE.forget_backend()
         STATE.persist()
 
-    session_id = STATE.last_opened
     return {
-        "app": {"name": APP_NAME, "version": APP_VERSION},
-        "settings": STATE.settings,
-        "session": open_payload(session_id),
-        "memories": STATE.memories,
-        "backend": {
-            "name": backend.name,
-            "online": online,
-            "detail": detail,
-            "url": normalise_base_url(STATE.settings["api_base"]),
-            "version": backend.version() if hasattr(backend, "version") else "",
-            "models": models,
-            "streams_tools": (
-                backend.streams_tool_calls()
-                if hasattr(backend, "streams_tool_calls")
-                else None
-            ),
-        },
+        "name": backend.name,
+        "online": online,
+        "detail": detail,
+        "url": normalise_base_url(STATE.settings["api_base"]),
+        "version": backend.version() if hasattr(backend, "version") else "",
+        "models": models,
+        "streams_tools": (
+            backend.streams_tool_calls()
+            if hasattr(backend, "streams_tool_calls")
+            else None
+        ),
+        # Se e' stato sostituito, il client deve saperlo: la tendina in alto
+        # mostrerebbe ancora quello che non c'e' piu'.
+        "model_name": STATE.settings["model_name"],
     }
+
+
+# Quanti messaggi viaggiano all'apertura di una conversazione.
+#
+# Una chat agentica lunga sono migliaia di messaggi, per la gran parte
+# risultati di tool: mandarli tutti voleva dire megabyte di JSON e qualche
+# secondo di disegno prima che si vedesse qualcosa -- per arrivare, nove volte
+# su dieci, in fondo, dove sta l'unica cosa che si stava andando a leggere.
+# Quindici coprono l'ultimo scambio con i suoi tool; il resto arriva
+# risalendo, un blocco per volta. Erano quaranta, ed e' stato un errore di
+# taratura misurato: sulla chat piu' pesante di questa postazione la coda
+# passa da 288 kB a 116, ma il numero che conta non e' quello -- sono le
+# **tendine**, perche' ogni risultato di tool diventa nodi nel DOM e quaranta
+# messaggi di una chat agentica sono in maggioranza risultati di tool.
+MESSAGGI_PER_PAGINA = 15
 
 
 def open_payload(session_id: str) -> dict[str, Any]:
     """Tutto il necessario per disegnare una conversazione.
+
+    ``messages`` e' la **coda** della cronologia, non tutta: gli ultimi
+    ``MESSAGGI_PER_PAGINA``, con ``messages_offset`` a dire da che punto
+    comincia e ``messages_total`` quanti ce ne sono. I precedenti si chiedono
+    a ``/api/sessions/{id}/messages`` risalendo.
 
     Se un turno e' in corso, ``messages`` e' la cronologia com'era *prima*
     dell'inizio del turno: il client la disegna e poi si attacca allo stream,
@@ -1211,9 +1393,18 @@ def open_payload(session_id: str) -> dict[str, Any]:
     messages = STATE.messages(session_id)
     runner = RUNNERS.get(session_id)
     live = runner is not None and not runner.finished.is_set()
+    completi = runner.snapshot if live else messages
+    coda = completi[-MESSAGGI_PER_PAGINA:] if MESSAGGI_PER_PAGINA else completi
     return {
         "session_id": session_id,
-        "messages": runner.snapshot if live else messages,
+        "messages": coda,
+        # Dove comincia quello che si sta mandando, e quanti ce ne sono in
+        # tutto: sono i due numeri che permettono al client di sapere che c'e'
+        # dell'altro sopra e da che punto chiederlo. Senza il totale, "sono
+        # arrivato in cima" sarebbe indistinguibile da "il server non ne ha
+        # mandati abbastanza".
+        "messages_offset": len(completi) - len(coda),
+        "messages_total": len(completi),
         "running": live,
         "pending": agent_mod.pending_question(messages),
         # Il piano viene dal disco, non dagli eventi: riaprendo una
@@ -1246,8 +1437,16 @@ def open_payload(session_id: str) -> dict[str, Any]:
 
 
 @app.get("/api/sessions")
-def list_sessions() -> dict[str, Any]:
-    return {"sessions": session_list(), "current": STATE.last_opened}
+def list_sessions(tutte: bool = False) -> dict[str, Any]:
+    """Conversazioni per la colonna di sinistra.
+
+    ``tutte=1`` le da' invece **tutte**, chat dei vault comprese. Lo usa il
+    telefono, che di vault non sa niente: li' un elenco solo e' l'unico
+    elenco che c'e', e togliergli le chat dei vault vorrebbe dire renderle
+    irraggiungibili da fuori casa.
+    """
+    sessions = session_list() if tutte else elenco_corrente()
+    return {"sessions": sessions, "current": STATE.last_opened}
 
 
 @app.get("/api/sessions/search")
@@ -1268,12 +1467,10 @@ def search_sessions(q: str = "", limit: int = 40) -> dict[str, Any]:
 
 @app.post("/api/sessions")
 def create_session() -> dict[str, Any]:
-    if not RUNNERS.running_ids():
-        # Cambio conversazione: le anteprime della precedente tengono tutto
-        # l'intervallo di porte pubblicato finche' vive il container. Si
-        # smonta qui; se in qualche chat ci fosse un turno davvero in corso
-        # la sandbox e' occupata per buono e si lascia toccare.
-        STATE.ferma_anteprime()
+    # La chat nuova nasce sulla cartella corrente: non si cambia posto, quindi
+    # l'unico motivo per smontare e' un'app rimasta viva nella conversazione
+    # da cui veniamo. Vedi ``smonta_se_serve``.
+    smonta_se_serve()
     nuovo = STATE.new_session()
     # Una chat creata dal telefono (o da un'altra finestra) deve comparire
     # nell'elenco delle altre senza refresh manuale.
@@ -1293,13 +1490,86 @@ def open_session(session_id: str) -> dict[str, Any]:
     # una chat cancellerebbe il ricordo della chat da cui vieni.
     STATE.last_opened = session_id
     if not RUNNERS.running_ids():
-        # Stessa regola della creazione: si liberano le porte delle app che
-        # restavano in piedi nella conversazione da cui venivamo. Senza questo
-        # un nuovo turno riproverebbe a pubblicare le stesse porte e fallirebbe
-        # al bind con "port is already allocated".
-        STATE.ferma_anteprime()
+        # Si liberano le porte delle app che restavano in piedi nella
+        # conversazione da cui venivamo -- ma solo quando serve davvero: vedi
+        # ``smonta_se_serve``, che e' la differenza fra due sottoprocessi
+        # docker ad ogni apertura di chat e zero.
+        smonta_se_serve(session_id)
         ripristina_workspace(session_id)
     return open_payload(session_id)
+
+
+def cambiera_cartella(session_id: str) -> bool:
+    """La conversazione che si sta per aprire porta altrove?
+
+    Domanda a costo zero -- due stringhe normalizzate -- che serve a non
+    pagarne una cara.
+    """
+    registrato = STATE.workspace_di(session_id)
+    if not registrato or not Path(registrato).expanduser().is_dir():
+        return False
+    return session_mod.chiave_cartella(registrato) != session_mod.chiave_cartella(
+        str(STATE.settings["workspace_dir"])
+    )
+
+
+def smonta_se_serve(session_id: str = "") -> None:
+    """Smonta il container solo quando c'e' davvero un motivo.
+
+    ``ferma_anteprime`` esiste per liberare le porte pubblicate, e le porte
+    danno fastidio in due casi soltanto: quando si sta per cambiare cartella
+    (il container nuovo proverebbe a pubblicare le stesse) e quando in questa
+    c'e' un'app viva da fermare. Fuori da quei due casi smontare e' lavoro
+    contro se' stessi -- il container e' senza stato e si ricrea uguale, e nel
+    frattempo si sono pagati un ``docker inspect`` e un ``docker rm`` **ad
+    ogni apertura di conversazione**.
+
+    Da quando immagine e container si preparano da soli al cambio di cartella
+    (``maybe_prepare_workspace``) non e' piu' solo uno spreco: e' distruggere
+    esattamente la cosa che si era appena finito di preparare.
+
+    ``background_live`` guarda un marchio su disco, non Docker: costa una stat.
+    """
+    if RUNNERS.running_ids():
+        # Un turno vivo tiene la sandbox occupata per buono: non si tocca.
+        return
+    ws = str(STATE.settings["workspace_dir"])
+    chiave = session_mod.chiave_cartella(ws)
+    subito = (
+        # 1. Si va altrove: il container della cartella nuova proverebbe a
+        #    pubblicare le stesse porte e fallirebbe al bind.
+        bool(session_id and cambiera_cartella(session_id))
+        # 2. C'e' un'app viva da fermare davvero (marchio su disco, non Docker).
+        or sandbox_mod.background_live(ws)
+        # 3. Una conversazione ha l'anteprima di un'app: quella tiene le porte
+        #    anche quando il marchio manca. E' la chat che ha fatto partire un
+        #    server ed e' stata lasciata li'.
+        or any(
+            (s.get("preview") or {}).get("kind") == "serve"
+            for s in STATE._sessions.values()
+        )
+    )
+    # 4. Prima volta in questa cartella, in questo processo: la spazzata dei
+    #    container rimasti in piedi da prima di un riavvio. Una volta sola --
+    #    rifarla ad ogni apertura di chat era un ``docker inspect`` per
+    #    scoprire, quasi sempre, che era gia' tutto pulito.
+    spazzata = chiave not in STATE._spazzate
+    STATE._spazzate.add(chiave)
+
+    if subito:
+        # Qui si aspetta, e si deve: il container nuovo nasce subito dopo
+        # (``ripristina_workspace`` -> ``maybe_prepare_workspace``) e
+        # troverebbe le porte ancora prese.
+        STATE.ferma_anteprime()
+    elif spazzata:
+        # Qui no: non c'e' niente che dipenda dall'esito, e il risultato quasi
+        # sempre e' "era gia' tutto pulito". Su Windows ogni ``docker`` e' un
+        # processo nuovo da mezzo secondo buono, e pagarlo **dentro** la
+        # richiesta significa una prima apertura di chat che sembra impiantata.
+        threading.Thread(
+            target=STATE.ferma_anteprime, daemon=True, name="spazzata-sandbox"
+        ).start()
+
 
 
 def ripristina_workspace(session_id: str) -> bool:
@@ -1348,6 +1618,33 @@ def read_session(session_id: str) -> dict[str, Any]:
     return open_payload(session_id)
 
 
+@app.get("/api/sessions/{session_id}/messages")
+def read_messages(session_id: str, before: int, limit: int = MESSAGGI_PER_PAGINA) -> dict[str, Any]:
+    """Il blocco di messaggi che sta **prima** di ``before``.
+
+    ``before`` e' un indice nella cronologia, non un id: e' l'``offset`` che
+    il client ha ricevuto con il blocco che ha gia' in mano, e chiedere
+    "quello che viene prima di questo" e' l'unica domanda che la risalita
+    pone. Un cursore per id costringerebbe a scandire la lista per ritrovarlo,
+    e i messaggi di una conversazione un id non ce l'hanno nemmeno.
+
+    Durante un turno vivo si legge dallo snapshot del runner e non dal disco,
+    o risalendo in una chat in corso si vedrebbe una cronologia piu' corta di
+    quella disegnata.
+    """
+    runner = RUNNERS.get(session_id)
+    live = runner is not None and not runner.finished.is_set()
+    completi = runner.snapshot if live else STATE.messages(session_id)
+    fine = max(0, min(int(before), len(completi)))
+    inizio = max(0, fine - max(1, int(limit)))
+    return {
+        "session_id": session_id,
+        "messages": completi[inizio:fine],
+        "messages_offset": inizio,
+        "messages_total": len(completi),
+    }
+
+
 @app.delete("/api/sessions/{session_id}")
 def delete_session(session_id: str) -> dict[str, Any]:
     if RUNNERS.is_running(session_id):
@@ -1357,10 +1654,9 @@ def delete_session(session_id: str) -> dict[str, Any]:
     if STATE.last_opened == session_id:
         STATE.new_session()
     EVENTS.publish("sessions", reason="deleted", session_id=session_id)
-    if not RUNNERS.running_ids():
-        # Una chat cancellata non deve lasciare le sue anteprime a tenere le
-        # porte fino al riavvio dell'app.
-        STATE.ferma_anteprime()
+    # Una chat cancellata non deve lasciare le sue anteprime a tenere le porte
+    # fino al riavvio dell'app.
+    smonta_se_serve()
     return open_payload(STATE.last_opened)
 
 
@@ -1482,6 +1778,30 @@ def models() -> dict[str, Any]:
     }
 
 
+@app.get("/api/ping")
+def ping_backend() -> dict[str, Any]:
+    """Solo lo stato dell'endpoint, senza effetti collaterali.
+
+    La goccia in alto la interroga a intervalli. ``/api/models`` avrebbe
+    detto la stessa cosa, ma sceglie anche un modello sostitutivo e riscrive
+    le impostazioni su disco: legare quell'effetto a un timer vorrebbe dire
+    che il modello configurato puo' cambiare mentre nessuno guarda.
+
+    Serve perche' la goccia si calcolava **una volta sola**, al caricamento
+    della pagina. Chi accende llama-server dopo aver aperto la UI vedeva
+    "offline" per sempre, senza nessun modo di farle cambiare idea che non
+    fosse un F5.
+    """
+    backend = STATE.backend()
+    online, detail = backend.ping()
+    return {
+        "online": online,
+        "detail": detail,
+        "name": backend.name,
+        "url": normalise_base_url(STATE.settings["api_base"]),
+    }
+
+
 @app.get("/api/profile")
 def recommended_profile() -> dict[str, Any]:
     """Parametri consigliati per il modello selezionato.
@@ -1502,7 +1822,15 @@ def recommended_profile() -> dict[str, Any]:
     info = STATE.backend().model_info(model) if hasattr(STATE.backend(), "model_info") else {}
     mb_per_token = profiles.kv_mb_per_token(info.get("model_info") if info else None)
 
-    if free_mb:
+    # Se il server dichiara la sua finestra (llama-server: -c al lancio), non
+    # c'e' niente da consigliare: quello **e'** il contesto. Proporne un altro
+    # sarebbe un consiglio che il server ignorera' comunque.
+    dal_server = getattr(STATE.backend(), "server_num_ctx", None)
+    fissato = dal_server() if callable(dal_server) else None
+
+    if fissato:
+        suggested_ctx = int(fissato)
+    elif free_mb:
         suggested_ctx = profiles.context_for_vram(free_mb, mb_per_token)
     else:
         # VRAM sconosciuta: e' il caso normale con Ollama su un'altra macchina
@@ -1521,6 +1849,8 @@ def recommended_profile() -> dict[str, Any]:
         "free_vram_mb": free_mb,
         "vram": vram,
         "kv_mb_per_token": round(mb_per_token, 4) if mb_per_token else None,
+        # Non None = il contesto non e' un consiglio ma un dato del server.
+        "server_num_ctx": int(fissato) if fissato else None,
         "vision": STATE.vision_enabled(),
         "thinking": thinking,
     }
@@ -1593,7 +1923,22 @@ def _vram_snapshot() -> dict[str, Any]:
         return {"source": None, "remote": False, "free": None}
 
     backend = STATE.backend()
-    loaded = backend.loaded_models() if hasattr(backend, "loaded_models") else []
+    if not hasattr(backend, "loaded_models"):
+        # llama-server non espone la VRAM: nessuna rotta dice cosa c'e' sulla
+        # scheda. Rispondere "occupato 0, quindi libera tutta" sarebbe la
+        # bugia peggiore possibile -- il modello e' li' che occupa 18 GB, e
+        # il contesto consigliato verrebbe calcolato su una scheda vuota.
+        # Meglio dichiarare di non sapere: con llama.cpp il numero che conta
+        # e' comunque il num_ctx del server, che si legge da /props.
+        return {
+            "source": None,
+            "remote": True,
+            "host": urlparse(normalise_base_url(api_base)).hostname,
+            "used": None,
+            "total": declared or None,
+            "free": None,
+        }
+    loaded = backend.loaded_models()
     used_mb = sum(int(m.get("size_vram") or 0) for m in loaded) // (1024 * 1024)
     snapshot: dict[str, Any] = {
         "source": "ollama /api/ps",
@@ -1723,30 +2068,71 @@ def prep_docker() -> dict[str, Any]:
 
 @app.post("/api/prep/image")
 def prep_image() -> dict[str, Any]:
-    def seleziona(tag: str) -> None:
-        # Costruirla e non usarla sarebbe il peggio dei due mondi: si paga la
-        # build e i comandi continuano a girare sull'immagine di serie.
-        STATE.settings["docker_image"] = tag
-        STATE.persist()
+    """Costruisce l'immagine adesso, che l'automatismo l'abbia gia' fatto o no.
 
-    PREP.build_image(str(STATE.settings["workspace_dir"]), on_done=seleziona)
+    E' la voce "Crea l'immagine" della tendina della cartella: un gesto
+    esplicito, quindi non passa da ``image_needed`` -- chi la chiede a mano la
+    vuole rifare, ed e' il rimedio quando il Dockerfile e' cambiato.
+    """
+    PREP.build_image(
+        str(STATE.settings["workspace_dir"]), on_done=seleziona_immagine
+    )
     return {"job": PREP.image.snapshot()}
 
 
-def maybe_prepare_workspace() -> None:
-    """Costruisce l'immagine del workspace corrente, se serve e se e' voluto.
+@app.post("/api/prep/container")
+def prep_container() -> dict[str, Any]:
+    """Crea il container adesso. E' la voce "Crea il container" della tendina."""
+    PREP.ensure_container(
+        str(STATE.settings["workspace_dir"]),
+        image=str(STATE.settings["docker_image"]),
+        network=bool(STATE.settings["sandbox_network"]),
+        ports=STATE.preview_ports(),
+    )
+    return {"job": PREP.container.snapshot()}
 
-    Chiamata quando il workspace cambia. ``image_needed`` e' quello che evita
-    di far partire una build da minuti ad ogni cambio di cartella: se
-    l'immagine c'e' gia', o l'utente ne ha scelta una sua, non si tocca niente.
+
+def maybe_prepare_workspace() -> None:
+    """Prepara l'ambiente della cartella appena aperta: immagine, poi container.
+
+    Chiamata quando il workspace **cambia** davvero (``ripristina_workspace``
+    esce prima se la cartella e' la stessa), e non ad ogni apertura di chat.
+
+    ## Perche' non fa piu' niente qui dentro
+
+    Prima questa funzione chiamava ``image_needed``, che fa un ``docker
+    version`` e un ``docker images``: due sottoprocessi **sul filo della
+    richiesta HTTP**, cioe' dentro l'apertura di una conversazione. Su Windows
+    sono decimi di secondo buoni ciascuno, e si pagavano ad ogni cambio di
+    cartella per scoprire, quasi sempre, che non c'era niente da fare.
+
+    Adesso la decisione la prende il thread di preparazione: qui resta un
+    controllo di sole impostazioni, che costa un accesso a un dizionario.
     """
-    if not STATE.settings.get("image_autobuild"):
-        return
     if str(STATE.settings["sandbox"]) != "docker":
         return
-    workspace = str(STATE.settings["workspace_dir"])
-    if image_needed(workspace, str(STATE.settings["docker_image"])):
-        prep_image()
+    PREP.prepara(
+        str(STATE.settings["workspace_dir"]),
+        image=str(STATE.settings["docker_image"]),
+        network=bool(STATE.settings["sandbox_network"]),
+        ports=STATE.preview_ports(),
+        # L'interruttore vale per l'immagine, non per il container: senza
+        # container l'agente non ha dove eseguire, e crearlo quando manca non
+        # scavalca nessuna scelta dell'utente.
+        costruisci_immagine=bool(STATE.settings.get("image_autobuild")),
+        on_image=seleziona_immagine,
+    )
+
+
+def seleziona_immagine(tag: str) -> None:
+    """L'immagine appena costruita diventa quella in uso.
+
+    Costruirla e non usarla sarebbe il peggio dei due mondi: si paga la build
+    e i comandi continuano a girare sull'immagine di serie, senza pytest ne'
+    git.
+    """
+    STATE.settings["docker_image"] = tag
+    STATE.persist()
 
 
 RECENT_WORKSPACES_MAX = 6
@@ -1825,6 +2211,54 @@ def preview_file(path: str) -> FileResponse:
         # e' esattamente il caso in cui non si vuole.
         headers={"X-Content-Type-Options": "nosniff", "Cache-Control": "no-store"},
     )
+
+
+class PreviewHostRequest(BaseModel):
+    path: str
+
+
+@app.post("/api/preview/host")
+def preview_host(req: PreviewHostRequest) -> dict[str, Any]:
+    """Apparecchia la cartella e ritorna l'indirizzo vivo di una pagina.
+
+    Perche' e' una POST e non una GET: ha due effetti collaterali veri --
+    sceglie la radice servita e, la prima volta, accende il server delle
+    anteprime. Una GET che cambia lo stato del server e' il genere di cosa che
+    un prefetch del browser esegue per conto suo.
+
+    La radice la calcola il server e non il client, per la ragione di sempre:
+    ``preview_root`` e' gia' scritta una volta in ``core/tools.py`` e la usa
+    anche il tool. Due implementazioni della stessa domanda divergono, e la
+    seconda e' quella che nessuno ricorda di aggiornare.
+    """
+    workspace = str(STATE.settings["workspace_dir"])
+    try:
+        target = resolve_path(workspace, req.path)
+    except WorkspaceError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    if not target.is_file():
+        raise HTTPException(404, "File non trovato.")
+
+    radice_rel = preview_root(workspace, req.path)
+    radice = resolve_path(workspace, radice_rel or ".")
+    # La radice si mette prima di accendere: cosi' non esiste un istante in
+    # cui il server e' su e servirebbe ancora la cartella di prima.
+    previewhost.set_root(radice)
+    origine = previewhost.ensure_running(
+        int(STATE.settings.get("preview_host_port") or 0)
+    )
+    if not origine:
+        # Porta spenta dall'utente, o dieci porte occupate di fila. Il client
+        # sa ripiegare sull'iframe con origine opaca: si vede la pagina senza
+        # storage ne' moduli, che e' meno di prima ma non e' niente.
+        return {"origin": None, "url": None, "root": radice_rel}
+
+    rel = target.resolve().relative_to(radice.resolve()).as_posix()
+    return {
+        "origin": origine,
+        "url": f"{origine}/{quote(rel)}",
+        "root": radice_rel,
+    }
 
 
 @app.get("/api/sandbox")
@@ -1945,7 +2379,9 @@ def remove_attachment(session_id: str, name: str) -> dict[str, Any]:
     except OSError:
         pass          # il file puo' essere stato rimosso a mano: non e' un errore
     entries[:] = keep
-    STATE.save(session_id)
+    # Il ciclo qui sopra ha tolto l'allegato da messaggi che possono essere
+    # ovunque nella cronologia: la coda va rifatta, non accodata.
+    STATE.save(session_id, riscrivi=True)
     return {"attachments": entries, "stats": session_stats(session_id)}
 
 
@@ -2191,11 +2627,11 @@ def pick_workspace() -> dict[str, Any]:
 
 
 class VaultRequest(BaseModel):
-    # ``path`` e' la cartella del vault; se non ha ancora la struttura
-    # LLM Wiki viene creata al volo (raw/, wiki/, schema, indici).
+    # ``path`` e' la cartella del vault. Registrarla scrive ``.vault.json``;
+    # la struttura LLM Wiki si crea **solo** se il vault e' una wiki.
     path: str
-    # Nome breve mostrato nella colonna di sinistra e usato dal tool
-    # vault_search per riferirsi al vault.
+    # Nome breve mostrato nella colonna di sinistra. Se il vault ha gia' un
+    # ``.vault.json``, quello vince: l'identita' sta nella cartella.
     nome: str = ""
 
 
@@ -2205,14 +2641,39 @@ class VaultOpenRequest(BaseModel):
     path: str = ""
 
 
+class VaultPatchRequest(BaseModel):
+    """Modifica dell'identita' di un vault. Solo i campi passati cambiano."""
+
+    path: str
+    nome: str | None = None
+    descrizione: str | None = None
+    # Le sole che arrivano al modello: vedi ``core/vault.py``.
+    istruzioni: str | None = None
+    wiki: bool | None = None
+    # La memoria del vault. Dall'interfaccia si puo' solo **togliere**: la
+    # scrive il modello mentre lavora, e un campo libero in cui riscriverla a
+    # mano sarebbe un secondo posto da cui puo' divergere.
+    note: list[str] | None = None
+
+
 def _registro_vault() -> list[dict[str, Any]]:
     return [v for v in (STATE.settings.get("vaults") or []) if str(v.get("path", "")).strip()]
 
 
+def _voce_vault(path: str, nome: str = "") -> dict[str, Any]:
+    """Una riga d'elenco completa: identita', conteggi, chat, se e' aperto."""
+    corrente = session_mod.chiave_cartella(str(STATE.settings["workspace_dir"]))
+    info = vault_mod.info_vault(
+        path, nome, chat=len(session_mod.list_sessions(limit=999, cartella=path))
+    )
+    voce = info.as_dict()
+    voce["attivo"] = session_mod.chiave_cartella(path) == corrente
+    return voce
+
+
 @app.get("/api/vaults")
 def lista_vault() -> dict[str, Any]:
-    """Elenco dei vault registrati, con le statistiche economiche."""
-    corrente = os.path.normcase(os.path.normpath(str(STATE.settings["workspace_dir"])))
+    """Elenco dei vault registrati, con identita' e conteggi."""
     voci: list[dict[str, Any]] = []
     for v in _registro_vault():
         path = str(v.get("path"))
@@ -2220,28 +2681,82 @@ def lista_vault() -> dict[str, Any]:
             # Come per i recent_workspaces: un vault cancellato non deve
             # restare nella tendina a suggerire errori.
             continue
-        info = vault_mod.info_vault(path, str(v.get("nome") or ""))
-        voce = info.as_dict()
-        voce["attivo"] = os.path.normcase(os.path.normpath(path)) == corrente
-        voci.append(voce)
+        voci.append(_voce_vault(path, str(v.get("nome") or "")))
     return {"vaults": voci}
+
+
+@app.get("/api/vaults/home")
+def home_vault(path: str) -> dict[str, Any]:
+    """Tutto quello che serve alla schermata iniziale di un vault.
+
+    Una chiamata sola e non tre: identita', conteggi ed elenco delle chat si
+    guardano insieme, e chiederli separatamente vorrebbe dire disegnare la
+    schermata a pezzi mentre le risposte arrivano.
+    """
+    if not os.path.isdir(path):
+        raise HTTPException(404, f"'{path}' non e' una cartella esistente.")
+    return {
+        "vault": _voce_vault(path),
+        "sessions": session_list(cartella=path),
+    }
+
+
+@app.patch("/api/vaults")
+def modifica_vault(request: VaultPatchRequest) -> dict[str, Any]:
+    """Cambia nome, descrizione, istruzioni o modalita' wiki di un vault.
+
+    Scrive in ``.vault.json``, cioe' **dentro la cartella**: il vault resta
+    quello che dice di essere anche se lo si sposta o lo si apre da un'altra
+    macchina, e il registro nelle preferenze torna a essere solo un elenco di
+    percorsi conosciuti.
+    """
+    base = Path(request.path).expanduser()
+    if not base.is_dir():
+        raise HTTPException(400, f"'{request.path}' non e' una cartella esistente.")
+    if request.wiki:
+        # Accendere la wiki senza la sua struttura darebbe un manutentore che
+        # fallisce alla prima ingest: le due cose si fanno insieme.
+        vault_mod.abilita_wiki(base)
+    vault_mod.aggiorna_config(
+        base,
+        nome=request.nome,
+        descrizione=request.descrizione,
+        istruzioni=request.istruzioni,
+        wiki=request.wiki,
+        note=tuple(request.note) if request.note is not None else None,
+    )
+    # Il nome nel registro e' solo un ripiego per quando il file non c'e':
+    # tenerlo allineato evita che l'elenco mostri il vecchio nome finche' la
+    # cartella non e' raggiungibile.
+    registro = _registro_vault()
+    chiave = session_mod.chiave_cartella(str(base))
+    for v in registro:
+        if session_mod.chiave_cartella(v["path"]) == chiave:
+            v["nome"] = vault_mod.leggi_config(base).nome
+    STATE.settings["vaults"] = registro
+    STATE.persist()
+    return {"vault": _voce_vault(str(base))}
 
 
 @app.post("/api/vaults")
 def registra_vault(request: VaultRequest) -> dict[str, Any]:
-    """Registra un vault (creando la struttura se manca) nel registro."""
+    """Registra un vault: scrive la sua identita' e lo mette nel registro."""
     path = Path(request.path).expanduser()
     if not path.is_dir():
         raise HTTPException(400, f"'{request.path}' non e' una cartella esistente.")
     path = path.resolve()
-    nome = request.nome.strip() or path.name
+    # Qui la cartella diventa un vault: ``.vault.json`` con il nome, e la
+    # struttura wiki solo se e' una wiki (una cartella qualsiasi non deve
+    # ritrovarsi raw/ e wiki/ che non ha chiesto).
+    vault_mod.ensure_vault(path, nome=request.nome.strip())
+    nome = vault_mod.leggi_config(path).nome
     registro = _registro_vault()
-    chiave = os.path.normcase(os.path.normpath(str(path)))
-    if not any(os.path.normcase(os.path.normpath(v["path"])) == chiave for v in registro):
+    chiave = session_mod.chiave_cartella(str(path))
+    if not any(session_mod.chiave_cartella(v["path"]) == chiave for v in registro):
         registro.append({"path": str(path), "nome": nome})
         STATE.settings["vaults"] = registro
         STATE.persist()
-    return {"vault": vault_mod.info_vault(path, nome).as_dict()}
+    return {"vault": _voce_vault(str(path), nome)}
 
 
 @app.post("/api/vaults/pick")
@@ -2266,10 +2781,6 @@ def scegli_vault_con_dialogo() -> dict[str, Any]:
     if not scelto:
         return {"cancelled": True}
 
-    # Qui, diversamente che da /api/vaults, la cartella scelta e' dichiarata
-    # come "nuovo vault": la struttura LLM Wiki si crea subito, cosi' la voce
-    # che torna alla UI mostra gia' indice e log e il vault e' interrogabile.
-    vault_mod.ensure_vault(Path(scelto).expanduser())
     voce = registra_vault(VaultRequest(path=scelto))
     return {"cancelled": False, "vault": voce["vault"]}
 
@@ -2317,6 +2828,11 @@ def apri_vault(request: VaultOpenRequest) -> dict[str, Any]:
         "recent_workspaces": STATE.settings["recent_workspaces"],
         "stats": session_stats(STATE.last_opened),
         "jobs": PREP.snapshot(),
+        # La schermata iniziale del vault si disegna con questi due, che
+        # arrivano nella stessa risposta dell'apertura: aprire un vault e'
+        # un gesto solo, e non deve costare tre richieste in fila.
+        "vault": _voce_vault(str(radice)),
+        "sessions": session_list(cartella=str(radice)),
     }
 
 

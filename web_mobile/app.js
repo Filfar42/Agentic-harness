@@ -29,6 +29,10 @@ let contaToolPasso = 0;
 // Quanto e' durato: dall'orologio mentre il turno e' vivo, dalla somma delle
 // durate dei tool quando si ridisegna una conversazione salvata -- li' il
 // tempo di parete non esiste piu', e inventarlo sarebbe peggio che tacerlo.
+// Il testo della risposta in corso, accumulato: gli eventi ``content``
+// portano solo il pezzo nuovo, e un pezzo da solo non si puo' ripulire dal
+// ``<think>`` ne' mostrare.
+let testoInCorso = "";
 let contaSecondi = 0;
 let inizioTurno = 0;
 let tickAttivita = null;
@@ -252,7 +256,9 @@ function nascondiAttivita() {
 
 async function loadSessions() {
   try {
-    const data = await api("/api/sessions");
+    // tutte=1: il telefono non ha i vault, quindi non ha nemmeno un modo di
+    // arrivare alle loro chat se il server gliele toglie dall'elenco.
+    const data = await api("/api/sessions?tutte=1");
     renderSessions(data.sessions || []);
     setBanner(null);
   } catch (err) {
@@ -643,6 +649,7 @@ function handleEvent(data) {
     case "start":
       running = true;
       inizioTurno = Date.now();
+      testoInCorso = "";
       contaPassi = 0;
       contaTool = 0;
       contaToolPasso = 0;
@@ -688,12 +695,18 @@ function handleEvent(data) {
       break;
     }
     case "content": {
-      // Il campo e' ``text`` ed e' **cumulativo** (come sul desktop). Il
-      // client mobile leggeva ``data.delta``, che non esiste: la risposta
-      // restava invisibile finche' il turno non finiva, ed era il motivo
-      // principale per cui dal telefono non si capiva se stesse lavorando.
+      // L'evento porta ``append`` (i soli caratteri nuovi) oppure ``text`` (il
+      // testo completo, che sostituisce): ne arriva uno solo dei due. Prima
+      // era sempre cumulativo, un evento per token -- e da un telefono in 4G
+      // erano megabyte per una risposta di due righe.
+      //
+      // (Storia: qui si leggeva ``data.delta``, che non e' mai esistito: la
+      // risposta restava invisibile fino a fine turno.)
       const bubble = liveBubble();
-      const clean = stripThink(data.text ?? "");
+      const grezzo = data.append
+        ? (testoInCorso += data.append)
+        : (testoInCorso = String(data.text ?? ""));
+      const clean = stripThink(grezzo);
       if (clean) bubble.textContent = clean;
       // Il messaggio sta arrivando: i passi hanno finito di servire.
       chiudiGruppoPassi();
@@ -702,6 +715,9 @@ function handleEvent(data) {
       break;
     }
     case "assistant": {
+      // Fine del passo: la versione autorevole arriva sempre intera, e da qui
+      // l'accumulo riparte da zero per il passo successivo.
+      testoInCorso = "";
       const bubble = liveBubble();
       bubble.classList.remove("live");
       const clean = stripThink(data.content ?? "");

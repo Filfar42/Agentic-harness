@@ -237,15 +237,56 @@ def test_la_colonna_di_destra_non_ha_piu_i_riquadri_traslocati():
     assert 'id="ws-browse"' not in pannello
     # contesto e consumo del turno in una scheda sola
     assert 'id="usage-block"' in pannello
-    # quattro schede in tutto: piano, note, consumo, file toccati. Erano sette.
-    assert pannello.count("<h4") == 4
+    # Quattro schede a vista: piano, note, consumo, file toccati. Erano sette.
+    # Le due del vault -- identita' e memoria -- sono **alternative** alle
+    # altre: parlano del posto in cui si sta, non della conversazione, e
+    # quando compaiono le altre quattro sono nascoste. La colonna resta magra,
+    # che e' la regola.
+    assert pannello.count("<h4") == 6
+    assert 'id="vault-card" style="display:none"' in pannello
+    assert 'id="vault-mem-card" style="display:none"' in pannello
+
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    corpo = js[js.index("function mostraVaultHome("):]
+    corpo = corpo[: corpo.index("\n}")]
+    assert "DEL_VAULT.includes(card.id)" in corpo, (
+        "le altre schede vanno nascoste quando compaiono quelle del vault"
+    )
+    # E devono tornare: si salva il display **prima** di azzerarlo, o si
+    # ricorderebbe 'none' e il piano non ricomparirebbe mai piu'.
+    assert corpo.index("dataset.vaultRestore =") < corpo.index("card.style.display = 'none'")
 
 
-def test_il_workspace_si_cambia_dalle_impostazioni_sotto_al_modello():
+def test_la_cartella_non_sta_piu_anche_nelle_impostazioni():
+    """C'era in due posti e i due facevano lo stesso identico gesto: scegliere
+    una cartella e aprirla in Esplora risorse. È rimasto quello in alto, che è
+    dove si legge dove si sta lavorando -- cercare una cosa dentro le
+    impostazioni per cambiarla è un passaggio in più per una scelta che si fa
+    mentre si lavora."""
     html = _html()
-    conn = html[html.index('id="tab-conn"'): html.index('id="tab-gen"')]
-    assert 'id="ws-path"' in conn and 'id="ws-browse"' in conn and 'id="ws-open"' in conn
-    assert conn.index('id="s-model"') < conn.index('id="ws-path"')
+    for sparito in ('id="ws-path"', 'id="ws-browse"', 'id="ws-open"'):
+        assert sparito not in html, sparito
+    # ...e il gesto non si è perso per strada: vive nella tendina in alto.
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    corpo = js[js.index("function renderWsMenu("):]
+    corpo = corpo[: corpo.index("\n}")]
+    assert "browseWorkspace()" in corpo
+    assert "/api/workspace/open" in corpo
+
+
+def test_i_rimedi_dell_ambiente_stanno_nella_tendina_della_cartella():
+    """Immagine e container si preparano da soli al cambio di cartella: farli a
+    mano è un rimedio, e i rimedi stanno accanto alla cosa da rimediare. Nelle
+    impostazioni sembravano due manopole da usare."""
+    html = _html()
+    assert 'id="sandbox-build"' not in html
+    assert 'id="sandbox-restart"' not in html
+
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    corpo = js[js.index("function renderWsMenu("):]
+    corpo = corpo[: corpo.index("\n}")]
+    assert "'Impostazioni'" in corpo
+    assert "/api/prep/container" in corpo and "/api/prep/image" in corpo
 
 
 def test_il_percorso_in_alto_e_il_comando_per_cambiarlo():

@@ -247,3 +247,73 @@ def test_un_modello_grande_merita_un_contesto_piu_piccolo():
 def test_senza_vram_nota_si_resta_prudenti():
     assert profiles.context_for_vram(None, 0.1875) == 8192
     assert profiles.context_for_vram(100, 0.1875) == 8192
+
+
+# ---------------------------------------------------------------------------
+# max_tokens e num_ctx sono due impostazioni, e nessuno le confrontava
+# ---------------------------------------------------------------------------
+
+
+def _prompt(token: int) -> list[dict]:
+    """Un prompt finto della dimensione voluta, in token stimati."""
+    # La stima e' su caratteri: ~3,6 per token. Si punta appena sopra, poi si
+    # verifica, perche' l'esattezza qui non serve -- serve l'ordine di
+    # grandezza giusto.
+    return [{"role": "user", "content": "x " * (token * 2)}]
+
+
+def test_il_tetto_si_stringe_su_quello_che_resta_nella_finestra():
+    """Con finestra 32k, prompt 24k e tetto 16k la somma sfonda di 8k.
+
+    Il server non rifiuta: genera finche' la finestra e' piena e poi si ferma
+    dove capita. Se capita dentro gli argomenti di una tool call, quello che
+    arriva all'harness e' JSON monco -- ed e' esattamente l'errore
+    "Argomenti JSON malformati" che si vedeva senza spiegazione.
+    """
+    messaggi = _prompt(24000)
+    tetto, spazio = agent_mod.tetto_per_la_finestra(messaggi, 32768, 16384)
+    assert tetto < 16384
+    assert tetto == max(spazio, 0)
+    # E la somma, adesso, ci sta: e' l'unica proprieta' che conta.
+    assert agent_mod.estimate_messages_tokens(messaggi) + tetto <= 32768
+
+
+def test_con_spazio_in_abbondanza_il_tetto_resta_quello_scelto():
+    """Il taglio deve mordere solo quando serve: altrove e' una manopola
+    dell'utente, e riscriverla in silenzio sarebbe la stessa specie di bugia."""
+    tetto, spazio = agent_mod.tetto_per_la_finestra(_prompt(2000), 131072, 16384)
+    assert tetto == 16384
+    assert spazio > 16384
+
+
+def test_una_finestra_gia_piena_non_da_un_tetto_negativo():
+    tetto, spazio = agent_mod.tetto_per_la_finestra(_prompt(40000), 32768, 16384)
+    assert tetto == 0
+    assert spazio < 0            # il numero vero resta leggibile
+
+
+def test_senza_finestra_dichiarata_non_si_tocca_niente():
+    """``num_ctx`` a zero vuol dire 'non lo so': indovinare sarebbe peggio."""
+    assert agent_mod.tetto_per_la_finestra(_prompt(9000), 0, 16384) == (16384, 0)
+
+
+# ---------------------------------------------------------------------------
+# Una chiamata tagliata a meta' non e' una chiamata scritta male
+# ---------------------------------------------------------------------------
+
+
+def test_la_chiamata_troncata_lo_dice_invece_di_dare_la_colpa_al_json():
+    """"Riemetti un oggetto JSON valido" e' un consiglio che non puo'
+    funzionare quando a mancare non e' la sintassi ma la fine del testo:
+    riemettere la stessa chiamata la fa finire nello stesso punto."""
+    monco = '{"filepath":"a.md","content":"# Titolo\\nprima riga incompl'
+    esito = agent_mod.argomenti_illeggibili(monco, "length", 16384)
+    assert "troncata" in esito["error"]
+    assert "16384" in esito["causa"]
+    assert "Spezzala" in esito["hint"]
+    assert esito["received"] == monco
+
+    # JSON davvero scritto male: il consiglio di prima e' quello giusto.
+    normale = agent_mod.argomenti_illeggibili("{non json}", "stop", 16384)
+    assert normale["error"] == "Argomenti JSON malformati."
+    assert "JSON valido" in normale["hint"]

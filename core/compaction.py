@@ -55,6 +55,7 @@ from dataclasses import dataclass, replace
 from collections.abc import Callable, Iterable, Sequence
 from typing import Any
 
+from .config import COMPACT_MAX_TOKENS
 from .textutils import chars_for_tokens, smart_truncate, strip_think
 
 # Quanta parte della finestra puo' occupare la cronologia prima di intervenire.
@@ -68,6 +69,35 @@ SOGLIA_DEFAULT = 0.75
 # con 0,75 e 0,35 ogni compattazione libera circa il 40% della finestra, cioe'
 # abbastanza lavoro da non rifarla per un pezzo.
 CODA_DEFAULT = 0.35
+
+# Tetto assoluto, in token, oltre il quale si compatta comunque -- qualunque
+# cosa dica la percentuale.
+#
+# La soglia in frazione della finestra ha smesso di funzionare quando la
+# finestra e' cresciuta. Misurato il 23/08/2026 sulle 61 sessioni salvate: con
+# ``num_ctx = 131.072`` il picco piu' alto mai raggiunto -- 90.018 token,
+# sessione da 485 messaggi -- e' il **68,7%**, e non ha sfiorato lo 0,75. In 61
+# sessioni la compattazione e' scattata 4 volte, tutte dentro l'unica che
+# girava su una finestra piccola. Alla finestra di oggi e' disattivata di
+# fatto: per accenderla servirebbe una sessione mezza volta piu' lunga della
+# piu' lunga mai fatta.
+#
+# Il difetto e' concettuale, non numerico: **il costo del contesto non e' una
+# frazione della finestra, e' un numero assoluto.** Su endpoint remoto sono
+# token spediti e pagati ad ogni passo -- 59,6 milioni sulle 47 sessioni
+# misurate, 12,5 solo nella piu' cara; sull'attenzione del modello e' degrado
+# che comincia molto prima che la finestra si riempia. Nessuno dei due guarda
+# la percentuale.
+#
+# 32.768 lascia in pace le sessioni normali (picco mediano misurato: 8.059) e
+# prende le sette lunghe, che sono anche le uniche in cui il degrado si e'
+# visto. 0 disattiva il tetto e torna al solo comportamento a percentuale.
+#
+# Il valore vive in ``config`` con gli altri numeri regolabili -- qui c'e' il
+# perche', li' c'e' il quanto, e il default dell'impostazione e' lo stesso
+# oggetto: due copie diverse dello stesso numero sono il modo classico in cui
+# una manopola smette di corrispondere a cio' che fa.
+TETTO_TOKEN_DEFAULT = COMPACT_MAX_TOKENS
 
 # Sotto questo numero di blocchi non si compatta: una generazione e un
 # ricalcolo di KV cache per accorpare tre messaggi sono un cattivo affare.
@@ -84,6 +114,30 @@ MAX_TOKEN_RIASSUNTO = 700
 # chiamata esattamente nel momento in cui serve. Si taglia al centro, dove le
 # cose stanno gia' nel riassunto precedente o sono ancora nella coda.
 QUOTA_TRASCRIZIONE = 0.5
+
+
+def finestra_efficace(num_ctx: int, tetto: int = TETTO_TOKEN_DEFAULT) -> int:
+    """La finestra su cui si decide di compattare, che non e' quella vera.
+
+    Soglia e coda sono in rapporto fra loro -- 0,75 e 0,35 -- e vanno mosse
+    insieme: abbassare solo la prima farebbe compattare per ritrovarsi pieni
+    al passo dopo, perche' la coda tenuta sarebbe piu' grande della soglia che
+    l'ha fatta scattare. Invece di correggerle una per una si restringe la
+    finestra su cui entrambe si calcolano, e i rapporti restano quelli tarati.
+
+    Con tetto 32.768 e ``SOGLIA_DEFAULT`` 0,75 la finestra efficace e' 43.690:
+    si compatta a 32.768 token e ne restano circa 15.300.
+
+    La finestra **vera** resta quella per il controllo di sfondamento
+    (``drop_oldest_turns``), che e' un problema diverso: li' si tratta di non
+    farsi rifiutare la richiesta dal server, e num_ctx e' l'unico numero che
+    conta.
+    """
+    if num_ctx <= 0:
+        return 0
+    if tetto <= 0:
+        return num_ctx
+    return min(num_ctx, int(tetto / SOGLIA_DEFAULT))
 
 
 @dataclass(slots=True)
@@ -138,7 +192,7 @@ def richieste_utente(messaggi: Iterable[dict[str, Any]]) -> list[str]:
     return fuori
 
 
-def trascrizione(messaggi: Sequence[dict[str, Any]]) -> str:
+def trascrizione(messaggi: Sequence[dict[str, Any]], *, archiviato: bool = False) -> str:
     """Il tratto da riassumere, in testo piano e gia' asciugato.
 
     Non si passa al riassuntore la cronologia in formato API: contiene i
@@ -166,10 +220,21 @@ def trascrizione(messaggi: Sequence[dict[str, Any]]) -> str:
                 f"{_esito_breve(str(msg.get('content') or ''))}"
             )
         elif ruolo == "summary":
-            # Un riassunto precedente entra nel nuovo: altrimenti si
-            # accumulerebbero, e la cronologia diventerebbe una pila di
-            # riassunti di riassunti.
-            righe.append(f"[RIASSUNTO PRECEDENTE] {str(msg.get('content') or '').strip()}")
+            if archiviato:
+                # Il riassunto precedente e' su disco, verbatim, nella
+                # libreria: rifarlo passare da qui vorrebbe dire riassumere un
+                # riassunto -- e alla terza compattazione il riassunto di un
+                # riassunto. Si lascia fuori e si dice dove sta.
+                righe.append(
+                    "[TRATTO PRECEDENTE] gia' archiviato per intero nella "
+                    "libreria (.memoria/): non riassumerlo di nuovo, e' li'."
+                )
+            else:
+                # Senza libreria non c'e' alternativa: o entra nel nuovo, o si
+                # perde. Si accumulerebbero, quindi entra.
+                righe.append(
+                    f"[RIASSUNTO PRECEDENTE] {str(msg.get('content') or '').strip()}"
+                )
     return "\n".join(righe)
 
 
@@ -272,14 +337,28 @@ def costruisci_riassunto(
     return strip_think("".join(pezzi)).strip()
 
 
-def render_messaggio(riassunto: str, richieste: Sequence[str]) -> str:
+def render_messaggio(
+    riassunto: str, richieste: Sequence[str], *, voce: Any = None
+) -> str:
     """Il messaggio che sostituisce il tratto compattato."""
-    pezzi = [
-        "<cronologia_compattata>",
-        "Questa parte della conversazione e' stata riassunta per far spazio "
-        "nel contesto. I dettagli non ci sono piu': quello che segue e' tutto "
-        "cio' che ne resta.",
-    ]
+    if voce is not None:
+        # Con la libreria la frase cambia di senso, e va cambiata: "i dettagli
+        # non ci sono piu'" sarebbe falso, e una frase falsa del prompt diventa
+        # una convinzione sbagliata su cui il modello agisce.
+        testa = (
+            "Questa parte della conversazione e' stata riassunta per far "
+            "spazio nel contesto. Il riassunto che segue e' anche salvato in "
+            f"`{voce.percorso}`, cosi' com'e': quando uscira' da qui lo "
+            "ritrovi li' con read_file, e non verra' riassunto una seconda "
+            "volta."
+        )
+    else:
+        testa = (
+            "Questa parte della conversazione e' stata riassunta per far "
+            "spazio nel contesto. I dettagli non ci sono piu': quello che "
+            "segue e' tutto cio' che ne resta."
+        )
+    pezzi = ["<cronologia_compattata>", testa]
     if richieste:
         pezzi += [
             "",

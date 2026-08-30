@@ -79,6 +79,21 @@ class Job:
                 self.log = log
             self.updated_at = time.time()
 
+    def begin(self) -> None:
+        """Marca il lavoro come in corso senza aprire un thread suo.
+
+        Serve quando a farlo e' il thread di un altro lavoro: la preparazione
+        automatica costruisce l'immagine dentro il thread del container,
+        perche' il secondo deve aspettare il primo. Senza questo, chi guarda
+        lo stato dell'immagine la vedrebbe 'idle' proprio mentre si costruisce
+        -- ed e' la scritta piu' sbagliata possibile in quel momento.
+        """
+        self._set(RUNNING)
+
+    def end(self, riuscito: bool, detail: str = "", log: str = "") -> None:
+        """Chiude un lavoro aperto con ``begin``."""
+        self._set(OK if riuscito else ERROR, detail, log)
+
     def start(self, work: Callable[[], tuple[bool, str, str]]) -> bool:
         """Lancia ``work`` in un thread. False se ne stava gia' girando uno.
 
@@ -114,9 +129,14 @@ class Prep:
     def __init__(self) -> None:
         self.docker = Job("docker")
         self.image = Job("image")
+        self.container = Job("container")
 
     def snapshot(self) -> dict[str, Any]:
-        return {"docker": self.docker.snapshot(), "image": self.image.snapshot()}
+        return {
+            "docker": self.docker.snapshot(),
+            "image": self.image.snapshot(),
+            "container": self.container.snapshot(),
+        }
 
     # -- Docker ------------------------------------------------------------
 
@@ -152,6 +172,101 @@ class Prep:
             return True, f"Immagine {tag} pronta.", log
 
         return self.image.start(work)
+
+
+    # -- container ---------------------------------------------------------
+
+    def ensure_container(
+        self,
+        workspace: str,
+        *,
+        image: str,
+        network: bool,
+        ports: tuple[int, int] | None = None,
+    ) -> bool:
+        """Crea il container del workspace se non c'e' gia'.
+
+        Sta fra i lavori di preparazione e non fra i tool per una ragione di
+        tempi: la prima ``docker run`` su un'immagine appena costruita puo'
+        durare parecchi secondi, e finora quel tempo lo pagava il **primo
+        comando** dell'agente -- cioe' l'utente lo vedeva come "il primo turno
+        e' lento" senza sapere perche'.
+        """
+
+        def work() -> tuple[bool, str, str]:
+            pronto, dettaglio = sandbox_mod.docker_available()
+            if not pronto:
+                return False, f"Docker non e' pronto: {dettaglio}", ""
+            try:
+                nome = sandbox_mod.ensure_container(
+                    workspace, image=image, network=network, ports=ports
+                )
+            except sandbox_mod.SandboxError as exc:
+                return False, str(exc), ""
+            return True, f"Container {nome} pronto.", ""
+
+        return self.container.start(work)
+
+    # -- la catena intera --------------------------------------------------
+
+    def prepara(
+        self,
+        workspace: str,
+        *,
+        image: str,
+        network: bool,
+        ports: tuple[int, int] | None = None,
+        costruisci_immagine: bool = True,
+        on_image: Callable[[str], None] | None = None,
+    ) -> bool:
+        """Immagine se manca, **poi** container. Tutto dentro un thread solo.
+
+        Due cose, in quest'ordine e non nell'altro: il container si crea
+        *dall'*immagine, quindi farlo prima vorrebbe dire crearlo da quella di
+        serie e ritrovarselo vecchio appena la build finisce.
+
+        E **la decisione sta qui dentro**, non nel chiamante. ``image_needed``
+        fa un ``docker version`` e un ``docker images``: due sottoprocessi che
+        prima si pagavano sul filo della richiesta HTTP -- cioe' dentro
+        l'apertura di una conversazione -- per scoprire quasi sempre che non
+        c'era niente da fare.
+        """
+
+        def work() -> tuple[bool, str, str]:
+            pronto, dettaglio = sandbox_mod.docker_available()
+            if not pronto:
+                return False, f"Docker non e' pronto: {dettaglio}", ""
+
+            tag = image
+            log = ""
+            if costruisci_immagine and image_needed(workspace, image):
+                # Il lavoro dell'immagine si apre e si chiude da qui: gira in
+                # questo thread, ma il suo stato deve leggersi dove tutti lo
+                # cercano.
+                self.image.begin()
+                sandbox_mod.write_dockerfile(workspace)      # non sovrascrive
+                try:
+                    tag, log = sandbox_mod.build_image(workspace)
+                except sandbox_mod.SandboxError as exc:
+                    # Senza l'immagine il container non puo' nascere: si dice
+                    # cos'e' andato storto invece di crearne uno da quella
+                    # sbagliata.
+                    self.image.end(False, str(exc))
+                    return False, f"Immagine non costruita: {exc}", ""
+                self.image.end(True, f"Immagine {tag} pronta.", log)
+                if on_image:
+                    on_image(tag)
+
+            try:
+                nome = sandbox_mod.ensure_container(
+                    workspace, image=tag, network=network, ports=ports
+                )
+            except sandbox_mod.SandboxError as exc:
+                return False, str(exc), log
+            costruita = " (immagine ricostruita)" if log else ""
+            return True, f"Container {nome} pronto{costruita}.", log
+
+        return self.container.start(work)
 
 
 def image_needed(workspace: str, current_image: str) -> bool:

@@ -167,6 +167,30 @@ def strip_think(text: str | None) -> str:
     return _ANY_THINK_RE.sub("", text).strip()
 
 
+def estrai_think(text: str | None) -> str:
+    """Il contrario di ``strip_think``: **solo** i blocchi di pensiero.
+
+    Serve a una cosa sola, e va detto qui perche' altrove sembrerebbe un
+    controsenso: il pensiero non deve mai rientrare nel contesto, ma resta
+    scritto nel messaggio in sessione (lo strip avviene in
+    ``build_api_messages``, non in scrittura). E' quindi l'unica traccia di
+    cosa il modello ha capito lungo un punto di piano, e alla chiusura del
+    punto vale la pena distillarla prima che il turno la porti via.
+
+    I tag di apertura e chiusura si tolgono: quello che torna e' il testo.
+    """
+    if not text:
+        return ""
+    pezzi = []
+    for m in _ANY_THINK_RE.finditer(text):
+        corpo = m.group(0)
+        corpo = re.sub(r"^<[^>]*>", "", corpo)
+        corpo = re.sub(r"</[^>]*>$", "", corpo).strip()
+        if corpo:
+            pezzi.append(corpo)
+    return "\n\n".join(pezzi)
+
+
 # Involucri del template Qwen che il modello a volte scrive **da solo** nel
 # canale testuale invece di lasciarli generare al runtime. Vanno rimossi:
 # sono rumore per l'utente e, nel caso di <tool_response>, sono un risultato
@@ -231,6 +255,7 @@ def smart_truncate(
     *,
     head_ratio: float = 0.62,
     label: str = "output",
+    consiglio: str | None = None,
 ) -> str:
     """Tronca al centro preservando testa e coda, allineando ai confini di riga.
 
@@ -261,10 +286,19 @@ def smart_truncate(
     omitted_chars = len(text) - len(head) - len(tail)
     omitted_lines = text.count("\n") - head.count("\n") - tail.count("\n")
 
+    # Il consiglio di default e' vero per un file (``read_file`` con
+    # start_line/end_line rilegge la porzione) ma **falso** per lo stdout di un
+    # comando, che dopo il taglio non sta piu' da nessuna parte: rilanciare il
+    # comando e' l'unica strada, e non sempre e' ripetibile. Chi ha depositato
+    # il testo intero passa il proprio consiglio e la frase torna vera. Vedi
+    # ``core/deposito.py``.
+    consiglio = consiglio or (
+        "Usa un comando piu' mirato (grep/head/tail) per vedere questa porzione"
+    )
     marker = (
         f"\n\n[... {label}: omessi {omitted_chars:,} caratteri "
         f"(~{max(omitted_lines, 0):,} righe) dal centro. "
-        f"Usa un comando piu' mirato (grep/head/tail) per vedere questa porzione ...]\n\n"
+        f"{consiglio} ...]\n\n"
     )
     return head + marker + tail
 

@@ -24,25 +24,37 @@ from .config import (
 from .compaction import (
     CODA_DEFAULT,
     SOGLIA_DEFAULT,
+    TETTO_TOKEN_DEFAULT,
     Compattazione,
     costruisci_riassunto,
+    finestra_efficace,
     render_messaggio,
     richieste_utente,
     taglio,
     trascrizione,
 )
+from pathlib import PurePath
+
 from . import delega as delega_mod
+from . import deposito as deposito_mod
+from . import libreria
+from . import pensiero
+from . import spec_delega as spec_delega_mod
+from . import vault as vault_mod
 from . import vault_search as vault_search_mod
 from .notes import render_block as render_notes
 from .plan import render_block, render_summary
 from .prompts import (
     ASK_NUDGE,
     COVERAGE_NUDGE,
+    DELEGA_ESEMPIO,
+    DELEGA_NUDGE,
     FAILED_SUMMARY_NUDGE,
     JSON_LEAK_NUDGE,
     LOOP_NUDGE,
     PLAN_NUDGE,
     PLAN_SUMMARY_NUDGE,
+    PROMPT_RIEPILOGO_FINALE,
     SUMMARY_NUDGE,
     THINK_WATCHDOG_NUDGE,
     TOOL_NUDGE,
@@ -70,6 +82,7 @@ from .tools import (
     looks_like_server,
     normalise_question,
     preview_kind,
+    preview_root,
     reset_scratch,
     uncovered_symbols,
 )
@@ -85,14 +98,86 @@ class StepStarted:
     total: int
 
 
+# Il pensiero e la risposta in corso viaggiano a **incrementi**, non piu' come
+# testo cumulativo, e questo e' il difetto piu' caro che l'harness abbia avuto.
+#
+# Com'era: ad ogni token generato si spediva tutto il testo accumulato fino a
+# li'. Un passo da 20.000 token di ragionamento sono 20.000 eventi, il primo da
+# pochi byte e l'ultimo da 80 kB: nell'ordine dei **centinaia di megabyte** per
+# un solo passo, tutti serializzati in JSON, spediti sul filo, tenuti in RAM nel
+# buffer del turno (che serve a chi si riattacca) e ridisegnati dal browser una
+# volta per token. Il sintomo era il popup di Chrome: "la pagina non risponde".
+#
+# Com'e': ``append`` porta i soli caratteri nuovi e il client li accoda;
+# ``text`` porta il testo completo e il client **sostituisce**. Ne arriva uno
+# solo dei due. La regola per chi legge questi eventi e' quindi: se c'e'
+# ``append``, accoda; altrimenti sostituisci con ``text``.
+#
+# Il testo completo continua ad arrivare alla fine di ogni passo, ed e' voluto:
+# e' la rete di sicurezza. Un abbonato lento puo' vedersi scartare dei frame
+# (``_SUBSCRIBER_QUEUE_MAX``), e con soli incrementi resterebbe con un testo
+# sbagliato fino alla fine del turno.
 @dataclass(slots=True)
 class ReasoningDelta:
-    text: str  # testo cumulativo, non incrementale: semplifica il rendering
+    text: str = ""      # testo completo: sostituisce
+    append: str = ""    # soli caratteri nuovi: si accoda
 
 
 @dataclass(slots=True)
 class ContentDelta:
-    text: str  # testo cumulativo
+    text: str = ""
+    append: str = ""
+
+
+# Quanti aggiornamenti al secondo, al massimo, del testo in corso. Dieci sono
+# il punto in cui l'occhio legge ancora un flusso continuo e il browser smette
+# di soffrire: il freno non perde niente -- l'aggiornamento saltato viene
+# incluso nel successivo, che porta tutto quello che nel frattempo e' arrivato.
+STREAM_INTERVALLO_S = 0.1
+
+
+class Rubinetto:
+    """Trasforma il testo accumulato dal parser in incrementi, a passo d'uomo.
+
+    Tiene due cose sole: cosa e' gia' stato spedito, e quando. Da quelle ricava
+    se c'e' qualcosa di nuovo da dire e se e' il momento di dirlo.
+
+    Il caso in cui il testo nuovo **non** comincia con quello gia' spedito
+    esiste: il parser puo' riscrivere all'indietro quando un tag ``<think>``
+    arriva spezzato fra due chunk. Li' non si puo' accodare, e si manda il
+    testo intero -- e' raro, e sbagliare da questa parte significa mostrare
+    testo doppio.
+    """
+
+    __slots__ = ("_pensiero", "_risposta", "_ultimo")
+
+    def __init__(self) -> None:
+        self._pensiero = ""
+        self._risposta = ""
+        self._ultimo = 0.0
+
+    @staticmethod
+    def _campi(gia_spedito: str, adesso: str) -> dict[str, str] | None:
+        if adesso == gia_spedito:
+            return None
+        if gia_spedito and adesso.startswith(gia_spedito):
+            return {"append": adesso[len(gia_spedito):]}
+        return {"text": adesso}
+
+    def aggiorna(self, pensiero: str, risposta: str) -> Iterator[Any]:
+        """Gli eventi da mandare adesso: nessuno, se e' troppo presto."""
+        adesso = time.monotonic()
+        if adesso - self._ultimo < STREAM_INTERVALLO_S:
+            return
+        campi = self._campi(self._pensiero, pensiero)
+        if campi is not None:
+            self._pensiero = pensiero
+            yield ReasoningDelta(**campi)
+        campi = self._campi(self._risposta, risposta)
+        if campi is not None:
+            self._risposta = risposta
+            yield ContentDelta(**campi)
+        self._ultimo = adesso
 
 
 @dataclass(slots=True)
@@ -325,6 +410,9 @@ def build_api_messages(
     preview_block: str = "",
     notes_block: str = "",
     skills_block: str = "",
+    libreria_block: str = "",
+    vault_notes_block: str = "",
+    delega_block: str = "",
 ) -> list[dict[str, Any]]:
     """Costruisce l'array da inviare al modello a partire dal log della UI.
 
@@ -443,7 +531,21 @@ def build_api_messages(
     # eval completo per aggiornare tre parole.
     coda = [
         blocco
-        for blocco in (skills_block, preview_block, notes_block, plan_block)
+        # La memoria del vault sta **prima** del foglio della chat: dal piu'
+        # vecchio e stabile al piu' fresco, e il piu' fresco resta attaccato
+        # al piano, che e' l'ultima cosa che il modello legge prima di agire.
+        for blocco in (
+            skills_block,
+            preview_block,
+            libreria_block,
+            vault_notes_block,
+            notes_block,
+            plan_block,
+            # Ultimo perche' e' l'unico che il figlio della delega ha: per lui
+            # e' quello che il piano e' per il padre, cioe' l'ultima cosa che
+            # legge prima di muoversi. Sul padre e' sempre vuoto.
+            delega_block,
+        )
         if blocco
     ]
     if coda:
@@ -560,6 +662,8 @@ def compatta_cronologia(
     budgets: Budgets,
     strip_thinking: bool,
     soglia_coda: float = CODA_DEFAULT,
+    finestra: int | None = None,
+    schedario: Any = None,
 ) -> Compattazione | None:
     """Riassume il tratto vecchio della cronologia e ne toglie la vista al modello.
 
@@ -574,7 +678,11 @@ def compatta_cronologia(
     riuscito: in quel caso e' meglio un contesto pieno che una cronologia
     buttata via senza averla riassunta.
     """
-    num_ctx = int(getattr(params, "num_ctx", 0) or 0)
+    # La coda si misura sulla stessa finestra su cui e' scattata la soglia:
+    # con il tetto assoluto attivo quella non e' ``num_ctx`` ma la finestra
+    # efficace, e usare qui quella vera terrebbe una coda piu' grande della
+    # soglia che ha appena fatto compattare -- cioe' compattare per niente.
+    num_ctx = int(finestra or 0) or int(getattr(params, "num_ctx", 0) or 0)
     if num_ctx <= 0:
         return None
 
@@ -612,7 +720,9 @@ def compatta_cronologia(
     prima = costo(vecchi)
     richieste = richieste_utente(vecchi)
     riassunto = costruisci_riassunto(
-        trascrizione(vecchi), backend=backend, params=params
+        trascrizione(vecchi, archiviato=schedario is not None),
+        backend=backend,
+        params=params,
     )
     if not riassunto:
         # Senza riassunto non si compatta, nemmeno tenendo le richieste
@@ -622,7 +732,13 @@ def compatta_cronologia(
         # almeno lo dichiara.
         return None
 
-    testo = render_messaggio(riassunto, richieste)
+    # Archiviare **prima** di inserire il messaggio: se il disco rifiuta, la
+    # compattazione avviene lo stesso (``archivia`` torna None e basta), ma il
+    # riassunto non deve mai finire in cronologia credendo di essere al sicuro
+    # su disco quando non c'e'.
+    voce = libreria.archivia(schedario, riassunto=riassunto, richieste=richieste) if schedario else None
+
+    testo = render_messaggio(riassunto, richieste, voce=voce)
     ui_messages.insert(
         cut,
         {
@@ -1033,6 +1149,93 @@ _THINK_LEVELS = ("low", "medium", "high", "max")
 DEEP_STEP = 3
 
 
+# Riserva fra il prompt e il tetto di generazione, in token.
+#
+# La stima dei token non e' il tokenizer: e' una regola su caratteri e parole,
+# e sbaglia in entrambe le direzioni. Un margine serve perche' l'errore che
+# conta e' solo uno dei due -- sottostimare il prompt vuol dire promettere al
+# modello uno spazio che il server non ha, ed e' esattamente la condizione che
+# taglia le tool call a meta'.
+MARGINE_FINESTRA = 768
+
+# Sotto questo tetto un passo agentico non ha piu' senso: non ci sta un
+# pensiero, una risposta e una chiamata. Meglio saperlo prima di generare.
+TETTO_INUTILE = 512
+
+
+def tetto_per_la_finestra(
+    api_messages: Sequence[dict[str, Any]], num_ctx: int, max_tokens: int
+) -> tuple[int, int]:
+    """Il tetto di generazione che ci sta **davvero**, e lo spazio rimasto.
+
+    ``max_tokens`` e ``num_ctx`` sono due impostazioni indipendenti, e nessuno
+    le confrontava: con una finestra da 32k e un tetto da 16k basta un prompt
+    di 24k -- cioe' il livello a cui la compattazione lascia le cose -- perche'
+    la somma sfondi. Il server non rifiuta: genera finche' la finestra e'
+    piena e poi si ferma, dove capita. Se capita dentro gli argomenti di una
+    tool call, quello che arriva qui e' JSON monco.
+
+    Non e' un problema di llama.cpp -- vale per qualunque endpoint -- ma li' e'
+    peggiore, perche' la finestra la fissa ``-c`` al lancio e non si allarga
+    chiedendo, e perche' il server puo' rispondere con un *context shift*
+    silenzioso invece che con un errore.
+
+    Ritorna ``(tetto, spazio)``. ``spazio`` viaggia a parte perche' e' il
+    numero che vale la pena raccontare: dice quanto manca alla parete, non
+    quanto si e' deciso di chiedere.
+    """
+    if num_ctx <= 0 or max_tokens <= 0:
+        return max_tokens, 0
+    spazio = num_ctx - estimate_messages_tokens(api_messages) - MARGINE_FINESTRA
+    return min(max_tokens, max(spazio, 0)), spazio
+
+
+def argomenti_illeggibili(
+    arguments: str, done_reason: str, max_tokens: int
+) -> dict[str, Any]:
+    """Il risultato da restituire quando gli argomenti di una tool call non
+    sono JSON valido.
+
+    Due cause diversissime, finora raccontate con la stessa frase:
+
+    * il modello ha scritto male il JSON -- succede, si riemette e passa;
+    * la **generazione e' stata tagliata** a meta' della chiamata, perche' il
+      tetto di ``max_tokens`` o la finestra del server sono finiti prima.
+
+    Nel secondo caso "Argomenti JSON malformati / riemetti un oggetto JSON
+    valido" e' un consiglio che non puo' funzionare: riemettere la stessa
+    chiamata la fa finire nello stesso punto, e il ciclo si ripete finche' i
+    passi non sono esauriti. Il server lo dice -- ``finish_reason: length`` --
+    e da oggi lo dice anche a noi (vedi ``done_reason`` nel transport
+    OpenAI-compatibile, dove per anni non e' stato letto).
+
+    La coda degli argomenti viaggia comunque: e' l'unico modo, per chi legge
+    il pannello, di vedere *dove* si e' fermata.
+    """
+    coda = (arguments or "")[:300]
+    if done_reason != "length":
+        return {
+            "error": "Argomenti JSON malformati.",
+            "hint": "Riemetti la chiamata con un oggetto JSON valido.",
+            "received": coda,
+        }
+    return {
+        "error": "Chiamata troncata: la generazione si e' fermata a meta' degli argomenti.",
+        "causa": (
+            "Il server ha chiuso con 'length'. O e' finito il tetto di "
+            f"max_tokens ({max_tokens} token), o e' finito lo spazio nella "
+            "finestra di contesto: in entrambi i casi la chiamata non e' mai "
+            "stata emessa per intero."
+        ),
+        "hint": (
+            "Riemetterla identica finira' nello stesso punto. Spezzala: meno "
+            "contenuto per chiamata, piu' chiamate -- per esempio una scrittura "
+            "corta e poi un edit_file che aggiunge il resto."
+        ),
+        "received": coda,
+    }
+
+
 def watchdog_chars_for_step(max_tokens: int, step: int) -> int:
     """Caratteri di ragionamento oltre i quali il passo viene interrotto.
 
@@ -1072,6 +1275,22 @@ def think_for_step(configured: Any, plan: Any, step: int) -> Any:
     poi. Il pavimento resta 'low' e non si azzera mai: su un modello che ragiona
     togliere del tutto il pensiero peggiora le tool call, che e' esattamente il
     problema che si voleva evitare.
+
+    ## Quando non puo' fare niente, e perche' non si vedeva
+
+    Con ``native_think`` impostato su **'auto'** -- che e' il default --
+    ``AppState.think_setting`` ritorna un **booleano** (la capability rilevata
+    dal modello), non un livello: qui non c'e' nessuna scala su cui scendere e
+    la funzione restituisce il valore intatto. La modulazione, cioe', esiste
+    solo se l'utente ha scelto un livello esplicito.
+
+    Non e' un difetto di questa funzione ed e' un fatto che va **visto**: nelle
+    quattro sessioni qwen3.8 misurate il 23/08/2026 il pensiero non si
+    accorciava mai col passo, e dai `<think>` salvati non c'era modo di capire
+    se lo scalino non si applicasse o non si notasse. Adesso la traccia sul
+    messaggio dell'assistente scrive sia il livello configurato sia quello
+    davvero chiesto: ``configurato: "on"`` vuol dire esattamente questo --
+    booleano, niente da modulare.
     """
     if not isinstance(configured, str):
         return configured          # booleano: niente da modulare
@@ -1132,11 +1351,34 @@ def render_preview_note(preview: dict[str, Any] | None) -> str:
                 "un'altra porta solo se ti serve una seconda applicazione."
             )
     else:
-        cosa = f"il file {preview.get('path')}"
+        percorso = str(preview.get("path") or "")
+        radice = preview.get("root")
+        if percorso.lower().endswith((".html", ".htm")):
+            dove = f"la cartella {radice}" if radice else "la cartella del workspace"
+            cosa = (
+                f"la pagina {percorso}, servita insieme a tutta {dove}: fogli "
+                "di stile, script e immagini ci sono gia'"
+            )
+        else:
+            cosa = f"il file {percorso}"
+        # Il pannello si ricarica da solo ad ogni write_file dentro la cartella
+        # mostrata. Senza dirglielo il modello richiama preview dopo ogni
+        # correzione -- un passo intero per non fare niente, e la stessa
+        # ragione per cui questo blocco esiste.
         coda = (
-            "E' gia' sul suo schermo: non c'e' bisogno di riaprirlo. Chiama "
-            "preview solo per mostrare qualcosa di diverso."
+            "E' gia' sul suo schermo e si ricarica da sola ogni volta che "
+            "scrivi un file di quella cartella: non richiamare preview dopo "
+            "una modifica. Chiamalo solo per mostrare qualcosa di diverso."
         )
+        if percorso.lower().endswith((".html", ".htm")):
+            # L'unico motivo legittimo per richiamarlo sulla stessa pagina, e
+            # va detto qui: il pannello si e' aperto da solo su un write_file,
+            # e quella strada mostra il file senza accendere niente.
+            coda += (
+                " L'unica eccezione: se la pagina ha bisogno del suo backend, "
+                "chiama preview action='file' su di lei -- l'harness riconosce "
+                "il progetto e lo avvia."
+            )
     return f"<anteprima>\nL'utente sta guardando {cosa}.\n</anteprima>\n{coda}"
 
 
@@ -1181,6 +1423,88 @@ def preview_from_result(
             }
 
     return _NO_PREVIEW
+
+
+def ultima_risposta(ui_messages: Sequence[dict[str, Any]]) -> str:
+    """Il testo dell'ultima risposta dell'assistente, dopo l'ultimo messaggio
+    dell'utente. Serve a sapere se il turno ha detto qualcosa o no.
+
+    Si guarda solo da li' in poi: la risposta del turno **precedente** e' in
+    cronologia e non conta -- e' proprio l'errore che farebbe passare per
+    "gia' risposto" un turno rimasto muto.
+    """
+    fuori = []
+    for msg in reversed(ui_messages):
+        if msg.get("role") == "user" and not msg.get("hidden"):
+            break
+        if msg.get("role") == "assistant":
+            fuori.append(strip_think(str(msg.get("content") or "")).strip())
+    return next((t for t in fuori if t), "")
+
+
+# Tetto al riepilogo forzato: e' un referto su lavoro gia' fatto, non un
+# ragionamento nuovo. Stessa taglia del riassunto di compattazione.
+MAX_TOKEN_RIEPILOGO = 700
+
+
+def riepilogo_finale(
+    ui_messages: Sequence[dict[str, Any]],
+    *,
+    backend: Any,
+    params: Any,
+    budgets: Any,
+    strip_thinking: bool,
+) -> str:
+    """Chiede al modello cosa e' successo, quando i passi sono gia' finiti.
+
+    Una chiamata sola, senza tool e senza pensiero: qui non c'e' niente da
+    decidere, c'e' da raccontare. Un riepilogo mancato non deve peggiorare le
+    cose -- si torna stringa vuota e il turno si chiude come prima.
+    """
+    api = build_api_messages(
+        ui_messages,
+        system_prompt=PROMPT_RIEPILOGO_FINALE,
+        env_header=None,
+        strip_thinking=strip_thinking,
+        compact_old_tools=True,
+        budgets=budgets,
+    )
+    if len(api) < 2:
+        return ""
+    p = replace(
+        params,
+        think=False,
+        temperature=0.2,
+        max_tokens=min(
+            int(getattr(params, "max_tokens", 2048) or 2048), MAX_TOKEN_RIEPILOGO
+        ),
+    )
+    pezzi: list[str] = []
+    try:
+        for evento in backend.stream(api, None, p):
+            if evento.kind == "content":
+                pezzi.append(evento.text)
+            elif evento.kind == "error":
+                return ""
+    except Exception:  # noqa: BLE001
+        return ""
+    return strip_think("".join(pezzi)).strip()
+
+
+def _nome_livello(think: Any) -> str:
+    """Il livello di pensiero in forma leggibile, qualunque cosa sia.
+
+    ``think`` e' una stringa sui modelli che accettano i livelli e un booleano
+    su tutti gli altri: una traccia che scrivesse ``true`` in un campo e
+    ``high`` nell'altro sarebbe illeggibile fra un mese.
+    """
+    if isinstance(think, str):
+        return think.strip().lower() or "?"
+    if think is True:
+        return "on"
+    if think is False:
+        return "off"
+    return "?"
 
 
 def params_for_step(params: Any, plan: Any, step: int) -> Any:
@@ -1249,6 +1573,15 @@ def run_turn(
     auto_preview: bool = True,
     compact_history: bool = True,
     soglia: float = SOGLIA_DEFAULT,
+    compact_max_tokens: int = TETTO_TOKEN_DEFAULT,
+    libreria_attiva: bool = True,
+    estratto_pensiero: bool = True,
+    # Blocco di coda calcolato dal chiamante a ogni passo, ricevendo quanti
+    # passi restano. Lo usa la delega per dire all'esploratore quanto tempo ha:
+    # e' ``agent`` a conoscere ``delega``, non il contrario, quindi il testo
+    # arriva da fuori come ``run_turn`` e ``build_messages``.
+    blocco_coda: Callable[[int], str] | None = None,
+    spec_delega: bool = True,
     plan_gate: bool = True,
     skills_block: str = "",
     abilita_delega: bool = True,
@@ -1305,6 +1638,11 @@ def run_turn(
                 tool_ctx=tool_ctx,
                 env_header=env_header,
                 run_turn=run_turn,
+                registra_esiti=spec_delega,
+                # Serve al referto di chiusura: quando il figlio finisce i
+                # passi senza rispondere, si rilegge il suo contesto per
+                # ricavarne almeno un referto parziale.
+                build_messages=build_api_messages,
             )
 
         tool_ctx.on_delega = _delega
@@ -1337,6 +1675,65 @@ def run_turn(
     truncated_nudges = 0
     watchdog_fires = 0
     riprese_stream = 0
+    # Letture esplorative di fila, cioe' passi in cui il modello ha solo
+    # guardato. Si azzera appena tocca il disco o delega: quello che si vuole
+    # riconoscere e' l'esplorazione lunga, non la lettura prima di una modifica.
+    esplorazioni_di_fila = 0
+    delega_nudged = False
+
+    # --- libreria dei concetti -------------------------------------------
+    # L'indice sta in coda, e il precarico d'ufficio ci si appoggia sopra: il
+    # recupero lo fa l'harness incrociando le parole del punto di piano aperto
+    # con i titoli, perche' la meta' che rilegge, se lasciata a un invito, non
+    # parte -- su questo progetto e' misurato (vedi ``core/libreria.py``).
+    schedario = (
+        tool_ctx.base if (libreria_attiva and getattr(tool_ctx, "base", None)) else None
+    )
+
+    def _blocco_libreria() -> str:
+        if schedario is None:
+            return ""
+        elenco = libreria.voci(schedario)
+        if not elenco:
+            return ""
+        indice = libreria.render_block(elenco)
+        aperto = tool_ctx.plan.current if tool_ctx.plan else None
+        contesto = (aperto.text if aperto else "") or last_user_request(ui_messages)
+        ripescato = libreria.precarico(schedario, elenco, contesto)
+        return "\n\n".join(p for p in (ripescato, indice) if p)
+
+    blocco_libreria = _blocco_libreria()
+
+    def _esempio_delega() -> str:
+        """L'ultima delega che in questo workspace ha funzionato al primo colpo.
+
+        Attaccata al sollecito invece che messa in coda al contesto: li'
+        sarebbe un costo a ogni passo per un'informazione che serve nel momento
+        in cui una delega si scrive, cioe' di rado. Un esempio vero vale piu'
+        di tre righe su come formulare bene una domanda.
+        """
+        if not spec_delega or not getattr(tool_ctx, "base", None):
+            return ""
+        domanda = spec_delega_mod.esempio_riuscito(tool_ctx.base)
+        return DELEGA_ESEMPIO.format(domanda=domanda) if domanda else ""
+
+    def blocco_memoria_vault() -> str:
+        """La memoria del vault, se si sta lavorando dentro uno.
+
+        Si ricostruisce ad ogni passo da ``tool_ctx.vault_notes`` e non dal
+        disco: il file cambia solo quando lo cambia il modello, e in quel caso
+        il tool aggiorna anche la lista. Rileggerlo ad ogni passo sarebbe una
+        stat e un ``json.load`` per un contenuto che quasi sempre e' lo stesso.
+        """
+        if not tool_ctx.vault_dir or not tool_ctx.vault_notes:
+            return ""
+        return vault_mod.blocco_note(
+            vault_mod.VaultConfig(
+                nome=PurePath(tool_ctx.vault_dir).name,
+                note=tuple(tool_ctx.vault_notes),
+            )
+        )
+
     # La richiesta ha piu' obiettivi: allora il piano non e' un suggerimento.
     multi_step = looks_multi_step(last_user_request(ui_messages))
     # Soglia del watchdog sul ragionamento, in caratteri. Deve scattare
@@ -1345,6 +1742,8 @@ def run_turn(
     # budget per agire. Con il 55% il pensiero ha spazio per essere serio e ne
     # resta abbastanza per emettere la tool call.
     max_tokens_turno = int(getattr(params, "max_tokens", 0) or 0)
+    # L'avviso di finestra quasi piena si da' una volta per turno.
+    avvisato_finestra = False
     # Una richiesta di sola lettura vale per il turno intero. Se pero' l'utente
     # ha appena risposto a un ask_user_question, ha parlato lui dopo: il
     # vincolo decade, altrimenti l'unica uscita di sicurezza sarebbe murata.
@@ -1369,11 +1768,56 @@ def run_turn(
         # domanda: quel turno e' la continuazione del precedente, e la prova
         # appena impostata dal modello e' esattamente cio' su cui deve tornare.
         reset_scratch(tool_ctx)
+    # La potatura del deposito sta qui e non a ogni scrittura: e' una stat per
+    # file su una cartella piccola, e farla dodici volte per turno cambierebbe
+    # solo il numero di syscall. Il deposito **non** si svuota come il banco di
+    # prova: un handle imbucato in un turno deve restare valido per tutta la
+    # conversazione, o la cronologia porterebbe il puntatore a un file che non
+    # esiste piu'.
+    if getattr(tool_ctx, "deposito_attivo", False) and getattr(tool_ctx, "base", None):
+        deposito_mod.pota(tool_ctx.base, int(getattr(tool_ctx, "deposito_max_mb", 0)))
     verification = VerificationTracker()
     tool_ctx.verification = verification
     tools_used = False
     total_usage: dict[str, Any] = {}
     stopped = should_stop or (lambda: False)
+
+    # --- traccia del pensiero ---------------------------------------------
+    # Misurato il 23/08/2026 sulle quattro sessioni qwen3.8: il pensiero **non**
+    # si accorcia col passo -- mediana 3.327 caratteri al passo 1 e 3.452 al
+    # passo 8+ -- benche' ``think_for_step`` debba scendere di uno scalino col
+    # punto di piano aperto e di due dal terzo passo. Dai soli `<think>` salvati
+    # non si puo' dire se non si applica o se uno scalino non si vede, perche'
+    # il livello *chiesto* non era scritto da nessuna parte. Adesso lo e'.
+    #
+    # Sta sul messaggio dell'assistente e non in un file di log a parte: cosi'
+    # e' gia' persistito nella sessione, gia' isolato nei test, e si legge
+    # accanto al pensiero che descrive. Al modello non arriva mai --
+    # ``build_api_messages`` guarda solo ruolo, contenuto e tool_calls.
+    traccia: dict[str, Any] = {}
+    stato_traccia = {"da": -1}
+
+    def marca_pensiero() -> None:
+        """Attacca la traccia al messaggio dell'assistente che l'ha prodotta.
+
+        Si cerca all'indietro e solo fra i messaggi nati **dopo** la fine dello
+        stream: un passo che non ha prodotto nessun messaggio (errore, stop)
+        non deve marcare quello del passo precedente con numeri che non sono
+        suoi.
+        """
+        if not traccia:
+            return
+        for i in range(len(ui_messages) - 1, stato_traccia["da"] - 1, -1):
+            if ui_messages[i].get("role") == "assistant":
+                ui_messages[i].setdefault("think", dict(traccia))
+                break
+        traccia.clear()
+
+    def fine(reason: str, passi: int) -> TurnFinished:
+        """Chiude il turno. Passa da qui per non perdere la traccia dell'ultimo
+        passo, che e' proprio quello dei turni che finiscono male."""
+        marca_pensiero()
+        return TurnFinished(reason=reason, steps=passi, usage=total_usage)
 
     def halt(step: int, reasoning: str = "", answer: str = "") -> Iterator[AgentEvent]:
         """Chiude il turno salvando quel che il modello aveva gia' prodotto."""
@@ -1385,7 +1829,7 @@ def run_turn(
             yield AssistantTurn(
                 content=answer.strip(), reasoning=reasoning.strip(), has_tool_calls=False
             )
-        yield TurnFinished(reason="stopped", steps=step, usage=total_usage)
+        yield fine("stopped", step)
 
     for step in range(1, max_steps + 1):
         if stopped():
@@ -1395,6 +1839,10 @@ def run_turn(
         # che puo' rispondere "invariato" solo finche' il contenuto precedente
         # e' ancora nel contesto e non e' stato compattato via.
         tool_ctx.step = step
+        # La traccia del passo precedente si attacca adesso: il suo messaggio
+        # e' stato appeso da uno qualsiasi dei rami che chiudono un passo, e
+        # farlo qui e' l'unico punto che li copre tutti senza toccarne otto.
+        marca_pensiero()
         yield StepStarted(step=step, total=max_steps)
 
         api_messages = build_api_messages(
@@ -1408,16 +1856,23 @@ def run_turn(
             # ``max_steps - step`` e non ``- step + 1``: e' quanti passi
             # restano *dopo* questo, cioe' quelli su cui puo' contare.
             plan_block=render_block(tool_ctx.plan, steps_left=max_steps - step),
+            delega_block=blocco_coda(max_steps - step) if blocco_coda else "",
             preview_block=render_preview_note(tool_ctx.preview),
             notes_block=render_notes(tool_ctx.notes),
             skills_block=skills_block,
+            libreria_block=blocco_libreria,
+            vault_notes_block=blocco_memoria_vault(),
         )
 
         # Compattazione a soglia, *fra un passo e l'altro*. E' qui che il
         # contesto esplode davvero: un compito da venti passi puo' saturare la
         # finestra senza che l'utente scriva una riga, e aspettare la fine del
         # turno vorrebbe dire aiutarlo dopo che e' morto.
-        if compact_history and context_pressure(api_messages, params.num_ctx) > soglia:
+        # La pressione si misura sulla **finestra efficace**: alla finestra
+        # vera di oggi (131k) la soglia in percentuale non e' raggiungibile in
+        # pratica -- vedi il commento a ``TETTO_TOKEN_DEFAULT``.
+        finestra_compat = finestra_efficace(params.num_ctx, compact_max_tokens)
+        if compact_history and context_pressure(api_messages, finestra_compat) > soglia:
             prima_tok = estimate_messages_tokens(api_messages)
             esito = compatta_cronologia(
                 ui_messages,
@@ -1425,9 +1880,15 @@ def run_turn(
                 params=params,
                 budgets=budgets,
                 strip_thinking=strip_thinking,
+                finestra=finestra_compat,
+                schedario=schedario,
             )
             if esito is not None:
                 count_nudge("compattazione")
+                # L'indice si rilegge dal disco solo qui: e' l'unico momento in
+                # cui puo' essere cambiato, e rileggerlo ad ogni passo sarebbe
+                # un glob per niente.
+                blocco_libreria = _blocco_libreria()
                 api_messages = build_api_messages(
                     ui_messages,
                     system_prompt=system_prompt,
@@ -1437,9 +1898,12 @@ def run_turn(
                     images=images,
                     budgets=budgets,
                     plan_block=render_block(tool_ctx.plan, steps_left=max_steps - step),
+                    delega_block=blocco_coda(max_steps - step) if blocco_coda else "",
                     preview_block=render_preview_note(tool_ctx.preview),
                     notes_block=render_notes(tool_ctx.notes),
-            skills_block=skills_block,
+                    skills_block=skills_block,
+                    libreria_block=blocco_libreria,
+                    vault_notes_block=blocco_memoria_vault(),
                 )
                 # I due numeri si misurano qui e non dentro la compattazione:
                 # sono il contesto che il modello pagava davvero prima e quello
@@ -1472,9 +1936,39 @@ def run_turn(
             watchdog_chars_for_step(max_tokens_turno, step) if think_watchdog else 0
         )
 
+        params_passo = params_for_step(params, tool_ctx.plan, step)
+        # Il tetto si taglia **dopo** la compattazione e il drop dei turni
+        # vecchi: prima di quelli il prompt non e' ancora quello che partira'.
+        tetto_passo, spazio_finestra = tetto_per_la_finestra(
+            api_messages, params.num_ctx, max_tokens_turno
+        )
+        if tetto_passo != max_tokens_turno:
+            try:
+                params_passo = replace(params_passo, max_tokens=tetto_passo)
+            except TypeError:      # non e' una dataclass: si lascia stare
+                pass
+        # Una volta sola per turno: ripeterlo ad ogni passo sarebbe rumore, e
+        # il primo passo che ci arriva e' gia' quello che spiega tutti i
+        # successivi. Va detto perche' e' l'unica cosa che l'utente puo'
+        # sistemare -- alzare -c sul server, abbassare max_tokens, o cominciare
+        # una chat nuova -- e perche' senza, un turno che si ferma a meta'
+        # sembra un capriccio del modello.
+        if tetto_passo < TETTO_INUTILE and not avvisato_finestra:
+            avvisato_finestra = True
+            yield AgentError(
+                f"Finestra quasi piena: restano {max(spazio_finestra, 0)} token "
+                f"su {params.num_ctx}. Da qui in avanti la generazione verra' "
+                "tagliata a meta' -- anche dentro una chiamata a un tool. "
+                "Alza la finestra del server, abbassa max_tokens, o comincia "
+                "una conversazione nuova."
+            )
+
+        # Un rubinetto per passo: cosa e' gia' arrivato alla UI vale per questa
+        # generazione e non per la prossima, che riparte da testo vuoto.
+        rubinetto = Rubinetto()
         try:
             events: Iterator[StreamEvent] = backend.stream(
-                api_messages, tools_schema, params_for_step(params, tool_ctx.plan, step)
+                api_messages, tools_schema, params_passo
             )
             for ev in events:
                 if stopped():
@@ -1488,13 +1982,11 @@ def run_turn(
                     break
                 if ev.kind == "reasoning":
                     if parser.feed_reasoning(ev.text):
-                        yield ReasoningDelta(parser.reasoning)
+                        yield from rubinetto.aggiorna(parser.reasoning, parser.answer)
                 elif ev.kind == "content":
                     r_changed, a_changed = parser.feed(ev.text)
-                    if r_changed:
-                        yield ReasoningDelta(parser.reasoning)
-                    if a_changed:
-                        yield ContentDelta(parser.answer)
+                    if r_changed or a_changed:
+                        yield from rubinetto.aggiorna(parser.reasoning, parser.answer)
                 elif ev.kind == "tool_call" and ev.tool_call:
                     tool_calls.append(ev.tool_call)
                 elif ev.kind == "usage" and ev.usage:
@@ -1536,6 +2028,41 @@ def run_turn(
 
         parser.finish()
 
+        # La traccia di questo passo: cosa era configurato, cosa e' stato
+        # davvero chiesto al modello, e quanto ha pensato. Vedi ``marca_pensiero``.
+        traccia.clear()
+        traccia.update(
+            {
+                "passo": step,
+                "configurato": _nome_livello(getattr(params, "think", None)),
+                "usato": _nome_livello(getattr(params_passo, "think", None)),
+                "punto_aperto": bool(getattr(tool_ctx.plan, "current", None)),
+                # **Quale** punto, non solo se ce n'era uno. Il booleano
+                # sopra resta perche' e' quello che leggono gli script di
+                # analisi gia' scritti; questo campo e' cio' che rende
+                # possibile raccogliere, alla chiusura di un punto, il
+                # pensiero dei passi che gli sono appartenuti (vedi
+                # ``core/pensiero.py``). Senza, l'unico legame fra un
+                # ragionamento e il lavoro che stava servendo non esiste.
+                "punto": (
+                    tool_ctx.plan.current.id
+                    if getattr(tool_ctx.plan, "current", None)
+                    else None
+                ),
+                "pensato": len(parser.reasoning),
+                "risposto": len(parser.answer),
+                "chiamate": len(tool_calls),
+                "watchdog": bool(watchdog_hit),
+                # Quanto spazio restava nella finestra prima di generare, e
+                # con che tetto si e' partiti. Sono i due numeri che spiegano
+                # una generazione tagliata: senza, in una sessione salvata non
+                # resta traccia di quanto poco margine ci fosse.
+                "spazio": int(spazio_finestra),
+                "tetto": int(tetto_passo),
+            }
+        )
+        stato_traccia["da"] = len(ui_messages)
+
         if interrupted or stopped():
             yield from halt(step, parser.reasoning, parser.answer)
             return
@@ -1564,13 +2091,17 @@ def run_turn(
                     time.sleep(PAUSA_RIPRESA_S)
                 continue
             yield AgentError(stream_error)
-            yield TurnFinished(reason="error", steps=step, usage=total_usage)
+            yield fine("error", step)
             return
 
+        # Il testo completo, una volta per passo: e' la rete di sicurezza degli
+        # incrementi. Chi si e' perso un frame (abbonato lento, riattacco a
+        # meta') qui torna in pari, e chi non si e' perso niente riscrive lo
+        # stesso testo che ha gia'.
         if parser.reasoning:
-            yield ReasoningDelta(parser.reasoning)
+            yield ReasoningDelta(text=parser.reasoning)
         if parser.answer:
-            yield ContentDelta(parser.answer)
+            yield ContentDelta(text=parser.answer)
 
         if watchdog_hit:
             watchdog_fires += 1
@@ -1798,7 +2329,7 @@ def run_turn(
                 {"role": "assistant", "content": _wrap(reasoning, answer), "ts": time.time()}
             )
             yield AssistantTurn(content=answer, reasoning=reasoning, has_tool_calls=False)
-            yield TurnFinished(reason="completed", steps=step, usage=total_usage)
+            yield fine("completed", step)
             return
 
         # --- esecuzione dei tool -------------------------------------------
@@ -1882,7 +2413,7 @@ def run_turn(
                     options=question["options"],
                     allow_multiple=question["allow_multiple"],
                 )
-                yield TurnFinished(reason="awaiting_user", steps=step, usage=total_usage)
+                yield fine("awaiting_user", step)
                 return
 
             try:
@@ -1931,11 +2462,14 @@ def run_turn(
             started = time.monotonic()
             if bad_args:
                 result = json.dumps(
-                    {
-                        "error": "Argomenti JSON malformati.",
-                        "hint": "Riemetti la chiamata con un oggetto JSON valido.",
-                        "received": (call["arguments"] or "")[:300],
-                    },
+                    # ``params_passo`` e non ``params``: il tetto puo' essere
+                    # stato abbassato per questo passo, ed e' quello vero che
+                    # ha tagliato la generazione.
+                    argomenti_illeggibili(
+                        call["arguments"],
+                        step_done_reason,
+                        int(getattr(params_passo, "max_tokens", 0) or 0),
+                    ),
                     ensure_ascii=False,
                 )
             else:
@@ -2028,9 +2562,7 @@ def run_turn(
                         options=domanda["options"],
                         allow_multiple=False,
                     )
-                    yield TurnFinished(
-                        reason="awaiting_user", steps=step, usage=total_usage
-                    )
+                    yield fine("awaiting_user", step)
                     return
             if call["name"] == NOTES_TOOL and ok:
                 yield NotesUpdated(notes=tool_ctx.notes.to_list())
@@ -2038,15 +2570,69 @@ def run_turn(
                 call["name"], args, result, ok, auto=auto_preview
             )
             if anteprima is not _NO_PREVIEW:
+                # La cartella servita si sa solo qui, dove c'e' il workspace:
+                # ``preview_from_result`` guarda una tool call e basta. Senza,
+                # la nota al modello direbbe "la cartella del workspace" anche
+                # per una pagina che sta in sito/ -- una frase falsa su cui poi
+                # ragiona.
+                if (
+                    isinstance(anteprima, dict)
+                    and anteprima.get("path")
+                    and "root" not in anteprima
+                ):
+                    anteprima["root"] = preview_root(
+                        tool_ctx.workspace, str(anteprima["path"])
+                    )
                 # Ricordarlo nel contesto del turno e' cio' che permette al
                 # passo successivo di sapere che il pannello e' gia' aperto.
                 tool_ctx.preview = anteprima
                 yield PreviewUpdated(payload=anteprima)
 
+        # --- estratto del pensiero dei punti appena chiusi -----------------
+        # La casella postale che ``manage_plan`` riempie chiudendo un punto. Si
+        # svuota **sempre**, anche quando non si estrae: un punto chiuso al
+        # turno scorso e distillato al prossimo archivierebbe il ragionamento
+        # sbagliato, e ``ToolContext`` sopravvive ai turni.
+        chiusi = list(tool_ctx.punti_chiusi)
+        tool_ctx.punti_chiusi.clear()
+        if chiusi and estratto_pensiero and schedario is not None and not stopped():
+            # La traccia di questo passo si attacca adesso invece che
+            # all'inizio del prossimo: il pensiero del passo che ha chiuso il
+            # punto appartiene a quel punto, ed e' spesso quello che contiene
+            # la conclusione. Il ``marca_pensiero`` in cima al ciclo restera'
+            # muto, perche' la traccia e' gia' stata consumata.
+            marca_pensiero()
+            for chiuso in chiusi:
+                blocchi = pensiero.blocchi_del_punto(ui_messages, chiuso["id"])
+                if not blocchi:
+                    continue
+                distillato = pensiero.estrai(
+                    blocchi,
+                    punto=chiuso["text"],
+                    backend=backend,
+                    params=params,
+                )
+                if not distillato:
+                    continue
+                voce = libreria.archivia_estratto(
+                    schedario,
+                    punto=chiuso["text"],
+                    estratto=distillato,
+                    saltato=bool(chiuso.get("saltato")),
+                )
+                if voce is not None:
+                    # L'indice in coda cambia adesso, non al turno prossimo:
+                    # il passo successivo deve poter vedere che quella voce
+                    # esiste, altrimenti il precarico la ignora per un intero
+                    # turno. L'estratto **non** torna nel risultato del tool:
+                    # ``manage_plan`` e' stato snellito apposta perche' valeva
+                    # il 13,5% dei token di risultato.
+                    blocco_libreria = _blocco_libreria()
+
         if stopped():
             # Fermarsi qui, a tool conclusi e risultati in cronologia, e' il
             # punto piu' pulito: la conversazione resta valida e riprendibile.
-            yield TurnFinished(reason="stopped", steps=step, usage=total_usage)
+            yield fine("stopped", step)
             return
 
         if leak_nudge_due:
@@ -2076,7 +2662,74 @@ def run_turn(
                 {"role": "user", "content": PLAN_NUDGE, "hidden": True}
             )
 
-    yield TurnFinished(reason="max_steps", steps=max_steps, usage=total_usage)
+        # Esplorazione lunga senza mai delegare. Il tool `esplora` c'e' e
+        # funziona: misurato il 23/08/2026 compare in 4 sessioni su 24, mentre
+        # l'esplorazione fatta a mano vale il 46% dei token di risultato che
+        # restano in contesto per sempre. Non manca lo strumento, manca che
+        # qualcuno lo nomini nel momento in cui servirebbe.
+        #
+        # Si conta per passi interi e non per singole chiamate: un read_file
+        # dentro un passo che scrive anche e' il ciclo normale leggi-modifica,
+        # e sollecitare li' sarebbe rumore. Il segnale e' il passo che *solo*
+        # guarda, ripetuto.
+        nomi_del_passo = {c["name"] for c in tool_calls}
+        if nomi_del_passo and nomi_del_passo <= set(TOOL_ESPLORATIVI):
+            esplorazioni_di_fila += len(tool_calls)
+        else:
+            esplorazioni_di_fila = 0
+        if (
+            enable_nudge
+            and abilita_delega
+            and not delega_nudged
+            and esplorazioni_di_fila >= MAX_ESPLORAZIONI_SENZA_DELEGA
+            and step < max_steps
+        ):
+            delega_nudged = True
+            count_nudge("delega")
+            ui_messages.append(
+                {
+                    "role": "user",
+                    "content": DELEGA_NUDGE.format(quante=esplorazioni_di_fila)
+                    + _esempio_delega(),
+                    "hidden": True,
+                }
+            )
+
+    # I passi sono finiti. Se il turno ha lavorato e non ha detto niente,
+    # l'utente ha davanti delle tendine di tool e nient'altro: una chiamata
+    # sola, senza tool, glielo racconta.
+    #
+    # Non e' un sollecito e non poteva esserlo: ``SUMMARY_NUDGE`` chiede al
+    # modello di scrivere al passo **successivo**, e qui un passo successivo
+    # non c'e' piu' -- ha in guardia ``step < max_steps`` esattamente per
+    # questo. E' lo stesso baratto di ``delega.referto_di_chiusura``: una
+    # generazione in piu' contro un turno intero buttato.
+    marca_pensiero()
+    if require_summary and tools_used and not ultima_risposta(ui_messages):
+        count_nudge("riepilogo_forzato")
+        testo = riepilogo_finale(
+            ui_messages,
+            backend=backend,
+            params=params,
+            budgets=budgets,
+            strip_thinking=strip_thinking,
+        )
+        if testo:
+            ui_messages.append(
+                {
+                    "role": "assistant",
+                    "content": testo,
+                    # Detto, perche' non e' una risposta come le altre: e' un
+                    # referto chiesto dall'harness quando il turno era gia'
+                    # finito. La UI puo' segnalarlo, e chi rilegge la sessione
+                    # non deve credere che il modello si sia fermato da solo.
+                    "forzato": True,
+                    "ts": time.time(),
+                }
+            )
+            yield AssistantTurn(content=testo, reasoning="", has_tool_calls=False)
+
+    yield fine("max_steps", max_steps)
 
 
 # Quante volte l'harness insiste perche' una verifica rossa venga riparata,
@@ -2084,6 +2737,14 @@ def run_turn(
 # oltre, si consumerebbe l'intero budget di passi su un problema che il modello
 # evidentemente non sa risolvere da solo.
 MAX_VERIFY_NUDGES = 2
+# I tool con cui si guarda e basta. Un passo fatto solo di questi e' una mossa
+# di esplorazione, e l'esplorazione e' esattamente cio' che si puo' delegare.
+TOOL_ESPLORATIVI = ("read_file", "search_files", "list_files")
+# Quante letture di fila prima di ricordare che esiste `esplora`. Cinque perche'
+# quattro sono ancora un giro di orientamento onesto: la delega conviene quando
+# la domanda e' aperta, non quando si stanno controllando due file noti. Il
+# sollecito scatta **una volta per turno** e si puo' ignorare.
+MAX_ESPLORAZIONI_SENZA_DELEGA = 5
 # Quota del budget di generazione oltre la quale un ragionamento senza nessuna
 # tool call viene interrotto. Il 55% non e' un numero tondo per caso: sotto, si
 # taglia un pensiero che stava per concludere; sopra, non resta abbastanza

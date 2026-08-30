@@ -1,9 +1,40 @@
-"""Vault LLM Wiki: un workspace organizzato secondo lo schema di Karpathy.
+"""Vault: una cartella con un nome, una descrizione e le sue conversazioni.
 
 ## Cos'e' un vault
 
-Un workspace che contiene una wiki personale mantenuta dall'agente, sul
-modello del pattern "LLM Wiki": tre livelli ben separati.
+Un posto di lavoro, non una modalita'. Nome, descrizione, cartella, e le chat
+che ci sono state fatte dentro: si apre e si trova quello che c'era, come una
+scrivania a cui si torna.
+
+Prima era solo l'attivazione della modalita' manutentore-wiki su un workspace
+riconosciuto dalla struttura ``raw/`` + ``wiki/``. Quella modalita' resta ed e'
+diventata **una proprieta' del vault** (``wiki: true`` in ``.vault.json``), non
+la sua definizione: un vault puo' essere una wiki, un progetto di codice, una
+raccolta di appunti.
+
+## Dove vive l'identita'
+
+In ``.vault.json``, nella radice del vault -- non nelle impostazioni
+dell'harness. Un vault che si autodescrive sopravvive allo spostamento della
+cartella, alla copia su un'altra macchina e alla reinstallazione: il registro
+nelle preferenze tiene solo l'elenco dei percorsi conosciuti, perche' quello
+non si puo' ricavare (nessuno vuole che l'harness scandisca il disco).
+
+Due campi di testo, e non uno, perche' rispondono a due domande diverse:
+
+* ``descrizione`` -- per chi guarda l'elenco: cos'e' questo posto. Non arriva
+  mai al modello.
+* ``istruzioni`` -- per il modello: come ci si lavora dentro. Entra nel prompt
+  di ogni chat del vault.
+
+Tenerli separati e' una difesa concreta: una riga scritta di fretta per
+ritrovare la cartella non deve diventare un'istruzione che l'agente segue in
+ogni turno per i mesi successivi.
+
+## Il livello wiki (opzionale)
+
+Quando ``wiki`` e' acceso, il workspace e' organizzato secondo il pattern "LLM
+Wiki" di Karpathy: tre livelli ben separati.
 
 - ``raw/``     -- fonti grezze (articoli, paper, trascrizioni). **Immutabili**:
                  l'agente le legge ma non le tocca mai.
@@ -27,9 +58,37 @@ senza server ne' modello: stanno qui.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import json
+import os
+from dataclasses import dataclass, replace
 from datetime import date
 from pathlib import Path
+
+# L'identita' del vault, nella sua radice. Col punto davanti: non compare negli
+# elenchi dell'agente e non sporca la cartella dell'utente.
+VAULT_FILE = ".vault.json"
+
+# Tetti sui due testi. La descrizione e' una riga d'elenco; le istruzioni
+# entrano nel prefisso di ogni turno del vault, quindi si pagano ad ogni passo
+# -- e' lo stesso motivo per cui le note di lavoro sono corte.
+MAX_DESCRIZIONE_CHARS = 400
+MAX_ISTRUZIONI_CHARS = 2_000
+
+# La memoria del vault. Tre livelli, e la differenza e' la **durata**:
+#
+# * ``core/notes.py`` -- il foglio della conversazione. Muore con il compito:
+#   "il bug era un off-by-one nel parser" fra due settimane non serve a nessuno.
+# * qui -- quello che si e' capito **di questo posto**. Vale per tutte le chat
+#   del vault e non muore con nessuna di esse: dove stanno le fonti, quale
+#   convenzione si e' concordata, cosa e' gia' stato scartato e perche'.
+# * ``core/memory.py`` -- i fatti stabili dell'utente, buoni ovunque.
+#
+# Il tetto e' piu' alto di quello delle note di chat (20) e piu' basso di
+# quello delle memorie globali (60): la memoria del vault si accumula per mesi,
+# ma viene rispedita ad **ogni passo di ogni chat** del vault, quindi e' il
+# posto dove un tetto largo si paga tutti i giorni.
+MAX_NOTE_VAULT = 40
+MAX_NOTA_VAULT_CHARS = 240
 
 # Nomi delle cartelle canoniche dello schema LLM Wiki.
 RAW_DIR = "raw"
@@ -45,34 +104,148 @@ LOG_FILE = f"{WIKI_DIR}/log.md"
 
 
 @dataclass(frozen=True)
+class VaultConfig:
+    """L'identita' di un vault, come sta scritta in ``.vault.json``."""
+
+    nome: str
+    descrizione: str = ""
+    # Le sole che arrivano al modello. Vedi il docstring del modulo per il
+    # perche' non sono lo stesso campo della descrizione.
+    istruzioni: str = ""
+    wiki: bool = False
+    # La memoria del vault: quello che l'agente ha imparato **qui**, valido
+    # per tutte le chat di questa cartella. Vedi ``MAX_NOTE_VAULT``.
+    note: tuple[str, ...] = ()
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "nome": self.nome,
+            "descrizione": self.descrizione,
+            "istruzioni": self.istruzioni,
+            "wiki": self.wiki,
+            "note": list(self.note),
+        }
+
+
+@dataclass(frozen=True)
 class VaultInfo:
-    """Cosa serve all'UI e al tool vault_search su un vault registrato."""
+    """Cosa serve all'UI su un vault registrato: identita' piu' conteggi."""
 
     path: str
     nome: str
+    descrizione: str = ""
+    istruzioni: str = ""
+    wiki: bool = False
     # Conteggi volutamente economici: contano i file, non li leggono.
     fonti: int = 0
     pagine: int = 0
+    chat: int = 0
+    note: tuple[str, ...] = ()
 
     def as_dict(self) -> dict[str, object]:
         return {
             "path": self.path,
             "nome": self.nome,
+            "descrizione": self.descrizione,
+            "istruzioni": self.istruzioni,
+            "wiki": self.wiki,
             "fonti": self.fonti,
             "pagine": self.pagine,
+            "chat": self.chat,
+            "note": list(self.note),
         }
 
 
-def is_vault(workspace: str | Path) -> bool:
-    """True se il percorso ha la forma minima di un vault.
+def ha_struttura_wiki(workspace: str | Path) -> bool:
+    """True se il percorso ha la forma di una wiki LLM: ``wiki/`` piu' ``raw/``.
 
-    La forma minima e' ``wiki/`` piu' ``raw/``: sono i due livelli che
-    distinguono una wiki mantenuta da una raccolta di appunti qualsiasi.
-    Chi vuole puo' partire anche da zero -- ``scaffold`` li crea -- ma un
-    vault *esistente* si riconosce dalla struttura, non da un flag.
+    Sono i due livelli che distinguono una wiki mantenuta da una raccolta di
+    appunti qualsiasi. Serve ancora per due cose: accendere ``wiki`` di serie
+    quando si registra una cartella che gia' lo era, e riconoscere i vault
+    nati prima di ``.vault.json``.
     """
     base = Path(workspace)
     return (base / WIKI_DIR).is_dir() and (base / RAW_DIR).is_dir()
+
+
+# Il nome storico. Ha smesso di voler dire "e' un vault" nel momento in cui un
+# vault e' diventato una cartella con un nome: adesso vuol dire "ha la forma
+# della wiki", che e' cio' che ha sempre davvero controllato.
+is_vault = ha_struttura_wiki
+
+
+def percorso_config(workspace: str | Path) -> Path:
+    return Path(workspace) / VAULT_FILE
+
+
+def is_registrato(workspace: str | Path) -> bool:
+    """True se la cartella si dichiara un vault, cioe' ha il suo ``.vault.json``."""
+    return percorso_config(workspace).is_file()
+
+
+def leggi_config(workspace: str | Path) -> VaultConfig:
+    """L'identita' del vault. Non fallisce mai: senza file, i valori di serie.
+
+    Il nome di serie e' quello della cartella, e ``wiki`` si accende da solo
+    sui vault che ne hanno la struttura: e' cio' che fa funzionare senza
+    migrazioni i vault nati prima di ``.vault.json``.
+    """
+    base = Path(workspace)
+    grezzo: dict[str, object] = {}
+    try:
+        with open(percorso_config(base), encoding="utf-8") as fh:
+            letto = json.load(fh)
+        if isinstance(letto, dict):
+            grezzo = letto
+    except (OSError, json.JSONDecodeError):
+        grezzo = {}
+    return VaultConfig(
+        nome=str(grezzo.get("nome") or base.name or "vault"),
+        descrizione=str(grezzo.get("descrizione") or "")[:MAX_DESCRIZIONE_CHARS],
+        istruzioni=str(grezzo.get("istruzioni") or "")[:MAX_ISTRUZIONI_CHARS],
+        wiki=bool(grezzo.get("wiki", ha_struttura_wiki(base))),
+        note=_ripulisci_note(grezzo.get("note")),
+    )
+
+
+def _ripulisci_note(grezze: object) -> tuple[str, ...]:
+    """Note valide, senza doppioni, entro i tetti. Non solleva mai."""
+    fuori: list[str] = []
+    if not isinstance(grezze, list):
+        return ()
+    for voce in grezze:
+        testo = " ".join(str(voce or "").split())[:MAX_NOTA_VAULT_CHARS]
+        if testo and testo not in fuori:
+            fuori.append(testo)
+    return tuple(fuori[:MAX_NOTE_VAULT])
+
+
+def scrivi_config(workspace: str | Path, config: VaultConfig) -> VaultConfig:
+    """Salva ``.vault.json``, con scrittura atomica come le altre preferenze."""
+    base = Path(workspace)
+    pulito = replace(
+        config,
+        nome=" ".join(str(config.nome or "").split())[:120] or base.name,
+        descrizione=str(config.descrizione or "").strip()[:MAX_DESCRIZIONE_CHARS],
+        istruzioni=str(config.istruzioni or "").strip()[:MAX_ISTRUZIONI_CHARS],
+        wiki=bool(config.wiki),
+        note=_ripulisci_note(list(config.note)),
+    )
+    tmp = percorso_config(base).with_suffix(".json.tmp")
+    try:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(pulito.as_dict(), fh, indent=2, ensure_ascii=False)
+        os.replace(tmp, percorso_config(base))
+    except OSError:
+        pass
+    return pulito
+
+
+def aggiorna_config(workspace: str | Path, **campi: object) -> VaultConfig:
+    """Cambia solo i campi passati. Gli altri restano quelli che erano."""
+    corrente = leggi_config(workspace)
+    noti = {k: v for k, v in campi.items() if v is not None and hasattr(corrente, k)}
+    return scrivi_config(workspace, replace(corrente, **noti))
 
 
 def scaffold(base: Path) -> list[str]:
@@ -103,19 +276,41 @@ def scaffold(base: Path) -> list[str]:
     return creati
 
 
-def ensure_vault(workspace: str | Path) -> Path:
+def ensure_vault(workspace: str | Path, *, nome: str = "") -> Path:
     """Rende vault il workspace dato e ne ritorna la radice assoluta.
 
-    E' il punto unico in cui un percorso diventa un vault: il server lo chiama
-    quando l'utente apre o registra una cartella come vault, cosi' anche una
-    cartella appena creata parte con la struttura giusta invece di fallire
-    alla prima ingest perche' ``wiki/`` non c'era.
+    E' il punto unico in cui una cartella diventa un vault: scrive
+    ``.vault.json`` se manca, e **solo se il vault e' una wiki** monta anche la
+    struttura ``raw/`` + ``wiki/``. Una cartella qualsiasi registrata come
+    vault non si ritrova due cartelle che non ha chiesto -- era il difetto del
+    vecchio ``ensure_vault``, che dava per scontato che vault e wiki fossero la
+    stessa cosa.
+
+    Idempotente: su un vault gia' avviato non tocca niente.
     """
     base = Path(workspace).expanduser().resolve()
     if not base.is_dir():
         raise NotADirectoryError(f"'{base}' non e' una cartella esistente.")
-    scaffold(base)
+    if not is_registrato(base):
+        scrivi_config(
+            base,
+            VaultConfig(nome=nome or base.name, wiki=ha_struttura_wiki(base)),
+        )
+    if leggi_config(base).wiki:
+        scaffold(base)
     return base
+
+
+def abilita_wiki(workspace: str | Path) -> VaultConfig:
+    """Accende la modalita' manutentore e crea la struttura che le serve.
+
+    Le due cose stanno insieme di proposito: accendere il flag senza ``wiki/``
+    e ``raw/`` darebbe un manutentore che fallisce alla prima ingest, e la
+    frase del prompt che promette i tre livelli sarebbe falsa.
+    """
+    base = Path(workspace)
+    scaffold(base)
+    return aggiorna_config(base, wiki=True)
 
 
 def conta_file(cartella: Path, suffisso: str = ".md") -> int:
@@ -125,14 +320,26 @@ def conta_file(cartella: Path, suffisso: str = ".md") -> int:
     return sum(1 for p in cartella.rglob(f"*{suffisso}") if p.is_file())
 
 
-def info_vault(path: str, nome: str = "") -> VaultInfo:
-    """Statistiche economiche su un vault: due conti di directory listing."""
+def info_vault(path: str, nome: str = "", *, chat: int = 0) -> VaultInfo:
+    """Identita' piu' statistiche economiche: due conti di directory listing.
+
+    ``nome`` resta accettato come ripiego per i vault del vecchio registro che
+    non hanno ancora un ``.vault.json``; quando il file c'e', vince lui.
+    """
     base = Path(path)
+    config = leggi_config(base)
+    if nome and not is_registrato(base):
+        config = replace(config, nome=nome)
     return VaultInfo(
         path=path,
-        nome=nome or base.name,
-        fonti=conta_file(base / RAW_DIR),
-        pagine=conta_file(base / WIKI_DIR),
+        nome=config.nome,
+        descrizione=config.descrizione,
+        istruzioni=config.istruzioni,
+        wiki=config.wiki,
+        fonti=conta_file(base / RAW_DIR) if config.wiki else 0,
+        pagine=conta_file(base / WIKI_DIR) if config.wiki else 0,
+        chat=chat,
+        note=config.note,
     )
 
 
@@ -306,8 +513,99 @@ link, indici, log, coerenza -- e' responsabilita' tua.\
 
 
 def is_modalita_vault(workspace: str | Path) -> bool:
-    """True se la sessione sta girando dentro un vault riconoscibile."""
-    return is_vault(workspace)
+    """True se qui l'agente deve fare il manutentore della wiki.
+
+    Non e' piu' "sto dentro un vault": un vault puo' essere un progetto di
+    codice, e li' il prompt del bibliotecario sarebbe fuori posto. E' il flag
+    ``wiki`` del vault -- che su una cartella senza ``.vault.json`` ricade
+    sulla struttura, quindi i vault di prima continuano a comportarsi uguale.
+    """
+    return leggi_config(workspace).wiki
+
+
+class NotaVaultError(ValueError):
+    """Uso non valido della memoria del vault."""
+
+
+def aggiungi_nota(workspace: str | Path, testo: str) -> VaultConfig:
+    """Una riga in piu' nella memoria del vault. Idempotente sui doppioni."""
+    pulito = " ".join(str(testo or "").split())
+    if not pulito:
+        raise NotaVaultError("La nota e' vuota.")
+    if len(pulito) > MAX_NOTA_VAULT_CHARS:
+        pulito = pulito[: MAX_NOTA_VAULT_CHARS - 1].rstrip() + "…"
+    corrente = leggi_config(workspace)
+    if pulito in corrente.note:
+        # Riscrivere la stessa nota e' un sintomo di un modello che gira a
+        # vuoto: non lo si premia con una riga in piu'.
+        return corrente
+    if len(corrente.note) >= MAX_NOTE_VAULT:
+        raise NotaVaultError(
+            f"La memoria del vault e' piena ({MAX_NOTE_VAULT} note). Togli "
+            "quelle superate con action='remove' prima di aggiungerne altre."
+        )
+    return scrivi_config(workspace, replace(corrente, note=(*corrente.note, pulito)))
+
+
+def togli_nota(workspace: str | Path, riferimento: str) -> VaultConfig:
+    """Toglie una nota citandola per testo, anche solo per il suo inizio.
+
+    Per prefisso e non solo esatta: un modello che cita una nota a memoria la
+    tronca, e rifiutare per una virgola mancante costa un giro per niente.
+    """
+    corrente = leggi_config(workspace)
+    ago = " ".join(str(riferimento or "").split())
+    if not ago:
+        raise NotaVaultError("Serve la nota da togliere.")
+    candidate = [n for n in corrente.note if n == ago] or [
+        n for n in corrente.note if n.startswith(ago[:40])
+    ]
+    if len(candidate) != 1:
+        raise NotaVaultError(f"Nessuna nota corrisponde a '{riferimento}'.")
+    tenute = tuple(n for n in corrente.note if n != candidate[0])
+    return scrivi_config(workspace, replace(corrente, note=tenute))
+
+
+def blocco_note(config: VaultConfig) -> str:
+    """La memoria del vault, da mettere **in coda** come il piano e le note.
+
+    Stessa ragione di sempre: il prefisso resta byte-identico fra un passo e
+    l'altro, ed e' cio' che rende riusabile il KV cache.
+    """
+    if not config.note:
+        return ""
+    righe = [f"- {n}" for n in config.note]
+    return "\n".join(
+        [
+            f"<memoria_del_vault nome=\"{config.nome}\">",
+            *righe,
+            "</memoria_del_vault>",
+            "",
+            "Cose imparate lavorando in questa cartella, in conversazioni "
+            "anche molto piu' vecchie di questa. Valgono come se le avessi "
+            "appena lette. Se ne scopri una nuova che varra' ancora fra un "
+            "mese, scrivila qui con manage_notes ambito='vault' -- il foglio "
+            "di questa chat invece muore con lei.",
+        ]
+    )
+
+
+def blocco_istruzioni(config: VaultConfig) -> str:
+    """Le istruzioni del vault, per il prompt di sistema.
+
+    Solo ``istruzioni``: la ``descrizione`` serve a ritrovare la cartella
+    nell'elenco e non deve diventare un ordine permanente per l'agente.
+    """
+    testo = (config.istruzioni or "").strip()
+    if not testo:
+        return ""
+    return (
+        f"\n\n<vault nome=\"{config.nome}\">\n"
+        "Istruzioni scritte dall'utente per il lavoro in questa cartella. "
+        "Valgono per tutta la conversazione.\n"
+        f"{testo}\n"
+        "</vault>"
+    )
 
 
 def blocco_manutenzione(workspace: str | Path) -> str:

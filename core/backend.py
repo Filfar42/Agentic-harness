@@ -17,6 +17,7 @@ per vLLM, llama.cpp server, LM Studio o qualunque endpoint compatibile.
 from __future__ import annotations
 
 import json
+import time
 from dataclasses import dataclass
 from typing import Any, Literal
 from collections.abc import Iterator
@@ -164,11 +165,29 @@ def parse_version(raw: str) -> tuple[int, ...]:
 # ``OllamaBackend.model_info``. Chiave: (base_url, nome del modello).
 _MODEL_INFO_CACHE: dict[tuple[str, str], dict[str, Any]] = {}
 
+# Anche i **fallimenti** vanno ricordati, per un po'. Non ricordarli sembrava
+# prudente ("al prossimo giro riprova") ed era la voce piu' cara dell'apertura
+# di una chat: ``session_stats`` chiede le capability del modello ad ogni
+# lettura di sessione, e con il modello su un'altra macchina spenta ogni
+# lettura pagava i sei secondi di timeout, per intero. Aprire una chat, finire
+# un turno, riallinearsi: sei secondi ognuno.
+#
+# Trenta secondi sono la misura di un endpoint che sta tornando su: abbastanza
+# per non ripagare il timeout dieci volte in un minuto, abbastanza poco perche'
+# accendere il server del modello si veda quasi subito.
+_MODEL_INFO_FALLITI: dict[tuple[str, str], float] = {}
+MODEL_INFO_FALLIMENTO_TTL_S = 30.0
+
 
 def forget_model_info() -> None:
     """Svuota la cache delle capability: da chiamare quando l'utente cambia
-    endpoint o modello, o quando ri-lancia la sonda a mano."""
+    endpoint o modello, o quando ri-lancia la sonda a mano.
+
+    Svuota anche i fallimenti ricordati: chi ri-lancia la sonda a mano lo fa
+    proprio perche' ha appena acceso qualcosa, e fargli aspettare il TTL
+    sarebbe rispondergli con la fotografia di prima."""
     _MODEL_INFO_CACHE.clear()
+    _MODEL_INFO_FALLITI.clear()
 
 
 class OllamaBackend:
@@ -188,6 +207,12 @@ class OllamaBackend:
         # None = decidi dalla versione del server.
         self._stream_with_tools = stream_with_tools
         self._version_cache: str | None = None
+        # I livelli di pensiero ("low"/"medium"/"high"/"max") li accettano solo
+        # le versioni recenti di Ollama; le altre rifiutano la richiesta con un
+        # 400. None = non si sa ancora e si prova; False = provato e rifiutato,
+        # da qui in poi si manda il booleano. Si impara dal server invece di
+        # dichiararlo con una tabella di versioni che invecchia da sola.
+        self._think_levels_ok: bool | None = None
 
     # -- introspezione ----------------------------------------------------
 
@@ -275,6 +300,10 @@ class OllamaBackend:
             cached = _MODEL_INFO_CACHE.get(key)
             if cached is not None:
                 return cached
+            fallito = _MODEL_INFO_FALLITI.get(key)
+            if fallito is not None and time.monotonic() - fallito < MODEL_INFO_FALLIMENTO_TTL_S:
+                # Ha appena fallito: non si ripaga il timeout adesso.
+                return {}
         try:
             resp = httpx.post(
                 f"{self.base_url}/api/show", json={"model": model}, timeout=6.0
@@ -282,7 +311,9 @@ class OllamaBackend:
             resp.raise_for_status()
             info = resp.json()
         except Exception:  # noqa: BLE001
-            return {}       # gli errori non si memorizzano: al prossimo giro riprova
+            _MODEL_INFO_FALLITI[key] = time.monotonic()
+            return {}
+        _MODEL_INFO_FALLITI.pop(key, None)
         _MODEL_INFO_CACHE[key] = info
         return info
 
@@ -367,8 +398,27 @@ class OllamaBackend:
             payload["tools"] = tools
         think = params.think_payload
         if think:
+            # Su un server che ha gia' rifiutato i livelli si manda il
+            # booleano: il pensiero resta acceso, si perde solo la manopola.
+            if isinstance(think, str) and self._think_levels_ok is False:
+                think = True
             payload["think"] = think
         return payload
+
+    def _livello_rifiutato(self, payload: dict[str, Any], corpo: str) -> bool:
+        """Il 400 e' colpa del livello di pensiero? Allora si riprova.
+
+        Due condizioni insieme, perche' una sola sbaglierebbe: che avessimo
+        davvero mandato un livello, e che il server nomini ``think`` nel
+        motivo. Un 400 per un altro motivo non deve spegnere una manopola che
+        funzionava.
+        """
+        if not isinstance(payload.get("think"), str):
+            return False
+        if "think" not in corpo.lower():
+            return False
+        self._think_levels_ok = False
+        return True
 
     def _emit_message(
         self, message: dict[str, Any], tool_index: int
@@ -431,6 +481,9 @@ class OllamaBackend:
                 timeout=httpx.Timeout(self.timeout_s, connect=10.0),
             )
             if resp.status_code >= 400:
+                if self._livello_rifiutato(payload, resp.text[:600]):
+                    yield from self._blocking_chat(messages, tools, params)
+                    return
                 yield StreamEvent(
                     "error", text=f"HTTP {resp.status_code}: {resp.text[:600]}"
                 )
@@ -473,6 +526,15 @@ class OllamaBackend:
             ) as resp:
                 if resp.status_code >= 400:
                     body = resp.read().decode("utf-8", "replace")[:600]
+                    # Un server troppo vecchio per i livelli di pensiero: si
+                    # riprova subito col booleano invece di far fallire il
+                    # passo. Una volta sola e non di piu': ``_livello_rifiutato``
+                    # ha appena messo il flag a False, quindi il payload del
+                    # secondo giro non ha piu' una stringa e la condizione non
+                    # puo' ripresentarsi.
+                    if self._livello_rifiutato(payload, body):
+                        yield from self.stream(messages, tools, params)
+                        return
                     yield StreamEvent("error", text=f"HTTP {resp.status_code}: {body}")
                     return
 
@@ -520,32 +582,70 @@ class OpenAICompatBackend:
         self.api_key = api_key or "not-needed"
         self.timeout_s = float(timeout_s)
 
-    def ping(self) -> tuple[bool, str]:
+    def _auth_headers(self) -> dict[str, str]:
+        """Header di autenticazione, uno solo per tutte le sonde.
+
+        Vale anche per le rotte *native* dei dialetti: llama-server lanciato
+        con ``--api-key`` protegge tutto, ``/props`` compreso, e a mani vuote
+        risponde 401 senza spiegare. Dalla UI quel 401 si legge "endpoint non
+        raggiungibile" mentre il server sta benissimo -- e la goccia rossa su
+        un server vivo e' il caso peggiore, perche' non sembra un errore.
+        """
+        return {"Authorization": f"Bearer {self.api_key}"}
+
+    def _fetch_models(self) -> tuple[bool, str, list[str]]:
+        """``GET /v1/models``. L'unico posto in cui quella rotta si interroga.
+
+        Sta a se' perche' ``status`` e ``list_models`` la vogliono entrambi, e
+        farli chiamare a vicenda -- con le sottoclassi che ne ridefiniscono uno
+        dei due -- e' il modo piu' rapido di scrivere una ricorsione infinita
+        senza accorgersene.
+        """
         try:
             resp = httpx.get(
-                f"{self.base_url}/models",
-                headers={"Authorization": f"Bearer {self.api_key}"},
-                timeout=4.0,
+                f"{self.base_url}/models", headers=self._auth_headers(), timeout=4.0
             )
             resp.raise_for_status()
-            return True, "endpoint raggiungibile"
-        except Exception as exc:  # noqa: BLE001
-            return False, f"{type(exc).__name__}: {exc}"
+            models = sorted(m.get("id", "") for m in resp.json().get("data", []))
+            return True, f"{len(models)} modelli disponibili", models
+        except Exception as exc:  # noqa: BLE001 - diagnostica per la UI
+            return False, f"{type(exc).__name__}: {exc}", []
+
+    def status(self) -> tuple[bool, str, list[str]]:
+        """Stato del server e catalogo dei modelli in **una sola** richiesta.
+
+        Stessa ragione della gemella su Ollama: ``ping`` e ``list_models``
+        interrogavano lo stesso ``/v1/models``, e chiamarli in coppia --
+        come faceva l'avvio della UI -- raddoppiava l'attesa, e con un
+        endpoint spento raddoppiava i 4s di timeout, senza aggiungere niente.
+        """
+        return self._fetch_models()
+
+    def ping(self) -> tuple[bool, str]:
+        online, detail, _ = self._fetch_models()
+        return online, detail
 
     def list_models(self) -> list[str]:
-        try:
-            resp = httpx.get(
-                f"{self.base_url}/models",
-                headers={"Authorization": f"Bearer {self.api_key}"},
-                timeout=4.0,
-            )
-            resp.raise_for_status()
-            return sorted(m.get("id", "") for m in resp.json().get("data", []))
-        except Exception:  # noqa: BLE001
-            return []
+        return self._fetch_models()[2]
 
     def supports_tools(self, model: str) -> bool | None:  # noqa: ARG002
         return None
+
+    # -- ganci per i dialetti (llama.cpp, vLLM, ...) -----------------------
+    #
+    # Esistono perche' l'alternativa era una seconda copia di ``stream``: la
+    # differenza fra un endpoint compatibile e l'altro sta in due punti soli,
+    # cosa si manda fuori standard e cosa si legge fuori standard.
+
+    def _extra_body(self, params: GenParams) -> dict[str, Any]:
+        """Campi fuori dallo standard OpenAI da mettere in ``extra_body``."""
+        # vLLM legge questo campo; Ollama lo ignora (per quello esiste il
+        # transport nativo qui sopra).
+        return {"max_model_len": params.num_ctx}
+
+    def _extra_usage(self, chunk: Any) -> dict[str, Any]:  # noqa: ARG002
+        """Numeri fuori standard letti dal chunk. Qui non ce ne sono."""
+        return {}
 
     def stream(
         self,
@@ -566,30 +666,55 @@ class OpenAICompatBackend:
             "max_tokens": params.max_tokens,
             "stream": True,
             "stream_options": {"include_usage": True},
-            # vLLM legge questi campi; Ollama li ignora (per quello esiste il
-            # transport nativo qui sopra).
-            "extra_body": {"max_model_len": params.num_ctx},
+            "extra_body": self._extra_body(params),
         }
         if tools:
             kwargs["tools"] = tools
             kwargs["tool_choice"] = "auto"
 
         buffers: dict[int, dict[str, str]] = {}
+        fuori_standard: dict[str, Any] = {}
+        usage_emesso = False
+        # Perche' la generazione si e' fermata. Nello standard OpenAI e'
+        # ``finish_reason``, su Ollama ``done_reason``: qui si traduce nel
+        # secondo, che e' il nome con cui il ciclo agentico lo conosce gia'.
+        #
+        # Nessuno lo leggeva. Una generazione tagliata a meta' -- tetto di
+        # ``max_tokens`` raggiunto, o finestra del server esaurita -- arrivava
+        # quindi indistinguibile da una finita bene, e se il taglio cadeva
+        # dentro gli argomenti di una tool call il modello si prendeva la colpa
+        # con un "Argomenti JSON malformati" che non descriveva niente di
+        # quello che era successo.
+        done_reason = ""
         try:
             stream = client.chat.completions.create(**kwargs)
             for chunk in stream:
+                # I numeri fuori standard si leggono **prima** dell'usage: su
+                # llama.cpp i timings viaggiano nello stesso chunk finale e
+                # devono poter entrare nello stesso evento.
+                fuori_standard.update(self._extra_usage(chunk))
+                # ...e cosi' il motivo dello stop: arriva sull'ultimo chunk con
+                # un ``choices`` pieno, mentre ``usage`` arriva su quello dopo,
+                # che di ``choices`` non ne ha. Leggerlo solo dentro il ramo
+                # dell'usage vorrebbe dire non leggerlo mai.
+                scelte = getattr(chunk, "choices", None) or []
+                if scelte and getattr(scelte[0], "finish_reason", None):
+                    done_reason = str(scelte[0].finish_reason)
                 if getattr(chunk, "usage", None):
                     usage = chunk.usage
+                    usage_emesso = True
                     yield StreamEvent(
                         "usage",
                         usage={
                             "prompt_tokens": getattr(usage, "prompt_tokens", 0),
                             "completion_tokens": getattr(usage, "completion_tokens", 0),
+                            "done_reason": done_reason,
+                            **fuori_standard,
                         },
                     )
-                if not chunk.choices:
+                if not scelte:
                     continue
-                delta = chunk.choices[0].delta
+                delta = scelte[0].delta
 
                 reasoning = getattr(delta, "reasoning_content", None) or getattr(
                     delta, "reasoning", None
@@ -619,8 +744,315 @@ class OpenAICompatBackend:
                             idx, slot["id"], slot["name"], slot["arguments"] or "{}"
                         ),
                     )
+            # Un server che non manda ``usage`` non deve far sparire anche i
+            # numeri che ha mandato: i tempi e i contatori del draft valgono
+            # da soli, ed e' su quelli che si decide se lo speculative
+            # decoding sta rendendo.
+            if not usage_emesso and (fuori_standard or done_reason):
+                yield StreamEvent(
+                    "usage", usage={"done_reason": done_reason, **fuori_standard}
+                )
         except Exception as exc:  # noqa: BLE001
             yield StreamEvent("error", text=f"{type(exc).__name__}: {exc}")
+
+
+class LlamaCppBackend(OpenAICompatBackend):
+    """``llama-server`` di llama.cpp: OpenAI-compatibile, ma con ``/props``.
+
+    Perche' non basta il transport ``openai`` generico -- tre motivi, tutti
+    silenziosi, cioe' della specie peggiore:
+
+    * **Il contesto non e' piu' un parametro della richiesta.** llama-server lo
+      fissa al lancio con ``-c`` e ignora quello che gli mandi, senza dirlo:
+      stessa classe di trappola di ``repeat_penalty`` su Ollama. Peggio -- se
+      l'harness ne crede uno piu' grande di quello vero, il server fa *context
+      shift* e riscrive la conversazione a meta' senza segnalare niente. Qui il
+      numero vero si **legge** da ``/props`` (``server_num_ctx``) e chi lo usa
+      si adegua: il server vince sull'impostazione.
+    * **I sampler hanno altri nomi.** ``top_k`` e ``repeat_penalty`` non sono
+      nello standard OpenAI: vanno in ``extra_body``, e sbagliarne il nome non
+      da' errore -- da' una manopola finta.
+    * **I tempi e i contatori del draft model.** Con ``timings_per_token``
+      llama.cpp mette nello stream quanto ha impiegato e, quando gira con uno
+      speculative decoder, quanti token il draft ha proposto e quanti ne sono
+      stati accettati. E' l'unica misura onesta di quanto rende il draft, e
+      arriva gratis dentro il turno invece che da un benchmark a parte.
+
+    Nota su ``--jinja``: senza quel flag llama-server non emette tool call.
+    Non lo dice; ``supports_tools`` che risponde ``False`` su un modello che i
+    tool li sa usare vuol dire quasi sempre quello.
+    """
+
+    name = "llamacpp"
+
+    # ``/props`` non cambia mentre il server e' vivo -- ma il server si
+    # riavvia, ed e' proprio riavviandolo che si cambia ``-c``. Una cache
+    # eterna farebbe credere all'harness una finestra che non esiste piu'.
+    PROPS_TTL_S = 60.0
+
+    # Nomi possibili dei contatori del draft. La README di llama.cpp non li
+    # documenta e la PR che porta DFlash2 e' ancora aperta: si accettano gli
+    # alias invece di scommettere su uno solo. Se un giorno non combacia
+    # nessuno, la riga sparisce dal pannello -- non si inventa un numero.
+    ALIAS_DRAFT_N = ("draft_n", "n_draft", "n_draft_total", "draft_n_total")
+    ALIAS_DRAFT_OK = ("draft_n_accepted", "n_draft_accepted", "draft_accepted")
+
+    def __init__(
+        self, base_url: str, api_key: str = "", timeout_s: float = 180.0
+    ) -> None:
+        super().__init__(base_url, api_key, timeout_s)
+        # ``self.base_url`` del padre finisce gia' per "/v1"; le rotte native
+        # di llama.cpp (/props, /slots) stanno sulla radice.
+        self.root_url = self.base_url[: -len("/v1")]
+        self._props: dict[str, Any] = {}
+        self._props_at: float = 0.0
+
+    # -- introspezione ----------------------------------------------------
+
+    def props(self, *, refresh: bool = False) -> dict[str, Any]:
+        """``GET /props``, con una cache a scadenza. Non solleva mai."""
+        adesso = time.monotonic()
+        fresca = self._props and (adesso - self._props_at) < self.PROPS_TTL_S
+        if fresca and not refresh:
+            return self._props
+        try:
+            resp = httpx.get(
+                f"{self.root_url}/props", headers=self._auth_headers(), timeout=4.0
+            )
+            resp.raise_for_status()
+            dati = resp.json()
+        except Exception:  # noqa: BLE001 - diagnostica, non un errore di turno
+            return self._props      # meglio l'ultimo noto che niente
+        if isinstance(dati, dict):
+            self._props = dati
+            self._props_at = adesso
+        return self._props
+
+    # Le tre sonde, in ordine di specificita'. La prima che risponde vince.
+    #
+    # ``/props`` resta in testa perche' e' anche il modo di **riconoscere**
+    # llama.cpp fra gli endpoint compatibili: ``/v1/models`` risponde a tutti,
+    # ``/props`` solo a lui -- ed e' su quella distinzione che ``auto`` sceglie
+    # il dialetto. Ma "non risponde /props" non e' un buon modo di dichiarare
+    # spento un server: certe build lo tengono dietro l'autenticazione, un
+    # reverse proxy davanti puo' non inoltrarlo, e le build vecchie non ce
+    # l'hanno affatto. Fermarsi li' voleva dire la goccia rossa su un server
+    # che stava rispondendo alle generazioni -- il caso peggiore, perche' non
+    # sembra un errore della UI: sembra che il server sia giu'.
+    SONDE = (
+        ("/props", "llama-server raggiungibile"),
+        ("/health", "llama-server raggiungibile (/health)"),
+        ("/v1/models", "endpoint raggiungibile (/v1/models)"),
+    )
+
+    def parla_llamacpp(self) -> bool:
+        """C'e' davvero llama-server dietro questo indirizzo?
+
+        Sonda **stretta**: solo ``/props``, che risponde soltanto a lui. E'
+        una domanda diversa da "e' acceso?" e va tenuta separata, o ``auto``
+        finirebbe a parlare il dialetto di llama.cpp a un vLLM qualunque --
+        che a ``/health`` risponde volentieri. ``ping`` puo' permettersi di
+        essere generoso perche' accende una goccia; questa no, perche' sceglie
+        come si formano le richieste per tutta la sessione.
+        """
+        try:
+            resp = httpx.get(
+                f"{self.root_url}/props", headers=self._auth_headers(), timeout=4.0
+            )
+            resp.raise_for_status()
+        except Exception:  # noqa: BLE001
+            return False
+        return True
+
+    def ping(self) -> tuple[bool, str]:
+        """Prova le sonde in ordine; il dettaglio dice **quale** ha risposto.
+
+        Quando falliscono tutte, il dettaglio le elenca tutte e tre con il
+        loro errore: e' l'unica riga che l'utente ha per capire se il server
+        e' spento, se e' l'indirizzo sbagliato o se e' la chiave che manca.
+        """
+        errori: list[str] = []
+        for rotta, detail in self.SONDE:
+            try:
+                resp = httpx.get(
+                    f"{self.root_url}{rotta}", headers=self._auth_headers(), timeout=4.0
+                )
+                resp.raise_for_status()
+                return True, detail
+            except Exception as exc:  # noqa: BLE001
+                errori.append(f"{rotta} {type(exc).__name__}")
+        return False, "nessuna rotta risponde: " + ", ".join(errori)
+
+    def status(self) -> tuple[bool, str, list[str]]:
+        """Come il padre, ma passando dalla catena di sonde.
+
+        Ereditare ``status`` dal generico avrebbe scavalcato ``ping``: la UI
+        avrebbe di nuovo giudicato llama-server dal solo ``/v1/models``, che
+        e' proprio la rotta che qui e' l'ultima scelta e non la prima.
+        """
+        online, detail = self.ping()
+        return online, detail, (self.list_models() if online else [])
+
+    def list_models(self) -> list[str]:
+        """Il modello caricato, anche quando ``/v1/models`` non dice niente.
+
+        llama-server ne serve **uno solo** e ignora il campo ``model`` della
+        richiesta: qualunque nome funzionerebbe. Ma un elenco vuoto lascia
+        l'utente a indovinare cosa scrivere nelle impostazioni -- e a chiedersi
+        se debba mettere il modello grande o il draft (mai il draft: quello non
+        e' indirizzabile, vive dentro il server). Meglio dire il nome vero,
+        preso dal percorso del file in ``/props`` quando l'endpoint standard
+        non risponde.
+        """
+        elenco = super().list_models()
+        if elenco:
+            return elenco
+        percorso = str(self.props().get("model_path") or "")
+        if not percorso:
+            return []
+        nome = percorso.replace("\\", "/").rsplit("/", 1)[-1]
+        if nome.lower().endswith(".gguf"):
+            nome = nome[: -len(".gguf")]
+        return [nome] if nome else []
+
+    def server_num_ctx(self) -> int | None:
+        """Finestra **vera** del server, o ``None`` se non la dichiara."""
+        props = self.props()
+        gen = props.get("default_generation_settings")
+        for sorgente in (gen if isinstance(gen, dict) else {}, props):
+            valore = sorgente.get("n_ctx")
+            if isinstance(valore, int) and valore > 0:
+                return valore
+        # Ripiego: /slots dichiara n_ctx per slot. Esiste solo se il server e'
+        # partito con --slots, quindi puo' mancare senza che sia un problema.
+        try:
+            resp = httpx.get(f"{self.root_url}/slots", timeout=4.0)
+            resp.raise_for_status()
+            slots = resp.json()
+        except Exception:  # noqa: BLE001
+            return None
+        if isinstance(slots, list) and slots and isinstance(slots[0], dict):
+            valore = slots[0].get("n_ctx")
+            if isinstance(valore, int) and valore > 0:
+                return valore
+        return None
+
+    def clamp_num_ctx(self, richiesto: int) -> int:
+        """Il minimo fra quello che si vuole e quello che il server ha.
+
+        Chiedere di piu' non allarga niente: fa solo credere all'harness di
+        avere spazio che non c'e', e i budget di troncamento si tarano su un
+        numero falso.
+        """
+        vero = self.server_num_ctx()
+        if vero and richiesto > vero:
+            return vero
+        return richiesto
+
+    def _caps(self) -> dict[str, Any]:
+        caps = self.props().get("chat_template_caps")
+        return caps if isinstance(caps, dict) else {}
+
+    def supports_tools(self, model: str) -> bool | None:  # noqa: ARG002
+        """``False`` qui vuol dire quasi sempre: manca ``--jinja``."""
+        segnali = [v for k, v in self._caps().items() if "tool" in k.lower()]
+        if segnali:
+            return any(bool(v) for v in segnali)
+        template = str(self.props().get("chat_template", ""))
+        if template:
+            return "tools" in template.lower() or None
+        return None
+
+    def supports_thinking(self, model: str) -> bool | None:  # noqa: ARG002
+        """Rimpiazza la capability ``thinking`` di ``/api/show`` di Ollama.
+
+        Serve a ``native_think: auto``, che senza questo metodo non rilevava
+        piu' niente sul transport compatibile e restava spento per sempre.
+        """
+        chiavi = ("reason", "think")
+        segnali = [
+            v
+            for k, v in self._caps().items()
+            if any(c in k.lower() for c in chiavi)
+        ]
+        if segnali:
+            return any(bool(v) for v in segnali)
+        template = str(self.props().get("chat_template", ""))
+        if template:
+            return "think" in template.lower() or None
+        return None
+
+    # -- dialetto ---------------------------------------------------------
+
+    def _extra_body(self, params: GenParams) -> dict[str, Any]:
+        """Sampler nel dialetto di llama.cpp.
+
+        ``max_model_len`` non c'e' apposta: qui il contesto lo comanda la riga
+        di lancio del server, e mandarlo sarebbe esattamente la manopola finta
+        descritta sopra.
+        """
+        body: dict[str, Any] = {
+            "top_k": int(params.top_k),
+            # Fa arrivare i timings -- e con essi i contatori del draft --
+            # dentro lo stream, invece di doverli chiedere a /slots dopo.
+            "timings_per_token": True,
+        }
+        # Fuori si chiama repetition_penalty, sul filo di llama.cpp
+        # repeat_penalty: stesso cambio di nome che c'e' su Ollama. 1.0 e' il
+        # neutro e non si manda.
+        if params.repetition_penalty != 1.0:
+            body["repeat_penalty"] = float(params.repetition_penalty)
+        if params.presence_penalty:
+            body["presence_penalty"] = float(params.presence_penalty)
+        if params.seed is not None:
+            body["seed"] = int(params.seed)
+        if params.stop:
+            body["stop"] = list(params.stop)
+        return body
+
+    @staticmethod
+    def _timings(chunk: Any) -> dict[str, Any]:
+        """Il blocco ``timings``, che nello standard OpenAI non esiste."""
+        grezzo = getattr(chunk, "timings", None)
+        if grezzo is None:
+            extra = getattr(chunk, "model_extra", None) or {}
+            grezzo = extra.get("timings")
+        if hasattr(grezzo, "model_dump"):
+            grezzo = grezzo.model_dump()
+        return grezzo if isinstance(grezzo, dict) else {}
+
+    def _extra_usage(self, chunk: Any) -> dict[str, Any]:
+        """Tempi e contatori del draft, nei nomi che il pannello gia' usa.
+
+        I tempi valgono da soli: sul transport compatibile ``eval_ms`` non
+        arrivava mai, e la riga "Velocita'" mostrava 0,0 tok/s su qualunque
+        turno. Qui il numero c'e' davvero, ed e' quello che serve per
+        confrontare una run con draft e una senza **dall'harness**, senza
+        montare un benchmark a parte.
+        """
+        t = self._timings(chunk)
+        if not t:
+            return {}
+        fuori: dict[str, Any] = {}
+        prompt_ms = t.get("prompt_ms")
+        eval_ms = t.get("predicted_ms")
+        if isinstance(prompt_ms, (int, float)):
+            fuori["prompt_eval_ms"] = round(prompt_ms)
+        if isinstance(eval_ms, (int, float)):
+            fuori["eval_ms"] = round(eval_ms)
+        if isinstance(prompt_ms, (int, float)) and isinstance(eval_ms, (int, float)):
+            fuori["total_ms"] = round(prompt_ms + eval_ms)
+        coppie = (
+            ("draft_n", self.ALIAS_DRAFT_N),
+            ("draft_accepted", self.ALIAS_DRAFT_OK),
+        )
+        for chiave, alias in coppie:
+            for nome in alias:
+                valore = t.get(nome)
+                if isinstance(valore, (int, float)):
+                    fuori[chiave] = int(valore)
+                    break
+        return fuori
 
 
 _STREAM_TOOLS_MODES = {"auto": None, "sempre": True, "mai": False}
@@ -634,12 +1066,21 @@ def build_backend(
     timeout_s: float,
     stream_tools: str = "auto",
 ) -> OllamaBackend | OpenAICompatBackend:
-    """Seleziona il transport. ``auto`` prova Ollama e ripiega su OpenAI."""
+    """Seleziona il transport.
+
+    ``auto`` prova Ollama, poi llama.cpp, poi il generico compatibile. La
+    sonda di mezzo esiste perche' ``/v1/models`` risponde a tutti mentre
+    ``/props`` risponde solo a llama-server: senza quel passaggio si finirebbe
+    a parlargli il dialetto sbagliato -- niente ``top_k``, niente timings, e
+    un ``num_ctx`` creduto invece che letto.
+    """
     transport = (transport or "auto").lower()
     swt = _STREAM_TOOLS_MODES.get(stream_tools)
 
     if transport == "ollama":
         return OllamaBackend(base_url, timeout_s, stream_with_tools=swt)
+    if transport == "llamacpp":
+        return LlamaCppBackend(base_url, api_key, timeout_s)
     if transport == "openai":
         return OpenAICompatBackend(base_url, api_key, timeout_s)
 
@@ -647,4 +1088,10 @@ def build_backend(
     ok, _ = candidate.ping()
     if ok:
         return candidate
+    llama = LlamaCppBackend(base_url, api_key, timeout_s)
+    # ``parla_llamacpp`` e non ``ping``: qui la domanda e' "chi sei", non "ci
+    # sei". ``ping`` risponde di si' anche a un vLLM raggiungibile, e sceglierlo
+    # qui vorrebbe dire mandargli i sampler nel dialetto sbagliato.
+    if llama.parla_llamacpp():
+        return llama
     return OpenAICompatBackend(base_url, api_key, timeout_s)

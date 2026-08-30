@@ -111,16 +111,35 @@ def current_session(client) -> str:
 
 
 def test_bootstrap_returns_everything_the_ui_needs(client):
+    """Tutto quello che serve a **disegnare** la pagina, e niente di remoto.
+
+    Le tre sonde al server del modello sono uscite di qui: erano tre viaggi di
+    rete prima di rispondere, cioe' fino a una decina di secondi di pagina
+    bianca con il modello su una macchina spenta -- mentre impostazioni,
+    conversazione e memorie erano gia' su questo disco.
+    """
     data = client.get("/api/bootstrap").json()
     assert data["app"]["name"]
     assert data["settings"]["model_name"] == "fake:latest"
-    assert data["backend"]["online"] is True
-    assert data["backend"]["streams_tools"] is True
+    # None = "non ancora chiesto": la goccia sa disegnare anche questo stato.
+    assert data["backend"]["online"] is None
+    assert data["backend"]["models"] == []
     session = data["session"]
     assert session["messages"] == []
     assert session["running"] is False
     assert session["pending"] is None
     assert "context_window" in session["stats"]
+
+
+def test_la_sonda_del_backend_e_una_rotta_a_parte(client):
+    """Le tre domande al server del modello in una richiesta sola: sono tre
+    round-trip, e chiederle separatamente sarebbe tre attese in fila."""
+    info = client.get("/api/backend").json()
+    assert info["online"] is True
+    assert info["streams_tools"] is True
+    assert info["models"]
+    # Se il modello configurato fosse sparito, il client deve poterlo sapere.
+    assert info["model_name"] == "fake:latest"
 
 
 def test_index_and_static_assets_are_served(client):
@@ -1050,6 +1069,13 @@ def test_rileggere_una_conversazione_non_ferma_le_anteprime(client, monkeypatch)
         client.server.STATE, "ferma_anteprime", lambda: bool(fermate.append(1))
     )
 
+    # Un'app viva nella conversazione: e' il caso in cui aprire *deve* liberare
+    # le porte. Dal 23/08/2026 aprire una chat nella stessa cartella, senza
+    # niente in piedi, non smonta piu' niente -- vedi ``smonta_se_serve``.
+    client.server.STATE.store_preview(
+        session_id, {"kind": "serve", "path": "app.py", "title": "App"}
+    )
+
     letta = client.get(f"/api/sessions/{session_id}")
     assert letta.status_code == 200
     assert letta.json()["session_id"] == session_id
@@ -1057,6 +1083,34 @@ def test_rileggere_una_conversazione_non_ferma_le_anteprime(client, monkeypatch)
 
     client.post(f"/api/sessions/{session_id}/open", json={})
     assert fermate == [1], "aprire, invece, libera le porte della chat precedente"
+
+
+def test_riaprire_nella_stessa_cartella_non_tocca_piu_docker(client, monkeypatch):
+    """Il costo che si voleva togliere.
+
+    ``ferma_anteprime`` serve a liberare le porte pubblicate, e le porte danno
+    fastidio solo se si cambia cartella o se c'e' un'app viva. Fuori da quei
+    casi smontare e' lavoro contro se' stessi: il container e' senza stato e si
+    ricrea uguale, ma nel frattempo si sono pagati un ``docker inspect`` e un
+    ``docker rm`` **ad ogni apertura di conversazione** -- e da quando il
+    container si prepara da solo al cambio di cartella, si distrugge anche
+    quello che si era appena finito di preparare.
+    """
+    a = client.post("/api/sessions", json={}).json()["session_id"]
+    b = client.post("/api/sessions", json={}).json()["session_id"]
+
+    fermate: list[int] = []
+    monkeypatch.setattr(
+        client.server.STATE, "ferma_anteprime", lambda: bool(fermate.append(1))
+    )
+
+    # La spazzata dei container rimasti in piedi da prima di un riavvio si fa
+    # **una volta per cartella per processo**, ed e' gia' avvenuta con le
+    # creazioni qui sopra: da adesso in poi non deve succedere piu' niente.
+    client.post(f"/api/sessions/{a}/open", json={})
+    client.post(f"/api/sessions/{b}/open", json={})
+    client.post(f"/api/sessions/{a}/open", json={})
+    assert fermate == [], "tre aperture nella stessa cartella, zero smontaggi"
 
 
 def test_la_ricerca_non_viene_scambiata_per_un_id_di_conversazione(client):
@@ -1237,3 +1291,105 @@ def test_a_turno_in_corso_la_cartella_non_si_sposta(client, tmp_path):
     # A turno finito, invece, si sposta.
     client.post(f"/api/sessions/{ferma}/open", json={})
     assert stato.settings["workspace_dir"] == str(altrove.resolve())
+
+
+# ---------------------------------------------------------------------------
+# Caricamento a scaglioni della cronologia
+# ---------------------------------------------------------------------------
+
+
+def _riempi(stato, session_id: str, quanti: int) -> None:
+    """Cronologia finta, gia' in ordine: user/assistant alternati."""
+    messaggi = stato.messages(session_id)
+    for i in range(quanti):
+        ruolo = "user" if i % 2 == 0 else "assistant"
+        messaggi.append({"role": ruolo, "content": f"m{i}"})
+
+
+def test_aprire_una_chat_manda_solo_la_coda(client):
+    """Migliaia di messaggi non devono viaggiare per far vedere gli ultimi."""
+    from server import main as server_main
+
+    stato = client.server.STATE
+    chat = client.post("/api/sessions", json={}).json()["session_id"]
+    _riempi(stato, chat, 150)
+
+    payload = client.post(f"/api/sessions/{chat}/open", json={}).json()
+    coda = payload["messages"]
+    assert len(coda) == server_main.MESSAGGI_PER_PAGINA
+    assert payload["messages_total"] == 150
+    assert payload["messages_offset"] == 150 - server_main.MESSAGGI_PER_PAGINA
+    # E' la **coda**, non la testa: l'ultimo messaggio scritto e' l'ultimo
+    # dell'elenco, o si aprirebbe la conversazione dal suo inizio.
+    assert coda[-1]["content"] == "m149"
+
+
+def test_una_chat_corta_arriva_tutta_e_lo_dice(client):
+    """Con meno di una pagina non c'e' niente sopra: ``offset`` a zero e'
+    l'unico modo che il client ha di non disegnare la sentinella."""
+    stato = client.server.STATE
+    chat = client.post("/api/sessions", json={}).json()["session_id"]
+    _riempi(stato, chat, 5)
+
+    payload = client.get(f"/api/sessions/{chat}").json()
+    assert payload["messages_offset"] == 0
+    assert payload["messages_total"] == 5
+    assert len(payload["messages"]) == 5
+
+
+def test_la_risalita_torna_il_blocco_precedente_e_si_ferma_in_cima(client):
+    """``before`` e' l'offset che il client ha in mano: 'quello che viene
+    prima di questo' e' l'unica domanda che la risalita pone."""
+    stato = client.server.STATE
+    chat = client.post("/api/sessions", json={}).json()["session_id"]
+    _riempi(stato, chat, 100)
+
+    blocco = client.get(f"/api/sessions/{chat}/messages?before=60&limit=25").json()
+    assert blocco["messages_offset"] == 35
+    assert [m["content"] for m in blocco["messages"]] == [f"m{i}" for i in range(35, 60)]
+
+    # Arrivati vicino alla testa non si va sotto zero: il blocco si accorcia.
+    cima = client.get(f"/api/sessions/{chat}/messages?before=10&limit=25").json()
+    assert cima["messages_offset"] == 0
+    assert len(cima["messages"]) == 10
+
+    # E in cima non c'e' piu' niente da chiedere.
+    vuoto = client.get(f"/api/sessions/{chat}/messages?before=0&limit=25").json()
+    assert vuoto["messages"] == []
+    assert vuoto["messages_offset"] == 0
+
+
+def test_il_piano_arriva_intero_anche_se_i_messaggi_sono_troncati(client):
+    """La coda e' un'economia sul **thread**, non sul pannello.
+
+    Il piano non si ricava dalla cronologia: viaggia a parte, ed e' quello
+    corrente. Se dipendesse dai messaggi mandati, aprire una chat lunga
+    mostrerebbe lo stato del piano di quaranta messaggi fa.
+    """
+    from core import plan as plan_mod
+
+    stato = client.server.STATE
+    chat = client.post("/api/sessions", json={}).json()["session_id"]
+    _riempi(stato, chat, 200)
+    piano = plan_mod.Plan.from_list([
+        {"id": 1, "text": "primo", "status": "done"},
+        {"id": 2, "text": "secondo", "status": "todo"},
+    ])
+    stato.store_plan(chat, piano)
+
+    payload = client.post(f"/api/sessions/{chat}/open", json={}).json()
+    assert len(payload["messages"]) < payload["messages_total"]
+    assert [p["status"] for p in payload["plan"]] == ["done", "todo"]
+
+
+def test_la_goccia_ha_una_rotta_sua_che_non_scrive_niente(client):
+    """``/api/models`` sceglie un modello sostitutivo e salva: legare
+    quell'effetto a un timer vorrebbe dire impostazioni che cambiano mentre
+    nessuno guarda."""
+    stato = client.server.STATE
+    stato.settings["model_name"] = "fake:latest"
+
+    dati = client.get("/api/ping").json()
+    assert dati["online"] is True
+    assert "detail" in dati and dati["name"]
+    assert stato.settings["model_name"] == "fake:latest"

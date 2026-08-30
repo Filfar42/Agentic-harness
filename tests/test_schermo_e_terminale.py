@@ -234,16 +234,30 @@ def test_ttyd_non_e_dato_per_scontato():
 # ---------------------------------------------------------------------------
 
 
-def test_allow_same_origin_solo_alle_applicazioni():
-    """Misurato in Chromium: con l'origine opaca il CORS rifiuta i moduli ES di
-    noVNC e la fetch di ttyd da 'origin: null'. Un'applicazione sta su
-    127.0.0.1:82xx, un'origine diversa da quella dell'harness, quindi il
-    permesso non le da' accesso ne' al nostro DOM ne' alle nostre risposte.
-    Un'anteprima di FILE arriva invece da /api/preview/file, cioe' dalla nostra
-    origine: li' quella combinazione annullerebbe il sandbox."""
+def test_allow_same_origin_solo_a_chi_sta_su_un_altra_origine():
+    """La regola, e non l'elenco dei casi.
+
+    Misurato in Chromium: con l'origine opaca il CORS rifiuta i moduli ES di
+    noVNC e la fetch di ttyd da 'origin: null', e `localStorage` solleva invece
+    di tornare vuoto. Il permesso si puo' dare a chi sta su **un'altra**
+    origine -- un'applicazione su 127.0.0.1:82xx, una pagina sul server delle
+    anteprime -- perche' li' non da' accesso ne' al nostro DOM ne' alle nostre
+    risposte. A cio' che arriva da /api/preview/file, cioe' dalla nostra stessa
+    origine, no: quella combinazione annullerebbe il sandbox.
+
+    Il test guarda la variabile, non i due casi: cosi' regge anche alla terza
+    sorgente, che dovra' comunque passare da li'.
+    """
     js = (WEB / "app.js").read_text(encoding="utf-8")
     blocco = js[js.index("if (payload.kind === 'app' || FRAME_EXT.includes(ext))"):]
     blocco = blocco[: blocco.index("return;")]
-    assert "if (payload.kind === 'app') permessi.push('allow-same-origin')" in blocco
+    # Il permesso passa da una condizione sola, che si chiama come la ragione.
+    assert "if (stessaOrigine) permessi.push('allow-same-origin')" in blocco
+    # Parte spento per tutto cio' che non e' un'applicazione...
+    assert "let stessaOrigine = payload.kind === 'app';" in blocco
+    # ...e si accende solo dopo che il server delle anteprime ha dato un
+    # indirizzo suo. Senza quell'indirizzo si resta sull'origine opaca.
+    accensione = blocco[blocco.index("const host = await previewHost("):]
+    assert "stessaOrigine = true;" in accensione[: accensione.index("}")+1]
     # e nessun altro punto del client lo concede
     assert js.count("allow-same-origin'") == 1

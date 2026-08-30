@@ -34,8 +34,11 @@ from core.tools import (  # noqa: E402
     ToolContext,
     dispatch,
     looks_like_server,
+    preview_backend,
     preview_kind,
+    preview_root,
 )
+from server import previewhost  # noqa: E402
 
 fake_ollama = fake.fake_ollama
 fake_docker = sbox.fake_docker
@@ -123,7 +126,14 @@ def test_mostrare_un_file_del_workspace(tmp_path):
     (tmp_path / "report.md").write_text("# titolo\n", encoding="utf-8")
     ctx = ToolContext(workspace=str(tmp_path), sandbox="host")
     payload = json.loads(dispatch(ctx, PREVIEW_TOOL, {"action": "file", "path": "report.md"}))
-    assert payload["preview"] == {"kind": "render", "path": "report.md", "title": "report.md"}
+    assert payload["preview"] == {
+        "kind": "render",
+        "path": "report.md",
+        # La cartella servita. Vuota = la radice del workspace: qui non c'e'
+        # nessun marcatore di progetto e il file sta in cima.
+        "root": "",
+        "title": "report.md",
+    }
 
 
 def test_un_file_fuori_dal_workspace_viene_rifiutato(tmp_path):
@@ -409,3 +419,328 @@ def test_il_raccoglitore_di_orfani_resta_dentro_l_intervallo(tmp_path):
     rende accettabile. Fuori dalle porte pubblicate non si tocca niente."""
     assert sandbox.kill_port_listener(tmp_path, 22, ports=(8200, 8203)) is False
     assert sandbox.kill_port_listener(tmp_path, 8200, ports=None) is False
+
+
+# ---------------------------------------------------------------------------
+# Una pagina e' una cartella, non un file (v2.35)
+# ---------------------------------------------------------------------------
+#
+# Il difetto osservato dall'utente: "un html senza il css e senza il backend
+# avviato non funziona come dovrebbe". Erano due cose diverse sotto la stessa
+# frase, e qui si provano separate.
+
+
+def test_una_pagina_porta_con_se_la_sua_cartella(tmp_path):
+    """Il primo guasto: `<link href="style.css">` dentro una pagina servita da
+    ``/api/preview/file`` si risolveva in ``/api/preview/style.css``. Nessun
+    errore visibile: solo un sito senza foglio di stile."""
+    sito = tmp_path / "sito"
+    sito.mkdir()
+    (sito / "index.html").write_text("<link href='style.css'>", encoding="utf-8")
+    (sito / "style.css").write_text("body{}", encoding="utf-8")
+    assert preview_root(tmp_path, "sito/index.html") == "sito"
+
+
+def test_una_sottopagina_risale_alla_radice_del_sito(tmp_path):
+    """`sito/pagine/chi-siamo.html` deve essere servita da `sito/`, senno' il
+    suo `../css/` e' fuori dalla radice e non esiste."""
+    (tmp_path / "sito" / "pagine").mkdir(parents=True)
+    (tmp_path / "sito" / "index.html").write_text("<h1>casa</h1>", encoding="utf-8")
+    (tmp_path / "sito" / "pagine" / "chi.html").write_text("<h1>chi</h1>", encoding="utf-8")
+    assert preview_root(tmp_path, "sito/pagine/chi.html") == "sito"
+
+
+def test_il_confine_piu_vicino_vince_sul_piu_alto(tmp_path):
+    """In un monorepo con `.git` in cima e `package.json` nel sito, la radice
+    giusta e' il sito: e' li' che si risolvono i percorsi assoluti."""
+    (tmp_path / ".git").mkdir()
+    app = tmp_path / "frontend"
+    (app / "public").mkdir(parents=True)
+    (app / "package.json").write_text("{}", encoding="utf-8")
+    (app / "public" / "index.html").write_text("<h1>x</h1>", encoding="utf-8")
+    assert preview_root(tmp_path, "frontend/public/index.html") == "frontend"
+
+
+def test_senza_nessun_indizio_si_serve_solo_la_cartella_del_file(tmp_path):
+    """Quello che non serve non si espone: mai il workspace intero per un file
+    che sta in una cartella sua."""
+    (tmp_path / "bozze").mkdir()
+    (tmp_path / "bozze" / "volantino.svg").write_text("<svg/>", encoding="utf-8")
+    assert preview_root(tmp_path, "bozze/volantino.svg") == "bozze"
+
+
+def test_la_radice_non_esce_mai_dal_workspace(tmp_path):
+    assert preview_root(tmp_path, "../../etc/passwd") == ""
+
+
+# --- il server che da' un'origine vera --------------------------------------
+
+
+@pytest.fixture()
+def statico(tmp_path):
+    """Il server delle anteprime, con una radice sotto controllo."""
+    radice = tmp_path / "sito"
+    (radice / "css").mkdir(parents=True)
+    (radice / "index.html").write_text("<link href='/css/app.css'>", encoding="utf-8")
+    (radice / "css" / "app.css").write_text("body{color:red}", encoding="utf-8")
+    (tmp_path / "segreto.txt").write_text("non toccare", encoding="utf-8")
+    previewhost.set_root(radice)
+    with TestClient(previewhost.app) as c:
+        yield c
+
+
+def test_il_foglio_di_stile_si_trova_dalla_radice(statico):
+    """Il motivo per cui la radice e' montata su `/` e non sotto un prefisso:
+    i percorsi assoluti sono meta' dei casi veri, e un prefisso li romperebbe
+    di nuovo."""
+    risposta = statico.get("/css/app.css")
+    assert risposta.status_code == 200
+    assert "color:red" in risposta.text
+    assert risposta.headers["content-type"].startswith("text/css")
+
+
+def test_la_cartella_serve_il_suo_index(statico):
+    assert "<link" in statico.get("/").text
+
+
+@pytest.mark.parametrize("path", ["/../segreto.txt", "/css/../../segreto.txt"])
+def test_il_server_delle_anteprime_non_esce_dalla_radice(statico, path):
+    """Stessa guardia dei tool (`resolve_path`) con la radice al posto del
+    workspace: non una seconda copia della logica."""
+    assert statico.get(path).status_code in (403, 404)
+
+
+def test_niente_cache_sulle_anteprime(statico):
+    """L'agente riscrive gli stessi file di continuo: una risposta in cache
+    significa guardare la versione di prima e non capire perche' la correzione
+    'non ha funzionato'."""
+    intestazioni = statico.get("/index.html").headers
+    assert intestazioni["cache-control"] == "no-store"
+    assert intestazioni["x-content-type-options"] == "nosniff"
+
+
+# --- la rotta che apparecchia -----------------------------------------------
+
+
+def test_la_rotta_host_dice_dove_guardare(client, monkeypatch):
+    (client.ws / "sito").mkdir()
+    (client.ws / "sito" / "index.html").write_text("<h1>x</h1>", encoding="utf-8")
+    client.server.STATE.settings["preview_host_port"] = 0  # server spento
+    risposta = client.post("/api/preview/host", json={"path": "sito/index.html"})
+    assert risposta.status_code == 200
+    corpo = risposta.json()
+    assert corpo["root"] == "sito"
+    # Porta spenta: il client sa ripiegare sull'iframe a origine opaca di
+    # prima. Peggio del nuovo, ma non e' un pannello vuoto.
+    assert corpo["url"] is None
+
+
+def test_la_rotta_host_non_apparecchia_fuori_dal_workspace(client):
+    assert client.post(
+        "/api/preview/host", json={"path": "../segreto.txt"}
+    ).status_code in (400, 404)
+
+
+# --- il backend acceso da solo ----------------------------------------------
+
+
+@pytest.fixture()
+def backend_finto(monkeypatch):
+    """Sostituisce il container: la porta risponde, e si registra il comando."""
+    avviati: list[str] = []
+
+    def start(command, workspace, **kwargs):
+        avviati.append(command)
+        return "4242"
+
+    monkeypatch.setattr(sandbox, "start_background", start)
+    monkeypatch.setattr(sandbox, "stop_background", lambda *a, **k: False)
+    monkeypatch.setattr(sandbox, "kill_port_listener", lambda *a, **k: False)
+    monkeypatch.setattr(sandbox, "background_log", lambda *a, **k: "")
+    monkeypatch.setattr(sandbox, "background_alive", lambda *a, **k: True)
+    # La porta si apre **dopo** l'avvio, come nella realta': prima e' libera
+    # (senno' il tool crederebbe di doverla liberare e si arrenderebbe), poi
+    # risponde. Un finto che risponde sempre nasconderebbe proprio il passo che
+    # qui interessa.
+    monkeypatch.setattr(
+        sandbox, "port_state",
+        lambda *a, **k: sandbox.PORT_OPEN if avviati else sandbox.PORT_FREE,
+    )
+    return avviati
+
+
+def _ctx_docker(tmp_path) -> ToolContext:
+    return ToolContext(
+        workspace=str(tmp_path), sandbox="docker", preview_ports=(8200, 8203)
+    )
+
+
+def test_una_pagina_con_un_backend_lo_accende_da_sola(tmp_path, monkeypatch, backend_finto):
+    """Il secondo guasto: la pagina si vedeva, ma ogni fetch verso la sua API
+    tornava un errore e sembrava rotta. L'informazione per capirlo era gia' sul
+    disco -- e quello che si puo' sapere gratis non si chiede al modello."""
+    (tmp_path / "app.py").write_text(
+        "from flask import Flask\napp = Flask(__name__)\n", encoding="utf-8"
+    )
+    (tmp_path / "index.html").write_text("<h1>ciao</h1>", encoding="utf-8")
+
+    payload = json.loads(
+        dispatch(_ctx_docker(tmp_path), PREVIEW_TOOL, {"action": "file", "path": "index.html"})
+    )
+    assert payload["preview"]["kind"] == "app"
+    assert payload["preview"]["port"] == 8200
+    # Un backend decide da se' i propri indirizzi: il percorso del file sul
+    # disco non e' l'URL della pagina.
+    assert payload["preview"]["url_path"] == "/"
+    assert "--host 0.0.0.0" in backend_finto[0] and "flask" in backend_finto[0]
+    assert "non riavviarlo" in payload["note"]
+
+
+def test_un_backend_che_non_risponde_ripiega_sullo_statico(tmp_path, monkeypatch, backend_finto):
+    """Meglio una pagina senza dati che un pannello vuoto -- ma il modello deve
+    leggere perche', o non ha modo di rimediare."""
+    (tmp_path / "main.py").write_text(
+        "from fastapi import FastAPI\napp = FastAPI()\n", encoding="utf-8"
+    )
+    (tmp_path / "index.html").write_text("<h1>ciao</h1>", encoding="utf-8")
+    # Il processo parte e muore subito: la porta resta libera per sempre.
+    monkeypatch.setattr(sandbox, "port_state", lambda *a, **k: sandbox.PORT_FREE)
+
+    payload = json.loads(
+        dispatch(_ctx_docker(tmp_path), PREVIEW_TOOL, {"action": "file", "path": "index.html"})
+    )
+    assert payload["preview"]["kind"] == "render"
+    assert "statico" in payload["note"]
+    assert "uvicorn" in backend_finto[0]
+
+
+def test_l_avvio_automatico_si_puo_spegnere(tmp_path, backend_finto):
+    (tmp_path / "app.py").write_text(
+        "from flask import Flask\napp = Flask(__name__)\n", encoding="utf-8"
+    )
+    (tmp_path / "index.html").write_text("<h1>ciao</h1>", encoding="utf-8")
+    ctx = _ctx_docker(tmp_path)
+    ctx.preview_autostart_backend = False
+
+    payload = json.loads(
+        dispatch(ctx, PREVIEW_TOOL, {"action": "file", "path": "index.html"})
+    )
+    assert payload["preview"]["kind"] == "render"
+    assert backend_finto == []
+
+
+def test_sull_host_una_pagina_resta_statica_senza_provarci(tmp_path, backend_finto):
+    """Senza container non c'e' nessuna porta da pubblicare: si mostra il file
+    e basta, senza far partire niente sulla macchina dell'utente."""
+    (tmp_path / "app.py").write_text(
+        "from flask import Flask\napp = Flask(__name__)\n", encoding="utf-8"
+    )
+    (tmp_path / "index.html").write_text("<h1>ciao</h1>", encoding="utf-8")
+    ctx = ToolContext(workspace=str(tmp_path), sandbox="host")
+    payload = json.loads(
+        dispatch(ctx, PREVIEW_TOOL, {"action": "file", "path": "index.html"})
+    )
+    assert payload["preview"]["kind"] == "render"
+    assert backend_finto == []
+
+
+@pytest.mark.parametrize(
+    "nome,contenuto,atteso",
+    [
+        ("app.py", "from flask import Flask\napp = Flask(__name__)", "flask"),
+        ("main.py", "from fastapi import FastAPI\napi = FastAPI()", "uvicorn main:api"),
+        ("manage.py", "import django\n", "runserver"),
+    ],
+)
+def test_il_riconoscimento_del_backend(tmp_path, nome, contenuto, atteso):
+    (tmp_path / nome).write_text(contenuto, encoding="utf-8")
+    spia = preview_backend(tmp_path, 8200)
+    assert spia and atteso in spia["command"]
+    assert "8200" in spia["command"]
+
+
+def test_vite_riceve_la_porta_giusta(tmp_path):
+    (tmp_path / "package.json").write_text(
+        json.dumps({"scripts": {"dev": "vite"}, "devDependencies": {"vite": "^5"}}),
+        encoding="utf-8",
+    )
+    spia = preview_backend(tmp_path, 8201)
+    assert spia["kind"] == "vite"
+    assert "--port 8201" in spia["command"] and "--host 0.0.0.0" in spia["command"]
+
+
+def test_un_sito_statico_non_ha_nessun_backend_da_avviare(tmp_path):
+    """Nel dubbio None: un riconoscimento sbagliato costa un avvio fallito e
+    del rumore, uno mancato costa solo quello che si aveva prima."""
+    (tmp_path / "index.html").write_text("<h1>x</h1>", encoding="utf-8")
+    (tmp_path / "style.css").write_text("body{}", encoding="utf-8")
+    assert preview_backend(tmp_path, 8200) is None
+
+
+# --- quello che il modello deve sapere --------------------------------------
+
+
+def test_al_modello_si_dice_che_il_pannello_si_ricarica_da_solo():
+    """Senza, richiama preview dopo ogni correzione: un passo intero per non
+    fare niente."""
+    nota = agent_mod.render_preview_note(
+        {"kind": "render", "path": "sito/index.html", "root": "sito"}
+    )
+    assert "sito" in nota
+    assert "ricarica" in nota.lower()
+
+
+def test_l_anteprima_aperta_da_sola_sa_da_che_cartella_e_servita(fake_ollama, tmp_path):
+    """``preview_from_result`` guarda una tool call e basta: il workspace non ce
+    l'ha. Senza l'aggiunta nel ciclo, la nota al modello direbbe "la cartella
+    del workspace" anche per una pagina che sta in sito/ -- una frase falsa su
+    cui poi ragiona."""
+    from core.backend import OllamaBackend
+    from core.config import GenParams
+    from core.tools import TOOLS_SCHEMA
+
+    (tmp_path / "sito").mkdir()
+    # C'e' gia' un index.html: e' l'indizio che rende `sito/` la radice. Il
+    # file scritto e' un altro, perche' riscrivere alla cieca un file mai letto
+    # e' proprio cio' che l'harness rifiuta.
+    (tmp_path / "sito" / "index.html").write_text("<h1>casa</h1>", encoding="utf-8")
+
+    url, _ = fake_ollama
+    originale = fake.SCRIPT
+    fake.SCRIPT = [[
+        {
+            "message": {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "function": {
+                            "name": "write_file",
+                            "arguments": {
+                                "filepath": "sito/contatti.html",
+                                "content": "<h1>contatti</h1>",
+                            },
+                        }
+                    }
+                ],
+            }
+        }
+    ]]
+    try:
+        eventi = list(
+            agent_mod.run_turn(
+                backend=OllamaBackend(url, timeout_s=20),
+                params=GenParams(model="fake:latest"),
+                tools_schema=TOOLS_SCHEMA,
+                tool_ctx=ToolContext(workspace=str(tmp_path), sandbox="host"),
+                ui_messages=[{"role": "user", "content": "aggiungi la pagina contatti"}],
+                system_prompt="SYS",
+                env_header=None,
+                max_steps=2,
+            )
+        )
+    finally:
+        fake.SCRIPT = originale
+
+    anteprime = [e for e in eventi if isinstance(e, agent_mod.PreviewUpdated)]
+    assert anteprime, "un file visuale scritto apre il pannello da solo"
+    assert anteprime[-1].payload["root"] == "sito"

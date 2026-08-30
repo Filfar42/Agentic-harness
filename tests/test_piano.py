@@ -206,6 +206,36 @@ def test_non_si_dichiara_fatto_un_punto_con_una_verifica_rossa(tmp_path):
     assert ctx.plan.get("1").status == "skipped"
 
 
+def test_il_risultato_non_rimanda_indietro_il_piano(tmp_path):
+    """Il piano sta gia' nel blocco di coda, rispedito integrale ad ogni passo.
+
+    Rimandarlo anche nel risultato del tool vuol dire scrivere la stessa cosa
+    due volte nella stessa richiesta. Misurato il 23/08/2026 sulle sessioni
+    salvate: ``manage_plan`` valeva il 13,5% di tutti i token di risultato dei
+    tool, terzo dopo read_file e run_command, per un'informazione che il
+    modello aveva gia' davanti.
+    """
+    ctx = ctx_vuoto(tmp_path)
+    testi = [f"punto numero {i} con un testo lungo abbastanza da pesare" for i in range(8)]
+    esito = json.loads(dispatch(ctx, PLAN_TOOL, {"action": "set", "steps": testi}))
+
+    assert esito["status"] == "ok"
+    assert "plan" not in esito, "il piano non deve tornare nel risultato"
+    # ...ma cio' che il blocco di coda **non** dice deve esserci: che
+    # l'operazione e' riuscita e cosa e' cambiato adesso.
+    assert esito["punti"] == 8
+    assert esito["current"] == "1"
+    assert esito["aperto_in_automatico"]["text"] == testi[0]
+
+    # E il risultato deve pesare come una ricevuta, non come una copia.
+    assert len(json.dumps(esito)) < len(json.dumps(ctx.plan.to_list())) / 2
+
+    # `show` resta l'eccezione: e' il solo caso in cui il piano *e'* la
+    # risposta, ed e' il modello a chiederlo esplicitamente.
+    mostrato = json.loads(dispatch(ctx, PLAN_TOOL, {"action": "show"}))
+    assert len(mostrato["plan"]) == 8
+
+
 def test_il_tool_avvisa_chi_ascolta_quando_il_piano_cambia(tmp_path):
     visto: list[int] = []
     ctx = ctx_vuoto(tmp_path)

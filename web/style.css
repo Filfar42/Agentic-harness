@@ -142,7 +142,40 @@ html[data-theme="dark"] .logo .logo-scuro { display: block; }
 
 .section-hint { font-weight: 400; color: var(--text-faint); margin-left: 4px; }
 
-.vaults-label { margin-top: auto; }
+/* La sezione Vault e' la meta' bassa della colonna, non una striscia in fondo:
+   con le chat annidate sotto ogni vault e' un elenco come quello sopra, non un
+   menu. `margin-top: auto` la spingeva in fondo e le lasciava l'altezza del suo
+   contenuto -- due vault aperti e il ramo usciva sotto il footer.
+   Quanto valga "meta'" lo decide la maniglia: `--vaults-h` e' l'altezza della
+   sezione, e le due parti scorrono per conto loro -- risalire fra i vault non
+   deve trascinare via le conversazioni, e viceversa. */
+#sessions { flex: 1 1 auto; }
+.vaults-sec {
+  flex: 0 0 var(--vaults-h, 50%); min-height: 0;
+  display: flex; flex-direction: column;
+}
+.vaults-label { border-top: 1px solid var(--border); padding-top: 10px; }
+#vaults {
+  flex: 1 1 auto; min-height: 0; overflow-y: auto;
+  padding: 0 6px 8px;
+}
+
+/* Maniglia orizzontale fra i due elenchi. E' la `.col-grip` girata di 90
+   gradi: stesso gesto, stessa invisibilita' a riposo, stesso doppio clic come
+   uscita di sicurezza. Sta in mezzo al flusso e non in `position: absolute`
+   perche' qui il confine e' davvero fra due elementi, non sopra di essi. */
+.row-grip {
+  flex: none; height: 8px; cursor: ns-resize; touch-action: none;
+  display: grid; place-items: center;
+}
+.row-grip::after {
+  content: ""; width: 34px; height: 2px; border-radius: 2px;
+  background: transparent; transition: background .12s;
+}
+.row-grip:hover::after { background: var(--accent); }
+/* Durante il trascinamento il cursore non deve tornare freccia uscendo dagli
+   8px della maniglia: la stessa regola che gia' vale per le colonne. */
+body.resizing-rows, body.resizing-rows * { cursor: ns-resize !important; user-select: none; }
 
 /* La sezione Vault vive in fondo alla colonna, sopra il footer: elenco
    compatto nello stile delle conversazioni, piu' la casella per registrare
@@ -176,6 +209,41 @@ html[data-theme="dark"] .logo .logo-scuro { display: block; }
 }
 .vault-meta { font-size: 10.5px; color: var(--text-faint); font-variant-numeric: tabular-nums; flex: none; }
 .vault-empty { padding: 2px 14px 8px; font-size: 11px; color: var(--text-faint); }
+
+/* Albero dei vault: la riga del vault, e sotto le sue chat rientrate.
+   Il rientro e' la riga verticale a sinistra, non solo il padding: dice dove
+   comincia e dove finisce il ramo anche quando le chat sono dieci. */
+.vault-node { position: relative; }
+.vault-row { display: flex; align-items: center; }
+.vault-row .vault { flex: 1; min-width: 0; padding-left: 2px; }
+.vault-twisty {
+  flex: none; width: 18px; height: 22px; margin-left: 8px;
+  display: flex; align-items: center; justify-content: center;
+  background: none; border: 0; padding: 0; cursor: pointer;
+  color: var(--text-faint); border-radius: 5px;
+}
+.vault-twisty:hover { color: var(--text); background: rgba(127, 122, 112, 0.14); }
+.vault-twisty .chev { transition: transform .12s; }
+.vault-node.open .vault-twisty .chev { transform: rotate(90deg); }
+.vault-branch {
+  margin: 0 0 4px 17px; padding-left: 8px;
+  border-left: 1px solid var(--border);
+}
+.vault-branch .vault-empty { padding: 3px 6px 4px; }
+.session.vault-session { font-size: 12px; padding-top: 4px; padding-bottom: 4px; }
+
+/* Sentinella della risalita, in cima al thread. Un pulsante e non un semplice
+   avviso: chi legge deve poter chiedere il blocco precedente senza dover
+   indovinare che scorrere fino in cima lo fa da solo. */
+.load-older {
+  display: block; width: 100%; margin: 0 0 14px;
+  padding: 9px 12px; font: inherit; font-size: 12px;
+  color: var(--text-dim); background: transparent;
+  border: 1px dashed var(--border-strong); border-radius: 9px;
+  cursor: pointer; text-align: center;
+}
+.load-older:hover:not(:disabled) { color: var(--accent); border-color: var(--accent); background: var(--accent-soft); }
+.load-older:disabled { cursor: wait; opacity: 0.65; }
 
 .new-chat {
   margin: 2px 10px 10px; padding: 7px 11px;
@@ -828,6 +896,14 @@ details.drawer.failed { border-color: color-mix(in srgb, var(--err) 40%, var(--b
   background: var(--bg);
 }
 #preview-pane[hidden] { display: none; }
+/* Stessa ragione della riga qui sopra, e la stessa trappola pagata due volte:
+   `display: flex` batte il `display: none` che il browser da' da solo a
+   [hidden], quindi nascondere la colonna della chat con l'attributo non
+   faceva niente. Il risultato era la schermata iniziale del vault che si
+   affiancava alla chat -- schermo diviso a meta' -- invece di prenderne il
+   posto, ed era visibile solo aprendo un vault mentre una chat era gia'
+   selezionata. */
+#chat-col[hidden] { display: none; }
 .preview-inner { flex: 1; min-width: 0; display: flex; flex-direction: column; }
 
 /* Il divisorio è largo 7px: sotto i 10 di zona sensibile un bordo trascinabile
@@ -1108,4 +1184,135 @@ table.grid td.no { color: var(--text-faint); }
 .compacted-note {
   margin-top: 6px; text-align: center;
   font-size: 11px; color: var(--text-faint);
+}
+
+/* ---------------------------------------------------------------------------
+   Vault: schermata iniziale e scheda d'identità
+   ---------------------------------------------------------------------------
+   Un vault è un posto, non una modalità: aprirlo mostra dove si è arrivati —
+   nome, a cosa serve, una casella per cominciare, e cosa c'era già. Prende il
+   posto della chat nella stessa colonna invece di affiancarlesi: sono due
+   viste dello stesso spazio, non due cose da guardare insieme. */
+
+#vault-col { flex: 1; min-width: 0; overflow-y: auto; }
+.vault-home { max-width: 720px; margin: 0 auto; padding: 48px 28px 40px; }
+
+.vault-head h1 {
+  margin: 0; font-size: 27px; font-weight: 600; letter-spacing: -0.01em;
+}
+/* La descrizione è la riga che risponde a "cos'era questo": tono basso, ma
+   sotto al nome, dove la si legge senza cercarla. */
+.vault-descr {
+  margin: 7px 0 0; font-size: 13.5px; line-height: 1.55; color: var(--text-muted);
+  white-space: pre-wrap;
+}
+
+/* La casella della chat nuova sta in alto e non in fondo all'elenco: nove
+   volte su dieci un vault si apre per scriverci, non per rileggere. */
+.vault-composer {
+  display: flex; gap: 8px; align-items: flex-end; margin: 26px 0 30px;
+  border: 1px solid var(--border-strong); border-radius: 12px;
+  background: var(--surface); box-shadow: var(--shadow-sm);
+  padding: 9px 9px 9px 12px;
+  transition: border-color .13s;
+}
+.vault-composer:focus-within { border-color: var(--accent); }
+.vault-composer textarea {
+  flex: 1; min-width: 0; border: 0; background: none; resize: none;
+  font: inherit; font-size: 14px; line-height: 1.55; color: var(--text);
+  padding: 3px 0; outline: none;
+}
+.vault-composer textarea::placeholder { color: var(--text-faint); }
+.vault-composer .btn { flex: none; }
+
+.vault-chats .section-label { padding-left: 0; }
+#vh-sessions { display: flex; flex-direction: column; gap: 1px; }
+
+/* Le righe delle conversazioni: stessa grammatica della colonna di sinistra —
+   niente bordi, niente card — ma con due righe, perché qui lo spazio c'è e
+   "quando" e "quanto" aiutano a riconoscere quella giusta. */
+.vault-chat {
+  display: flex; flex-direction: column; gap: 2px; width: 100%;
+  text-align: left; font: inherit; background: none; border: 0;
+  border-radius: 9px; padding: 9px 11px; cursor: pointer;
+  transition: background .12s;
+}
+.vault-chat:hover { background: rgba(127, 122, 112, 0.11); }
+.vault-chat-title {
+  font-size: 13.5px; color: var(--text);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.vault-chat-meta { font-size: 11.5px; color: var(--text-faint); }
+.vault-chat.running .vault-chat-title::after {
+  content: ''; display: inline-block; width: 6px; height: 6px; margin-left: 7px;
+  border-radius: 50%; background: var(--accent); vertical-align: middle;
+}
+
+/* Il badge "w" sulle righe della colonna: dice quali vault sono wiki senza
+   aggiungere una parola. Le altre proprietà stanno nel titolo al passaggio. */
+.vault-badge {
+  flex: none; font-size: 9.5px; font-weight: 600; line-height: 1;
+  padding: 2px 4px; border-radius: 4px;
+  color: var(--text-faint); border: 1px solid var(--border-strong);
+}
+
+/* "esci" accanto all'etichetta dell'elenco: uscire da un vault deve costare
+   quanto entrarci, e nessuno cerca un modo per uscire dentro le impostazioni. */
+.section-label { display: flex; align-items: baseline; gap: 8px; }
+.section-back {
+  margin-left: auto; font: inherit; font-size: 10px; font-weight: 600;
+  text-transform: uppercase; letter-spacing: 0.06em;
+  color: var(--text-faint); background: none; border: 0; cursor: pointer;
+  padding: 0; text-transform: uppercase;
+}
+.section-back:hover { color: var(--accent); }
+
+/* La scheda a destra: i campi sono nudi finché non li si tocca, come il resto
+   del pannello — è una scheda di lettura in cui si può anche scrivere, non un
+   modulo da compilare. */
+.field-lite {
+  display: block; font-size: 10.5px; font-weight: 600; letter-spacing: 0.05em;
+  text-transform: uppercase; color: var(--text-faint); margin: 9px 0 3px;
+}
+.hint-inline { font-weight: 400; text-transform: none; letter-spacing: 0; opacity: 0.8; }
+#vault-card input[type="text"], #vault-card textarea {
+  width: 100%; box-sizing: border-box; font: inherit; font-size: 12.5px;
+  color: var(--text); background: var(--bg-subtle);
+  border: 1px solid transparent; border-radius: 7px; padding: 5px 7px;
+  line-height: 1.5; resize: vertical;
+}
+#vault-card input[type="text"]:hover, #vault-card textarea:hover { border-color: var(--border); }
+#vault-card input[type="text"]:focus, #vault-card textarea:focus {
+  outline: none; border-color: var(--accent); background: var(--surface);
+}
+#vault-card .switch.compact { margin: 11px 0 4px; font-size: 12.5px; }
+.vault-path {
+  font-family: var(--mono); font-size: 11.5px; font-weight: 400 !important;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 60%;
+}
+
+/* Memoria del vault: righe di testo, niente riquadri annidati. Il × compare
+   al passaggio — togliere una nota è un gesto raro e deliberato, e un bottone
+   sempre acceso su ogni riga sarebbe un invito a cancellare. */
+.vmem {
+  display: flex; align-items: flex-start; gap: 6px;
+  font-size: 12.5px; line-height: 1.5; color: var(--text-dim);
+  padding: 4px 0; border-bottom: 1px solid var(--border);
+}
+.vmem:last-child { border-bottom: 0; }
+.vmem-text { flex: 1; min-width: 0; }
+.vmem-del {
+  flex: none; border: 0; background: none; cursor: pointer; padding: 0 2px;
+  color: var(--text-faint); font-size: 14px; line-height: 1; opacity: 0;
+  transition: opacity .12s, color .12s;
+}
+.vmem:hover .vmem-del { opacity: 1; }
+.vmem-del:hover { color: var(--accent); }
+
+/* Il resoconto chiesto dall'harness a passi esauriti. Tono basso e riga
+   sottile: non è un errore, è un'informazione sul perché il turno finisce lì.
+   Senza, una chiusura forzata si legge come una chiusura riuscita. */
+.turn-forzato {
+  margin-top: 8px; padding-top: 7px; border-top: 1px dashed var(--border-strong);
+  font-size: 11.5px; color: var(--text-faint);
 }

@@ -26,12 +26,34 @@ quali" -- e sbagliare costa un referto sbagliato, non un file corrotto.
 Su una macchina sola e' seriale: la delega non e' parallelismo, e' latenza in
 cambio di contesto. Lo stesso baratto della compattazione, con la differenza
 che qui si paga *prima* di riempire la finestra invece che dopo.
+
+## Il modo in cui falliva (misurato il 23/08/2026)
+
+Su 17 esplorazioni registrate nelle sessioni salvate: **11 referti utili e 6
+fallimenti totali**, e **8 su 17 hanno toccato il tetto dei sei passi**. Tre
+volte il figlio ha speso sei passi a leggere e ha restituito *niente* -- il
+padre ha pagato la latenza e ha ricevuto un errore che gli suggeriva di
+"cercare da solo".
+
+Un tool che fallisce una volta su tre insegna a non usarlo, e infatti nelle
+stesse sessioni l'esplorazione fatta a mano dal padre (``read_file`` +
+``search_files``) vale ancora il **46% dei token di risultato**: esattamente
+cio' che questo modulo esiste per togliere.
+
+La causa non e' il tetto in se': e' che il tetto colpiva **senza rete**. I sei
+passi di lettura erano gia' spesi e il loro contenuto era ancora li', nel
+contesto del figlio -- mancava solo qualcuno che glielo chiedesse. Da qui
+``referto_di_chiusura``: quando i passi finiscono senza risposta, una chiamata
+sola e senza tool trasforma il lavoro gia' fatto in un referto parziale.
+Parziale batte vuoto, e il padre ha comunque i percorsi da cui ripartire.
 """
 
 from __future__ import annotations
 
 from dataclasses import replace
 from typing import Any
+
+from . import spec_delega
 
 # Tetto ai passi del figlio. Basso di proposito: una ricerca che non si chiude
 # in sei mosse non e' una ricerca, e' un compito -- e un compito va nel piano
@@ -41,6 +63,11 @@ MAX_PASSI_DELEGA = 6
 # Tetto al referto. Se torna piu' di cosi', la delega ha spostato il problema
 # invece di risolverlo.
 MAX_REFERTO_CHARS = 2_000
+
+# Tetto al referto di chiusura (vedi ``referto_di_chiusura``). Stessa taglia di
+# un riassunto di compattazione, perche' e' la stessa cosa: un referto su
+# lavoro gia' fatto, non un ragionamento nuovo.
+MAX_TOKEN_CHIUSURA = 700
 
 # I soli tool che il figlio riceve. Niente scrittura, niente run_command
 # (che scrive eccome), niente piano, niente domande all'utente: il figlio non
@@ -161,6 +188,72 @@ un'informazione anche quella.
 """
 
 
+PROMPT_CHIUSURA = f"""\
+Hai finito i passi a disposizione e non puoi piu' leggere niente. Quello che \
+hai davanti e' tutto quello che avrai.
+
+Scrivi ORA il referto, anche incompleto. Chi te l'ha chiesto non vedra' \
+nient'altro: se non scrivi, il suo lavoro e' perso e dovra' rifarlo a mano.
+
+Regole: percorsi completi e numeri di riga per tutto quello che hai \
+effettivamente visto; una riga finale con cosa resta da guardare e dove. Se \
+non hai trovato la risposta, dillo elencando cosa hai **escluso** -- e' \
+un'informazione anche quella. Solo cose che hai letto davvero, mai dedotte. \
+Al massimo {MAX_REFERTO_CHARS} caratteri, niente preamboli.
+"""
+
+
+def referto_di_chiusura(
+    messaggi: list[dict[str, Any]],
+    *,
+    backend: Any,
+    params: Any,
+    build_messages: Any,
+    budgets: Any,
+) -> str:
+    """Chiede al figlio il referto quando i passi sono finiti senza risposta.
+
+    Costa una generazione in piu', ma la alternativa misurata e' buttare sei
+    passi di letture riuscite: e' il baratto piu' facile di tutto il modulo.
+
+    Senza tool e senza pensiero, come il riassuntore della compattazione: qui
+    non c'e' niente da decidere, solo da scrivere quello che si e' gia' letto.
+
+    ``build_messages`` arriva come parametro e non come import per la stessa
+    ragione di ``run_turn``: e' ``agent`` a conoscere questo file, non il
+    contrario.
+    """
+    api = build_messages(
+        messaggi,
+        system_prompt=PROMPT_CHIUSURA,
+        env_header=None,
+        strip_thinking=True,
+        compact_old_tools=False,
+        budgets=budgets,
+    )
+    if len(api) < 2:
+        return ""
+    p = replace(
+        params,
+        think=False,
+        temperature=0.1,
+        max_tokens=min(
+            int(getattr(params, "max_tokens", 2048) or 2048), MAX_TOKEN_CHIUSURA
+        ),
+    )
+    pezzi: list[str] = []
+    for evento in backend.stream(api, None, p):
+        if evento.kind == "content":
+            pezzi.append(evento.text)
+        elif evento.kind == "error":
+            # Un referto di chiusura mancato lascia le cose come stavano: si
+            # torna all'errore di prima, che almeno dice cosa e' successo.
+            return ""
+    from .textutils import strip_think
+
+    return strip_think("".join(pezzi)).strip()
+
+
 def schema_ridotto(tools_schema: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Lo schema del figlio: gli stessi tool del padre, filtrati."""
     return [
@@ -179,6 +272,8 @@ def esegui(
     tool_ctx: Any,
     env_header: str | None,
     run_turn: Any,
+    build_messages: Any = None,
+    registra_esiti: bool = True,
 ) -> dict[str, Any]:
     """Esegue il sotto-turno e restituisce il referto.
 
@@ -220,7 +315,20 @@ def esegui(
 
     messaggi: list[dict[str, Any]] = [{"role": "user", "content": compito}]
     passi = 0
+    # Quanto tempo gli resta, a ogni passo. E' la stessa leva che sul padre ha
+    # gia' funzionato -- il blocco del piano dice quanti passi agentici
+    # restano perche' senza il modello pianificava come se ne avesse infiniti
+    # -- puntata contro il difetto misurato del figlio: 8 esplorazioni su 17
+    # toccavano il tetto dei sei passi. E' informazione, non esortazione.
+    base_fatti = getattr(tool_ctx, "base", None) if registra_esiti else None
+
+    def _coda(passi_rimasti: int) -> str:
+        return spec_delega.blocco_figlio(
+            base_fatti, passi_rimasti=passi_rimasti, totale=MAX_PASSI_DELEGA
+        )
+
     for evento in run_turn(
+        blocco_coda=_coda,
         backend=backend,
         params=params_figlio,
         tools_schema=schema_ridotto(tools_schema),
@@ -244,6 +352,10 @@ def esegui(
         plan_gate=False,
         enable_nudge=False,
         abilita_delega=False,
+        # Il figlio non archivia: la libreria e' della conversazione del padre,
+        # e un esploratore che ci scrive dentro ci mette pezzi di un contesto
+        # che nessuno ha visto.
+        libreria_attiva=False,
     ):
         if type(evento).__name__ == "StepStarted":
             passi += 1
@@ -270,7 +382,36 @@ def esegui(
     # meta': passi bruciati senza risposta, e la causa va detta al padre.
     esaurito = passi >= MAX_PASSI_DELEGA
 
+    # La rete. Prima di dichiarare fallita un'esplorazione che ha letto dei
+    # file, gliene si chiede il referto: quel contenuto e' ancora nel contesto
+    # del figlio, e senza questa chiamata lo si butta insieme ai passi.
+    chiuso_a_forza = False
+    if not referto and letti and build_messages is not None:
+        referto = referto_di_chiusura(
+            messaggi,
+            backend=backend,
+            params=params_figlio,
+            build_messages=build_messages,
+            budgets=budget_stretti(budgets_padre),
+        )
+        chiuso_a_forza = bool(referto)
+
+    def _registra(riuscito: bool) -> None:
+        """Com'e' andata, per i derivati. Fatto osservato, mai dedotto: sono
+        gli stessi campi che finiscono nel referto per il padre."""
+        if base_fatti is None:
+            return
+        spec_delega.registra(
+            base_fatti,
+            domanda=compito,
+            passi=passi,
+            riuscito=riuscito,
+            esaurito=esaurito,
+            chiuso_a_forza=chiuso_a_forza,
+        )
+
     if not referto:
+        _registra(False)
         return {
             "errore": (
                 "L'esplorazione non ha prodotto una risposta"
@@ -285,16 +426,22 @@ def esegui(
             # si e' fermato: la domanda successiva parte da dove era arrivata lui.
             "file_letti": letti,
             "esaurito": esaurito,
+            # "o cerca da solo" e' stato tolto di proposito: era l'uscita che
+            # il modello prendeva sempre, ed e' la strada che riporta
+            # l'esplorazione dentro il contesto del padre -- cioe' il costo
+            # che questo modulo esiste per evitare.
             "hint": (
-                "Riformula il compito piu' stretto partendo da 'file_letti', o cerca da solo."
+                "Rifai la domanda piu' stretta partendo da 'file_letti': "
+                "un solo obiettivo, un solo file o simbolo."
                 if esaurito
-                else "Riformula il compito in modo piu' stretto, o cerca da solo."
+                else "Rifai la domanda piu' stretta: un solo obiettivo per volta."
             ),
         }
 
     # Il troncamento deve essere *visibile*: senza marker il padre non sa di
     # avere informazioni incomplete e rifà da capo tutto il lavoro -- la delega
     # costa due volte invece di una.
+    _registra(True)
     out = {
         "passi": passi,
         # Dire cosa ha guardato serve al padre per fidarsi -- o per non fidarsi:
@@ -315,4 +462,14 @@ def esegui(
         # Risposta c'e', ma e' arrivata col passo 6 gia' speso: il padre deve
         # poterla leggere come "probabilmente incompleta" e riformulare.
         out["esaurito"] = True
+    if chiuso_a_forza:
+        # Il figlio non aveva risposto: questo referto e' stato ricavato dopo,
+        # da quello che aveva letto. Dirlo cambia come il padre lo legge --
+        # e' un recupero, non una conclusione.
+        out["chiuso_a_forza"] = True
+        out["nota"] = (
+            "L'esploratore ha finito i passi senza rispondere: questo referto "
+            "e' stato ricavato dalle letture che aveva gia' fatto. Trattalo "
+            "come parziale."
+        )
     return out

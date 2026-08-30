@@ -79,6 +79,140 @@ def test_il_riquadro_dell_ultima_esecuzione_si_spegne_cambiando_chat():
     assert "resetUsage()" in corpo
 
 
+def test_entrando_in_una_chat_si_atterra_sull_ultimo_messaggio():
+    """Si entrava in una conversazione e ci si trovava al **primo** messaggio.
+
+    La catena, che nessuno dei due pezzi mostrava da solo: `#scroller` ha
+    `scroll-behavior: smooth`, quindi `scrollTop = scrollHeight` non salta ma
+    anima; per i primi fotogrammi il thread e' ancora in cima; e in cima il
+    gestore dello scroll chiede il blocco di messaggi precedenti, che ridisegna
+    tutto e ripristina la posizione di *quel* momento -- l'inizio. Con in piu'
+    una pagina di cronologia caricata che nessuno aveva chiesto.
+    """
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    corpo = js[js.index("function scrollDown(") :]
+    corpo = corpo[: corpo.index("\n}\n")]
+    assert "behavior: 'instant'" in corpo
+    # Nessuno deve tornare all'assegnazione diretta: e' quella che anima.
+    assert "scroller.scrollTop = scroller.scrollHeight" not in js
+    # E il disegno della cronologia deve finire in fondo.
+    storia = js[js.index("function renderHistory(") :]
+    storia = storia[: storia.index("\n}\n")]
+    assert "scrollDown(true)" in storia
+
+
+def test_la_cronologia_si_chiede_solo_risalendo():
+    """Vicino alla cima ci si passa anche scendendo -- ed e' quello che fa ogni
+    ancoraggio al fondo. La condizione e' il **verso**, non la distanza."""
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    corpo = js[js.index("scroller.addEventListener('scroll'") :]
+    corpo = corpo[: corpo.index("});")]
+    assert "const sale = scroller.scrollTop < state.ultimoScrollTop;" in corpo
+    assert "if (sale && scroller.scrollTop < 220) caricaPrecedenti();" in corpo
+    # Chi sposta la pagina da solo dichiara dove l'ha messa, senno' il suo
+    # stesso evento di scroll passa per una risalita dell'utente.
+    salto = js[js.index("function scrollDown(") :]
+    assert "state.ultimoScrollTop = scroller.scrollTop;" in salto[: salto.index("\n}\n")]
+
+
+# ---------------------------------------------------------------------------
+# Sospensione del computer: la connessione cade, il turno no
+# ---------------------------------------------------------------------------
+#
+# Osservato dall'utente (30/08/2026): il computer su cui gira l'harness va in
+# sospensione, in chat compare "network error", poi l'agente sembra congelato;
+# chiudendo e riaprendo la conversazione tutto si riallinea e riprende. Il
+# lavoro non si era mai fermato -- il turno vive in un thread suo e il suo
+# buffer di eventi e' completo -- era la pagina che non guardava piu'.
+
+
+def test_lo_stream_caduto_si_riattacca_invece_di_arrendersi():
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    corpo = js[js.index("async function attachStream(") :]
+    corpo = corpo[: corpo.index("\n}\n")]
+    # E' un ciclo di connessioni, non una connessione sola.
+    assert "while (true) {" in corpo
+    assert "aspettaOSvegliati(attesaRiattacco(" in corpo
+    # Una caduta si racconta con la riga di stato, non con una casella rossa.
+    assert "statoTurno(turn, messaggioRiattacco(" in corpo
+    assert "error-box" not in corpo
+    js_msg = js[js.index("function messaggioRiattacco(") :]
+    assert "mi riattacco" in js_msg[: js_msg.index("\n}\n")]
+
+
+def test_il_riattacco_non_si_arrende_mai_ma_rallenta():
+    """Le attese crescono per non martellare un server davvero morto; non
+    finiscono, perche' una sospensione di otto ore deve recuperarsi da sola."""
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    assert "const RIATTACCO_ATTESE = [500, 1000, 2000, 4000, 8000];" in js
+    corpo = js[js.index("function attesaRiattacco(") :]
+    corpo = corpo[: corpo.index("\n}\n")]
+    assert "RIATTACCO_ATTESA_MAX" in corpo
+    # e la sveglia anticipata: al risveglio non si aspetta il turno di guardia
+    attesa = js[js.index("function aspettaOSvegliati(") :]
+    attesa = attesa[: attesa.index("\n}\n")]
+    for evento in ("'online'", "'visibilitychange'", "'abort'"):
+        assert evento in attesa, evento
+
+
+def test_ogni_ricollegamento_ridisegna_il_turno_da_capo():
+    """Il server rimanda **tutto** l'arretrato: senza buttare il nodo vecchio,
+    ogni riconnessione raddoppierebbe pensiero e tool gia' mostrati."""
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    corpo = js[js.index("async function attachStream(") :]
+    corpo = corpo[: corpo.index("\n}\n")]
+    nuovo = corpo.index("turn = nuovoTurnoDiStream();", corpo.index("while (true) {"))
+    assert "vecchio.wrap.remove();" in corpo[nuovo:], corpo[nuovo : nuovo + 200]
+
+
+def test_una_lettura_spezzata_non_e_la_fine_del_turno():
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    corpo = js[js.index("async function leggiLoStream(") :]
+    corpo = corpo[: corpo.index("\n}\n")]
+    assert "return { tipo: 'caduto'" in corpo
+    # Un abort (cambio chat) non e' una caduta: quello non si riattacca.
+    assert "AbortError" in corpo and "return { tipo: 'estraneo'" in corpo
+
+
+def test_una_sola_funzione_per_rimettersi_in_pari():
+    """Il bus globale non ha arretrato: quello che passa mentre la connessione
+    e' giu' non lo ripete nessuno, e la sola fonte completa e' il disco. La
+    rilettura ha tre chiamanti -- fine turno, riattacco, sveglia -- e deve
+    essere una funzione sola, o le tre copie divergono."""
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    assert js.count("async function riallinea(") == 1
+    corpo = js[js.index("async function riallinea(") :]
+    corpo = corpo[: corpo.index("\n}\n")]
+    # GET, mai la POST /open: aprire e' un gesto che ferma le anteprime.
+    assert "api(`/api/sessions/${encodeURIComponent(sessionId)}`)" in corpo
+    assert "/open" not in corpo
+    # e non calpesta una fonte viva
+    assert "attaccatoAUnoStream()" in corpo
+    assert js.count("riallinea(") >= 4
+
+
+def test_la_sveglia_non_ridisegna_se_la_sentinella_e_viva():
+    """Rileggere ad ogni ritorno sulla scheda avrebbe un effetto collaterale
+    sgradevole: il thread si ridisegna e chi stava leggendo indietro si
+    ritrova in fondo. Finche' il bus e' aperto, la pagina e' gia' in pari."""
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    corpo = js[js.index("function bindSveglie(") :]
+    corpo = corpo[: corpo.index("\n}\n")]
+    assert "state.bus.readyState === EventSource.OPEN) return;" in corpo
+    for evento in ("'online'", "'visibilitychange'", "'pageshow'"):
+        assert evento in corpo, evento
+
+
+def test_il_bus_che_si_ricollega_rilegge_la_conversazione():
+    """EventSource si ricollega da solo, ma senza arretrato: ogni riapertura
+    che non sia la prima e' una finestra di eventi persi."""
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    corpo = js[js.index("function bindGlobalEvents(") :]
+    corpo = corpo[: corpo.index("\n  bus.onmessage")]
+    assert "bus.onopen" in corpo and "primaApertura" in corpo
+    assert "riallinea(state.sessionId)" in corpo
+
+
 def test_la_riga_ottimistica_non_duplica_e_non_disturba_la_ricerca():
     js = (WEB / "app.js").read_text(encoding="utf-8")
     corpo = js[js.index("function aggiungiAllElenco(") :]

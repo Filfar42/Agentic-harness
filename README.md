@@ -48,7 +48,7 @@ core/
   settings.py          preferenze persistenti fra un avvio e l'altro
   vault.py             vault LLM Wiki: struttura, schema, prompt del manutentore
   vault_search.py      sotto-turno che interroga una wiki senza cambiare workspace
-tests/                 644 test, nessun modello reale richiesto
+tests/                 915 test, nessun modello reale richiesto
 ```
 
 `core/` non importa nulla del livello di presentazione: il ciclo agentico e' un
@@ -124,6 +124,46 @@ contenuto no: un CSV da poche centinaia di KB saturerebbe da solo la finestra
 di un modello locale. Se all'agente serve un allegato, lo apre con `read_file`
 e paga i token quando c'e' un motivo.
 
+### Una pagina e' una cartella, non un file
+
+Fino alla v2.34 l'anteprima di una pagina era il **file** e basta, servito da
+`/api/preview/file?path=...`. Un `<link href="style.css">` dentro quella pagina
+si risolve pero' in `/api/preview/style.css`, che non esiste: ogni sito scritto
+dall'agente si vedeva senza foglio di stile e senza script. Non "un po'
+diverso" -- un'altra cosa, e senza nessun errore da nessuna parte.
+
+Da qui in avanti si serve la **cartella**, su un **secondo server** minuscolo
+(`server/previewhost.py`) che sta su una porta sua (8124 di serie, spostabile,
+0 = spento). Le due cose vanno insieme e non e' un caso: sulla porta
+dell'harness la cartella non si poteva servire senza dare alla pagina scritta
+dal modello la nostra stessa origine, cioe' le nostre API. Su un'origine
+diversa il permesso `allow-same-origin` e' innocuo, e la pagina ottiene quello
+che le serve per essere viva: `localStorage`, moduli ES, `fetch`.
+
+- **Quale cartella.** Dal file si sale finche' si incontra un confine di
+  progetto (`package.json`, `pyproject.toml`, `.git`, `requirements.txt`); il
+  piu' vicino vince, cosi' in un monorepo la radice e' il sito e non il
+  repository. Senza confini, la cartella piu' alta che contiene un
+  `index.html`; senza neanche quello, la cartella del file. Mai il workspace
+  intero se non e' li' che sta la pagina: quello che non serve non si espone.
+- **Il backend, se ce n'e' uno.** Prima di mostrare, l'harness guarda la
+  cartella: `app.py`/`main.py` che dichiarano Flask o FastAPI, `manage.py` di
+  Django, `package.json` con Vite o con uno script `dev`/`start`. Se ne
+  riconosce uno lo avvia nella sandbox e mostra **quello**, all'indirizzo suo:
+  un backend decide da se' le proprie URL, il percorso del file sul disco non
+  e' l'indirizzo della pagina. Se non risponde, si ripiega sulla pagina statica
+  e il log finisce nel risultato del tool -- di solito mancano le dipendenze, e
+  il modello puo' installarle e riprovare. Si spegne da Impostazioni.
+- **Si ricarica da sola.** Ogni `write_file`/`edit_file` dentro la cartella
+  mostrata ricarica il pannello, con una pausa che assorbe le raffiche. Il
+  segnale e' lo stesso da cui nascono le gocce dei file: nessun evento nuovo,
+  nessun watcher sul disco. Terminale e schermo sono esclusi -- sono
+  dell'utente, e ricaricarli gli butterebbe via quello che ci sta facendo.
+
+Al modello questo si dice nel blocco `<anteprima>`: che il pannello e' gia'
+aperto **e** che si ricarica da solo. Senza, richiama `preview` dopo ogni
+correzione -- un passo intero per non fare niente.
+
 ### Finestre e terminale nell'anteprima
 
 Il pannello sa mostrare una cosa sola: un iframe su una porta pubblicata.
@@ -141,14 +181,16 @@ server HTTP su una porta".
 
 Due dettagli che non sono ovvi:
 
-**L'iframe delle applicazioni ha `allow-same-origin`, quello dei file no.** Con
+**L'iframe ha `allow-same-origin` solo dove l'origine e' un'altra.** Con
 l'origine opaca il browser applica il CORS ai moduli ES e alle `fetch`, e sia
-noVNC (`core/rfb.js`) sia ttyd (`/token`) vengono rifiutati da `origin: null`.
-Un'applicazione sta su `127.0.0.1:82xx`, un'origine **diversa** da quella
-dell'harness, quindi il permesso non le da' accesso ne' al DOM ne' alle
-risposte delle API. Un'anteprima di file arriva invece da `/api/preview/file`,
-cioe' dalla nostra stessa origine: li' `allow-scripts` e `allow-same-origin`
-insieme annullerebbero il sandbox, e restano separati.
+noVNC (`core/rfb.js`) sia ttyd (`/token`) vengono rifiutati da `origin: null`;
+in piu' `localStorage` non torna vuoto, **solleva**. Un'applicazione sta su
+`127.0.0.1:82xx` e una pagina sul server delle anteprime (vedi sotto): sono
+origini **diverse** da quella dell'harness, quindi il permesso non da' accesso
+ne' al DOM ne' alle risposte delle API. Cio' che arriva da `/api/preview/file`
+-- markdown, immagini, codice -- viene invece dalla nostra stessa origine, e li'
+`allow-scripts` e `allow-same-origin` insieme annullerebbero il sandbox: non
+vanno mai nella stessa lista.
 
 **La porta VNC non esce dal container** (`-localhost`): fuori ci va solo noVNC,
 sulla porta che hai gia' concesso.
@@ -337,7 +379,7 @@ generazione, ed e' li' che il controllo scatta piu' spesso.
 ## Test
 
 ```bash
-uv run pytest tests -q              # 681 verdi
+uv run pytest tests -q              # 915 verdi
 ```
 
 Va lanciato con l'interprete del progetto. Con un python di sistema si ottiene
@@ -360,6 +402,144 @@ del backend. La sandbox si prova con un finto `docker` messo sul PATH. Nessun
 modello richiesto.
 
 ## Storia delle revisioni
+
+**v2.36.1** — le ultime due attese, tolte alla radice.
+
+**La pagina non aspetta piu' la rete.** `/api/bootstrap` faceva tre viaggi
+verso il server del modello (`status`, `version`, `streams_tool_calls`) *prima*
+di rispondere: con il modello su un'altra macchina spenta erano fino a una
+decina di secondi di **pagina bianca** — non un'interfaccia lenta, proprio
+nessuna interfaccia, mentre impostazioni, conversazione e memorie erano gia' su
+questo disco. Adesso il bootstrap risponde con `online: null`, la goccia dice
+"controllo…", e la sonda va per conto suo su `/api/backend` a pagina gia' viva.
+
+**I messaggi si scrivono in coda.** Una conversazione ora sono **due file**:
+`<id>.json` con i metadati (titolo, piano, note, allegati, e i due numeri che
+servono alla sidebar) e `<id>.jsonl` con i messaggi, uno per riga, scritti in
+append. Prima la cronologia stava dentro il JSON dei metadati e salvare voleva
+dire riserializzare e riscrivere tutto: su una chat da 2,5 MB sono **23 ms** di
+GIL — cioe' 23 ms in cui il server non risponde a nessuno — pagati ad **ogni
+tool finito**, ed erano proprio le conversazioni lunghe a pagarli piu' spesso.
+Adesso un messaggio nuovo costa la sua riga: **0,5 ms**.
+
+Il pericolo dell'append e' che i messaggi vengono anche modificati sul posto —
+la traccia del pensiero si attacca all'assistente del passo precedente, la
+cancellazione di un allegato ripulisce i messaggi che lo nominavano, la
+compattazione sostituisce un tratto di cronologia. Due difese, e insieme
+coprono tutto: **l'impronta** dell'ultima riga scritta (che vede accorciamenti,
+compattazioni e modifiche all'ultimo messaggio, e allora riscrive) e **la
+riscrittura di fine turno**, l'unico momento in cui la cronologia e' ferma e
+completa — una volta per turno invece di una per tool.
+
+Tre effetti collaterali graditi: la sidebar non apre piu' la cronologia di
+nessuno (`n_messages` sta nei metadati), non c'e' nessuna migrazione da
+lanciare (la coda nasce al primo salvataggio, e una conversazione mai piu'
+aperta resta com'e'), e un processo che muore durante la scrittura ora costa
+**l'ultimo messaggio** invece di tutta la chat — con un file unico restava un
+JSON illeggibile.
+
+*Nota per gli script di analisi in `claude output/`: leggono
+`chat_sessions/*.json` aspettandosi la chiave `messages`, che per le
+conversazioni convertite non c'e' piu'. I messaggi vanno letti dal `.jsonl`
+accanto.*
+
+**v2.36.0** — l'interfaccia smette di essere lenta. Quattro cause, misurate.
+
+**1. Il pensiero viaggiava al quadrato.** Ad ogni token generato si spediva
+*tutto* il testo accumulato fino a li'. Un passo da 20.000 token di
+ragionamento sono 20.000 eventi, il primo da pochi byte e l'ultimo da 80 kB:
+**~1,8 GB** di JSON per un solo passo, serializzati, spediti, tenuti in RAM nel
+buffer del turno (quello che serve a chi si riattacca) e ridisegnati dal
+browser una volta per token. Era questo a far comparire il popup di Chrome "la
+pagina non risponde". Ora l'evento porta `append` — i soli caratteri nuovi — e
+non piu' di dieci volte al secondo: **0,2 MB in 800 eventi**, quattro ordini di
+grandezza. Il testo completo continua ad arrivare una volta per passo, ed e'
+voluto: un abbonato lento puo' vedersi scartare dei frame, e quello lo rimette
+in pari.
+
+**2. Il modello irraggiungibile si pagava ad ogni richiesta.** `session_stats`
+chiede le capability del modello, e i fallimenti non venivano memorizzati ("al
+prossimo giro riprova"). Con il modello su un'altra macchina spenta, ogni
+lettura di sessione pagava i **sei secondi** di timeout per intero: aprire una
+chat, finire un turno, riallinearsi. Ora un fallimento si ricorda per trenta
+secondi — e la sonda a mano lo dimentica, perche' chi la lancia ha appena
+acceso qualcosa.
+
+**3. Il conto del contesto si rifaceva sempre.** Ricostruire i messaggi per
+l'API e stimarli costa quanto tutta la cronologia, e `session_stats` viene
+chiamata ad ogni apertura, ad ogni fine turno, ad ogni invio, ad ogni
+riallineamento. Ora si ricalcola solo quando cambia uno dei suoi ingredienti.
+Le due cose insieme: `GET /api/sessions/<chat da 2,5 MB>` da **155 ms a 7,6
+ms**, senza contare i sei secondi del punto 2.
+
+**4. Meno lavoro per il browser.** La coda della cronologia passa da 40
+messaggi a **15** (in una chat agentica sono in maggioranza risultati di tool,
+e ogni risultato e' una tendina). E le tendine dei tool costruiscono argomenti
+e risultato **al primo clic**, non da chiuse: un `write_file` da 34 kB non
+entra piu' nel DOM per non essere guardato.
+
+Nella stessa revisione: **l'anteprima non si spalanca piu' da sola entrando in
+una chat.** L'anteprima memorizzata e' il ricordo di cosa l'agente mostrava
+l'ultima volta; riaprirla ad ogni ingresso significava mezzo schermo occupato
+da una pagina di ieri, da chiudere a mano ogni volta. Ora entrare in una
+conversazione la lascia chiusa — la riapre solo un turno **vivo**, o l'agente
+che mostra qualcosa adesso. Rileggere una chat in cui si e' gia' dentro (fine
+turno, riallineamento) invece non la tocca: chiuderla li' vorrebbe dire far
+sparire da sola la pagina appena costruita.
+
+E fuori dalla richiesta: la spazzata dei container rimasti da un riavvio
+precedente ora gira in un thread. Serviva quasi sempre a scoprire che era gia'
+tutto pulito, e su Windows ogni `docker` e' mezzo secondo buono pagato dentro
+la prima apertura di chat.
+
+**v2.35.0** — l'anteprima di una pagina e' la pagina, non il suo file.
+
+Tre difetti sotto una frase sola dell'utente ("un html senza il css e senza il
+backend avviato non funziona come dovrebbe"). Il primo: si serviva **un file**,
+quindi i percorsi relativi del sito puntavano dentro `/api/preview/`, e lo
+stile non arrivava. Il secondo: l'iframe dei file aveva l'origine opaca --
+scelta giusta finche' il file arrivava dalla nostra porta -- e con quella
+`localStorage` solleva, i moduli ES vengono rifiutati e ogni `fetch` e'
+cross-origin. Il terzo: una pagina che parla con un backend spento non e'
+un'anteprima, e' un'anteprima che mente.
+
+La cura e' una sola cosa fatta in tre punti: un secondo server sulla sua porta
+che monta la cartella del progetto su `/` (quindi origine diversa, quindi
+`allow-same-origin` senza aprire le API dell'harness), il riconoscimento del
+backend con avvio automatico e ripiego sullo statico se non risponde, e la
+ricarica viva ad ogni salvataggio dentro quella cartella.
+
+Nella stessa revisione: **entrando in una chat si atterra sull'ultimo
+messaggio**. Ci si ritrovava al primo, ed erano due cose che da sole non si
+vedevano. `#scroller` ha `scroll-behavior: smooth`, quindi `scrollTop =
+scrollHeight` non salta ma **anima**; per i primi fotogrammi il thread e'
+ancora in cima; e in cima il gestore dello scroll chiede il blocco di messaggi
+precedenti, che ridisegna tutto e ripristina la posizione di *quel* momento --
+l'inizio, con in piu' una pagina di cronologia che nessuno aveva chiesto. Ora
+l'ancoraggio salta (`behavior: 'instant'`, piu' un secondo colpo al fotogramma
+dopo per il contenuto che si assesta) e la cronologia si chiede solo quando il
+movimento e' davvero **verso l'alto**.
+
+E ancora: **una sospensione del computer non interrompe piu' niente.** Il turno
+vive gia' in un thread suo, con un buffer di eventi completo — riattaccarsi non
+perde nulla, ed e' per questo che chiudere e riaprire la conversazione la
+rimetteva in pari. Il client pero' non ci provava: a stream spezzato scriveva
+una casella rossa e restava sordo fino alla fine del turno. Ora `attachStream`
+e' un **ciclo di connessioni**: una caduta e' un riattacco (0,5s, 1, 2, 4, 8,
+poi ogni 10s, e subito al risveglio del computer o al ritorno della rete), e ad
+ogni ricollegamento l'arretrato ridisegna il turno da capo — il nodo vecchio se
+ne va, senno' pensiero e tool si sdoppierebbero. Al posto della casella rossa
+c'e' la riga di stato che dice cosa sta succedendo.
+
+La seconda meta' e' che il bus globale **non ha arretrato**: quello che passa
+mentre la connessione e' giu' non lo ripete nessuno, e un turno finito durante
+una sospensione non lascia altra traccia che i messaggi salvati. La cura e' una
+funzione sola, `riallinea()`, che rilegge la conversazione dal disco (GET, mai
+la POST `/open`, che e' un gesto e ferma le anteprime) e ha tre chiamanti: la
+fine di uno stream interrotto, la riapertura del bus, e le sveglie
+(`online`, `visibilitychange`, `pageshow`). Le sveglie non fanno niente finche'
+il bus e' aperto: rileggere ad ogni ritorno sulla scheda ridisegnerebbe il
+thread e butterebbe in fondo chi stava leggendo indietro.
 
 **v2.34.1** — un Ctrl+C riuscito non stampa piu' un traceback.
 

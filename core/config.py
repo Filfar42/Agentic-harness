@@ -23,7 +23,7 @@ APP_NAME = "Local Agent Harness"
 # preferenze. 2.31.0 e' stato il merge del fork Qwen; 2.32.0 i passi del
 # turno sul telefono; 2.33.0 Ctrl+C che spegne davvero e la sincronizzazione
 # in diretta; 2.34.0 il workspace legato alla conversazione.
-APP_VERSION = "2.34.1"
+APP_VERSION = "2.36.1"
 
 # --- percorsi di persistenza ------------------------------------------------
 DATA_DIR = Path("chat_sessions")
@@ -59,6 +59,11 @@ SEARCH_MAX_MATCHES = 80
 
 # Oltre questa percentuale di num_ctx la cronologia viene compattata.
 HISTORY_COMPACT_THRESHOLD = 0.75
+# ...e comunque non oltre questi token, percentuale o no: la finestra e'
+# cresciuta piu' in fretta della soglia e a 131k quella percentuale non e' piu'
+# raggiungibile in pratica. Le misure che giustificano il numero stanno nel
+# commento a ``compaction.TETTO_TOKEN_DEFAULT``, che legge questo valore.
+COMPACT_MAX_TOKENS = 32_768
 # I risultati dei tool piu' vecchi di N passi vengono ridotti a un sommario.
 TOOL_RESULT_FULL_WINDOW = 3
 
@@ -218,7 +223,10 @@ DEFAULTS: dict[str, Any] = {
     # Chrome, perche' e' una stringa presente negli archivi di data breach.
     "api_key": "",
     "model_name": "qwen2.5-coder:7b",
-    "transport": "auto",  # auto | ollama | openai
+    # auto | ollama | openai | llamacpp.
+    # 'llamacpp' e' llama-server: compatibile OpenAI, ma il contesto lo fissa
+    # -c al lancio e i sampler hanno altri nomi. 'auto' lo riconosce da /props.
+    "transport": "auto",
     # Ollama < 0.8.0 non emette tool call quando stream=true: la richiesta
     # riesce, il testo arriva, ma le tool_calls no. 'auto' rileva la versione
     # del server e sceglie da solo.
@@ -301,6 +309,18 @@ DEFAULTS: dict[str, Any] = {
     "preview_ports_enabled": True,
     "preview_port_base": 8200,
     "preview_port_count": 4,
+    # Porta di partenza del server che serve le anteprime di pagine. E' un
+    # secondo server, minuscolo, su un'origine diversa da quella dell'harness:
+    # e' cio' che permette all'iframe di avere `allow-same-origin` -- e quindi
+    # localStorage, moduli ES e fetch -- senza che la pagina scritta dal
+    # modello possa leggere le risposte delle nostre rotte. Si accende alla
+    # prima anteprima e prova le dieci porte successive se quella e' occupata.
+    # 0 = spento: le pagine tornano nell'iframe con origine opaca di prima.
+    "preview_host_port": 8124,
+    # Una pagina che parla con un backend spento non e' un'anteprima, e'
+    # un'anteprima che mente. Se il progetto ne dichiara uno (Flask, FastAPI,
+    # Django, Vite, package.json), l'harness lo avvia prima di mostrare.
+    "preview_autostart_backend": True,
     # efficienza
     # Se la richiesta ha piu' obiettivi e il modello lavora senza un piano,
     # l'harness glielo chiede. Vedi core/plan.py per il perche'.
@@ -320,6 +340,37 @@ DEFAULTS: dict[str, Any] = {
     # e' alta: sotto non succede niente.
     "compact_history": True,
     "compact_threshold": HISTORY_COMPACT_THRESHOLD,
+    # Tetto in token: si compatta al piu' tardi qui, anche se la percentuale
+    # sopra non e' stata raggiunta. Serve perche' la finestra e' cresciuta piu'
+    # in fretta della soglia -- vedi ``compaction.TETTO_TOKEN_DEFAULT`` per i
+    # numeri misurati. 0 = nessun tetto, torna al solo comportamento a
+    # percentuale.
+    "compact_max_tokens": COMPACT_MAX_TOKENS,
+    # Ogni tratto compattato viene anche salvato in `<workspace>/.memoria/`,
+    # cosi' com'e' e per sempre. Serve a due cose: il riassunto smette di
+    # essere riassunto una seconda volta alla compattazione dopo, e il contesto
+    # ne tiene solo una riga d'indice invece del testo.
+    "libreria_concetti": True,
+    # Alla chiusura di un punto di piano, il ragionamento dei passi che gli
+    # sono appartenuti viene distillato in SCOPERTO/SCARTATO e archiviato in
+    # `.memoria/`. Costa una chiamata per punto chiuso; scrive nella stessa
+    # cartella della libreria, quindi senza `libreria_concetti` l'estratto
+    # verrebbe scritto e mai riletto -- percio' l'harness lo esegue solo con
+    # entrambe attive. Vedi `core/pensiero.py`.
+    "estratto_pensiero": True,
+    # I risultati troppo lunghi (stdout/stderr di run_command, elenchi di
+    # search_files) vengono scritti interi in `<workspace>/.deposito/` prima
+    # di essere troncati, e il risultato ne porta il percorso. Il costo in
+    # contesto non cambia di un token: cambia che la coda tagliata smette di
+    # essere perduta. Vedi `core/deposito.py`.
+    "deposito_risultati": True,
+    "deposito_max_mb": 64,
+    # L'esploratore della delega sa a ogni passo quanti gliene restano, e
+    # l'esito di ogni esplorazione resta scritto in `.memoria/.deleghe.json`.
+    # Da quei fatti si ricavano al volo due frasi: l'avviso al figlio quando in
+    # questo workspace le esplorazioni finiscono spesso i passi, e un esempio
+    # vero di domanda ben posta in coda al sollecito. Vedi `core/spec_delega.py`.
+    "spec_delega": True,
     "auto_env_header": True,
     # UI
     "theme_mode": "light",  # light | dark
@@ -350,6 +401,17 @@ def resolve_tristate(value: Any, detected: bool | None) -> bool:
 
 
 THINK_LEVELS = ("low", "medium", "high", "max")
+
+# A che livello si traduce ``native_think: auto`` quando il modello dichiara di
+# saper ragionare. **Un livello e non ``True``**: `agent.think_for_step` scende
+# di uno scalino col punto di piano aperto e di due dal terzo passo, ma sa
+# farlo solo su una scala -- davanti a un booleano lascia tutto com'e'. Con
+# ``auto`` quella modulazione era percio' inerte, e in silenzio.
+#
+# 'high' e non 'medium' perche' 'auto' vuol dire "fai tu": il primo passo di
+# ogni turno deve restare quello che decide, ed e' da li' che gli scalini
+# scendono. Chi vuole partire piu' basso sceglie il livello a mano.
+THINK_AUTO_LEVEL = "high"
 
 
 def resolve_think(value: Any, detected: bool | None) -> bool | str:

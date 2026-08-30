@@ -42,7 +42,14 @@
       Nuova chat
     </button>
 
-    <div class="section-label">Conversazioni</div>
+    <!-- L'etichetta dice DOVE si sta guardando: dentro un vault l'elenco è
+         quello del vault, fuori è quello delle chat libere. Un elenco solo, ma
+         non sempre lo stesso: senza l'etichetta l'unico modo di sapere quale
+         dei due si ha davanti sarebbe non ritrovarci una chat. -->
+    <div class="section-label" id="sessions-label">
+      <span id="sessions-label-text">Conversazioni</span>
+      <button class="section-back" id="vault-exit" hidden title="Torna alle conversazioni libere">esci</button>
+    </div>
     <!-- La ricerca sta in cima all'elenco e non dietro un pulsante: con
          quaranta conversazioni dal titolo che comincia tutto uguale ("Nel
          workspace deve esistere...") scorrere non è un modo di ritrovarle.
@@ -59,15 +66,25 @@
     </div>
     <div id="sessions"></div>
 
-    <div class="section-label vaults-label">Vault <span class="section-hint">LLM Wiki</span></div>
-    <!-- I vault sono workspace organizzati come wiki LLM (raw/ immutabile,
-         wiki/ dell'agente, schema CLAUDE.md): aprirne uno mette l'agente in
-         modalita' manutentore. Dalle chat normali il tool vault_search li
-         interroga senza cambiare workspace. -->
-    <div class="vault-add">
-      <button class="vault-new" id="vault-new" title="Scegli la cartella con Esplora risorse">+ Nuovo vault</button>
+    <!-- Il confine fra i due elenchi si trascina: quanto spazio meritino i
+         vault dipende da quanti ne hai e da quante chat tieni aperte sotto,
+         e non è una cosa che si possa decidere una volta per tutte da qui.
+         Stessa grammatica delle maniglie verticali, ruotata: invisibile a
+         riposo, doppio clic per tornare a metà e metà. -->
+    <div class="row-grip" id="vaults-grip"
+         title="Trascina per dare più o meno spazio ai vault (doppio clic: metà e metà)"></div>
+
+    <!-- Un vault è un posto di lavoro: nome, descrizione, cartella e le chat
+         che ci sono state fatte dentro. Cliccarne uno apre la sua schermata
+         iniziale, non solo il workspace. La modalità manutentore-wiki è
+         diventata una proprietà del vault, non la sua definizione. -->
+    <div class="vaults-sec" id="vaults-sec">
+      <div class="section-label vaults-label">Vault</div>
+      <div class="vault-add">
+        <button class="vault-new" id="vault-new" title="Scegli la cartella con Esplora risorse">+ Nuovo vault</button>
+      </div>
+      <div id="vaults"></div>
     </div>
-    <div id="vaults"></div>
 
     <div class="sidebar-foot">
       <button class="icon-btn" id="theme-toggle" title="Tema chiaro/scuro">☀</button>
@@ -158,6 +175,33 @@
          il risultato senza che nessuno dei due si accorci. Il divisorio si
          trascina. -->
     <div id="main-split">
+      <!-- Schermata iniziale di un vault: prende il posto della chat, non le si
+           affianca. È la stessa colonna, con un contenuto diverso — un posto in
+           cui si arriva, si scrive la prima riga di una chat nuova o si ritrova
+           una vecchia. Nascosta finché non si apre un vault. -->
+      <div id="vault-col" hidden>
+        <div class="vault-home">
+          <header class="vault-head">
+            <h1 id="vh-nome">—</h1>
+            <p class="vault-descr" id="vh-descr"></p>
+          </header>
+
+          <!-- Il campo della chat nuova sta in alto e non in fondo all'elenco:
+               nove volte su dieci si apre un vault per scriverci, non per
+               rileggere. -->
+          <div class="vault-composer">
+            <textarea id="vh-input" rows="3" placeholder="Nuova conversazione in questo vault…"
+                      spellcheck="false"></textarea>
+            <button class="btn primary" id="vh-send">Avvia</button>
+          </div>
+
+          <div class="vault-chats">
+            <div class="section-label">Conversazioni <span class="section-hint" id="vh-count"></span></div>
+            <div id="vh-sessions"></div>
+          </div>
+        </div>
+      </div>
+
       <div id="chat-col">
         <div id="scroller"><div id="thread"></div></div>
 
@@ -244,6 +288,42 @@
 
   <!-- ---------------------------- pannello destro ------------------------ -->
   <aside id="panel">
+    <!-- L'identità del vault. Sta in cima e compare solo dentro un vault,
+         perché è la scheda del posto in cui si sta: nome, a cosa serve, come
+         ci si lavora, dov'è. I due testi sono separati di proposito — la
+         descrizione è per te e non arriva mai al modello, le istruzioni sì:
+         una riga scritta di fretta per ritrovare la cartella non deve
+         diventare un ordine che l'agente segue per i mesi successivi. Si
+         salvano uscendo dal campo, dentro .vault.json — cioè nella cartella,
+         così il vault resta sé stesso anche se lo sposti. -->
+    <div class="card" id="vault-card" style="display:none">
+      <h4>Vault</h4>
+      <label class="field-lite" for="v-nome">Nome</label>
+      <input id="v-nome" type="text" maxlength="120" spellcheck="false">
+      <label class="field-lite" for="v-descr">Descrizione <span class="hint-inline">solo per te</span></label>
+      <textarea id="v-descr" rows="2" maxlength="400" placeholder="Cos'è questo posto"></textarea>
+      <label class="field-lite" for="v-istr">Istruzioni <span class="hint-inline">vanno al modello</span></label>
+      <textarea id="v-istr" rows="4" maxlength="2000" placeholder="Come si lavora qui dentro"></textarea>
+      <div class="switch compact">
+        <input type="checkbox" id="v-wiki">
+        <div><label for="v-wiki" style="margin:0">Modalità wiki</label>
+          <div class="help">L'agente diventa il manutentore di una wiki LLM: <code>raw/</code> immutabile, <code>wiki/</code> sua, schema in <code>CLAUDE.md</code>. Accendendola la struttura viene creata.</div></div>
+      </div>
+      <div class="kv"><span>Cartella</span><span class="vault-path" id="v-path" title="">—</span></div>
+      <div class="kv" id="v-wiki-counts" style="display:none"><span>Wiki</span><span id="v-counts">—</span></div>
+    </div>
+
+    <!-- La memoria del vault: quello che l'agente ha capito di QUESTO posto.
+         Tre fogli, e la differenza è quanto vivono: le note della chat muoiono
+         con lei, questa vale per tutte le conversazioni della cartella, le
+         memorie a lungo termine valgono ovunque. La scrive il modello con
+         manage_notes ambito='vault'; qui si legge e si toglie quello che non
+         è più vero — una nota sbagliata è peggio di nessuna nota. -->
+    <div class="card" id="vault-mem-card" style="display:none">
+      <h4>Memoria del vault <span class="plan-count" id="v-mem-count">—</span></h4>
+      <div id="v-mem"></div>
+    </div>
+
     <!-- Il piano sta in cima perché è la risposta alla domanda che l'utente si
          fa davvero mentre l'agente lavora: "a che punto è?". Prima l'unico
          segnale era una tendina del pensiero che si apriva e si chiudeva.
@@ -298,6 +378,13 @@
           <span title="Solleciti automatici che l'harness ha dovuto iniettare">Correzioni</span>
           <span id="u-nudges">—</span>
         </div>
+        <!-- Quanto rende il draft model. Compare solo se il server ne ha uno e
+             ne dichiara i contatori: senza speculative decoding la riga non
+             c'è, e non c'è nemmeno un numero inventato al suo posto. -->
+        <div class="kv" id="u-draft-row" style="display:none">
+          <span title="Token proposti dal draft model e accettati dal modello grande">Draft</span>
+          <span id="u-draft">—</span>
+        </div>
       </div>
     </div>
 
@@ -348,8 +435,9 @@
                 <option value="auto">auto</option>
                 <option value="ollama">ollama</option>
                 <option value="openai">openai</option>
+                <option value="llamacpp">llamacpp</option>
               </select>
-              <div class="help">Solo <code>/api/chat</code> di Ollama applica davvero num_ctx, num_gpu e keep_alive.</div>
+              <div class="help">Solo <code>/api/chat</code> di Ollama applica davvero num_ctx, num_gpu e keep_alive. Con <code>llamacpp</code> il contesto lo comanda <code>-c</code> al lancio del server: l'harness lo <em>legge</em> da <code>/props</code> e ci si adegua. <code>auto</code> riconosce da solo quale dei due sta rispondendo.</div>
             </div>
             <div class="field">
               <label for="s-stream-tools">Tool in streaming</label>
@@ -366,19 +454,12 @@
               <datalist id="s-model-list"></datalist>
               <div class="help">Digita il nome di qualsiasi modello (es. per OpenRouter/OpenAI) oppure sceglilo dai suggerimenti trovati sull'endpoint.</div>
             </div>
-            <!-- Subito sotto al modello: sono le due scelte che definiscono
-                 "chi lavora e su cosa", e finché stava in fondo alla colonna
-                 di destra la cartella era l'unica delle due a non avere posto
-                 qui dentro. Il selettore resta quello del sistema operativo. -->
-            <div class="field">
-              <label>Cartella di lavoro</label>
-              <div class="path" id="ws-path">—</div>
-              <div class="btn-row" style="margin:7px 0 0">
-                <button class="mini-btn" id="ws-browse">Cambia…</button>
-                <button class="mini-btn" id="ws-open">Apri</button>
-              </div>
-              <div class="help">Le ultime cartelle usate si riaprono anche dal percorso in alto a sinistra, senza passare di qui.</div>
-            </div>
+            <!-- La cartella di lavoro NON sta qui. Stava qui e in alto a
+                 sinistra, e le due copie facevano lo stesso identico gesto:
+                 scegliere una cartella e aprirla in Esplora risorse. È rimasta
+                 quella in alto, che è dove si legge dove si sta lavorando —
+                 cercare una cosa dentro le impostazioni per cambiarla è un
+                 passaggio in più per una scelta che si fa mentre si lavora. -->
             <div class="field">
               <label for="s-api-key">API key</label>
               <!-- NON usare type="password": il gestore password di Chrome
@@ -420,10 +501,12 @@
               <div><label for="s-sandbox-network" style="margin:0">Rete nel container</label>
                 <div class="help">Spenta, l'agente non puo' scaricare nulla ne' mandare dati fuori.</div></div>
             </div>
-            <div class="btn-row" style="margin-bottom:12px">
-              <button class="mini-btn" id="sandbox-build">Costruisci l'immagine</button>
-              <button class="mini-btn" id="sandbox-restart">Ricrea il container</button>
-            </div>
+            <!-- I due tasti "Costruisci l'immagine" e "Ricrea il container"
+                 non stanno più qui. Immagine e container si preparano da soli
+                 quando si cambia cartella; farli a mano è un rimedio, e i
+                 rimedi stanno accanto alla cosa da rimediare — nella tendina
+                 della cartella in alto a sinistra, sotto "Impostazioni". -->
+
             <div class="switch">
               <input type="checkbox" id="s-danger">
               <div><label for="s-danger" style="margin:0">Consenti comandi distruttivi</label>
@@ -548,6 +631,36 @@
           <input type="number" id="s-compact-threshold" min="0.4" max="0.95" step="0.05">
           <div class="help">Frazione della finestra oltre la quale scatta. A 0.75 resta un quarto di contesto libero per il passo successivo.</div>
         </div>
+        <div class="field" style="margin-left:30px">
+          <label for="s-compact-max-tokens">…e comunque non oltre (token)</label>
+          <input type="number" id="s-compact-max-tokens" min="0" max="200000" step="4096">
+          <div class="help">Il costo del contesto è un numero assoluto, non una frazione: su endpoint remoto sono token pagati ad ogni passo, e l'attenzione del modello cala molto prima che la finestra si riempia. Con finestre grandi la sola percentuale non scatta mai. 0 = nessun tetto.</div>
+        </div>
+        <div class="switch" style="margin-left:30px">
+          <input type="checkbox" id="s-libreria">
+          <div><label for="s-libreria" style="margin:0">Salva i tratti compattati in <code>.memoria/</code></label>
+            <div class="help">Ogni riassunto finisce anche su disco, così com'è e per sempre. Serve a due cose: non viene riassunto una seconda volta alla compattazione dopo — che è il modo in cui un riassunto diventa la fotocopia di una fotocopia — e in contesto ne resta una riga di indice invece del testo. Il modello li rilegge con read_file, e quelli che riguardano il punto aperto glieli rimette davanti l'harness.</div></div>
+        </div>
+        <div class="switch" style="margin-left:30px">
+          <input type="checkbox" id="s-estratto-pensiero">
+          <div><label for="s-estratto-pensiero" style="margin:0">Distilla il ragionamento quando un punto di piano si chiude</label>
+            <div class="help">Il ragionamento vale 22 volte le risposte e viene buttato a ogni turno, ma non è scarto: dentro ci sono errori veri, versioni, percorsi e comandi che funzionano, scritti da nessun'altra parte. Alla chiusura (o al salto) di un punto, una chiamata sola ne tiene solo <code>SCOPERTO</code> e <code>SCARTATO</code> e li archivia in <code>.memoria/</code>. Costa una chiamata per punto chiuso, e richiede l'impostazione qui sopra: senza indice, l'estratto verrebbe scritto e mai riletto.</div></div>
+        </div>
+        <div class="switch">
+          <input type="checkbox" id="s-spec-delega">
+          <div><label for="s-spec-delega" style="margin:0">Impara dagli esiti delle esplorazioni</label>
+            <div class="help">Su 17 esplorazioni misurate, 8 finivano i sei passi senza rispondere: il figlio non sa quanto tempo gli resta. Con questa attiva se lo vede a ogni passo, e l'esito di ogni delega resta scritto in <code>.memoria/.deleghe.json</code>. Da quei fatti si ricavano al volo due frasi — un avviso al figlio quando qui le esplorazioni sfondano spesso, e un esempio vero di domanda ben posta in coda al sollecito. I fatti non si riscrivono mai; le frasi si rifanno da capo ogni volta, così se l'evidenza cambia cambiano anche loro.</div></div>
+        </div>
+        <div class="switch">
+          <input type="checkbox" id="s-deposito">
+          <div><label for="s-deposito" style="margin:0">Deposita i risultati troppo lunghi in <code>.deposito/</code></label>
+            <div class="help">Oggi un risultato che sfora il budget viene <em>troncato</em>: per un file la coda si rilegge a righe, ma per lo stdout di un comando quel testo non esiste più da nessuna parte e l'unica strada è rilanciarlo. Col deposito il testo intero finisce su disco <em>prima</em> del taglio e il risultato ne porta il percorso: in contesto entrano gli stessi token di prima, ma la coda smette di essere perduta. Vale per <code>run_command</code> e <code>search_files</code>.</div></div>
+        </div>
+        <div class="field" style="margin-left:30px">
+          <label for="s-deposito-max-mb">Tetto del deposito (MB)</label>
+          <input type="number" id="s-deposito-max-mb" min="0" max="4096" step="16">
+          <div class="help">Sopra il tetto escono i file più vecchi. Le conversazioni non si chiudono mai da sole, quindi legare la vita del deposito alla sessione vorrebbe dire non potarlo mai. 0 = nessun tetto.</div>
+        </div>
         <div class="switch">
           <input type="checkbox" id="s-envhdr">
           <div><label for="s-envhdr" style="margin:0">Inietta l'environment header</label>
@@ -580,6 +693,16 @@
         <div class="field">
           <label for="s-preview-port-count">Quante porte</label>
           <input type="number" id="s-preview-port-count" min="1" max="20">
+        </div>
+        <div class="switch">
+          <input type="checkbox" id="s-preview-autobackend">
+          <div><label for="s-preview-autobackend" style="margin:0">Avvia da solo il backend del progetto</label>
+            <div class="help">Prima di mostrare una pagina, se la sua cartella dichiara un backend (Flask, FastAPI, Django, Vite, <code>package.json</code>) l'harness lo avvia. Se non risponde, la pagina si vede lo stesso come file statico e il modello legge il log.</div></div>
+        </div>
+        <div class="field">
+          <label for="s-preview-host-port">Porta del server delle anteprime</label>
+          <input type="number" id="s-preview-host-port" min="0" max="65500">
+          <div class="help">Le pagine si servono da qui, non dalla porta dell'harness: è un'origine diversa, ed è quello che permette loro di avere <code>localStorage</code>, moduli ES e <code>fetch</code> senza poter leggere le risposte delle rotte dell'harness. Si accende alla prima anteprima. 0 = spento.</div>
         </div>
         <div class="switch">
           <input type="checkbox" id="s-require-plan">

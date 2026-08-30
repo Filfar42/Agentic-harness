@@ -162,8 +162,11 @@ def test_una_pagina_senza_risultati_torna_il_suggerimento_giusto(monkeypatch):
     payload = json.loads(
         tools_mod.dispatch(_ctx(), "web_search", {"query": "qualcosa"})
     )
-    assert "risultati interpretabili" in payload["error"]
-    assert "Riformula" in payload["hint"]
+    # Quel che conta qui e' che l'errore arrivi al modello **come testo**, con
+    # il suo hint. Quale dei due messaggi sia -- e questa paginetta e' proprio
+    # un bot-check, quindi e' il rifiuto -- lo decidono i due test in fondo.
+    assert "motore di ricerca" in payload["error"]
+    assert payload["hint"]
 
 
 def test_dispatch_rifiuta_web_search_se_il_turno_non_lo_ha_chiesto():
@@ -262,3 +265,63 @@ def test_senza_vault_registrati_il_tool_del_vault_non_compare(client):
 
     stato.settings["vaults"] = [{"path": "/tmp/vault", "nome": "appunti"}]
     assert "vault_search" in [t["function"]["name"] for t in stato.tools_schema()]
+
+
+# ---------------------------------------------------------------------------
+# Porta in faccia contro elenco vuoto: due cause, due consigli opposti
+# ---------------------------------------------------------------------------
+
+# Quello che l'endpoint HTML manda quando ha deciso che sei un bot: nessun
+# blocco `result__a`, e una pagina corta.
+HTML_RIFIUTO = """
+<html><body><p>Unfortunately, bots use DuckDuckGo too.
+Please try again later.</p></body></html>
+"""
+
+# Una pagina di risultati **vera** che pero' non ha trovato niente: il guscio
+# del sito c'e' tutto, ed e' proprio la taglia a distinguerla dal rifiuto.
+HTML_ZERO_RISULTATI = (
+    "<html><head><title>ricerca</title></head><body>"
+    + "<div class='site'>impaginazione e menu</div>" * 200
+    + "<p>Nessun risultato.</p></body></html>"
+)
+
+
+@pytest.fixture()
+def rete_che_rifiuta(monkeypatch):
+    import httpx
+
+    def finto_post(url, **_):
+        return _RispostaFinta(HTML_RIFIUTO)
+
+    monkeypatch.setattr(httpx, "post", finto_post)
+
+
+@pytest.fixture()
+def rete_senza_risultati(monkeypatch):
+    import httpx
+
+    def finto_post(url, **_):
+        return _RispostaFinta(HTML_ZERO_RISULTATI)
+
+    monkeypatch.setattr(httpx, "post", finto_post)
+
+
+def test_il_limite_di_frequenza_non_si_cura_riformulando(rete_che_rifiuta):
+    """Nella sessione del 29/08 la prima ricerca e' passata e le venti dopo
+    no: il modello ha speso venti passi ad accorciare la query contro una
+    pagina che non conteneva risultati per **nessuna** query. Il consiglio
+    "riformula con parole piu' comuni" era quello sbagliato."""
+    with pytest.raises(tools_mod.WorkspaceError) as errore:
+        tools_mod.tool_web_search(_ctx(), "Endress Hauser")
+    assert "rifiutato" in str(errore.value)
+    assert "Non riformulare" in errore.value.hint
+
+
+def test_un_elenco_davvero_vuoto_invita_ancora_a_riformulare(rete_senza_risultati):
+    """L'altro caso esiste e il suo consiglio resta buono: distinguere serve a
+    questo, non a sostituire un messaggio con un altro."""
+    with pytest.raises(tools_mod.WorkspaceError) as errore:
+        tools_mod.tool_web_search(_ctx(), "wh1190b aerotermo criogenico")
+    assert "risultati interpretabili" in str(errore.value)
+    assert "Riformula" in errore.value.hint

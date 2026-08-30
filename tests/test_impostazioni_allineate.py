@@ -56,8 +56,12 @@ def test_nessuno_riallinea_piu_i_campi_a_mano():
     profilo = blocco(sorgente, "$('#profile-apply').onclick")
     assert "'#s-temp'" not in profilo and "num_ctx" not in profilo
     assert "renderHeader();" in profilo
-    build = blocco(sorgente, "$('#sandbox-build').onclick")
-    assert "$('#s-docker-image').value" not in build
+    # La terza copia era dentro il pulsante della build, che non esiste più:
+    # l'immagine appena costruita la seleziona il **server** (``seleziona_
+    # immagine``), quindi non c'è più nessun posto da cui il client possa
+    # scriverla a mano e dimenticarsi di riallineare il resto.
+    assert "$('#sandbox-build')" not in sorgente
+    assert "$('#s-docker-image').value =" not in sorgente
 
 
 def test_un_valore_fuori_elenco_non_sparisce_in_silenzio():
