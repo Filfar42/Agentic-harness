@@ -164,6 +164,14 @@ def cerca_nel_vault(
         read_cache={},
         new_symbols={},
         step=0,
+        # Il perimetro di sola lettura come dato, non come schema: qui pesa
+        # il doppio, perche' il workspace del cercatore e' la cartella di un
+        # ALTRO vault dell'utente. ``schema_ridotto`` dice al modello cosa
+        # esiste; le chiamate scritte come testo non lo consultano.
+        tool_consentiti=frozenset(TOOL_CERCA),
+        # Un cercatore non apre altri sotto-turni.
+        on_delega=None,
+        on_vault_search=None,
     )
 
     messaggi: list[dict[str, Any]] = [

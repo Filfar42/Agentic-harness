@@ -9,9 +9,11 @@ il fake lo muta proprio come farebbe il vero ciclo.
 
 from __future__ import annotations
 
+import json
+
 import tests.test_agent_loop as fake
 from core.config import GenParams
-from core.delega import MAX_PASSI_DELEGA, MAX_REFERTO_CHARS, esegui
+from core.delega import MAX_PASSI_DELEGA, MAX_REFERTO_CHARS, TOOL_DELEGA, esegui
 from core.tools import ToolContext
 
 # Il finto server Ollama sta li' e ci gira il ciclo vero: il sollecito alla
@@ -402,3 +404,79 @@ def test_budget_riferimento_valori_attesi_e_coerenza_col_prompt():
     assert rif == budget_stretti(budgets_for(BASE_NUM_CTX))
     # ...ed e' memoizzato: chiamate successive restituiscono lo stesso oggetto.
     assert budget_riferimento() is rif
+
+
+# ---------------------------------------------------------------------------
+# Il perimetro di sola lettura del figlio
+# ---------------------------------------------------------------------------
+#
+# Lo schema ridotto dice al figlio quali tool esistono. Non e' un permesso:
+# ``parse_text_tool_calls`` recupera le chiamate che il modello scrive come
+# testo confrontandole con ``TOOL_NAMES`` -- il vocabolario dell'harness -- e
+# ``dispatch`` guardava solo ``TOOL_IMPLS``. Un figlio che scriveva
+# ``{"name": "run_command", ...}`` come testo eseguiva comandi. Il percorso non
+# e' un caso limite: e' quello che l'harness supporta apposta per i modelli che
+# non fanno function calling nativo.
+
+
+def test_il_figlio_riceve_il_perimetro_come_dato_non_come_schema(tmp_path):
+    visto = {}
+
+    def _spia(**kw):
+        visto["ctx"] = kw["tool_ctx"]
+        return iter(())
+
+    _esegui(tmp_path, _run=_spia)
+    ctx = visto["ctx"]
+    assert ctx.tool_consentiti == frozenset(TOOL_DELEGA)
+    assert ctx.puo_usare("read_file")
+    assert not ctx.puo_usare("run_command")
+    assert not ctx.puo_usare("write_file")
+
+
+def test_un_esploratore_non_genera_esploratori(tmp_path):
+    """``ctx_figlio`` ereditava le due porte da cui si aprono altri sotto-turni."""
+    visto = {}
+
+    def _spia(**kw):
+        visto["ctx"] = kw["tool_ctx"]
+        return iter(())
+
+    ctx_padre = ToolContext(
+        workspace=str(tmp_path),
+        sandbox="host",
+        on_delega=lambda compito: {"referto": "x"},
+        on_vault_search=lambda **kw: {"referto": "y"},
+    )
+    esegui(
+        "dove sta budgets_for?",
+        backend=object(),
+        params=GenParams(model="fake"),
+        tools_schema=[],
+        tool_ctx=ctx_padre,
+        env_header=None,
+        run_turn=_spia,
+        registra_esiti=False,
+    )
+    assert visto["ctx"].on_delega is None
+    assert visto["ctx"].on_vault_search is None
+
+
+def test_dispatch_rifiuta_un_tool_fuori_perimetro(tmp_path):
+    """La difesa vera: ``dispatch`` non esegue, non importa da dove arrivi il nome."""
+    from core.tools import dispatch
+
+    ctx = ToolContext(
+        workspace=str(tmp_path),
+        sandbox="host",
+        tool_consentiti=frozenset(TOOL_DELEGA),
+    )
+    esito = json.loads(dispatch(ctx, "run_command", {"command": "echo compromesso"}))
+    assert "error" in esito
+    assert "run_command" in esito["error"]
+    # e il messaggio dice cosa PUO' fare, non solo cosa non puo'
+    assert "read_file" in esito.get("hint", "")
+
+    # senza perimetro (il turno normale) lo stesso tool passa
+    normale = ToolContext(workspace=str(tmp_path), sandbox="host")
+    assert normale.puo_usare("run_command")

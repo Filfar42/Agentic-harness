@@ -311,6 +311,19 @@ def esegui(
         new_symbols={},
         step=0,
         budgets=budget_stretti(budgets_padre),
+        # Il perimetro di sola lettura, come **dato** e non come schema.
+        # ``schema_ridotto`` dice al figlio quali tool esistono; questo gli
+        # impedisce di usarne altri. Non e' ridondanza: le chiamate che il
+        # modello scrive come testo vengono recuperate confrontandole con
+        # ``TOOL_NAMES`` -- che e' per scelta dichiarata il vocabolario
+        # dell'harness e non il permesso del turno -- e finivano in
+        # ``dispatch``, che guardava solo ``TOOL_IMPLS``. Un figlio che
+        # scriveva ``{"name": "run_command", ...}`` come testo eseguiva.
+        tool_consentiti=frozenset(TOOL_DELEGA),
+        # E un esploratore non genera esploratori: senza azzerarle, il figlio
+        # ereditava le due porte da cui si aprono altri sotto-turni.
+        on_delega=None,
+        on_vault_search=None,
     )
 
     messaggi: list[dict[str, Any]] = [{"role": "user", "content": compito}]

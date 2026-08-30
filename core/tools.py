@@ -330,6 +330,25 @@ class ToolContext:
     # Tracker per le verifiche rosse, impostato da agent.py per permetterne
     # l'azzeramento automatico o manuale quando un comando non e' pertinente.
     verification: Any = None
+    # I tool che questo turno puo' eseguire. ``None`` = tutti (il turno
+    # normale); un insieme = solo quelli, ed e' cosi' che i sotto-turni --
+    # l'esploratore della delega e il cercatore del vault -- restano di sola
+    # lettura.
+    #
+    # Prima il perimetro esisteva solo nello **schema** passato al modello, e
+    # lo schema non e' un permesso: ``parse_text_tool_calls`` recupera le
+    # chiamate scritte come testo accettando ogni nome di ``TOOL_NAMES`` --
+    # che e' per scelta dichiarata il vocabolario dell'harness, non cio' che
+    # questo turno puo' fare -- e ``dispatch`` guardava solo ``TOOL_IMPLS``.
+    # Un figlio che scriveva ``{"name": "run_command", ...}`` come testo
+    # eseguiva comandi. Il percorso non e' teorico: e' quello che l'harness
+    # supporta apposta per i modelli che non fanno function calling nativo, e
+    # su qwen2.5-coder:7b e' l'unico che si osservi.
+    tool_consentiti: frozenset[str] | None = None
+
+    def puo_usare(self, name: str) -> bool:
+        """Questo turno ha il permesso di eseguire ``name``?"""
+        return self.tool_consentiti is None or name in self.tool_consentiti
 
     def clear_red_command(self) -> None:
         self.red_command = None
@@ -2922,6 +2941,17 @@ def dispatch(ctx: ToolContext, name: str, args: dict[str, Any]) -> str:
         return _err(
             f"Tool '{name}' inesistente.",
             hint="Tool disponibili: " + ", ".join(sorted(TOOL_IMPLS)),
+        )
+    # Il permesso si controlla **qui**, dove si esegue, e non nello schema.
+    # Lo schema dice al modello cosa esiste; il recupero delle chiamate
+    # scritte come testo (``parse_text_tool_calls``) non lo consulta, e in un
+    # sotto-turno di sola lettura era l'unica cosa che separasse
+    # l'esploratore da ``run_command``.
+    if not ctx.puo_usare(name):
+        return _err(
+            f"Tool '{name}' non disponibile in questo turno.",
+            hint="Strumenti di questo turno: "
+            + ", ".join(sorted(ctx.tool_consentiti or ())),
         )
     allowed = _ALLOWED_ARGS.get(name, set())
     clean = {k: v for k, v in (args or {}).items() if k in allowed}

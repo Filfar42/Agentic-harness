@@ -144,6 +144,7 @@ def _run_turn_che_risponde(risposta: str, spioni: dict):
         spioni["system_prompt"] = kw["system_prompt"]
         spioni["params"] = kw["params"]
         spioni["nomi_tool"] = [t["function"]["name"] for t in kw["tools_schema"]]
+        spioni["ctx"] = kw["tool_ctx"]
         yield ToolFinished()
         yield AssistantTurn(risposta)
 
@@ -185,6 +186,15 @@ def test_cerca_nel_vault_gira_sul_vault_e_cita_le_fonti(tmp_path):
     # ...senza pensiero e coi soli tre tool di lettura.
     assert spioni["params"].think is False
     assert spioni["nomi_tool"] == ["list_files", "read_file", "search_files"]
+    # ...e con quei tre tool come **permesso**, non solo come schema: le
+    # chiamate scritte come testo non passano dallo schema, e il workspace
+    # del cercatore e' la cartella di un altro vault dell'utente.
+    assert spioni["ctx"].tool_consentiti == frozenset(vault_search.TOOL_CERCA)
+    assert not spioni["ctx"].puo_usare("write_file")
+    assert not spioni["ctx"].puo_usare("run_command")
+    # Un cercatore non apre altri sotto-turni.
+    assert spioni["ctx"].on_delega is None
+    assert spioni["ctx"].on_vault_search is None
 
 
 def test_cerca_nel_vault_nome_sconosciuto_errore_pulito(tmp_path):
