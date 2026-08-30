@@ -2651,6 +2651,15 @@ def _note_del_vault(ctx: ToolContext, action: str, text: str) -> str:
             )
     except vault_mod.NotaVaultError as exc:
         return _err(str(exc))
+    except vault_mod.VaultScritturaError as exc:
+        # La nota non e' finita sul disco. Va detto: prima ``scrivi_config``
+        # ritornava la configurazione nuova comunque, e il modello riceveva
+        # "registrata" su una nota che non c'era.
+        return _err(
+            f"Non ho potuto salvare la memoria del vault: {exc}",
+            hint="La nota NON e' stata registrata. Controlla i permessi della "
+            "cartella del vault, o riprova.",
+        )
 
     ctx.vault_notes = list(config.note)
     ctx.vault_notes_changed()
@@ -3614,9 +3623,12 @@ TOOL_NAMES = frozenset(
 # Schemi snelli per i modelli che non hanno bisogno di essere imboccati
 # ---------------------------------------------------------------------------
 #
-# Gli schemi completi costano ~1.790 token **ad ogni singola richiesta**: da
-# quando il system prompt snello ne occupa 612, sono diventati il blocco fisso
-# piu' grande del prompt. Buona parte di quel peso sono istruzioni pedagogiche
+# Gli schemi completi sono il blocco fisso piu' grande della richiesta -- piu'
+# del system prompt, in entrambi i percorsi -- e si pagano **ad ogni singolo
+# passo agentico**. Quanto costino lo dice ``prompts.costi_del_prefisso()`` e
+# non un numero scritto qui: la versione precedente di questo commento diceva
+# "~1.790 token" per uno schema che ne occupa 4.318, e "612" per un prompt che
+# ne occupa 3.001. Buona parte di quel peso sono istruzioni pedagogiche
 # ("USALO PER VERIFICARE il tuo lavoro dopo ogni modifica: 'pytest -q', ...")
 # che servono a un modello che non collega la richiesta al tool giusto.
 #

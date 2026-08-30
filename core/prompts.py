@@ -202,7 +202,10 @@ viene riassunta e i dettagli spariscono: le note restano.
 # passo per passo sono stampelle che su qwen2.5-coder cambiano davvero il
 # comportamento. Su un modello che ragiona sono due cose insieme:
 #
-#   * ~800 token di contesto occupati ad ogni singola richiesta;
+#   * contesto occupato ad ogni singola richiesta (quanto, lo dice
+#     ``costi_del_prefisso()`` qui sotto: i numeri scritti a mano invecchiano
+#     da soli mentre i testi crescono, ed e' successo -- il commento diceva
+#     "612 token" per un prompt che ne occupa 3.001);
 #   * istruzioni che competono con il compito. Un modello capace che legge
 #     "cosa c'e' nel progetto -> list_files" tende a *eseguire la tabella*
 #     invece di ragionare sul problema.
@@ -854,3 +857,37 @@ intuito. Un'ipotesi che il ragionamento non ha verificato non e' uno SCOPERTO: \
 o la ometti, o scrivi che era un'ipotesi. Se non resta niente che valga la \
 pena conservare, rispondi esattamente NIENTE e nient'altro.\
 """
+
+
+# ---------------------------------------------------------------------------
+# Quanto costa davvero il blocco fisso
+# ---------------------------------------------------------------------------
+
+
+def costi_del_prefisso() -> dict[str, int]:
+    """Il peso in token di prompt e schemi, misurato adesso.
+
+    I numeri stavano nei commenti -- "il prompt snello occupa 612 token", "gli
+    schemi ~1.790" -- ed erano sbagliati di 4,9x e 2,4x: erano veri quando
+    qualcuno li ha misurati, e sono invecchiati in silenzio mentre i testi
+    crescevano. Un numero che si ricalcola non puo' mentire, e un test puo'
+    controllare che il rapporto fra i due percorsi sia ancora quello che
+    giustifica la scelta automatica.
+
+    Importa i tool qui dentro e non in testa al modulo perche' ``tools``
+    importa ``prompts``: il giro si chiude solo a runtime.
+    """
+    import json
+
+    from .textutils import estimate_tokens
+    from .tools import TOOLS_SCHEMA, TOOLS_SCHEMA_LEAN
+
+    def _schema(s: list) -> int:
+        return estimate_tokens(json.dumps(s, ensure_ascii=False))
+
+    return {
+        "prompt_esteso": estimate_tokens(SYSTEM_PROMPT),
+        "prompt_snello": estimate_tokens(SYSTEM_PROMPT_LEAN),
+        "schemi_estesi": _schema(TOOLS_SCHEMA),
+        "schemi_snelli": _schema(TOOLS_SCHEMA_LEAN),
+    }

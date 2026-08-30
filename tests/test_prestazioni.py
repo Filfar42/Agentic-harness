@@ -362,3 +362,61 @@ def test_il_client_disegna_prima_e_sonda_dopo():
     assert "api('/api/backend')" in sonda
     assert "renderStatusPill(info.online" in sonda
     assert "fillModels(info.models)" in sonda
+
+
+# ---------------------------------------------------------------------------
+# Il costo del blocco fisso: misurato, non dichiarato
+# ---------------------------------------------------------------------------
+
+
+def test_il_percorso_snello_costa_davvero_meno():
+    """Il commento che invecchia da solo, chiuso con un test.
+
+    Non fissa i valori -- i testi cambiano, ed e' giusto -- ma il RAPPORTO che
+    giustifica la scelta automatica in ``pick_system_prompt``. Se un giorno lo
+    snello smettesse di essere piu' leggero, questo lo direbbe invece di
+    lasciare in piedi tre commenti che spiegano un vantaggio inesistente.
+
+    Storia: i commenti dichiaravano "prompt snello 612 token" e "schemi ~1.790".
+    Misurati il 30/08/2026: 3.001 e 4.318, sbagliati di 4,9x e 2,4x.
+    """
+    from core.prompts import costi_del_prefisso
+
+    c = costi_del_prefisso()
+    snello = c["prompt_snello"] + c["schemi_snelli"]
+    esteso = c["prompt_esteso"] + c["schemi_estesi"]
+    assert snello < esteso, (
+        f"il percorso 'snello' costa {snello} token contro {esteso}: la scelta "
+        f"automatica sta ottimizzando al contrario"
+    )
+
+
+def test_gli_schemi_pesano_piu_del_prompt():
+    """Dove conviene tagliare, se si vuole tagliare.
+
+    Vale in entrambi i percorsi, ed e' il motivo per cui togliere dallo schema
+    i tool inutilizzabili (web_search spento, vault_search senza vault) rende
+    piu' che accorciare il prompt.
+    """
+    from core.prompts import costi_del_prefisso
+
+    c = costi_del_prefisso()
+    assert c["schemi_estesi"] > c["prompt_esteso"]
+    assert c["schemi_snelli"] > c["prompt_snello"]
+
+
+def test_il_prompt_snello_e_piu_lungo_di_quello_esteso():
+    """Il nome descrive gli schemi, non il prompt.
+
+    Non e' un difetto da correggere di corsa -- il totale del percorso snello
+    resta piu' basso, che e' cio' che conta -- ma va saputo: chi legge
+    "snello" si aspetta un testo piu' corto, e non lo e'. Il giorno in cui
+    qualcuno accorcia SYSTEM_PROMPT_LEAN, questo test glielo dice.
+    """
+    from core.prompts import costi_del_prefisso
+
+    c = costi_del_prefisso()
+    assert c["prompt_snello"] > c["prompt_esteso"], (
+        "SYSTEM_PROMPT_LEAN e' diventato davvero piu' corto di SYSTEM_PROMPT: "
+        "aggiorna questo test e i commenti che spiegano la differenza"
+    )

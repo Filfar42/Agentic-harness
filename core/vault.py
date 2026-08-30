@@ -203,7 +203,17 @@ def leggi_config(workspace: str | Path) -> VaultConfig:
         nome=str(grezzo.get("nome") or base.name or "vault"),
         descrizione=str(grezzo.get("descrizione") or "")[:MAX_DESCRIZIONE_CHARS],
         istruzioni=str(grezzo.get("istruzioni") or "")[:MAX_ISTRUZIONI_CHARS],
-        wiki=bool(grezzo.get("wiki", ha_struttura_wiki(base))),
+        # ``ha_struttura_wiki`` costa due ``is_dir()`` e ``leggi_config`` gira
+        # quattro volte per turno: si valuta solo quando serve davvero, cioe'
+        # quando la chiave manca. E si tratta ``null`` come "manca": con
+        # ``get(chiave, ripiego)`` un ``"wiki": null`` scritto a mano ritornava
+        # None -- la chiave c'e' -- e il ripiego sulla struttura non scattava
+        # su una cartella che aveva raw/ e wiki/.
+        wiki=bool(
+            grezzo["wiki"]
+            if grezzo.get("wiki") is not None
+            else ha_struttura_wiki(base)
+        ),
         note=_ripulisci_note(grezzo.get("note")),
     )
 
@@ -236,8 +246,20 @@ def scrivi_config(workspace: str | Path, config: VaultConfig) -> VaultConfig:
         with open(tmp, "w", encoding="utf-8") as fh:
             json.dump(pulito.as_dict(), fh, indent=2, ensure_ascii=False)
         os.replace(tmp, percorso_config(base))
-    except OSError:
-        pass
+    except OSError as errore:
+        # Non si puo' ritornare ``pulito`` come se fosse stato salvato. Chi
+        # chiama e' ``aggiungi_nota``, che risponde al modello con l'elenco
+        # delle note aggiornato: il modello legge "registrata", ci costruisce
+        # sopra il resto del turno, e la nota non esiste. Una frase che
+        # descrive un comportamento dell'harness deve essere vera, e qui la
+        # frase e' un valore di ritorno.
+        try:
+            tmp.unlink()          # senza, il .tmp resta li' per sempre
+        except OSError:
+            pass
+        raise VaultScritturaError(
+            f"Non ho potuto salvare '{percorso_config(base)}': {errore}"
+        ) from errore
     return pulito
 
 
@@ -313,11 +335,29 @@ def abilita_wiki(workspace: str | Path) -> VaultConfig:
     return aggiorna_config(base, wiki=True)
 
 
-def conta_file(cartella: Path, suffisso: str = ".md") -> int:
-    """Numero di file con quel suffisso sotto una cartella, ricorsivo."""
+def conta_file(
+    cartella: Path, suffisso: str = ".md", *, escludi: tuple[str, ...] = ()
+) -> int:
+    """Numero di file con quel suffisso sotto una cartella, ricorsivo.
+
+    ``suffisso=""`` conta tutti i file: e' quello che serve per ``raw/``, dove
+    le fonti sono PDF, txt, epub e trascrizioni. Contando solo i ``.md`` un
+    vault con duecento paper mostrava "0 fonti".
+
+    ``escludi`` sono nomi di sottocartelle da saltare -- ``assets`` in ``raw/``,
+    che per struttura del vault e' il posto delle immagini di corredo e non
+    delle fonti.
+    """
     if not cartella.is_dir():
         return 0
-    return sum(1 for p in cartella.rglob(f"*{suffisso}") if p.is_file())
+    modello = f"*{suffisso}" if suffisso else "*"
+    return sum(
+        1
+        for p in cartella.rglob(modello)
+        if p.is_file()
+        and not p.name.startswith(".")
+        and not set(p.relative_to(cartella).parts[:-1]) & set(escludi)
+    )
 
 
 def info_vault(path: str, nome: str = "", *, chat: int = 0) -> VaultInfo:
@@ -336,7 +376,16 @@ def info_vault(path: str, nome: str = "", *, chat: int = 0) -> VaultInfo:
         descrizione=config.descrizione,
         istruzioni=config.istruzioni,
         wiki=config.wiki,
-        fonti=conta_file(base / RAW_DIR) if config.wiki else 0,
+        # In ``raw/`` si contano tutti i file, non i soli .md: le fonti sono
+        # paper, PDF e trascrizioni, e contando solo i markdown un vault con
+        # duecento paper mostrava "0 fonti". Fuori restano gli ``assets``, che
+        # per struttura del vault sono le immagini di corredo. In ``wiki/``
+        # solo i .md, che sono le pagine -- li' un allegato non e' una pagina.
+        fonti=(
+            conta_file(base / RAW_DIR, "", escludi=(Path(ASSETS_DIR).name,))
+            if config.wiki
+            else 0
+        ),
         pagine=conta_file(base / WIKI_DIR) if config.wiki else 0,
         chat=chat,
         note=config.note,
@@ -359,7 +408,14 @@ def leggi_indice(workspace: str | Path, max_chars: int = 6_000) -> str:
         taglio = testo[:max_chars]
         # Si tronca sull'ultima riga intera: un indice mozzato a meta' riga
         # farebbe credere a una pagina che non c'e'.
-        taglio = taglio[: taglio.rfind("\n") + 1]
+        #
+        # ...ma solo se una riga intera c'e'. Con ``rfind`` a -1 -- nessun a
+        # capo nei primi ``max_chars`` caratteri, che e' il caso di un indice
+        # scritto su una riga sola -- il ``+1`` faceva ``taglio[:0]`` e
+        # l'indice spariva del tutto, lasciando la sola dicitura "troncato".
+        ultimo_a_capo = taglio.rfind("\n")
+        if ultimo_a_capo > 0:
+            taglio = taglio[: ultimo_a_capo + 1]
         return taglio + "\n[indice troncato]"
     return testo
 
@@ -387,21 +443,36 @@ def voce_log(operazione: str, soggetto: str) -> str:
     return f"## [{oggi}] {operazione} | {soggetto}\n"
 
 
-def appendi_log(workspace: str | Path, operazione: str, soggetto: str) -> None:
-    """Aggiunge una voce in coda a ``wiki/log.md``. Append-only, come da schema."""
+def appendi_log(workspace: str | Path, operazione: str, soggetto: str) -> bool:
+    """Aggiunge una voce in coda a ``wiki/log.md``. Append-only, come da schema.
+
+    Ritorna False se non ha potuto scrivere -- cartella ``wiki/`` assente,
+    disco pieno -- invece di sollevare: e' un'annotazione, e far fallire
+    un'operazione riuscita perche' non si e' potuto annotarla sarebbe peggio
+    del non annotarla. Prima sollevava ``FileNotFoundError`` su un vault senza
+    ``wiki/``, e il ``try`` interno proteggeva solo la rilettura.
+    """
     log = Path(workspace) / LOG_FILE
-    esiste = log.exists()
-    with open(log, "a", encoding="utf-8") as fh:
-        if esiste:
-            # Il log cresce per blocchi: una riga vuota separa le voci, ma
-            # solo se il file non finisce gia' con la separazione giusta.
-            try:
-                coda = log.read_text(encoding="utf-8")[-2:]
-                if coda and not coda.endswith("\n\n"):
-                    fh.write("\n" if coda.endswith("\n") else "\n\n")
-            except OSError:
-                pass
-        fh.write(voce_log(operazione, soggetto))
+    try:
+        coda = ""
+        if log.exists():
+            # Solo gli ultimi due byte: prima si rileggeva l'INTERO file per
+            # guardarli, su un log append-only che cresce per mesi.
+            with open(log, "rb") as fh:
+                try:
+                    fh.seek(-2, os.SEEK_END)
+                except OSError:      # file piu' corto di due byte
+                    fh.seek(0)
+                coda = fh.read().decode("utf-8", errors="replace")
+        with open(log, "a", encoding="utf-8") as fh:
+            # Il log cresce per blocchi: una riga vuota separa le voci, ma solo
+            # se il file non finisce gia' con la separazione giusta.
+            if coda and not coda.endswith("\n\n"):
+                fh.write("\n" if coda.endswith("\n") else "\n\n")
+            fh.write(voce_log(operazione, soggetto))
+    except OSError:
+        return False
+    return True
 
 
 # --- testi di parte -------------------------------------------------------
@@ -527,6 +598,15 @@ class NotaVaultError(ValueError):
     """Uso non valido della memoria del vault."""
 
 
+class VaultScritturaError(OSError):
+    """``.vault.json`` non e' stato salvato.
+
+    Esiste perche' il silenzio era la modalita' di guasto peggiore: la funzione
+    ritornava la configurazione nuova anche quando il disco aveva ancora quella
+    vecchia, e il modello riceveva "nota registrata" su una nota che non c'era.
+    """
+
+
 def aggiungi_nota(workspace: str | Path, testo: str) -> VaultConfig:
     """Una riga in piu' nella memoria del vault. Idempotente sui doppioni."""
     pulito = " ".join(str(testo or "").split())
@@ -560,8 +640,18 @@ def togli_nota(workspace: str | Path, riferimento: str) -> VaultConfig:
     candidate = [n for n in corrente.note if n == ago] or [
         n for n in corrente.note if n.startswith(ago[:40])
     ]
-    if len(candidate) != 1:
+    if not candidate:
         raise NotaVaultError(f"Nessuna nota corrisponde a '{riferimento}'.")
+    if len(candidate) > 1:
+        # "Nessuna corrisponde" era falso e mandava il modello nella direzione
+        # sbagliata: cambiava testo invece di essere piu' preciso, e girava a
+        # vuoto. Qui gli si dice il vero problema e gli si danno gli inizi da
+        # cui scegliere.
+        inizi = "; ".join(f"'{n[:50]}...'" for n in candidate[:4])
+        raise NotaVaultError(
+            f"'{riferimento}' corrisponde a {len(candidate)} note: {inizi}. "
+            "Cita piu' testo per dire quale."
+        )
     tenute = tuple(n for n in corrente.note if n != candidate[0])
     return scrivi_config(workspace, replace(corrente, note=tenute))
 
@@ -608,27 +698,64 @@ def blocco_istruzioni(config: VaultConfig) -> str:
     )
 
 
-def blocco_manutenzione(workspace: str | Path) -> str:
-    """Blocco di contesto vault per il prompt di sistema del manutentore.
+def blocco_struttura(workspace: str | Path) -> str:
+    """La parte del contesto vault che NON cambia fra un passo e l'altro.
 
-    Due letture economiche (indice e coda del log): danno al manutentore
-    lo stato corrente della wiki senza scandire l'albero ad ogni turno.
+    Solo percorsi e nomi di cartella: due ingest di fila producono lo stesso
+    testo identico, quindi puo' stare nel prompt di sistema senza rompere il
+    prefisso. Lo *stato* -- indice e log -- sta in ``blocco_stato``, che va in
+    coda come il piano e le note.
+    """
+    return "\n".join(
+        [
+            "\n\n## Struttura del vault\n",
+            f"Workspace: `{Path(workspace).resolve()}`.",
+            "`raw/` (fonti, immutabili), `wiki/` (la wiki, tua), "
+            f"`{SCHEMA_FILE}` (lo schema).",
+            "",
+            f"All'inizio di una nuova sessione rileggi `{SCHEMA_FILE}`: "
+            "le convenzioni possono essere cambiate dall'ultima volta.",
+        ]
+    )
+
+
+def blocco_stato(workspace: str | Path) -> str:
+    """Indice e coda del log, da mettere **in coda** con ruolo ``user``.
+
+    Stesso posto e stessa ragione del piano, delle note e della memoria del
+    vault: il prefisso deve restare byte-identico fra un passo e l'altro, ed e'
+    cio' che rende riusabile il KV cache.
+
+    Prima questo blocco stava nel prompt di **sistema** (misurato: 6.682
+    caratteri, circa 1.670 token) e conteneva ``wiki/index.md`` -- il file che
+    ogni ingest riscrive. Il prefisso si invalidava sull'operazione per cui la
+    modalita' wiki esiste, e non di 1.670 token: dal token zero, perche' quello
+    che segue un prefisso cambiato va tutto ricalcolato.
     """
     indice = leggi_indice(workspace)
     coda = leggi_log_coda(workspace)
-    parti = [
-        "\n\n## Stato del vault\n",
-        f"Workspace: `{Path(workspace).resolve()}`.",
-        "Struttura attesa: `raw/` (fonti, immutabili), `wiki/` (la wiki, tua), "
-        f"`{SCHEMA_FILE}` (lo schema).",
-        "",
-        "### Indice attuale della wiki (`wiki/index.md`)",
-        indice,
-        "",
-        "### Ultime operazioni (`wiki/log.md`)",
-        coda if coda.strip() else "_(log vuoto: nessuna operazione registrata)_",
-        "",
-        "All'inizio di una nuova sessione rileggi anche `" + SCHEMA_FILE + "`: "
-        "le convenzioni possono essere cambiate dall'ultima volta.",
-    ]
-    return "\n".join(parti)
+    if not indice.strip() and not coda.strip():
+        return ""
+    return "\n".join(
+        [
+            "<stato_del_vault>",
+            "### Indice attuale della wiki (`wiki/index.md`)",
+            indice if indice.strip() else "_(indice vuoto o illeggibile)_",
+            "",
+            "### Ultime operazioni (`wiki/log.md`)",
+            coda if coda.strip() else "_(log vuoto: nessuna operazione registrata)_",
+            "</stato_del_vault>",
+        ]
+    )
+
+
+def blocco_manutenzione(workspace: str | Path) -> str:
+    """Nome storico: struttura piu' stato, tutto insieme.
+
+    Resta per chi lo chiamava, ma **non va nel prompt di sistema**: e' la somma
+    di un pezzo fermo e di uno che cambia a ogni ingest, e mescolarli e' cio'
+    che rompeva il prefisso. Chi costruisce il prompt usi ``blocco_struttura``
+    in testa e ``blocco_stato`` in coda.
+    """
+    stato = blocco_stato(workspace)
+    return blocco_struttura(workspace) + (("\n\n" + stato) if stato else "")

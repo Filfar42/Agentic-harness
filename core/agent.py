@@ -413,6 +413,7 @@ def build_api_messages(
     skills_block: str = "",
     libreria_block: str = "",
     vault_notes_block: str = "",
+    vault_state_block: str = "",
     delega_block: str = "",
 ) -> list[dict[str, Any]]:
     """Costruisce l'array da inviare al modello a partire dal log della UI.
@@ -539,6 +540,11 @@ def build_api_messages(
             skills_block,
             preview_block,
             libreria_block,
+            # Lo stato della wiki -- indice e coda del log -- sta qui e non nel
+            # prompt di sistema: cambia a ogni ingest, e in testa invalidava il
+            # prefisso proprio nell'operazione per cui la modalita' wiki
+            # esiste. Prima della memoria del vault perche' e' piu' volatile.
+            vault_state_block,
             vault_notes_block,
             notes_block,
             plan_block,
@@ -1752,6 +1758,19 @@ def run_turn(
         domanda = spec_delega_mod.esempio_riuscito(tool_ctx.base)
         return DELEGA_ESEMPIO.format(domanda=domanda) if domanda else ""
 
+    def blocco_stato_vault() -> str:
+        """Indice e coda del log della wiki, per i vault in modalita' wiki.
+
+        Stava nel prompt di **sistema** (misurato: ~1.670 token) e conteneva
+        ``wiki/index.md``, cioe' il file che ogni ingest riscrive: il prefisso
+        si invalidava sull'operazione per cui la modalita' wiki esiste, e non
+        di 1.670 token ma dal token zero.
+        """
+        cartella = getattr(tool_ctx, "vault_dir", "") or ""
+        if not cartella or not vault_mod.is_modalita_vault(cartella):
+            return ""
+        return vault_mod.blocco_stato(cartella)
+
     def blocco_memoria_vault() -> str:
         """La memoria del vault, se si sta lavorando dentro uno.
 
@@ -1896,6 +1915,7 @@ def run_turn(
             notes_block=render_notes(tool_ctx.notes),
             skills_block=skills_block,
             libreria_block=blocco_libreria,
+            vault_state_block=blocco_stato_vault(),
             vault_notes_block=blocco_memoria_vault(),
         )
 

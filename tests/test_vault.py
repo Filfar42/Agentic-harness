@@ -93,6 +93,10 @@ def test_blocco_manutenzione_porta_indice_e_log(tmp_path):
     assert "# Indice attuale della wiki" in blocco
     assert vault_mod.SCHEMA_FILE in blocco
     assert "_(log vuoto: nessuna operazione registrata)_" in blocco
+    # ...e le due meta' sono separabili: la struttura sta ferma, lo stato no.
+    assert vault_mod.SCHEMA_FILE in vault_mod.blocco_struttura(base)
+    assert "# Indice attuale della wiki" in vault_mod.blocco_stato(base)
+    assert "# Indice attuale della wiki" not in vault_mod.blocco_struttura(base)
 
 
 def test_is_modalita_vault_accetta_str_e_path(tmp_path):
@@ -415,14 +419,51 @@ def test_prompt_di_sistema_diventa_manutentore_su_vault(client_vault):
     st.settings["workspace_dir"] = str(kv)
     sp = AppState.system_prompt(st)
     assert "manutentore della wiki" in sp
-    assert "## Stato del vault" in sp
+    assert "## Struttura del vault" in sp
 
     # Il prompt personalizzato dell'utente vince, ma il blocco vault resta.
     st.settings["system_prompt"] = "Sei l'assistente di casa Rossi."
     sp = AppState.system_prompt(st)
     assert "assistente di casa Rossi" in sp
     assert "manutentore della wiki" not in sp
-    assert "## Stato del vault" in sp
+    assert "## Struttura del vault" in sp
+
+
+def test_lo_stato_della_wiki_non_entra_nel_prompt_di_sistema(client_vault):
+    """Il prefisso deve restare byte-identico fra un passo e l'altro.
+
+    ``blocco_manutenzione`` metteva ``wiki/index.md`` -- fino a 6.000 caratteri,
+    misurati ~1.670 token -- nel prompt di sistema. L'indice viene riscritto a
+    ogni ingest, cioe' nell'operazione per cui la modalita' wiki esiste: il
+    prefisso si invalidava li', e non di 1.670 token ma dal token zero, perche'
+    quello che segue un prefisso cambiato va tutto ricalcolato.
+    """
+    from server.main import AppState
+
+    client, st, td = client_vault
+    kv = td / "mio_vault"
+    vault_mod.scaffold(kv)
+    st.settings["workspace_dir"] = str(kv)
+
+    (kv / "wiki" / "index.md").write_text(
+        "# Indice\n- [[Memex]] la macchina di Bush\n", encoding="utf-8"
+    )
+    prima = AppState.system_prompt(st)
+
+    # un ingest: l'indice cambia
+    (kv / "wiki" / "index.md").write_text(
+        "# Indice\n- [[Memex]] la macchina di Bush\n- [[Hypertext]] Nelson 1965\n",
+        encoding="utf-8",
+    )
+    vault_mod.appendi_log(kv, "ingest", "nelson-1965.pdf")
+    dopo = AppState.system_prompt(st)
+
+    assert prima == dopo, "il prompt di sistema cambia a ogni ingest: prefisso perso"
+    assert "Memex" not in prima
+    # ...e lo stato c'e' comunque, dove non costa il prefisso
+    stato = vault_mod.blocco_stato(kv)
+    assert "Memex" in stato and "Hypertext" in stato
+    assert "nelson-1965.pdf" in stato
 
 
 # ---------------------------------------------------------------------------
@@ -930,3 +971,105 @@ def test_anche_l_anteprima_sparisce_nella_home_del_vault():
     chiudi = chiudi[: chiudi.index("\n}")]
     assert "!state.previewAperta" in chiudi
     assert "pane.hidden" not in chiudi.split("if (!pane")[1].split(")")[0]
+
+
+# ---------------------------------------------------------------------------
+# Il ritorno che mentiva
+# ---------------------------------------------------------------------------
+
+
+def test_una_scrittura_fallita_non_passa_per_riuscita(tmp_path, monkeypatch):
+    """``scrivi_config`` ritornava la configurazione nuova comunque.
+
+    Chi chiama e' ``aggiungi_nota``, che risponde al modello con l'elenco delle
+    note aggiornato: il modello leggeva "registrata", ci costruiva sopra il
+    resto del turno, e la nota non esisteva. Una frase che descrive un
+    comportamento dell'harness deve essere vera, e qui la frase e' un valore di
+    ritorno.
+    """
+    import os as _os
+
+    base = tmp_path / "kv"
+    base.mkdir()
+    vault_mod.ensure_vault(base, nome="prova")
+    vault_mod.aggiungi_nota(base, "questa c'e' davvero")
+
+    def _replace_rotto(_a, _b):
+        raise OSError("disco pieno")
+
+    monkeypatch.setattr(_os, "replace", _replace_rotto)
+    with pytest.raises(vault_mod.VaultScritturaError):
+        vault_mod.aggiungi_nota(base, "questa non arriva sul disco")
+    monkeypatch.undo()
+
+    # sul disco c'e' ancora solo la prima, e nessun .tmp abbandonato
+    assert list(vault_mod.leggi_config(base).note) == ["questa c'e' davvero"]
+    assert not (base / ".vault.json.tmp").exists()
+
+
+def test_togliere_una_nota_ambigua_dice_che_e_ambigua(tmp_path):
+    """"Nessuna nota corrisponde" era falso: ne corrispondevano troppe.
+
+    Il modello leggeva "nessuna", cambiava testo invece di essere piu' preciso,
+    e girava a vuoto.
+    """
+    base = tmp_path / "kv"
+    base.mkdir()
+    vault_mod.ensure_vault(base)
+    vault_mod.aggiungi_nota(base, "la cartella delle prove sta in tmp")
+    vault_mod.aggiungi_nota(base, "la cartella dei log sta in var")
+
+    with pytest.raises(vault_mod.NotaVaultError) as errore:
+        vault_mod.togli_nota(base, "la cartella")
+    messaggio = str(errore.value)
+    assert "2 note" in messaggio
+    assert "Nessuna nota corrisponde" not in messaggio
+
+    # e una davvero assente continua a dire che e' assente
+    with pytest.raises(vault_mod.NotaVaultError) as assente:
+        vault_mod.togli_nota(base, "il registro delle spedizioni")
+    assert "Nessuna nota corrisponde" in str(assente.value)
+
+
+def test_un_indice_su_una_riga_sola_non_sparisce(tmp_path):
+    """``rfind`` a -1 piu' uno faceva ``taglio[:0]``: restava la sola dicitura."""
+    base = tmp_path / "kv"
+    vault_mod.scaffold(base)
+    (base / "wiki" / "index.md").write_text("A" * 200, encoding="utf-8")
+    testo = vault_mod.leggi_indice(base, max_chars=50)
+    assert "A" * 50 in testo
+    assert "[indice troncato]" in testo
+
+
+def test_le_fonti_di_un_vault_non_sono_solo_i_markdown(tmp_path):
+    """In ``raw/`` stanno paper e PDF: contando i soli .md si vedeva "0 fonti"."""
+    base = tmp_path / "kv"
+    vault_mod.scaffold(base)
+    (base / "raw" / "bush-1945.pdf").write_bytes(b"%PDF")
+    (base / "raw" / "intervista.txt").write_text("trascrizione", encoding="utf-8")
+    (base / "raw" / "assets" / "figura.png").write_bytes(b"x")   # corredo, non fonte
+    assert vault_mod.info_vault(str(base)).fonti == 2
+
+
+def test_il_log_non_fa_fallire_un_ingest_riuscito(tmp_path):
+    """Annotare e' un di piu': se non si puo', non si butta via l'operazione."""
+    nudo = tmp_path / "senza_wiki"
+    nudo.mkdir()
+    assert vault_mod.appendi_log(nudo, "ingest", "x.pdf") is False   # non solleva
+
+    base = tmp_path / "kv"
+    vault_mod.scaffold(base)
+    assert vault_mod.appendi_log(base, "ingest", "bush-1945.pdf") is True
+    assert "bush-1945.pdf" in vault_mod.leggi_log_coda(base)
+
+
+def test_wiki_esplicitamente_nullo_ricade_sulla_struttura(tmp_path):
+    """``get(chiave, ripiego)`` non scatta su un null: la chiave c'e'."""
+    import json as _json
+
+    base = tmp_path / "kv"
+    vault_mod.scaffold(base)
+    (base / ".vault.json").write_text(
+        _json.dumps({"nome": "kv", "wiki": None}), encoding="utf-8"
+    )
+    assert vault_mod.leggi_config(base).wiki is True

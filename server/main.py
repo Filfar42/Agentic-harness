@@ -611,7 +611,13 @@ class AppState:
             enabled=web_search,
         )
         if vault_mod.is_modalita_vault(self.settings["workspace_dir"]):
-            prompt += vault_mod.blocco_manutenzione(self.settings["workspace_dir"])
+            # Solo la **struttura**: percorsi e nomi di cartella, che due
+            # ingest di fila producono identici. Lo stato della wiki -- indice
+            # e coda del log -- va in coda con ruolo 'user', come il piano e
+            # le note, e per la stessa ragione: qui invalidava il prefisso a
+            # ogni ingest, cioe' proprio nell'operazione per cui la modalita'
+            # wiki esiste. Vedi ``core/vault.blocco_stato``.
+            prompt += vault_mod.blocco_struttura(self.settings["workspace_dir"])
         # Le istruzioni del vault valgono anche fuori dalla modalita' wiki: e'
         # il senso di averle separate dalla descrizione. Vanno dopo il blocco
         # del manutentore perche' sono dell'utente, e l'ultima parola su come
@@ -697,11 +703,13 @@ class AppState:
     def tools_schema(self, web_search: bool = False) -> list[dict[str, Any]]:
         """Schemi completi o snelli, con la stessa regola del system prompt.
 
-        Da quando il prompt snello occupa 612 token, gli schemi dei tool sono
-        il blocco fisso piu' grande della richiesta: ~1.790 token pagati ad
-        ogni passo agentico. Le descrizioni lunghe servono a un modello che
-        fatica a collegare la richiesta al tool; a uno che ragiona sono 617
-        token buttati per passo.
+        Gli schemi dei tool sono il blocco fisso piu' grande della richiesta,
+        piu' del prompt di sistema in entrambi i percorsi, e si pagano ad ogni
+        passo agentico. Le descrizioni lunghe servono a un modello che fatica a
+        collegare la richiesta al tool; a uno che ragiona sono peso morto.
+        Quanto pesino di preciso lo dice ``prompts.costi_del_prefisso()``: i
+        numeri che stavano scritti qui erano sbagliati di 2,4x e 4,9x, perche'
+        erano veri il giorno in cui qualcuno li aveva misurati.
         """
         snello = self.thinking_enabled()
         base = TOOLS_SCHEMA_LEAN if snello else TOOLS_SCHEMA
