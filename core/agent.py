@@ -55,6 +55,7 @@ from .prompts import (
     PLAN_NUDGE,
     PLAN_SUMMARY_NUDGE,
     PROMPT_RIEPILOGO_FINALE,
+    RIPETIZIONE_NUDGE,
     SUMMARY_NUDGE,
     THINK_WATCHDOG_NUDGE,
     TOOL_NUDGE,
@@ -758,22 +759,38 @@ def compatta_cronologia(
     )
 
 
-def drop_oldest_turns(api_messages: list[dict], num_ctx: int) -> list[dict]:
+def drop_oldest_turns(
+    api_messages: list[dict],
+    num_ctx: int,
+    soglia: float = HISTORY_COMPACT_THRESHOLD,
+) -> list[dict]:
     """Sliding window: elimina i turni piu' vecchi mantenendo system + coda.
 
     Rimuove sempre gruppi completi (assistant + relativi tool) per non lasciare
     ``tool_call_id`` orfani, che fanno fallire il template di chat.
+
+    Lineare, non quadratica. Prima ogni ``pop(0)`` ricalcolava la pressione
+    sull'**intera** lista: misurato, 80 ms su 800 messaggi, con il costo per
+    messaggio che cresce con la dimensione -- cioe' proprio quando questa
+    funzione serve, che e' quando la cronologia e' enorme. Qui il costo di ogni
+    messaggio si calcola una volta sola e si sottrae.
     """
     head = [m for m in api_messages if m.get("role") == "system"]
     body = [m for m in api_messages if m.get("role") != "system"]
 
-    while body and context_pressure(head + body, num_ctx) > HISTORY_COMPACT_THRESHOLD:
-        # scarta il primo messaggio e tutti i tool che lo seguono
-        body.pop(0)
-        while body and body[0].get("role") == "tool":
-            body.pop(0)
-        if len(body) <= 2:
-            break
+    costi = [estimate_messages_tokens([m]) for m in body]
+    totale = estimate_messages_tokens(head) + sum(costi)
+    tetto = num_ctx * soglia
+    i = 0
+    while i < len(body) and totale > tetto and len(body) - i > 2:
+        totale -= costi[i]
+        i += 1
+        # I risultati seguono la chiamata che li ha chiesti: un ``tool`` senza
+        # l'``assistant`` che lo precede e' un messaggio che il backend rifiuta.
+        while i < len(body) and body[i].get("role") == "tool":
+            totale -= costi[i]
+            i += 1
+    body = body[i:]
 
     if len(body) < len([m for m in api_messages if m.get("role") != "system"]):
         head.append(
@@ -1600,9 +1617,27 @@ def run_turn(
     """
     nudged = False
     leak_nudged = False
+    ripetizione_nudged = False
+    ripetizione_dovuta: tuple[str, int] | None = None
+    ripetizioni = RipetizioniTool()
     summary_requested = False
     coverage_nudged = False
     verify_nudges = 0
+    # Tetto COMPLESSIVO ai passi che le reti di sicurezza possono consumare.
+    #
+    # Ogni sollecito ha gia' il suo contatore, e ognuno preso da solo e' tarato
+    # bene. Ma i tetti si sommano: 2 riprese di stream + 2 watchdog + 2
+    # troncamenti + 2 verifiche + 3 flag = 11, contro un ``max_agent_loops`` di
+    # serie di 12. Nel caso peggiore -- un modello debole su un compito
+    # difficile, cioe' esattamente quello per cui i solleciti esistono -- al
+    # lavoro restava UN passo, e ogni sollecito appende anche due messaggi in
+    # cronologia: si toglie tempo e spazio insieme.
+    #
+    # Qui i solleciti si contendono un budget unico. Quando finisce, il turno
+    # smette di correggersi e usa i passi che restano per lavorare.
+    passi_di_servizio = 0
+    max_passi_di_servizio = max(2, max_steps // 3)
+    servizio_esaurito = False
     # Quante volte ogni rete di sicurezza e' entrata in funzione. Sono stampelle
     # nate per i modelli piccoli: costano un round-trip in piu' quando scattano
     # e zero quando non scattano, quindi la domanda non e' "servono in teoria"
@@ -1920,8 +1955,32 @@ def run_turn(
         # riuscito) il contesto sfonda, si buttano i turni piu' vecchi dalla
         # sola vista API. Perde informazione e va detto, ma e' pur sempre
         # meglio di una richiesta che il server rifiuta.
-        if context_pressure(api_messages, params.num_ctx) > HISTORY_COMPACT_THRESHOLD:
-            api_messages = drop_oldest_turns(api_messages, params.num_ctx)
+        #
+        # Il margine e' fisso e si misura su ``num_ctx``: e' un problema diverso
+        # dalla compattazione -- qui si tratta di non farsi rifiutare la
+        # richiesta -- e non deve seguire una preferenza dell'utente.
+        #
+        # Ma deve restare l'ULTIMA spiaggia, e non lo era. Con una soglia utente
+        # sopra 0,75 (il campo arriva a 0,95) e una finestra sotto i 32k, questo
+        # scattava PRIMA della compattazione: chi alzava la soglia per tenersi
+        # piu' cronologia se la vedeva buttare via senza che nessuno l'avesse
+        # riassunta, cioe' l'esatto contrario di quello che aveva chiesto.
+        margine_sfondamento = max(HISTORY_COMPACT_THRESHOLD, float(soglia))
+        if context_pressure(api_messages, params.num_ctx) > margine_sfondamento:
+            api_messages = drop_oldest_turns(
+                api_messages, params.num_ctx, soglia=margine_sfondamento
+            )
+
+        # Il budget di servizio e' finito: si dice, invece di smettere in
+        # silenzio. Da qui in poi i solleciti automatici non scattano piu' e
+        # tutti i passi che restano vanno al lavoro.
+        if passi_di_servizio >= max_passi_di_servizio and not servizio_esaurito:
+            servizio_esaurito = True
+            yield AgentError(
+                f"Passi di servizio esauriti ({max_passi_di_servizio} di "
+                f"{max_steps}): i solleciti automatici si spengono e i passi "
+                f"restanti vanno tutti al lavoro."
+            )
 
         parser = ThinkStreamParser()
         tool_calls: list[dict[str, Any]] = []
@@ -1962,6 +2021,26 @@ def run_turn(
                 "Alza la finestra del server, abbassa max_tokens, o comincia "
                 "una conversazione nuova."
             )
+        # ...e sotto il tetto inutile il turno **finisce**, invece di generare
+        # lo stesso. L'avviso qui sopra era informativo e il ciclo tirava
+        # dritto: con ``tetto_passo`` a zero si chiedeva al modello di produrre
+        # zero token, si otteneva una risposta vuota, e quella risposta vuota
+        # faceva scattare i solleciti -- che aggiungono altri messaggi, cioe'
+        # riducono ancora lo spazio. Un giro a vuoto che si stringe da solo.
+        #
+        # La soglia e' la stessa dell'avviso: sotto TETTO_INUTILE non ci sta un
+        # pensiero, una risposta e una chiamata, quindi non c'e' niente da
+        # tentare. Meglio chiudere dicendo perche'.
+        if tetto_passo < TETTO_INUTILE:
+            yield AgentError(
+                f"Turno interrotto al passo {step}: nella finestra non resta "
+                f"spazio per generare ({max(spazio_finestra, 0)} token liberi "
+                f"su {params.num_ctx}, ne servono almeno {TETTO_INUTILE}). "
+                "Il lavoro fatto finora e' salvo: comincia una conversazione "
+                "nuova, o alza la finestra del modello."
+            )
+            yield fine("finestra_piena", step)
+            return
 
         # Un rubinetto per passo: cosa e' gia' arrivato alla UI vale per questa
         # generazione e non per la prossima, che riparte da testo vuoto.
@@ -2076,9 +2155,11 @@ def run_turn(
                 step < max_steps
                 and riprese_stream < MAX_RIPRESE_STREAM
                 and errore_riprovabile(stream_error)
+                and passi_di_servizio < max_passi_di_servizio
             ):
                 riprese_stream += 1
                 count_nudge("ripresa_stream")
+                passi_di_servizio += 1
                 yield AgentError(
                     f"Chiamata al modello interrotta ({stream_error}) — riprendo "
                     f"da dove eravamo, tentativo {riprese_stream} di "
@@ -2103,9 +2184,10 @@ def run_turn(
         if parser.answer:
             yield ContentDelta(text=parser.answer)
 
-        if watchdog_hit:
+        if watchdog_hit and passi_di_servizio < max_passi_di_servizio:
             watchdog_fires += 1
             count_nudge("think_watchdog")
+            passi_di_servizio += 1
             spesi = estimate_tokens(parser.reasoning)
             # Il ragionamento interrotto **non** finisce in cronologia. Sono
             # migliaia di token di un pensiero a meta': rimetterli nel contesto
@@ -2161,9 +2243,11 @@ def run_turn(
                 and not answer
                 and truncated_nudges < MAX_TRUNCATED_NUDGES
                 and step < max_steps
+                and passi_di_servizio < max_passi_di_servizio
             ):
                 truncated_nudges += 1
                 count_nudge("truncated")
+                passi_di_servizio += 1
                 ui_messages.append(
                     {
                         "role": "user",
@@ -2182,10 +2266,16 @@ def run_turn(
             # Ciclo di self-correction: se una verifica e' rossa il turno non
             # e' finito, per quanto il modello si sia convinto del contrario.
             red = verification.unresolved
-            if red and verify_nudges < MAX_VERIFY_NUDGES and step < max_steps:
+            if (
+                red
+                and verify_nudges < MAX_VERIFY_NUDGES
+                and step < max_steps
+                and passi_di_servizio < max_passi_di_servizio
+            ):
                 command, attempts, code = red
                 verify_nudges += 1
                 count_nudge("loop" if attempts >= LOOP_THRESHOLD else "verify")
+                passi_di_servizio += 1
                 ui_messages.append(
                     {"role": "assistant", "content": _wrap(reasoning, answer), "ts": time.time()}
                 )
@@ -2218,9 +2308,10 @@ def run_turn(
                 and step < max_steps
             ):
                 scoperti = uncovered_symbols(tool_ctx)
-                if scoperti:
+                if scoperti and passi_di_servizio < max_passi_di_servizio:
                     coverage_nudged = True
                     count_nudge("coverage")
+                    passi_di_servizio += 1
                     elenco = ", ".join(f"{n} (in {f})" for n, f in scoperti[:5])
                     ui_messages.append(
                         {
@@ -2244,6 +2335,14 @@ def run_turn(
             # Il turno ha toccato il workspace ma finisce senza una parola:
             # l'utente resterebbe a guardare delle tendine chiuse senza sapere
             # cosa e' successo. Si chiede il riepilogo, una volta sola.
+            # Il riepilogo e' l'unico sollecito **esente** dal budget di
+            # servizio, e non e' un'eccezione di comodo: gli altri sette sono
+            # tentativi di correzione -- riprova, ripensa, verifica -- e quando
+            # il budget finisce e' giusto che smettano. Questo invece e' la
+            # parola di chiusura del turno, ed e' cio' che impedisce a un turno
+            # che ha lavorato di finire in silenzio davanti all'utente. Proprio
+            # un turno che ha bruciato il budget in correzioni e' quello che
+            # rischia di piu' di chiudersi senza dire com'e' andata.
             if (
                 require_summary
                 and not summary_requested
@@ -2294,9 +2393,10 @@ def run_turn(
             # apposta cosi' la domanda arriva davvero all'utente".
             if needs_push and looks_like_clarifying_question(answer):
                 needs_push = False
-                if enable_nudge and not nudged and step < max_steps:
+                if enable_nudge and not nudged and step < max_steps and passi_di_servizio < max_passi_di_servizio:
                     nudged = True
                     count_nudge("ask")
+                    passi_di_servizio += 1
                     ui_messages.append(
                         {
                             "role": "assistant",
@@ -2311,9 +2411,16 @@ def run_turn(
                         content=answer, reasoning=reasoning, has_tool_calls=False
                     )
                     continue
-            if enable_nudge and not nudged and step < max_steps and needs_push:
+            if (
+                enable_nudge
+                and not nudged
+                and step < max_steps
+                and needs_push
+                and passi_di_servizio < max_passi_di_servizio
+            ):
                 nudged = True
                 count_nudge("tool")
+                passi_di_servizio += 1
                 ui_messages.append(
                     {
                         "role": "assistant",
@@ -2476,7 +2583,19 @@ def run_turn(
                 result = dispatch(tool_ctx, call["name"], args)
             duration = time.monotonic() - started
 
-            ok = '"error"' not in result[:200]
+            ok = _esito_del_tool(result)
+            # La ripetizione si registra **dopo** l'esecuzione e solo se e'
+            # andata bene: rifare una chiamata che era fallita e' legittimo.
+            if ok:
+                if call["name"] in ("write_file", "edit_file"):
+                    # Una scrittura invalida le letture: dopo, rileggere lo
+                    # stesso file ha senso e non e' una ripetizione.
+                    ripetizioni.dimentica_letture()
+                else:
+                    quante = ripetizioni.registra(call["name"], args)
+                    if quante >= RipetizioniTool.SOGLIA and not ripetizione_nudged:
+                        ripetizione_nudged = True
+                        ripetizione_dovuta = (call["name"], quante)
             verification.record(call["name"], result)
             # Il guard sui file di test ha bisogno di sapere se c'e' una
             # verifica rossa aperta: qui e' l'unico punto che lo sa.
@@ -2642,6 +2761,22 @@ def run_turn(
                 {"role": "user", "content": JSON_LEAK_NUDGE, "hidden": True}
             )
 
+        # La stessa chiamata per la terza volta. Non consuma un passo di
+        # servizio -- non fa ripartire il passo, si accoda ai risultati che il
+        # modello sta gia' per leggere -- ma va detta, perche' e' l'unico modo
+        # di guasto agentico comune che nessuna delle altre difese vedeva.
+        if ripetizione_dovuta is not None:
+            nome_tool, quante = ripetizione_dovuta
+            ripetizione_dovuta = None
+            count_nudge("ripetizione")
+            ui_messages.append(
+                {
+                    "role": "user",
+                    "content": RIPETIZIONE_NUDGE.format(tool=nome_tool, quante=quante),
+                    "hidden": True,
+                }
+            )
+
         # Il modello si e' messo a lavorare su una richiesta con piu' obiettivi
         # senza scrivere un piano. Il sollecito va **dopo** i risultati dei
         # tool, come tutti gli altri: infilato prima spezzerebbe l'adiacenza
@@ -2674,7 +2809,13 @@ def run_turn(
         # guarda, ripetuto.
         nomi_del_passo = {c["name"] for c in tool_calls}
         if nomi_del_passo and nomi_del_passo <= set(TOOL_ESPLORATIVI):
-            esplorazioni_di_fila += len(tool_calls)
+            # Un passo, un punto -- come dice il commento qui sopra da sempre.
+            # La riga sommava ``len(tool_calls)``: un passo solo con cinque
+            # read_file in parallelo, che e' il comportamento *buono* di un
+            # modello capace di chiamate multiple, arrivava a cinque al primo
+            # passo e si prendeva il sollecito di delega senza aver esplorato
+            # niente.
+            esplorazioni_di_fila += 1
         else:
             esplorazioni_di_fila = 0
         if (
@@ -2820,6 +2961,46 @@ LOOP_THRESHOLD = 3
 SHELL_NOT_A_VERIFICATION = frozenset({126, 127})
 
 
+class RipetizioniTool:
+    """Chiamate identiche ripetute nello stesso turno.
+
+    Il modo di guasto piu' comune di un agente non e' il comando che fallisce
+    -- per quello c'e' ``VerificationTracker`` -- ma la chiamata che **riesce**
+    e che il modello rifa' perche' non ha usato il risultato. Costa un passo e
+    una seconda copia dello stesso contenuto in contesto, e nessuna delle altre
+    difese la vede: il tracker guarda solo ``run_command``, e
+    ``esplorazioni_di_fila`` conta le esplorazioni senza accorgersi che sono la
+    stessa.
+    """
+
+    __slots__ = ("_viste",)
+
+    # Alla terza, non alla seconda: rileggere un file dopo averlo modificato e'
+    # legittimo, e sollecitare li' sarebbe rumore su un comportamento corretto.
+    SOGLIA = 3
+
+    def __init__(self) -> None:
+        self._viste: dict[tuple[str, str], int] = {}
+
+    def registra(self, name: str, args: dict[str, Any] | None) -> int:
+        """Quante volte questa esatta chiamata e' gia' stata fatta nel turno."""
+        # Gli argomenti si normalizzano ordinandoli: ``{"a":1,"b":2}`` e
+        # ``{"b":2,"a":1}`` sono la stessa chiamata, e un modello che rigenera
+        # il JSON non li mette sempre nello stesso ordine.
+        try:
+            firma = (name, json.dumps(args or {}, sort_keys=True, ensure_ascii=False))
+        except (TypeError, ValueError):
+            firma = (name, repr(args))
+        self._viste[firma] = self._viste.get(firma, 0) + 1
+        return self._viste[firma]
+
+    def dimentica_letture(self) -> None:
+        """Una scrittura invalida le letture: dopo, rileggere ha senso."""
+        self._viste = {
+            k: v for k, v in self._viste.items() if k[0] not in TOOL_ESPLORATIVI
+        }
+
+
 class VerificationTracker:
     """Tiene il conto delle verifiche rosse ancora aperte nel turno.
 
@@ -2894,6 +3075,30 @@ class VerificationTracker:
             return None
         command, (count, code) = max(self.failing.items(), key=lambda kv: kv[1][0])
         return (command, count, code)
+
+
+def _esito_del_tool(result: str) -> bool:
+    """Il tool e' andato bene? Leggendo la busta, non cercando una parola.
+
+    Prima: ``ok = '"error"' not in result[:200]``. Un ``read_file`` su un
+    sorgente che contiene la stringa ``"error"`` nei primi 200 caratteri -- un
+    modulo di gestione errori, un JSON di configurazione, un test -- veniva
+    marcato fallito: la tendina si colorava di rosso e il modello leggeva un
+    esito che non corrispondeva a quello che era successo.
+
+    I risultati dei tool sono tutti JSON con una busta nota (``_ok`` e ``_err``
+    in ``tools.py``): l'errore e' una **chiave**, non una sottostringa.
+    """
+    try:
+        payload = json.loads(result)
+    except (json.JSONDecodeError, TypeError):
+        # Non e' JSON: e' il caso dei risultati gia' troncati o di un tool che
+        # ritorna testo. Si ricade sul vecchio criterio, che li' e' l'unico
+        # possibile -- ma solo li', non su tutto.
+        return '"error"' not in result[:200]
+    if not isinstance(payload, dict):
+        return True
+    return "error" not in payload
 
 
 def _wrap(reasoning: str, answer: str) -> str:

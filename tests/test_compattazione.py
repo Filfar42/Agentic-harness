@@ -601,3 +601,80 @@ def test_senza_tetto_la_finestra_larga_non_compatta_piu(tmp_path):
         )
     )
     assert be.riassunti == 0
+
+
+# ---------------------------------------------------------------------------
+# L'ordine fra le due difese
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("soglia_utente", [0.60, 0.75, 0.85, 0.95])
+def test_lo_scarto_dei_turni_resta_l_ultima_spiaggia(soglia_utente):
+    """``drop_oldest_turns`` perde informazione; ``compatta_cronologia`` la riassume.
+
+    Il campo nell'interfaccia arriva a 0,95. Con una soglia utente sopra 0,75 e
+    una finestra sotto i 32k, lo scarto scattava PRIMA della compattazione: chi
+    alzava la soglia per tenersi piu' cronologia se la vedeva buttare via senza
+    che nessuno l'avesse riassunta -- l'esatto contrario di quello che aveva
+    chiesto.
+    """
+    from core.config import HISTORY_COMPACT_THRESHOLD, finestra_efficace
+
+    num_ctx = 16_384
+    margine = max(HISTORY_COMPACT_THRESHOLD, soglia_utente)
+    compatta_a = finestra_efficace(num_ctx) * soglia_utente
+    scarta_a = num_ctx * margine
+    assert compatta_a <= scarta_a, (
+        f"con soglia {soglia_utente} lo scarto dei turni scatta a {scarta_a:.0f} "
+        f"token e la compattazione a {compatta_a:.0f}: si perde cronologia che "
+        f"sarebbe stata riassunta"
+    )
+
+
+def test_lo_scarto_dei_turni_e_lineare_non_quadratico():
+    """80 ms su 800 messaggi, e il costo per messaggio cresceva con la dimensione.
+
+    Ogni ``pop(0)`` ricalcolava la pressione sull'intera lista -- cioe' proprio
+    quando questa funzione serve, che e' quando la cronologia e' enorme.
+    """
+    import time as _t
+
+    from core.agent import drop_oldest_turns
+
+    def cronologia(coppie: int) -> list[dict]:
+        msgs: list[dict] = [{"role": "system", "content": "x" * 8_000}]
+        for i in range(coppie):
+            msgs.append(
+                {
+                    "role": "assistant",
+                    "content": "a" * 400,
+                    "tool_calls": [
+                        {
+                            "id": f"c{i}",
+                            "type": "function",
+                            "function": {"name": "read_file", "arguments": "{}"},
+                        }
+                    ],
+                }
+            )
+            msgs.append(
+                {"role": "tool", "tool_call_id": f"c{i}", "name": "read_file",
+                 "content": "x" * 3_000}
+            )
+        return msgs
+
+    def per_messaggio(coppie: int) -> float:
+        msgs = cronologia(coppie)
+        t0 = _t.perf_counter()
+        drop_oldest_turns(list(msgs), 8_192)
+        return (_t.perf_counter() - t0) / len(msgs)
+
+    piccolo = per_messaggio(50)
+    grande = per_messaggio(400)
+    # Lineare: il costo per messaggio non deve crescere con la dimensione.
+    # Quadratico dava un fattore 8; qui si tiene largo per non essere fragile
+    # su una macchina lenta.
+    assert grande < piccolo * 3, (
+        f"costo per messaggio: {piccolo * 1000:.4f} ms a 100 messaggi, "
+        f"{grande * 1000:.4f} ms a 800 -- sembra ancora quadratico"
+    )

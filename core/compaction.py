@@ -55,20 +55,32 @@ from dataclasses import dataclass, replace
 from collections.abc import Callable, Iterable, Sequence
 from typing import Any
 
-from .config import COMPACT_MAX_TOKENS
+from .config import (
+    CODA_COMPATTAZIONE,
+    COMPACT_MAX_TOKENS,
+    HISTORY_COMPACT_THRESHOLD,
+    finestra_efficace,
+)
 from .textutils import chars_for_tokens, smart_truncate, strip_think
 
 # Quanta parte della finestra puo' occupare la cronologia prima di intervenire.
 # Non e' "quanto contesto e' pieno": e' quanto ne resta libero per il passo
 # successivo, che deve contenere il prossimo risultato di tool *e* la
 # generazione. A 0,75 su 64k restano 16k, che bastano.
-SOGLIA_DEFAULT = 0.75
+#
+# **Alias**, non una seconda copia. Erano due letterali 0.75 in due moduli
+# diversi, e ``agent`` li importava tutti e due usandoli in punti diversi:
+# coincidevano, che e' il modo in cui una divergenza resta invisibile fino al
+# giorno in cui qualcuno ne muove uno. ``finestra_efficace`` e' tarata sul
+# rapporto 0,75/0,35, e con le due soglie disallineate quel rapporto smette di
+# valere senza che niente lo segnali.
+SOGLIA_DEFAULT = HISTORY_COMPACT_THRESHOLD
 
 # Quanto contesto deve restare occupato *dopo* la compattazione. La distanza
 # fra questo e la soglia e' cio' che impedisce di ricompattare al passo dopo:
 # con 0,75 e 0,35 ogni compattazione libera circa il 40% della finestra, cioe'
 # abbastanza lavoro da non rifarla per un pezzo.
-CODA_DEFAULT = 0.35
+CODA_DEFAULT = CODA_COMPATTAZIONE
 
 # Tetto assoluto, in token, oltre il quale si compatta comunque -- qualunque
 # cosa dica la percentuale.
@@ -116,28 +128,11 @@ MAX_TOKEN_RIASSUNTO = 700
 QUOTA_TRASCRIZIONE = 0.5
 
 
-def finestra_efficace(num_ctx: int, tetto: int = TETTO_TOKEN_DEFAULT) -> int:
-    """La finestra su cui si decide di compattare, che non e' quella vera.
-
-    Soglia e coda sono in rapporto fra loro -- 0,75 e 0,35 -- e vanno mosse
-    insieme: abbassare solo la prima farebbe compattare per ritrovarsi pieni
-    al passo dopo, perche' la coda tenuta sarebbe piu' grande della soglia che
-    l'ha fatta scattare. Invece di correggerle una per una si restringe la
-    finestra su cui entrambe si calcolano, e i rapporti restano quelli tarati.
-
-    Con tetto 32.768 e ``SOGLIA_DEFAULT`` 0,75 la finestra efficace e' 43.690:
-    si compatta a 32.768 token e ne restano circa 15.300.
-
-    La finestra **vera** resta quella per il controllo di sfondamento
-    (``drop_oldest_turns``), che e' un problema diverso: li' si tratta di non
-    farsi rifiutare la richiesta dal server, e num_ctx e' l'unico numero che
-    conta.
-    """
-    if num_ctx <= 0:
-        return 0
-    if tetto <= 0:
-        return num_ctx
-    return min(num_ctx, int(tetto / SOGLIA_DEFAULT))
+# ``finestra_efficace`` e' importata da ``config``, dove vive accanto a
+# ``budgets_for``: sono le due politiche sullo stesso parametro, e finche'
+# stavano in moduli diversi non si conoscevano -- a 131k una diceva "tieni
+# 96.000 caratteri per file" e l'altra "compatta a 32.767 token". Resta
+# raggiungibile da qui, che e' da dove il resto del codice la prende.
 
 
 @dataclass(slots=True)

@@ -58,7 +58,15 @@ LIST_FILES_MAX_ENTRIES = 300
 SEARCH_MAX_MATCHES = 80
 
 # Oltre questa percentuale di num_ctx la cronologia viene compattata.
+#
+# Sta qui e non in ``compaction`` perche' ``budgets_for`` deve conoscerla: i
+# budget di troncamento e la soglia di compattazione sono due politiche sullo
+# **stesso** parametro, e finche' vivevano in due moduli diversi divergevano.
+# ``compaction.SOGLIA_DEFAULT`` e' un alias di questa, non una seconda copia.
 HISTORY_COMPACT_THRESHOLD = 0.75
+# Quanto contesto deve restare occupato *dopo* la compattazione. La distanza
+# fra questa e la soglia e' cio' che impedisce di ricompattare al passo dopo.
+CODA_COMPATTAZIONE = 0.35
 # ...e comunque non oltre questi token, percentuale o no: la finestra e'
 # cresciuta piu' in fretta della soglia e a 131k quella percentuale non e' piu'
 # raggiungibile in pratica. Le misure che giustificano il numero stanno nel
@@ -68,19 +76,83 @@ COMPACT_MAX_TOKENS = 32_768
 TOOL_RESULT_FULL_WINDOW = 3
 
 # Estremi dello scalatore. Sotto: una finestra da 8k non deve ereditare budget
-# pensati per 16k, o il primo read_file la riempie da sola. Sopra: il tetto
-# esiste perche' un singolo risultato di tool non deve mai poter occupare una
-# frazione sproporzionata della finestra, per quanto grande sia.
+# pensati per 16k, o il primo read_file la riempie da sola.
+#
+# Sopra, il tetto vero non e' piu' questo numero: da quando ``context_scale``
+# misura la finestra **efficace**, la scala non puo' superare
+# ``finestra_efficace / BASE_NUM_CTX`` = 2,67 con la taratura di serie, e
+# MAX_BUDGET_SCALE resta come limite di sicurezza per il caso in cui qualcuno
+# alzi COMPACT_MAX_TOKENS.
 MIN_BUDGET_SCALE = 0.5
 MAX_BUDGET_SCALE = 8.0
 
-# Tetto alla finestra dei risultati integrali. Cresce con il contesto perche'
-# e' la difesa piu' efficace contro il costo *vero* della compattazione: ogni
-# risultato compattato riscrive un messaggio in mezzo alla cronologia, il
-# prefisso diverge da quello del passo precedente e il KV cache di Ollama va
-# ricalcolato da li' in poi. Su una finestra larga la compattazione e' un
-# risparmio di token pagato con un ricalcolo di prompt: conviene non farla.
+# Tetto superiore alla finestra dei risultati integrali.
+#
+# Tenerne piu' di uno intero e' la difesa piu' efficace contro il costo *vero*
+# della compattazione: ogni risultato compattato riscrive un messaggio in mezzo
+# alla cronologia, il prefisso diverge da quello del passo precedente e il KV
+# cache va ricalcolato da li' in poi. Su una finestra larga la compattazione e'
+# un risparmio di token pagato con un ricalcolo di prompt: conviene non farla.
+#
+# Ma quanti tenerne non e' piu' una funzione libera della finestra: e' cio' che
+# resta della quota dopo aver deciso quanto puo' essere lungo un singolo
+# risultato (vedi ``budgets_for``). La quota si spende **prima** sulla
+# lunghezza, perche' e' la ragione per cui ``budgets_for`` esiste: "troncare un
+# file a 12.000 caratteri avendo lo spazio per tenerlo intero" e' il modo piu'
+# silenzioso di sbagliare, e viene prima di tenerne dodici a meta'. Quello che
+# si perde nel troncamento finisce comunque in ``.deposito/``.
 MAX_TOOL_RESULT_FULL_WINDOW = 16
+
+# Quanta parte della soglia di compattazione possono occupare, da soli, i
+# risultati che ci si impegna a tenere integrali.
+#
+# E' l'invariante che mancava fra questo modulo e ``compaction``. Le due
+# politiche misuravano finestre diverse: ``budgets_for`` scalava linearmente su
+# ``num_ctx``, ``finestra_efficace`` tagliava al tetto assoluto, e sopra i 32k
+# divergevano. Misurato: a num_ctx 131.072 il codice si impegnava a tenere
+# integrali fino a 384.000 token di risultati in una finestra che compatta a
+# 32.767 -- fattore 11,7 -- e la compattazione scattava al **terzo passo su
+# dodici**. La curva non era monotona: il punto migliore era 32k, e da li' in
+# poi allargare la finestra peggiorava il contesto, che e' il contrario di
+# quello che si ottiene comprando un modello da 128k.
+#
+# 0,75 non e' un numero nuovo: e' il rapporto che la taratura a 16k gia'
+# produce (3 x 3.000 = 9.000 token su una soglia di 12.288). Con questo valore
+# il comportamento a 16k e a 32k resta identico a prima -- che e' quello che i
+# test verificano -- e cambiano solo le finestre sopra il tetto.
+QUOTA_RISULTATI_INTEGRALI = 0.75
+
+# Meno di tre risultati integrali e il modello perde il filo fra due letture:
+# e' il pavimento dell'invariante, non un obiettivo.
+MIN_RISULTATI_INTEGRALI = 3
+
+
+def finestra_efficace(num_ctx: int, tetto: int = COMPACT_MAX_TOKENS) -> int:
+    """La finestra su cui si decide di compattare, che non e' quella vera.
+
+    Soglia e coda sono in rapporto fra loro -- 0,75 e 0,35 -- e vanno mosse
+    insieme: abbassare solo la prima farebbe compattare per ritrovarsi pieni al
+    passo dopo, perche' la coda tenuta sarebbe piu' grande della soglia che
+    l'ha fatta scattare. Invece di correggerle una per una si restringe la
+    finestra su cui entrambe si calcolano, e i rapporti restano quelli tarati.
+
+    Con tetto 32.768 e soglia 0,75 la finestra efficace e' 43.690: si compatta
+    a 32.768 token e ne restano circa 15.300.
+
+    La finestra **vera** resta quella per il controllo di sfondamento
+    (``drop_oldest_turns``), che e' un problema diverso: li' si tratta di non
+    farsi rifiutare la richiesta dal server, e ``num_ctx`` e' l'unico numero
+    che conta.
+
+    Vive qui e non in ``compaction`` perche' ``budgets_for`` deve chiamarla:
+    finche' stavano in due moduli diversi, le due funzioni che devono essere
+    d'accordo non si conoscevano.
+    """
+    if num_ctx <= 0:
+        return 0
+    if tetto <= 0:
+        return num_ctx
+    return min(num_ctx, int(tetto / HISTORY_COMPACT_THRESHOLD))
 
 
 @dataclass(frozen=True, slots=True)
@@ -105,7 +177,7 @@ class Budgets:
     scale: float = 1.0
 
 
-def context_scale(num_ctx: int) -> float:
+def context_scale(num_ctx: int, tetto_compattazione: int = COMPACT_MAX_TOKENS) -> float:
     """Quanto e' piu' larga la finestra rispetto alla taratura di riferimento.
 
     Scala **lineare** di proposito. La tentazione e' di crescere sublineare
@@ -114,19 +186,47 @@ def context_scale(num_ctx: int) -> float:
     un decimo -- sono gli stessi rapporti che si vogliono a 64k. Il numero
     assoluto e' cambiato perche' e' cambiata la finestra, non perche' e'
     cambiato il compito.
+
+    Si misura sulla finestra **efficace** e non su ``num_ctx``: sopra il tetto
+    assoluto la finestra su cui si compatta smette di crescere, e scalare i
+    budget su un numero piu' grande di quello significa tarare i risultati per
+    uno spazio che non c'e'.
     """
     if num_ctx <= 0:
         return 1.0
-    raw = float(num_ctx) / float(BASE_NUM_CTX)
+    raw = float(finestra_efficace(num_ctx, tetto_compattazione)) / float(BASE_NUM_CTX)
     return max(MIN_BUDGET_SCALE, min(MAX_BUDGET_SCALE, raw))
 
 
-def budgets_for(num_ctx: int) -> Budgets:
-    """Budget di troncamento adatti alla finestra passata."""
-    scale = context_scale(num_ctx)
+def budgets_for(num_ctx: int, tetto_compattazione: int = COMPACT_MAX_TOKENS) -> Budgets:
+    """Budget di troncamento adatti alla finestra su cui si compatta davvero.
+
+    L'invariante che governa questa funzione e' uno solo, ed e' quello che
+    mancava: **i risultati che ci si impegna a tenere integrali non possono da
+    soli superare la quota della soglia che li fa compattare.** Vedi
+    ``QUOTA_RISULTATI_INTEGRALI`` per il perche' e per i numeri misurati.
+    """
+    scale = context_scale(num_ctx, tetto_compattazione)
+    finestra = finestra_efficace(num_ctx, tetto_compattazione) or BASE_NUM_CTX
+    soglia = int(finestra * HISTORY_COMPACT_THRESHOLD)
+    quota = int(soglia * QUOTA_RISULTATI_INTEGRALI)
+
+    # Il tetto per singolo risultato e' il minore fra "quanto lo scalerebbe la
+    # finestra" e "quanto ne stanno MIN_RISULTATI_INTEGRALI dentro la quota":
+    # un solo read_file non deve poter riempire da solo lo spazio riservato a
+    # tutti quelli che si tengono interi.
+    read_chars = min(
+        int(READ_FILE_MAX_CHARS * scale),
+        chars_per_token(quota // MIN_RISULTATI_INTEGRALI),
+    )
+    integrali = min(
+        MAX_TOOL_RESULT_FULL_WINDOW,
+        max(MIN_RISULTATI_INTEGRALI, quota // max(read_chars // 4, 1)),
+    )
+
     return Budgets(
-        tool_result_max_chars=int(TOOL_RESULT_MAX_CHARS * scale),
-        read_file_max_chars=int(READ_FILE_MAX_CHARS * scale),
+        tool_result_max_chars=min(int(TOOL_RESULT_MAX_CHARS * scale), read_chars // 2),
+        read_file_max_chars=read_chars,
         command_stdout_max_chars=int(COMMAND_STDOUT_MAX_CHARS * scale),
         command_stderr_max_chars=int(COMMAND_STDERR_MAX_CHARS * scale),
         # Le liste crescono piu' piano dei testi: 300 file gia' bastano a
@@ -134,12 +234,18 @@ def budgets_for(num_ctx: int) -> Budgets:
         # 301-esimo carattere di un errore.
         list_files_max_entries=int(LIST_FILES_MAX_ENTRIES * min(scale, 3.0)),
         search_max_matches=int(SEARCH_MAX_MATCHES * min(scale, 3.0)),
-        tool_result_full_window=min(
-            MAX_TOOL_RESULT_FULL_WINDOW,
-            max(1, int(round(TOOL_RESULT_FULL_WINDOW * scale))),
-        ),
+        tool_result_full_window=integrali,
         scale=scale,
     )
+
+
+def chars_per_token(token: int) -> int:
+    """Quattro caratteri per token: la stessa conversione di ``textutils``.
+
+    Duplicata qui e non importata perche' ``config`` non deve dipendere da
+    nessun altro modulo del pacchetto: e' quello che tutti importano.
+    """
+    return max(0, int(token) * 4)
 
 @dataclass(slots=True)
 class GenParams:

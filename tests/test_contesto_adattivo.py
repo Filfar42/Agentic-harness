@@ -54,19 +54,71 @@ def test_alla_finestra_di_riferimento_i_budget_non_cambiano():
     assert b.scale == 1.0
 
 
-def test_una_finestra_quadrupla_quadruplica_i_testi():
-    b = budgets_for(65_536)
-    assert b.scale == 4.0
-    assert b.read_file_max_chars == 4 * config_mod.READ_FILE_MAX_CHARS
-    assert b.command_stderr_max_chars == 4 * config_mod.COMMAND_STDERR_MAX_CHARS
+def test_una_finestra_doppia_raddoppia_i_testi():
+    """La scala resta lineare finche' la finestra su cui si compatta cresce."""
+    b = budgets_for(32_768)
+    assert b.scale == 2.0
+    assert b.read_file_max_chars == 2 * config_mod.READ_FILE_MAX_CHARS
+    assert b.command_stderr_max_chars == 2 * config_mod.COMMAND_STDERR_MAX_CHARS
+
+
+def test_oltre_il_tetto_di_compattazione_i_budget_smettono_di_crescere():
+    """Il difetto misurato il 30/08/2026, messo nero su bianco.
+
+    ``budgets_for`` scalava su ``num_ctx``, ``finestra_efficace`` tagliava al
+    tetto assoluto, e sopra i 32k le due politiche divergevano: a 131.072 il
+    codice si impegnava a tenere integrali fino a 384.000 token di risultati in
+    una finestra che compatta a 32.767 -- fattore 11,7 -- e la compattazione
+    scattava al **terzo passo su dodici**. La curva non era monotona: il punto
+    migliore era 32k, e da li' allargare la finestra peggiorava il contesto.
+
+    Adesso i budget si tarano sulla finestra su cui si compatta davvero, quindi
+    sopra il tetto restano fermi invece di crescere per uno spazio che non c'e'.
+    """
+    grande = budgets_for(131_072)
+    enorme = budgets_for(262_144)
+    assert grande.read_file_max_chars == enorme.read_file_max_chars
+    assert grande.tool_result_full_window == enorme.tool_result_full_window
+    # e sono comunque piu' larghi di quelli a 16k: il tetto e' un tetto, non un
+    # ritorno alla taratura base
+    assert grande.read_file_max_chars > budgets_for(config_mod.BASE_NUM_CTX).read_file_max_chars
 
 
 def test_le_liste_crescono_meno_dei_testi():
     """La voce 301 di un albero informa molto meno del carattere 301 di uno stderr."""
-    b = budgets_for(131_072)          # scala 8
-    assert b.read_file_max_chars == 8 * config_mod.READ_FILE_MAX_CHARS
-    assert b.list_files_max_entries == 3 * config_mod.LIST_FILES_MAX_ENTRIES
-    assert b.search_max_matches == 3 * config_mod.SEARCH_MAX_MATCHES
+    b = budgets_for(131_072)
+    base = budgets_for(config_mod.BASE_NUM_CTX)
+    cresciuta_lista = b.list_files_max_entries / base.list_files_max_entries
+    cresciuto_testo = b.read_file_max_chars / base.read_file_max_chars
+    assert cresciuta_lista <= cresciuto_testo
+    assert b.list_files_max_entries <= 3 * config_mod.LIST_FILES_MAX_ENTRIES
+    assert b.search_max_matches <= 3 * config_mod.SEARCH_MAX_MATCHES
+
+
+@pytest.mark.parametrize(
+    "num_ctx", [4_096, 8_192, 16_384, 24_576, 32_768, 49_152, 65_536, 131_072, 262_144]
+)
+def test_i_risultati_integrali_non_superano_la_soglia_che_li_fa_compattare(num_ctx):
+    """L'invariante che mancava fra ``budgets_for`` e ``finestra_efficace``.
+
+    Non e' una preferenza di taratura: e' la relazione che rende sensata la
+    coppia. Se i risultati che ci si impegna a tenere interi pesano piu' della
+    quota della soglia, la compattazione scatta per colpa dei budget -- e piu'
+    grande e' la finestra, prima scatta.
+    """
+    b = budgets_for(num_ctx)
+    soglia = int(
+        config_mod.finestra_efficace(num_ctx) * config_mod.HISTORY_COMPACT_THRESHOLD
+    )
+    picco = b.tool_result_full_window * (b.read_file_max_chars // 4)
+    assert picco <= soglia * config_mod.QUOTA_RISULTATI_INTEGRALI, (
+        f"a num_ctx={num_ctx} i {b.tool_result_full_window} risultati tenuti "
+        f"integrali pesano {picco} token contro una soglia di {soglia}"
+    )
+    assert b.tool_result_full_window >= min(
+        config_mod.MIN_RISULTATI_INTEGRALI, b.tool_result_full_window
+    )
+    assert b.tool_result_full_window >= 1
 
 
 def test_una_finestra_stretta_non_eredita_budget_larghi():
@@ -78,14 +130,27 @@ def test_una_finestra_stretta_non_eredita_budget_larghi():
 
 
 def test_la_scala_ha_un_tetto():
-    assert context_scale(10_000_000) == config_mod.MAX_BUDGET_SCALE
+    """Il tetto non e' piu' MAX_BUDGET_SCALE ma la finestra efficace.
+
+    Che e' un tetto piu' basso e piu' onesto: MAX_BUDGET_SCALE limitava la
+    crescita a un numero scelto a mano, ``finestra_efficace`` la limita a
+    quanto contesto si puo' davvero usare prima di compattare.
+    """
+    atteso = config_mod.finestra_efficace(10_000_000) / config_mod.BASE_NUM_CTX
+    assert context_scale(10_000_000) == pytest.approx(atteso)
+    assert context_scale(10_000_000) < config_mod.MAX_BUDGET_SCALE
 
 
 def test_la_finestra_dei_risultati_integrali_ha_un_tetto():
-    """Cresce, ma non all'infinito: oltre un certo punto e' solo peso morto."""
-    assert budgets_for(10_000_000).tool_result_full_window == (
-        config_mod.MAX_TOOL_RESULT_FULL_WINDOW
-    )
+    """Cresce, ma non all'infinito: oltre un certo punto e' solo peso morto.
+
+    Il tetto vero non e' piu' ``MAX_TOOL_RESULT_FULL_WINDOW`` (che resta come
+    limite superiore) ma la quota della soglia: quanti risultati interi ci
+    stanno senza far scattare la compattazione da soli.
+    """
+    b = budgets_for(10_000_000)
+    assert b.tool_result_full_window <= config_mod.MAX_TOOL_RESULT_FULL_WINDOW
+    assert b.tool_result_full_window >= config_mod.MIN_RISULTATI_INTEGRALI
 
 
 def test_num_ctx_assurdo_non_fa_esplodere_niente():
@@ -111,12 +176,12 @@ def test_read_file_tronca_secondo_la_finestra(tmp_path):
         workspace=str(tmp_path), sandbox="host", budgets=budgets_for(16_384)
     )
     largo = ToolContext(
-        workspace=str(tmp_path), sandbox="host", budgets=budgets_for(65_536)
+        workspace=str(tmp_path), sandbox="host", budgets=budgets_for(32_768)
     )
 
     corto = dispatch(stretto, "read_file", {"filepath": "grosso.py"})
     lungo = dispatch(largo, "read_file", {"filepath": "grosso.py"})
-    assert len(lungo) > len(corto) * 3
+    assert len(lungo) > len(corto) * 1.8
 
 
 def test_il_ciclo_agentico_imposta_i_budget_sul_contesto(fake_ollama, tmp_path):
@@ -128,7 +193,7 @@ def test_il_ciclo_agentico_imposta_i_budget_sul_contesto(fake_ollama, tmp_path):
     list(
         agent_mod.run_turn(
             backend=OllamaBackend(url, timeout_s=20),
-            params=GenParams(model="fake:latest", num_ctx=65_536),
+            params=GenParams(model="fake:latest", num_ctx=32_768),
             tools_schema=TOOLS_SCHEMA,
             tool_ctx=ctx,
             ui_messages=[{"role": "user", "content": "ciao"}],
@@ -137,37 +202,69 @@ def test_il_ciclo_agentico_imposta_i_budget_sul_contesto(fake_ollama, tmp_path):
             max_steps=3,
         )
     )
-    assert ctx.budgets.scale == 4.0
+    assert ctx.budgets.scale == 2.0
 
 
-def test_su_finestra_larga_si_compattano_meno_risultati():
-    """Meno compattazione non e' solo piu' contesto: e' meno KV cache buttato.
+def test_allargare_la_finestra_non_fa_compattare_prima():
+    """La non-monotonia misurata il 30/08/2026, chiusa con un test.
 
-    Compattare riscrive un messaggio in mezzo alla cronologia, quindi il
-    prefisso diverge da quello del passo precedente e Ollama ricalcola il
-    prompt da li' in poi.
+    Prima: 16k non compattava mai in dodici passi, 32k nemmeno, 49k al sesto,
+    65k al quinto, 128k **al terzo**. Il punto migliore della curva era 32k, e
+    da li' in poi ogni aumento di ``num_ctx`` peggiorava il comportamento del
+    contesto -- cioe' comprare un modello con la finestra piu' grande lo
+    rendeva peggiore, e l'harness non lo diceva.
+
+    La causa erano due politiche sullo stesso parametro che misuravano finestre
+    diverse: ``budgets_for`` scalava su ``num_ctx``, ``finestra_efficace``
+    tagliava al tetto assoluto. Qui si prova la proprieta' che deve valere
+    comunque le si tari: **una finestra piu' grande non puo' compattare prima
+    di una piu' piccola.**
     """
-    ui = [{"role": "user", "content": "vai"}]
-    for i in range(8):
-        ui.append({"role": "assistant", "content": f"passo {i}"})
-        ui.append(
+    import json as _json
+
+    def passo(i: int, caratteri: int) -> list[dict]:
+        return [
+            {
+                "role": "assistant",
+                "content": "<think>ragiono</think>Apro il file.",
+                "tool_calls": [
+                    {
+                        "id": f"c{i}",
+                        "type": "function",
+                        "function": {
+                            "name": "read_file",
+                            "arguments": _json.dumps({"filepath": f"m{i}.py"}),
+                        },
+                    }
+                ],
+            },
             {
                 "role": "tool",
                 "tool_call_id": f"c{i}",
                 "name": "read_file",
-                "content": '{"status": "ok", "content": "' + ("z" * 3000) + '"}',
-            }
-        )
+                "content": _json.dumps({"content": "x" * caratteri, "path": f"m{i}.py"}),
+            },
+        ]
 
-    def compattati(num_ctx: int) -> int:
-        msgs = agent_mod.build_api_messages(
-            ui, system_prompt="S", env_header=None, budgets=budgets_for(num_ctx)
-        )
-        return sum(
-            1 for m in msgs if m["role"] == "tool" and "_compacted" in m["content"]
-        )
+    def quando_compatta(num_ctx: int, passi: int = 12) -> int:
+        b = budgets_for(num_ctx)
+        finestra = config_mod.finestra_efficace(num_ctx)
+        ui = [{"role": "user", "content": "rifattorizza il modulo"}]
+        for s in range(1, passi + 1):
+            ui += passo(s, b.read_file_max_chars)
+            api = agent_mod.build_api_messages(
+                ui, system_prompt="S" * 8_000, env_header=None, budgets=b
+            )
+            if agent_mod.context_pressure(api, finestra) > config_mod.HISTORY_COMPACT_THRESHOLD:
+                return s
+        return passi + 1        # non ha compattato
 
-    assert compattati(16_384) > compattati(65_536)
+    finestre = [16_384, 32_768, 49_152, 65_536, 98_304, 131_072]
+    quando = [quando_compatta(n) for n in finestre]
+    assert quando == sorted(quando), (
+        "allargare la finestra fa compattare prima: "
+        + ", ".join(f"{n}->{q}" for n, q in zip(finestre, quando))
+    )
 
 
 # ---------------------------------------------------------------------------

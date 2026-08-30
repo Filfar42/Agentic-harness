@@ -656,6 +656,23 @@ LOOP_NUDGE = (
     "chiedi con ask_user_question invece di insistere."
 )
 
+# Iniettato quando la stessa chiamata, con gli stessi argomenti, torna per la
+# terza volta nello stesso turno.
+#
+# E' il modo di guasto agentico piu' comune e l'unico che l'harness non
+# copriva: ``VerificationTracker`` guarda i comandi che *falliscono*,
+# ``esplorazioni_di_fila`` conta le esplorazioni ma non si accorge che sono la
+# stessa. Una lettura che riesce e viene rifatta costa un passo e una seconda
+# copia dello stesso file in contesto, e nessuno la vedeva.
+RIPETIZIONE_NUDGE = (
+    "Hai gia' chiamato `{tool}` con questi stessi argomenti {quante} volte in "
+    "questo turno, e il risultato e' stato lo stesso: e' ancora qui sopra nella "
+    "conversazione, scorri indietro e usalo.\n"
+    "Se ti serve qualcosa che quel risultato non conteneva, cambia la chiamata "
+    "-- un altro file, un'altra porzione, un altro strumento -- oppure di' cosa "
+    "manca invece di richiedere la stessa cosa."
+)
+
 # Variante del riepilogo per un turno che si chiude comunque in rosso:
 # il riepilogo deve dire la verita', non arrotondare.
 FAILED_SUMMARY_NUDGE = (
