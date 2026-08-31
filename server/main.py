@@ -60,6 +60,7 @@ from core.backend import (
     normalise_base_url,
 )
 from core.config import (
+    DEFAULTS,
     SKILLS_DIR,
     SKILLS_SUBDIR_WORKSPACE,
     APP_NAME,
@@ -1368,6 +1369,23 @@ _NOMI_TRANSPORT = {
 }
 
 
+def _tipo_compatibile(valore: Any, atteso: Any) -> bool:
+    """Il valore ha un tipo che ``load_settings`` accettera' al prossimo avvio?
+
+    Stessa regola di ``settings.load_settings``, applicata all'ingresso invece
+    che alla rilettura: un booleano non passa per un intero (``isinstance(True,
+    int)`` e' vero, ed e' il caso che ci si scorda), e un intero passa per un
+    float perche' JSON non distingue ``1`` da ``1.0``.
+    """
+    if isinstance(atteso, bool):
+        return isinstance(valore, bool)
+    if isinstance(atteso, int):
+        return isinstance(valore, int) and not isinstance(valore, bool)
+    if isinstance(atteso, float):
+        return isinstance(valore, (int, float)) and not isinstance(valore, bool)
+    return isinstance(valore, type(atteso))
+
+
 def _nome_transport(transport: str) -> str:
     """Il nome del transport senza toccare la rete.
 
@@ -2413,6 +2431,12 @@ def sandbox_restart() -> dict[str, Any]:
                 workspace,
                 image=str(STATE.settings["docker_image"]),
                 network=bool(STATE.settings["sandbox_network"]),
+                # ...e le porte. Senza, il container rinasceva senza
+                # l'intervallo pubblicato: le anteprime delle applicazioni
+                # smettevano di funzionare dopo un riavvio della sandbox, e
+                # l'unico modo di riaverle era cambiare qualcosa che facesse
+                # ricreare il container una seconda volta.
+                ports=STATE.preview_ports(),
             )
     except sandbox_mod.SandboxError as exc:
         raise HTTPException(400, str(exc)) from exc
@@ -2539,11 +2563,30 @@ def global_events() -> StreamingResponse:
 @app.post("/api/settings")
 def update_settings(request: SettingsRequest) -> dict[str, Any]:
     touched = set()
+    rifiutate: list[str] = []
     for key, value in request.values.items():
-        if key in STATE.settings or key == "system_prompt":
-            if STATE.settings.get(key) != value:
-                touched.add(key)
-            STATE.settings[key] = value
+        if key not in STATE.settings and key != "system_prompt":
+            continue
+        # Il tipo si controlla **all'ingresso**, non al prossimo avvio.
+        #
+        # Prima passava qualunque cosa: ``{"num_ctx": "grande"}`` finiva nelle
+        # impostazioni in memoria e funzionava fino al riavvio, quando
+        # ``load_settings`` scartava il valore per tipo sbagliato e rimetteva
+        # il default in silenzio. E' lo stesso modo di guasto di
+        # ``deposito_max_mb``, ma per la porta HTTP invece che per un campo
+        # della UI -- e qui vale per tutte e cinquanta le chiavi.
+        atteso = DEFAULTS.get(key)
+        if atteso is not None and not _tipo_compatibile(value, atteso):
+            rifiutate.append(
+                f"{key}: atteso {type(atteso).__name__}, ricevuto "
+                f"{type(value).__name__}"
+            )
+            continue
+        if STATE.settings.get(key) != value:
+            touched.add(key)
+        STATE.settings[key] = value
+    if rifiutate:
+        raise HTTPException(400, "Valori non validi -- " + "; ".join(rifiutate))
     # Le cache dei derivati valgono finche' non si cambia a cosa puntano.
     if touched & {"transport", "api_base", "api_key", "timeout_seconds",
                   "stream_tools", "model_name"}:

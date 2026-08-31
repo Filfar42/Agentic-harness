@@ -106,6 +106,21 @@ COOKIE = "harness_mobile"
 COOKIE_MAX_AGE = 30 * 24 * 3600
 
 
+def _uguale(presentato: str, atteso: str) -> bool:
+    """Confronto a tempo costante che non esplode su input arbitrario.
+
+    ``secrets.compare_digest`` su due ``str`` pretende che siano entrambe
+    ASCII: con un carattere accentato nel parametro ``?k=`` -- che chiunque
+    puo' mettere -- solleva ``TypeError``, e il ponte rispondeva 500 invece di
+    401. Confrontando i byte il problema non esiste, e la proprieta' di tempo
+    costante resta.
+    """
+    return secrets.compare_digest(
+        presentato.encode("utf-8", "surrogatepass"),
+        atteso.encode("utf-8", "surrogatepass"),
+    )
+
+
 def token() -> str:
     """La chiave d'accesso di questo ponte, la stessa ad ogni avvio.
 
@@ -162,7 +177,7 @@ async def guardia_del_token(request: Request, call_next):
     # Basta che UNA sia giusta, non la prima in ordine: un cookie valido non
     # deve perdere contro un'intestazione vecchia rimasta appesa a un client.
     # compare_digest e non ``==``: il confronto a tempo costante e' gratis.
-    if not any(secrets.compare_digest(c, atteso) for c in presentate):
+    if not any(_uguale(c, atteso) for c in presentate):
         return JSONResponse(
             {
                 "detail": (

@@ -108,6 +108,17 @@ def save_settings(settings: dict[str, Any], path: Path | None = None) -> bool:
     try:
         with open(tmp, "w", encoding="utf-8") as fh:
             json.dump(payload, fh, ensure_ascii=False, indent=2)
+        # I permessi si stringono sul **temporaneo**, prima del replace: cosi'
+        # il file definitivo nasce gia' chiuso e non c'e' un istante in cui
+        # esiste leggibile da tutti. Qui dentro ci sono ``api_key`` e
+        # ``mobile_token`` accanto a ``theme_mode``, e il file nasceva con i
+        # permessi di default -- su Linux 0644, su Windows l'ACL della cartella.
+        try:
+            os.chmod(tmp, 0o600)
+        except OSError:
+            # Su alcuni filesystem (FAT, certe condivisioni di rete) chmod non
+            # fa niente e non e' un motivo per non salvare le preferenze.
+            pass
         os.replace(tmp, path)
     except OSError:
         return False

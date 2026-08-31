@@ -132,24 +132,29 @@ def cerca_nel_vault(
             )
         }
 
+    # La coda del log non si legge piu' qui: arriva dentro ``blocco_stato``,
+    # insieme all'indice, e va in coda invece che nel prompt di sistema.
     indice = vault_mod.leggi_indice(base)
-    coda_log = vault_mod.leggi_log_coda(base)
     system_prompt = PROMPT_CERCATORE.format(
         passi=MAX_PASSI_CERCA,
         indice=vault_mod.INDEX_FILE,
         referto=MAX_REFERTO_CHARS,
     )
-    if indice.strip():
-        system_prompt += (
-            "\n# Indice attuale della wiki\n\n" + indice + "\n"
-        )
-    else:
+    if not indice.strip():
+        # Questa riga si', nel prompt: e' un fatto stabile sulla cartella, non
+        # un contenuto che cambia.
         system_prompt += (
             f"\nL'indice (`{vault_mod.INDEX_FILE}`) e' vuoto o illeggibile: "
             "parti dagli stessi file in `wiki/`.\n"
         )
-    if coda_log.strip():
-        system_prompt += "\n# Ultime operazioni registrate\n\n" + coda_log + "\n"
+    # L'indice e la coda del log vanno **in coda**, non nel prompt di sistema.
+    #
+    # E' lo stesso difetto corretto in ``vault.blocco_manutenzione``, qui nel
+    # sotto-agente: ``wiki/index.md`` viene riscritto a ogni ingest, e in testa
+    # invalidava il prefisso del cercatore. Sul cercatore pesa meno che sul
+    # padre -- il suo prefisso vive sei passi -- ma la ragione e' la stessa, e
+    # due chiamate consecutive sulla stessa wiki adesso lo riusano davvero.
+    blocco_stato = vault_mod.blocco_stato(base)
 
     # Contesto figlio: workspace DEL VAULT, non quello corrente. Niente
     # piano, note, memorie, preview: il cercatore consulta, non partecipa.
@@ -174,9 +179,10 @@ def cerca_nel_vault(
         on_vault_search=None,
     )
 
-    messaggi: list[dict[str, Any]] = [
-        {"role": "user", "content": _compito(query, vault_mod.info_vault(str(base), nome_usato))}
-    ]
+    compito = _compito(query, vault_mod.info_vault(str(base), nome_usato))
+    if blocco_stato:
+        compito = f"{blocco_stato}\n\n{compito}"
+    messaggi: list[dict[str, Any]] = [{"role": "user", "content": compito}]
     passi = 0
     for evento in run_turn(
         backend=backend,
@@ -188,7 +194,11 @@ def cerca_nel_vault(
         env_header=env_header,
         max_steps=MAX_PASSI_CERCA,
     ):
-        if evento.__class__.__name__ == "ToolFinished":
+        # ``StepStarted`` come in ``delega.esegui``: prima qui si contavano i
+        # ``ToolFinished``, cioe' le **chiamate**, e lo stesso campo ``passi``
+        # significava due cose diverse nei due referti -- un passo con tre
+        # letture ne dichiarava tre.
+        if evento.__class__.__name__ == "StepStarted":
             passi += 1
             continue
         if evento.__class__.__name__ == "AssistantTurn":

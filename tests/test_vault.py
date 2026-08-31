@@ -146,6 +146,12 @@ def _vault_di_prova(tmp_path: Path) -> Path:
     return base
 
 
+class StepStarted:
+    def __init__(self, step=0, total=0):
+        self.step = step
+        self.total = total
+
+
 def _run_turn_che_risponde(risposta: str, spioni: dict):
     def _run(**kw):
         spioni["workspace"] = kw["tool_ctx"].workspace
@@ -153,6 +159,11 @@ def _run_turn_che_risponde(risposta: str, spioni: dict):
         spioni["params"] = kw["params"]
         spioni["nomi_tool"] = [t["function"]["name"] for t in kw["tools_schema"]]
         spioni["ctx"] = kw["tool_ctx"]
+        spioni["messaggi"] = kw["ui_messages"]
+        # ``StepStarted`` e non ``ToolFinished``: il cercatore conta i **passi**
+        # come fa la delega, non le chiamate a tool. Prima lo stesso campo
+        # ``passi`` significava due cose diverse nei due referti.
+        yield StepStarted(step=1, total=1)
         yield ToolFinished()
         yield AssistantTurn(risposta)
 
@@ -189,8 +200,15 @@ def test_cerca_nel_vault_gira_sul_vault_e_cita_le_fonti(tmp_path):
     assert "Bush" in esito["referto"]
     # Il figlio gira sul workspace del vault, non su quello del padre...
     assert spioni["workspace"] == str(base)
-    # ...col prompt del cercatore che porta l'indice della wiki...
-    assert "# Indice attuale della wiki" in spioni["system_prompt"]
+    # ...col prompt del cercatore, che pero' NON porta l'indice: quello sta in
+    # coda, nel compito, perche' wiki/index.md cambia a ogni ingest e in testa
+    # invalidava il prefisso. E' lo stesso difetto corretto in
+    # vault.blocco_manutenzione, qui nel sotto-agente.
+    assert "cercatore di una wiki personale" in spioni["system_prompt"]
+    assert "Indice attuale della wiki" not in spioni["system_prompt"]
+    compito = spioni["messaggi"][0]["content"]
+    assert "stato_del_vault" in compito
+    assert "Memex" in compito
     # ...senza pensiero e coi soli tre tool di lettura.
     assert spioni["params"].think is False
     assert spioni["nomi_tool"] == ["list_files", "read_file", "search_files"]

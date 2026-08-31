@@ -551,3 +551,18 @@ def test_il_manifest_porta_la_chiave_nello_start_url(mobile):
     for icona in dati["icons"]:
         assert "maskable" in icona["purpose"]
         assert mobile.get(icona["src"]).status_code == 200
+
+
+def test_un_token_con_accenti_non_fa_esplodere_il_ponte(mobile):
+    """``secrets.compare_digest`` su due ``str`` pretende che siano ASCII.
+
+    Con un carattere accentato nel parametro ``?k=`` -- che chiunque puo'
+    mettere -- sollevava ``TypeError`` e il ponte rispondeva 500 invece di 401.
+    """
+    # La fixture manda la chiave buona come intestazione su ogni richiesta:
+    # qui va tolta, o il ?k= non verrebbe nemmeno guardato.
+    senza = {"X-Harness-Token": ""}
+    for cattivo in ("però", "chiave-é", "日本語"):
+        mobile.cookies.clear()
+        r = mobile.get(f"/api/bootstrap?k={cattivo}", headers=senza)
+        assert r.status_code == 401, f"{cattivo!r} -> {r.status_code}"

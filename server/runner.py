@@ -19,6 +19,7 @@ prima tutto l'arretrato e poi il flusso dal vivo.
 
 from __future__ import annotations
 
+import json
 import queue
 import threading
 from collections.abc import Callable, Iterator
@@ -173,6 +174,9 @@ class TurnRunner:
 class RunnerRegistry:
     """I turni in corso, uno per conversazione al massimo."""
 
+    # Quanti turni **finiti** restano ricordati. Vedi ``_pota``.
+    MAX_FINITI = 24
+
     def __init__(self) -> None:
         self._runners: dict[str, TurnRunner] = {}
         self._lock = threading.Lock()
@@ -186,6 +190,29 @@ class RunnerRegistry:
             runners = list(self._runners.values())
         for runner in runners:
             runner.stacca_gli_abbonati()
+
+    def _pota(self) -> None:
+        """Dimentica i turni finiti piu' vecchi. Va chiamata col lock preso.
+
+        Il registro non veniva mai potato: ogni conversazione toccata nel
+        processo lasciava per sempre il suo ``TurnRunner``, e ognuno tiene lo
+        snapshot della cronologia **piu' tutti i frame del turno** -- che su un
+        turno lungo sono megabyte. Un'app tenuta aperta per giorni li
+        accumulava tutti.
+
+        Si tiene una coda generosa: riaprire una chat finita e rivederne lo
+        svolgimento e' il motivo per cui i frame esistono, e ``MAX_FINITI`` e'
+        molto piu' di quante conversazioni si guardino in una sessione.
+        """
+        finiti = [
+            sid for sid, r in self._runners.items() if r.finished.is_set()
+        ]
+        if len(finiti) <= self.MAX_FINITI:
+            return
+        # I dizionari conservano l'ordine di inserimento: i primi sono i piu'
+        # vecchi, e sono quelli che si lasciano andare.
+        for sid in finiti[: len(finiti) - self.MAX_FINITI]:
+            self._runners.pop(sid, None)
 
     def get(self, session_id: str) -> TurnRunner | None:
         with self._lock:
@@ -214,12 +241,33 @@ class RunnerRegistry:
                 raise RuntimeError("Un turno e' gia' in corso per questa conversazione.")
             runner = TurnRunner(session_id, snapshot)
             self._runners[session_id] = runner
+            self._pota()
 
         def target() -> None:
             try:
                 work(runner)
             except Exception as exc:  # noqa: BLE001 - l'errore va mostrato
                 runner.error = f"{type(exc).__name__}: {exc}"
+                # ...e va mostrato **davvero**. Prima l'attributo veniva
+                # valorizzato e nessuno lo emetteva: un'eccezione nel worker
+                # chiudeva lo stream in silenzio, e l'utente vedeva il turno
+                # smettere senza una riga che dicesse perche'. Il frame passa
+                # dalla stessa strada di tutti gli altri, quindi finisce
+                # nell'arretrato e chi si riaggancia lo rivede.
+                runner.emit(
+                    "data: "
+                    + json.dumps(
+                        {
+                            "type": "error",
+                            "message": (
+                                "Il turno si e' interrotto per un guasto "
+                                f"dell'harness: {runner.error}"
+                            ),
+                        },
+                        ensure_ascii=False,
+                    )
+                    + "\n\n"
+                )
             finally:
                 runner.close()
 

@@ -107,12 +107,27 @@ MIN_TOOL_RESULT_CHARS = 1_500
 PASSI_INTEGRALI_FIGLIO = 3
 
 
-def parametri_figlio(params: Any) -> Any:
-    """Parametri di generazione del sotto-turno: stesso modello, piu' margine."""
+def parametri_figlio(params: Any, backend: Any = None) -> Any:
+    """Parametri di generazione del sotto-turno: stesso modello, piu' margine.
+
+    Il ``+50%`` passa dal limite vero del server quando lo si conosce. Su
+    llama-server la finestra la fissa ``-c`` all'avvio e non si allarga
+    chiedendo: moltiplicare e basta faceva credere al figlio di avere 48k su un
+    server da 32k, e i suoi budget di troncamento si taravano su un numero
+    falso -- che e' lo stesso difetto che ``clamp_num_ctx`` esiste per evitare
+    sul padre.
+    """
     num_ctx = int(getattr(params, "num_ctx", 0) or 0)
     if num_ctx <= 0:
         return replace(params, think=False)
-    return replace(params, think=False, num_ctx=int(num_ctx * FATTORE_NUM_CTX_FIGLIO))
+    voluto = int(num_ctx * FATTORE_NUM_CTX_FIGLIO)
+    limite = getattr(backend, "clamp_num_ctx", None)
+    if callable(limite):
+        try:
+            voluto = int(limite(voluto))
+        except Exception:  # noqa: BLE001 - una sonda fallita non ferma la delega
+            pass
+    return replace(params, think=False, num_ctx=max(num_ctx, voluto))
 
 
 def budget_stretti(budgets: Any) -> Any:
@@ -245,13 +260,21 @@ def referto_di_chiusura(
         ),
     )
     pezzi: list[str] = []
-    for evento in backend.stream(api, None, p):
-        if evento.kind == "content":
-            pezzi.append(evento.text)
-        elif evento.kind == "error":
-            # Un referto di chiusura mancato lascia le cose come stavano: si
-            # torna all'errore di prima, che almeno dice cosa e' successo.
-            return ""
+    try:
+        for evento in backend.stream(api, None, p):
+            if evento.kind == "content":
+                pezzi.append(evento.text)
+            elif evento.kind == "error":
+                # Un referto di chiusura mancato lascia le cose come stavano:
+                # si torna all'errore di prima, che almeno dice cosa e'
+                # successo.
+                return ""
+    except Exception:  # noqa: BLE001 - vale la stessa regola del ramo "error"
+        # Il ramo qui sopra copre l'errore che il backend *dichiara*; questo
+        # copre quello che **solleva**. Senza, un'eccezione qui faceva fallire
+        # il tool di delega proprio nel percorso che esiste per recuperare un
+        # sotto-turno gia' andato male: si perdeva il lavoro due volte.
+        return ""
     from .textutils import strip_think
 
     return strip_think("".join(pezzi)).strip()
@@ -293,7 +316,7 @@ def esegui(
     # La finestra si allarga un poco (margine), i risultati si dimezzano (leva):
     # sei passi pieni devono entrare nella finestra *e* lasciare spazio al
     # referto, che e' l'unica cosa che il padre riceve.
-    params_figlio = parametri_figlio(params)
+    params_figlio = parametri_figlio(params, backend)
     budgets_padre = getattr(tool_ctx, "budgets", None)
     if budgets_padre is None:
         from .config import budgets_for

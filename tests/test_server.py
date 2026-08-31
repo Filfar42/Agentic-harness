@@ -1472,3 +1472,47 @@ def test_un_watchdog_non_butta_via_il_backend():
     # ha pensato troppo a lungo" e buttato via un backend sano.
     rotto = agent_mod.AgentError("connessione rifiutata", guasto_backend=True)
     assert _e_un_guasto_del_backend(rotto)
+
+
+def test_un_valore_di_tipo_sbagliato_viene_rifiutato_subito(client):
+    """Prima passava, funzionava fino al riavvio, e poi spariva in silenzio.
+
+    ``{"num_ctx": "grande"}`` finiva nelle impostazioni in memoria; al riavvio
+    ``load_settings`` lo scartava per tipo sbagliato e rimetteva il default
+    senza dirlo a nessuno. E' lo stesso modo di guasto di ``deposito_max_mb``,
+    ma per la porta HTTP -- e vale per tutte e cinquanta le chiavi.
+    """
+    prima = client.get("/api/bootstrap").json()["settings"]["num_ctx"]
+    r = client.post("/api/settings", json={"values": {"num_ctx": "grande"}})
+    assert r.status_code == 400, r.text
+    assert "num_ctx" in r.text
+    assert client.get("/api/bootstrap").json()["settings"]["num_ctx"] == prima
+
+    # un booleano non passa per un intero, anche se isinstance(True, int) e' vero
+    assert client.post("/api/settings", json={"values": {"num_ctx": True}}).status_code == 400
+    # ...e un valore giusto continua a passare
+    ok = client.post("/api/settings", json={"values": {"num_ctx": 8192}})
+    assert ok.status_code == 200, ok.text
+
+
+def test_il_riavvio_della_sandbox_non_perde_le_porte(client, monkeypatch):
+    """Il container rinasceva senza l'intervallo pubblicato.
+
+    Le anteprime delle applicazioni smettevano di funzionare dopo un riavvio
+    della sandbox, e l'unico modo di riaverle era far ricreare il container una
+    seconda volta cambiando qualcos'altro.
+    """
+    from core import sandbox as sandbox_mod
+    from server import main as server_main
+
+    visti: dict = {}
+    monkeypatch.setattr(sandbox_mod, "stop", lambda *_a, **_k: None)
+    monkeypatch.setattr(server_main.sandbox_mod, "stop", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        server_main.sandbox_mod, "ensure_container",
+        lambda ws, **kw: visti.update(kw) or "finto",
+    )
+    monkeypatch.setattr(server_main, "sandbox_status", lambda: {"ok": True})
+    server_main.STATE.settings["sandbox"] = "docker"
+    client.post("/api/sandbox/restart")
+    assert "ports" in visti, "ensure_container chiamata senza ports="
