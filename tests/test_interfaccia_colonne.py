@@ -337,3 +337,130 @@ def test_il_confine_fra_conversazioni_e_vault_si_trascina():
     assert "VAULTS_H_MIN" in corpo and "CONVERSAZIONI_H_MIN" in corpo
     # E la misura sopravvive al ricaricamento.
     assert "localStorage.setItem(VAULTS_H_KEY" in corpo
+
+
+# ---------------------------------------------------------------------------
+# Accessibilità del desktop
+# ---------------------------------------------------------------------------
+#
+# Il mobile, con 79 righe di HTML, ne aveva più del desktop con 756: la
+# striscia di attività ha `aria-live` dal principio, e chi usa VoiceOver sente
+# cambiare lo stato senza toccare lo schermo. Sul desktop non c'era niente --
+# né i passi né la risposta in arrivo venivano annunciati.
+
+
+def test_la_riga_di_stato_del_turno_si_annuncia():
+    """`aria-live` sulla riga di stato, non sul thread.
+
+    Sul thread — che è tutta la conversazione — uno screen reader rileggerebbe
+    la risposta ad ogni incremento dello stream, cioè decine di volte al
+    secondo. La riga di stato è una riga sola e cambia una volta per passo.
+    """
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    corpo = js[js.index("function nuovoTurnoDiStream(") :]
+    corpo = corpo[: corpo.index("\n}\n")]
+    assert "aria-live" in corpo and "polite" in corpo
+    html = (WEB / "index.html").read_text(encoding="utf-8")
+    thread = re.search(r'<div id="thread"[^>]*>', html)
+    assert thread and "aria-live" not in thread.group(0), (
+        "aria-live sul thread: uno screen reader rileggerebbe tutta la "
+        "risposta ad ogni token"
+    )
+
+
+def test_le_schede_delle_impostazioni_dicono_quale_e_aperta():
+    """Cinque bottoni che si distinguono per una classe CSS.
+
+    Una classe uno screen reader non la legge: senza `aria-selected` chi non
+    vede lo schermo non ha modo di sapere in quale sezione si trova.
+    """
+    html = (WEB / "index.html").read_text(encoding="utf-8")
+    schede = re.findall(r'<button class="tab[^"]*"[^>]*>', html, re.S)
+    assert len(schede) == 5, f"{len(schede)} schede trovate"
+    assert all('role="tab"' in s for s in schede), "manca role=tab"
+    assert sum('aria-selected="true"' in s for s in schede) == 1, (
+        "esattamente una scheda va marcata come aperta"
+    )
+    pannelli = re.findall(r'<section class="tab-panel[^"]*"[^>]*>', html)
+    assert len(pannelli) == 5
+    assert all('role="tabpanel"' in p and "aria-labelledby=" in p for p in pannelli)
+
+    # E lo stato deve **muoversi**: se il click sposta solo la classe, l'HTML
+    # è a posto e la UI mente dal secondo clic in poi.
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    gestore = js[js.index("$$('.tab').forEach(") :]
+    gestore = gestore[: gestore.index("\n  });")]
+    assert "aria-selected" in gestore
+
+
+def test_la_chiave_api_e_mascherata_anche_senza_webkit():
+    """`-webkit-text-security` in Firefox non esiste.
+
+    Là il campo *sembrava* mascherato e mostrava la chiave in chiaro, che è
+    peggio di un campo dichiaratamente visibile: nessuno pensa di coprire uno
+    schermo che sembra già coperto.
+    """
+    css = (WEB / "style.css").read_text(encoding="utf-8")
+    assert "-webkit-text-security" in css, "la mascheratura CSS è sparita"
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    assert "CSS.supports('-webkit-text-security'" in js, (
+        "nessun ripiego per i browser che non conoscono -webkit-text-security"
+    )
+    assert "'password'" in js[js.index("CSS.supports('-webkit-text-security'") :][:400]
+
+
+# ---------------------------------------------------------------------------
+# Il renderer markdown del desktop, eseguito davvero
+# ---------------------------------------------------------------------------
+
+
+def _markdown_js():
+    """`esc` + `markdown` estratti dal sorgente e pronti da valutare."""
+    quickjs = pytest.importorskip("quickjs")
+    js = (WEB / "app.js").read_text(encoding="utf-8")
+    pezzi = []
+    for nome in ("esc", "markdown"):
+        trovata = re.search(rf"function {nome}\([^)]*\) \{{.*?\n\}}", js, re.DOTALL)
+        assert trovata, f"funzione {nome} non trovata"
+        pezzi.append(trovata.group(0))
+    costanti = re.findall(r"^const (?:SEGNA|RE_SEGNA) = .*$", js, re.M)
+    assert len(costanti) == 2, costanti
+    ctx = quickjs.Context()
+    ctx.eval("\n".join([*costanti, *pezzi]))
+    return ctx
+
+
+def test_un_documento_che_contiene_il_segnaposto_non_si_mangia_un_blocco():
+    """`%%BLOCK0%%` era testo semplice.
+
+    Un documento che lo conteneva davvero se lo vedeva sostituire col primo
+    blocco di codice; `%%BLOCK99%%` senza un blocco 99 stampava la stringa
+    `undefined` in mezzo alla risposta. Succede quando l'agente scrive di
+    questo renderer -- cioè proprio quando si sta lavorando qui.
+    """
+    ctx = _markdown_js()
+    fuori = ctx.eval(
+        "markdown('Il segnaposto era %%BLOCK0%%\\n\\n```py\\nx = 1\\n```')"
+    )
+    assert "%%BLOCK0%%" in fuori, "il segnaposto letterale è stato mangiato"
+    assert "x = 1" in fuori
+    assert "undefined" not in ctx.eval("markdown('vedi %%BLOCK99%%')")
+
+
+def test_i_titoli_conservano_il_loro_livello():
+    """`#{1,6}` diventava sempre `<h3>`: la gerarchia dei report spariva
+    **prima** che il CSS potesse deciderne la resa."""
+    ctx = _markdown_js()
+    fuori = ctx.eval("markdown('# Uno\\n\\n## Due\\n\\n#### Quattro')")
+    assert "<h1>Uno</h1>" in fuori
+    assert "<h2>Due</h2>" in fuori
+    assert "<h4>Quattro</h4>" in fuori
+
+
+def test_il_markup_del_modello_resta_escapato():
+    """La regola che non deve mai rompersi mentre si tocca il renderer."""
+    ctx = _markdown_js()
+    fuori = ctx.eval("markdown('ecco <img src=x onerror=alert(1)> e **grassetto**')")
+    assert "<img" not in fuori
+    assert "&lt;img" in fuori
+    assert "<strong>grassetto</strong>" in fuori

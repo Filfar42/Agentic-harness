@@ -123,13 +123,11 @@ class _Params:
     think: bool | str = True
 
 
-class ToolFinished:
-    pass
-
-
-class AssistantTurn:
-    def __init__(self, content):
-        self.content = content
+# Gli eventi **veri**: ``cerca_nel_vault`` li riconosce con ``isinstance``.
+# Prima erano sosia locali, e passavano il confronto sul nome della classe --
+# cioe' i test restavano verdi anche se ``core/agent`` rinominava l'evento e
+# il cercatore smetteva di riconoscere qualsiasi referto.
+from core.agent import AssistantTurn, StepStarted, ToolFinished
 
 
 def _vault_di_prova(tmp_path: Path) -> Path:
@@ -146,12 +144,6 @@ def _vault_di_prova(tmp_path: Path) -> Path:
     return base
 
 
-class StepStarted:
-    def __init__(self, step=0, total=0):
-        self.step = step
-        self.total = total
-
-
 def _run_turn_che_risponde(risposta: str, spioni: dict):
     def _run(**kw):
         spioni["workspace"] = kw["tool_ctx"].workspace
@@ -164,8 +156,8 @@ def _run_turn_che_risponde(risposta: str, spioni: dict):
         # come fa la delega, non le chiamate a tool. Prima lo stesso campo
         # ``passi`` significava due cose diverse nei due referti.
         yield StepStarted(step=1, total=1)
-        yield ToolFinished()
-        yield AssistantTurn(risposta)
+        yield ToolFinished("c1", "read_file", {}, "ok", 0.0, True)
+        yield AssistantTurn(risposta, "", False)
 
     return _run
 
@@ -1145,3 +1137,23 @@ def test_lo_stato_della_wiki_arriva_al_modello_in_coda(tmp_path, fake_ollama):
     # ...e non in testa: il prefisso deve restare byte-identico fra i passi
     sistema = " ".join(m["content"] for m in prima["messages"] if m.get("role") == "system")
     assert "Memex" not in sistema
+
+
+def test_il_nome_del_vault_non_puo_chiudere_il_suo_attributo():
+    """Il nome è testo scritto dall'utente, e finisce dentro un attributo.
+
+    Uno che contiene una virgoletta chiude l'attributo, e da lì in poi il
+    resto del nome viene letto come marcatura. Non è una falla -- è l'utente
+    che nomina la propria cartella -- ma è un blocco che dice al modello una
+    cosa diversa da quella che l'utente intendeva, ed è il genere di cosa su
+    cui il modello poi agisce.
+    """
+    config = vault_mod.VaultConfig(
+        nome='casa "mia" <script>',
+        note=("una nota",),
+        istruzioni="lavora così",
+    )
+    for blocco in (vault_mod.blocco_note(config), vault_mod.blocco_istruzioni(config)):
+        prima = blocco.strip().splitlines()[0]
+        assert prima.count('"') == 2, prima
+        assert "<script>" not in prima

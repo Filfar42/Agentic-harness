@@ -328,6 +328,47 @@ def test_an_existing_dockerfile_is_never_overwritten(workspace):
     assert path.read_text(encoding="utf-8") == "FROM mia-immagine\n"
 
 
+def test_il_contesto_di_build_esclude_le_cartelle_pesanti(fake_docker, workspace):
+    """Il Dockerfile copia tre file; il contesto e' tutto il workspace.
+
+    Su un progetto con ``node_modules`` o ``.venv`` sono gigabyte impacchettati
+    e spediti al demone per essere buttati, e la barra resta ferma su "invio del
+    contesto" per minuti prima che la build cominci.
+
+    Il file si chiama ``Dockerfile.sandbox.dockerignore`` e non ``.dockerignore``
+    di proposito: docker cerca prima il nome legato al Dockerfile, cosi' le
+    esclusioni valgono per questa build e non per i ``docker build`` che
+    l'utente fa per conto suo nella stessa cartella.
+    """
+    sandbox.write_dockerfile(workspace)
+    esclusioni = sandbox.dockerignore_path(workspace)
+    assert esclusioni.name == "Dockerfile.sandbox.dockerignore"
+    testo = esclusioni.read_text(encoding="utf-8")
+    for pesante in ("node_modules/", ".venv/", ".git/", "__pycache__/"):
+        assert pesante in testo, f"{pesante} finisce ancora nel contesto di build"
+
+
+def test_un_workspace_gia_preparato_ottiene_comunque_le_esclusioni(fake_docker, workspace):
+    """``write_dockerfile`` si ferma appena trova il Dockerfile.
+
+    Un workspace preparato da una versione precedente ha il Dockerfile e non le
+    esclusioni, e non passerebbe mai di la': sarebbe la build lenta per sempre.
+    """
+    sandbox.dockerfile_path(workspace).write_text("FROM python:3.12-slim\n", encoding="utf-8")
+    assert not sandbox.dockerignore_path(workspace).exists()
+    sandbox.build_image(workspace)
+    assert sandbox.dockerignore_path(workspace).exists()
+
+
+def test_le_esclusioni_esistenti_non_si_sovrascrivono(fake_docker, workspace):
+    sandbox.write_dockerfile(workspace)
+    esclusioni = sandbox.dockerignore_path(workspace)
+    esclusioni.write_text("mia-roba/\n", encoding="utf-8")
+    sandbox.write_dockerfile(workspace)
+    sandbox.build_image(workspace)
+    assert esclusioni.read_text(encoding="utf-8") == "mia-roba/\n"
+
+
 def test_building_without_a_dockerfile_says_so(fake_docker, workspace):
     with pytest.raises(sandbox.SandboxError, match=r"Dockerfile.sandbox"):
         sandbox.build_image(workspace)
@@ -418,3 +459,22 @@ def test_quotes_in_a_command_survive_the_wrapping(fake_docker, workspace):
     import shlex
     # la shell interna deve ricevere esattamente il comando originale
     assert shlex.split(wrapped)[-1] == comando
+
+
+def test_il_binario_scaricato_si_verifica_prima_di_installarlo():
+    """Il ripiego di ttyd scarica un eseguibile e lo mette in /usr/local/bin.
+
+    È il punto più delicato del Dockerfile: quel binario poi gira dentro
+    l'immagine dell'agente. Senza un digest ci si fida di chiunque stia in
+    mezzo alla connessione nel momento della build -- e una build si rifà
+    raramente, quindi un binario sbagliato ci resta per mesi.
+    """
+    tpl = sandbox.DOCKERFILE_TEMPLATE
+    blocco = tpl[tpl.index("ttyd: se la distribuzione") :]
+    blocco = blocco[: blocco.index("\n\n#")]
+    assert "sha256sum -c" in blocco, "il binario si installa senza verifica"
+    # Un digest per architettura, non uno solo copiato due volte.
+    import re
+
+    digest = set(re.findall(r"sha=([0-9a-f]{64})", blocco))
+    assert len(digest) == 2, f"{len(digest)} digest distinti: {digest}"

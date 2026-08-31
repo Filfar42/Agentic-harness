@@ -309,14 +309,33 @@ class GenParams:
             opts["stop"] = list(self.stop)
         return opts
 
+    # I livelli che Ollama accetta come stringa. Fuori da questi, ``think`` e'
+    # un interruttore: mandare una stringa qualsiasi fa rispondere 400 al
+    # server, e il turno muore per un valore di configurazione.
+    LIVELLI_PENSIERO = ("low", "medium", "high", "max")
+    # Come si scrive "acceso" nelle impostazioni scritte a mano.
+    ACCESO = ("si", "sì", "true", "on", "1")
+
     @property
     def think_payload(self) -> bool | str | None:
-        """Valore da mettere in ``think``, o None per ometterlo del tutto."""
+        """Valore da mettere in ``think``, o None per ometterlo del tutto.
+
+        Il ``None`` non e' un dettaglio: ``build_payload`` omette il campo, e
+        omettere non e' la stessa cosa di ``think: false`` -- il secondo lo
+        spegne anche su un modello che lo terrebbe acceso per conto suo.
+
+        Una stringa che non e' ne' un livello ne' un modo di dire "acceso" --
+        ``think: "forse"`` in un file scritto a mano -- torna ``None`` e non
+        ``False``: significa "non ho capito, non mi impiccio", che e' la
+        risposta giusta per un valore che non vuol dire niente. Prima tornava
+        ``False``, cioe' *spegneva* il pensiero, e funzionava solo perche' chi
+        legge fa ``if think:`` e non distingue i due.
+        """
         if isinstance(self.think, str):
-            level = self.think.strip().lower()
-            if level in {"low", "medium", "high", "max"}:
-                return level
-            return level in {"si", "sì", "true", "on", "1"}
+            livello = self.think.strip().lower()
+            if livello in self.LIVELLI_PENSIERO:
+                return livello
+            return True if livello in self.ACCESO else None
         return bool(self.think) or None
 
 

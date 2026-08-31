@@ -269,9 +269,12 @@ def render_block(elenco: list[Voce]) -> str:
     righe = [f"- {v.percorso} — {v.titolo}" for v in mostrate]
     if len(elenco) > len(mostrate):
         quante = len(elenco) - len(mostrate)
+        # Il primo numero si **legge**, non si assume che sia 1: dopo una
+        # cancellazione a mano dello schedario la numerazione non riparte, e
+        # "da 001" mandava il modello a cercare un file che non c'e' piu'.
         righe.insert(
             0,
-            f"- (altre {quante} voci piu' vecchie, da 001 a "
+            f"- (altre {quante} voci piu' vecchie, da {elenco[0].numero:03d} a "
             f"{elenco[-len(mostrate) - 1].numero:03d}, sempre in {SCHEDARIO}/)",
         )
     return "\n".join(
@@ -305,6 +308,13 @@ def precarico(base: Path, elenco: list[Voce], contesto: str) -> str:
 
     ``read_file`` resta comunque la strada per tutto il resto: e' l'altra
     gamba, e non richiede nessun tool nuovo.
+
+    Sembra caro -- ri-tokenizza i titoli di tutte le voci a ogni chiamata, e
+    ``voci()`` apre ogni ``.md`` per leggerne la prima riga -- e non lo e'.
+    Misurato il 31/08/2026 su uno schedario da cento voci: ``voci()`` 3,1 ms,
+    questa funzione 0,3 ms, una volta per turno. Una cache qui aggiungerebbe
+    una chiave da invalidare ad ogni archiviazione per guadagnare tre
+    millesimi di un turno che ne dura migliaia.
     """
     parole = _parole(contesto)
     if not parole or not elenco:

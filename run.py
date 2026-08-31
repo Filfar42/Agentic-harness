@@ -46,11 +46,22 @@ class ServerCheSiFermaDavvero(uvicorn.Server):
     lascia fare a uvicorn quello che avrebbe fatto comunque.
     """
 
+    # Altri server da fermare insieme a questo (il ponte del telefono).
+    # Dichiarato qui e non appiccicato all'istanza dal chiamante: era un
+    # attributo che compariva dal nulla su un oggetto di libreria, e chi
+    # leggeva ``getattr(self, "_compagni", ())`` non aveva modo di sapere chi
+    # ce lo mettesse ne' quando.
+    compagni: list[uvicorn.Server]
+
+    def __init__(self, config: uvicorn.Config) -> None:
+        super().__init__(config)
+        self.compagni = []
+
     def handle_exit(self, sig: int, frame: FrameType | None) -> None:
         from server.runner import annuncia_spegnimento
 
         annuncia_spegnimento()
-        for altro in getattr(self, "_compagni", ()):
+        for altro in self.compagni:
             altro.should_exit = True
         super().handle_exit(sig, frame)
 
@@ -134,7 +145,7 @@ def main() -> None:
             timeout_graceful_shutdown=TIMEOUT_SPEGNIMENTO,
         )
     )
-    server._compagni = [ponte] if ponte is not None else []
+    server.compagni = [ponte] if ponte is not None else []
     corri(server)
 
 

@@ -199,7 +199,10 @@ def test_turn_survives_switching_conversation(client):
     il lavoro prosegua fino in fondo e che tornando su A sia tutto li'.
     """
     handler = fake._Handler
-    handler.delay = 0.25                       # rende il turno abbastanza lento
+    # Un solo ritardo, al primo passo: basta a tenere il turno in volo mentre
+    # arrivano le richieste qui sotto, e costa 0,4 s invece di 1,85 -- il
+    # ``delay`` per chunk dormiva sette volte per dire la stessa cosa.
+    handler.ritardo_primo_passo = 0.4
     try:
         session_a = current_session(client)
         assert client.post(
@@ -223,7 +226,7 @@ def test_turn_survives_switching_conversation(client):
         # ...e riattaccandosi si rivede tutto, fino al termine
         events = read_sse(client.get(f"/api/stream/{session_a}"))
     finally:
-        handler.delay = 0.0
+        handler.ritardo_primo_passo = 0.0
 
     assert any(e["type"] == "tool_end" for e in events), "il turno e' morto col cambio chat"
     assert events[-1]["type"] == "state"
@@ -237,7 +240,7 @@ def test_turn_survives_switching_conversation(client):
 
 def test_second_turn_on_a_busy_conversation_is_refused(client):
     handler = fake._Handler
-    handler.delay = 0.25
+    handler.ritardo_primo_passo = 0.4
     try:
         session_id = current_session(client)
         client.post("/api/chat", json={"session_id": session_id, "prompt": "vai"})
@@ -245,19 +248,19 @@ def test_second_turn_on_a_busy_conversation_is_refused(client):
         assert second.status_code == 409
         read_sse(client.get(f"/api/stream/{session_id}"))   # attende la fine
     finally:
-        handler.delay = 0.0
+        handler.ritardo_primo_passo = 0.0
 
 
 def test_deleting_a_running_conversation_is_refused(client):
     handler = fake._Handler
-    handler.delay = 0.25
+    handler.ritardo_primo_passo = 0.4
     try:
         session_id = current_session(client)
         client.post("/api/chat", json={"session_id": session_id, "prompt": "vai"})
         assert client.delete(f"/api/sessions/{session_id}").status_code == 409
         read_sse(client.get(f"/api/stream/{session_id}"))
     finally:
-        handler.delay = 0.0
+        handler.ritardo_primo_passo = 0.0
 
 
 def test_changing_chat_stops_previews_and_frees_the_ports(client, monkeypatch):
@@ -1516,3 +1519,18 @@ def test_il_riavvio_della_sandbox_non_perde_le_porte(client, monkeypatch):
     server_main.STATE.settings["sandbox"] = "docker"
     client.post("/api/sandbox/restart")
     assert "ports" in visti, "ensure_container chiamata senza ports="
+
+
+def test_salvare_un_impostazione_riesce_anche_se_la_chat_aperta_e_sparita(client):
+    """``/api/settings`` mette in coda alla risposta le statistiche della chat
+    aperta. Se quella chat è stata cancellata da un altro schermo -- o dal
+    telefono -- la rotta rispondeva 404 su un salvataggio **già riuscito**, e
+    l'utente vedeva fallire il cambio di un'impostazione che era stata scritta.
+    """
+    sessione = client.post("/api/sessions").json()["session_id"]
+    client.post(f"/api/sessions/{sessione}/open", json={})
+    client.delete(f"/api/sessions/{sessione}")
+
+    risposta = client.post("/api/settings", json={"values": {"num_ctx": 8192}})
+    assert risposta.status_code == 200, risposta.text
+    assert risposta.json()["settings"]["num_ctx"] == 8192

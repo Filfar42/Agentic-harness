@@ -153,7 +153,11 @@ def test_ctrl_c_avvisa_gli_stream_prima_di_mettersi_ad_aspettare():
     server = run_harness.ServerCheSiFermaDavvero(
         run_harness.uvicorn.Config("server.main:app")
     )
-    server._compagni = [ponte]
+    # Attributo dichiarato dalla classe, non appiccicato da fuori: prima
+    # era ``server._compagni``, che compariva dal nulla su un oggetto di
+    # libreria e che questo test poteva scrivere sbagliandone il nome senza
+    # che niente se ne accorgesse.
+    server.compagni = [ponte]
     try:
         server.handle_exit(signal.SIGINT, None)
 
@@ -269,7 +273,7 @@ def test_ctrl_c_spegne_il_server_anche_con_un_browser_attaccato():
             processo.wait(timeout=10)
 
 
-def test_un_ctrl_c_riuscito_non_stampa_un_traceback():
+def test_un_ctrl_c_riuscito_non_stampa_un_traceback(capsys):
     """Il difetto che restava dopo aver fatto funzionare Ctrl+C.
 
     A spegnimento avvenuto uvicorn ri-solleva il segnale che aveva
@@ -278,6 +282,11 @@ def test_un_ctrl_c_riuscito_non_stampa_un_traceback():
     costruiamo a mano -- serve per agganciare ``handle_exit`` -- e quel pezzo
     era rimasto scoperto: il Ctrl+C funzionava e stampava sette righe di
     traceback, cioe' sembrava un crash.
+
+    Il test guarda anche l'uscita stampata, e non solo che non voli
+    un'eccezione: senza, provava meta' della cosa che il suo nome dichiara --
+    un ``corri`` che assorbisse il segnale *e* stampasse le sette righe lo
+    avrebbe passato, ed e' esattamente il difetto che c'era.
     """
     run_harness = _run()
 
@@ -288,6 +297,8 @@ def test_un_ctrl_c_riuscito_non_stampa_un_traceback():
             raise KeyboardInterrupt
 
     run_harness.corri(FintoServer())  # non deve alzare niente
+    uscita = capsys.readouterr()
+    assert "Traceback" not in (uscita.out + uscita.err)
 
 
 def test_un_avvio_fallito_esce_con_un_codice_diverso_da_zero():

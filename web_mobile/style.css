@@ -173,6 +173,19 @@ html, body {
   border-bottom-right-radius: 4px;
 }
 
+/* I tre segni che `scriviFormattato` traduce in nodi veri. Il codice inline
+   non deve rompere la riga su uno schermo stretto: preferisce andare a capo
+   fra le parole, e se proprio non ci sta scorre invece di sfondare la bolla. */
+.msg strong { font-weight: 650; }
+.msg code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.88em;
+  padding: 1px 4px;
+  border-radius: 5px;
+  background: rgba(127, 127, 127, 0.18);
+  word-break: break-all;
+}
+
 .msg.agent {
   align-self: flex-start;
   background: var(--panel);

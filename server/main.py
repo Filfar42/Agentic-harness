@@ -56,6 +56,7 @@ from core import vault as vault_mod
 from server import previewhost
 from core.backend import (
     build_backend,
+    chiudi_client,
     forget_model_info,
     normalise_base_url,
 )
@@ -132,6 +133,9 @@ async def lifespan(_app: FastAPI):
     # thread demone: un demone morirebbe comunque all'uscita, ma chiedere e'
     # piu' pulito che tagliare -- e con --reload il processo non esce affatto.
     previewhost.shutdown()
+    # Stessa ragione: il client condiviso verso il backend tiene connessioni
+    # keep-alive aperte, e con --reload il processo sopravvive al ricaricamento.
+    chiudi_client()
 
 
 app = FastAPI(title=APP_NAME, version=APP_VERSION, lifespan=lifespan)
@@ -269,6 +273,32 @@ class AppState:
 
     # -- conversazioni -----------------------------------------------------
 
+    def sessioni_aperte(self) -> list[dict[str, Any]]:
+        """Istantanea delle conversazioni tenute in memoria.
+
+        ``_sessions`` e' privato e lo mutano i worker dei turni: leggerlo da
+        fuori senza lucchetto -- come faceva ``smonta_se_serve`` -- e' una
+        iterazione su un dizionario che un altro thread puo' cambiare sotto.
+        Qui la copia si fa **dentro** il lucchetto, e chi legge ha una lista
+        che nessuno tocca piu'.
+        """
+        with self._lock:
+            return list(self._sessions.values())
+
+    def prima_spazzata(self, chiave: str) -> bool:
+        """True la prima volta che si vede questa cartella in questo processo.
+
+        Segna e risponde in un gesto solo: ``chiave not in`` seguito da
+        ``add`` sono due operazioni, e due chat aperte insieme passavano
+        entrambe per la prima volta -- cioe' due spazzate di Docker invece di
+        una, che e' proprio il costo che questa memoria esisteva per togliere.
+        """
+        with self._lock:
+            if chiave in self._spazzate:
+                return False
+            self._spazzate.add(chiave)
+            return True
+
     def session(self, session_id: str) -> dict[str, Any]:
         """Carica (o recupera dalla cache) una conversazione."""
         with self._lock:
@@ -404,7 +434,7 @@ class AppState:
                     # I pannelli di anteprima delle altre conversazioni puntano
                     # a porte che non esistono piu': senza questo passo restereb-
                     # bero link morti fino al prossimo serve.
-                    for sessione in list(self._sessions.values()):
+                    for sessione in self.sessioni_aperte():
                         sessione.pop("preview", None)
         except Exception:  # noqa: BLE001 - mai bloccare il cambio chat
             # Nessun canale per l'errore: chi chiama questa funzione sta
@@ -584,6 +614,11 @@ class AppState:
             self._think = None
             self._vision = None
         forget_model_info()
+        # Anche il verdetto della schermata di prontezza: meta' di quei
+        # controlli e' proprio "il server dei modelli risponde, e il modello
+        # scelto c'e'". Tenerlo dopo un cambio di endpoint vorrebbe dire
+        # rispondere sul server di prima.
+        dimentica_prontezza()
 
     def skills(self) -> list[skills_mod.Skill]:
         """Skill disponibili adesso, rilette dal disco ad ogni turno.
@@ -769,9 +804,9 @@ class AppState:
         return f"{base}\n\n{block}" if base else block
 
     def tool_ctx(self, session_id: str, web_search: bool = False) -> ToolContext:
-        def persist(memories: list[dict[str, str]]) -> None:
+        def persist(memories: list[dict[str, str]]) -> bool:
             self.memories = memories
-            memory_mod.save_memories(memories)
+            return memory_mod.save_memories(memories)
 
         def persist_plan(plan: plan_mod.Plan) -> None:
             self.store_plan(session_id, plan)
@@ -1036,16 +1071,31 @@ def contesto_usato(session_id: str) -> int:
 
 
 def session_stats(session_id: str) -> dict[str, Any]:
+    """I numeri della barra in alto per una conversazione.
+
+    Se quella conversazione non c'e' piu' -- cancellata da un altro schermo,
+    dal telefono, o dalla cartella a mano -- si torna la parte che non dipende
+    da lei invece di sollevare. Le rotte che la mettono in coda alla risposta
+    (``/api/settings`` prima fra tutte) non stanno rispondendo *su* quella
+    conversazione: rispondevano 404 su un salvataggio riuscito, e l'utente
+    vedeva fallire il cambio di un'impostazione che era gia' stato scritto.
+    """
+    try:
+        contesto = contesto_usato(session_id)
+        toccati = sorted(STATE.touched(session_id))
+        allegati = pending_attachments(session_id)
+    except HTTPException:
+        contesto, toccati, allegati = 0, [], []
     return {
-        "context_used": contesto_usato(session_id),
+        "context_used": contesto,
         "context_window": int(STATE.settings["num_ctx"]),
-        "touched_files": sorted(STATE.touched(session_id)),
+        "touched_files": toccati,
         # Solo quelli ancora in attesa di partire: gli altri stanno gia'
         # disegnati sotto il messaggio con cui sono stati inviati, e ripeterli
         # nella barra del composer li farebbe sembrare in coda una seconda
         # volta. 'image' dice alla UI quali il modello puo' davvero guardare:
         # con un modello senza vision restano file come gli altri.
-        "attachments": pending_attachments(session_id),
+        "attachments": allegati,
         "vision": STATE.vision_enabled(),
         "memories": len(STATE.memories),
         "sessions": elenco_corrente(),
@@ -1369,21 +1419,12 @@ _NOMI_TRANSPORT = {
 }
 
 
-def _tipo_compatibile(valore: Any, atteso: Any) -> bool:
-    """Il valore ha un tipo che ``load_settings`` accettera' al prossimo avvio?
-
-    Stessa regola di ``settings.load_settings``, applicata all'ingresso invece
-    che alla rilettura: un booleano non passa per un intero (``isinstance(True,
-    int)`` e' vero, ed e' il caso che ci si scorda), e un intero passa per un
-    float perche' JSON non distingue ``1`` da ``1.0``.
-    """
-    if isinstance(atteso, bool):
-        return isinstance(valore, bool)
-    if isinstance(atteso, int):
-        return isinstance(valore, int) and not isinstance(valore, bool)
-    if isinstance(atteso, float):
-        return isinstance(valore, (int, float)) and not isinstance(valore, bool)
-    return isinstance(valore, type(atteso))
+# La regola dei tipi e' **una sola**, e sta accanto a ``DEFAULTS``: qui c'era
+# una copia piu' stretta di quella di ``load_settings``, con un commento che
+# diceva "stessa regola" e non lo era. Le due porte della stessa casa avevano
+# due serrature diverse: un ``true`` su un campo intero lo rifiutava questa e
+# lo accettava la rilettura all'avvio.
+_tipo_compatibile = settings_mod.tipo_compatibile
 
 
 def _nome_transport(transport: str) -> str:
@@ -1668,15 +1709,14 @@ def smonta_se_serve(session_id: str = "") -> None:
         #    server ed e' stata lasciata li'.
         or any(
             (s.get("preview") or {}).get("kind") == "serve"
-            for s in STATE._sessions.values()
+            for s in STATE.sessioni_aperte()
         )
     )
     # 4. Prima volta in questa cartella, in questo processo: la spazzata dei
     #    container rimasti in piedi da prima di un riavvio. Una volta sola --
     #    rifarla ad ogni apertura di chat era un ``docker inspect`` per
     #    scoprire, quasi sempre, che era gia' tutto pulito.
-    spazzata = chiave not in STATE._spazzate
-    STATE._spazzate.add(chiave)
+    spazzata = STATE.prima_spazzata(chiave)
 
     if subito:
         # Qui si aspetta, e si deve: il container nuovo nasce subito dopo
@@ -2083,6 +2123,32 @@ def _check(id_: str, label: str, state: str, detail: str, action: str = "") -> d
     return {"id": id_, "label": label, "state": state, "detail": detail, "action": action}
 
 
+# I controlli costano: ``backend.status()`` fino a 4 s con il server dei modelli
+# spento, e ``docker_available()`` + ``image_exists()`` un sottoprocesso docker
+# l'uno. La rotta pero' viene chiamata all'apertura di **ogni chat vuota** e
+# ogni 2,5 s finche' un lavoro di preparazione e' in corso: era mezzo secondo
+# per ogni chat aperta nel caso buono, quattro secondi in quello cattivo.
+#
+# La finestra e' corta di proposito. Questa schermata e' quella che si guarda
+# *mentre* si sistema l'ambiente -- si accende Ollama e si torna a guardarla --
+# quindi una risposta vecchia e' peggio di una lenta. Cinque secondi tolgono le
+# raffiche (due chat aperte di fila, la pagina che si ridisegna) e non si
+# frappongono fra un rimedio e la sua verifica.
+READINESS_TTL_S = 5.0
+_readiness_cache: tuple[float, list[dict[str, Any]]] | None = None
+
+
+def dimentica_prontezza() -> None:
+    """Butta la fotografia: la chiama chi ha appena cambiato le carte in tavola.
+
+    Senza, cambiare endpoint o far partire una build lasciava sullo schermo il
+    verdetto sull'ambiente **di prima** -- e la schermata di prontezza esiste
+    proprio per dire com'e' adesso.
+    """
+    global _readiness_cache  # noqa: PLW0603 - una fotografia sola, di modulo
+    _readiness_cache = None
+
+
 @app.get("/api/readiness")
 def readiness() -> dict[str, Any]:
     """Tutto quello che serve perche' il primo messaggio funzioni davvero.
@@ -2097,6 +2163,22 @@ def readiness() -> dict[str, Any]:
     senza pytest ne' git). Schiacciarli insieme renderebbe la spia rossa troppo
     spesso per essere presa sul serio.
     """
+    global _readiness_cache  # noqa: PLW0603 - vedi READINESS_TTL_S
+    lavori = PREP.snapshot()
+    # ``jobs`` non si mette mai in cache: e' la barra di avanzamento, ed e' cio'
+    # che si guarda proprio mentre gli altri controlli sono fermi su una
+    # fotografia. Con un lavoro in corso si salta la cache del tutto: e' il
+    # momento in cui l'ambiente cambia sotto gli occhi di chi guarda.
+    in_corso = any(j.get("state") == "running" for j in lavori.values())
+    if not in_corso and _readiness_cache is not None:
+        scattata, salvati = _readiness_cache
+        if time.monotonic() - scattata < READINESS_TTL_S:
+            return {
+                "checks": salvati,
+                "ready": not any(c["state"] == "error" for c in salvati),
+                "jobs": lavori,
+            }
+
     checks: list[dict[str, Any]] = []
 
     # 1. Il workspace esiste? Banale, e la prima cosa che rompe tutto il resto.
@@ -2175,9 +2257,13 @@ def readiness() -> dict[str, Any]:
                 lavoro["detail"] or dettaglio_docker, "docker",
             ))
 
+    _readiness_cache = (time.monotonic(), checks)
     return {
         "checks": checks,
         "ready": not any(c["state"] == "error" for c in checks),
+        # Ripresa adesso, non ``lavori`` di sopra: fra l'inizio e la fine di
+        # questa funzione possono passare i quattro secondi di timeout del
+        # server dei modelli, e in quei quattro secondi una build puo' finire.
         "jobs": PREP.snapshot(),
     }
 
@@ -2599,6 +2685,10 @@ def update_settings(request: SettingsRequest) -> dict[str, Any]:
         except sandbox_mod.SandboxError:
             pass
     if touched:
+        # ``forget_backend`` copre solo la meta' di connessione: sandbox,
+        # immagine e cartella cambiano gli altri controlli, e da qui si
+        # passa per tutti e cinquanta i campi.
+        dimentica_prontezza()
         STATE.persist()
     # Il workspace si puo' cambiare anche da qui, non solo dal selettore: e
     # allora passa dalla stessa porta, senno' questa strada si dimenticherebbe
@@ -2616,8 +2706,14 @@ def get_memories() -> dict[str, Any]:
 @app.post("/api/memories")
 def add_memory(request: MemoryRequest) -> dict[str, Any]:
     ok, message = memory_mod.add_memory(STATE.memories, request.text)
-    if ok:
-        memory_mod.save_memories(STATE.memories)
+    if ok and not memory_mod.save_memories(STATE.memories):
+        # Aggiunta in memoria ma non su disco: dirlo adesso, non alla
+        # riapertura, quando sarebbe sparita senza spiegazione.
+        return {
+            "ok": False,
+            "message": "Non sono riuscito a scriverla su disco: sparira' alla chiusura.",
+            "memories": STATE.memories,
+        }
     return {"ok": ok, "message": message, "memories": STATE.memories}
 
 
@@ -2638,6 +2734,9 @@ def applica_workspace(path: Path) -> str:
     """
     STATE.settings["workspace_dir"] = str(path.resolve())
     remember_workspace()
+    # Cambia la cartella, cambiano il controllo sul workspace e il tag
+    # dell'immagine: la fotografia di prima parla di un altro progetto.
+    dimentica_prontezza()
     STATE.persist()
     maybe_prepare_workspace()
     lega_workspace_alla_chat_aperta()

@@ -1045,6 +1045,34 @@ def test_la_versione_e_la_stessa_in_pyproject():
     assert dichiarata.group(1) == APP_VERSION
 
 
+def test_le_dipendenze_sono_le_stesse_in_requirements():
+    """Le stesse dipendenze, dichiarate due volte.
+
+    ``requirements.txt`` esiste perche' ``Dockerfile.sandbox`` installa da li':
+    la sandbox e' un'altra macchina e non legge il pyproject di questo
+    progetto. Il commento in testa al file chiede di toccarle insieme, ed e'
+    tutto cio' che le teneva allineate -- cioe' niente, come per la versione
+    qui sopra. Se divergono, l'agente lavora dentro un container con
+    dipendenze diverse da quelle con cui gira l'harness, e lo scopre da un
+    ImportError a meta' turno.
+
+    Il confronto e' sulla riga intera, vincolo compreso: due ``httpx`` con
+    minimi diversi sono gia' una divergenza.
+    """
+    import tomllib
+
+    radice = Path(__file__).resolve().parents[1]
+    dati = tomllib.loads((radice / "pyproject.toml").read_text(encoding="utf-8"))
+    dichiarate = {d.strip() for d in dati["project"]["dependencies"]}
+    righe = (radice / "requirements.txt").read_text(encoding="utf-8").splitlines()
+    installate = {r.strip() for r in righe if r.strip() and not r.startswith("#")}
+    assert installate == dichiarate, (
+        "pyproject.toml e requirements.txt non dichiarano le stesse dipendenze -- "
+        f"solo nel pyproject: {sorted(dichiarate - installate)}; "
+        f"solo in requirements: {sorted(installate - dichiarate)}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Correzioni dell'audit del 30/08/2026
 # ---------------------------------------------------------------------------
@@ -1141,3 +1169,75 @@ def test_il_piano_non_perde_il_punto_in_corso_in_silenzio():
     # ...ma riscriverlo tenendolo dentro resta legittimo
     piano.set_steps([piano.current.text, "un punto nuovo"])
     assert piano.current is not None
+
+
+def test_un_comando_lungo_riuscito_non_si_colora_di_rosso():
+    """``'"esito": "ok"' not in result[:200]`` sbagliava in due modi.
+
+    Il campo ``esito`` viene dopo ``command`` e ``stdout`` nella busta di
+    ``run_command``: con un comando lungo, o un output che comincia subito, a
+    200 caratteri non ci si arriva e ogni comando **riuscito** veniva contato
+    come fallito -- tendina rossa su un `pytest` verde. E al contrario, un
+    output che contiene quella stringa per conto suo faceva passare per
+    riuscito un comando fallito.
+    """
+    from core.agent import _comando_riuscito
+
+    lungo = json.dumps(
+        {"command": "pytest " + "tests/test_x.py " * 20, "stdout": "." * 400,
+         "returncode": 0, "esito": "ok"}
+    )
+    assert _comando_riuscito(lungo) is True
+    assert _comando_riuscito(json.dumps({"esito": "FALLITO"})) is False
+    bugiardo = json.dumps({"esito": "FALLITO", "stdout": '"esito": "ok"'})
+    assert _comando_riuscito(bugiardo) is False
+
+
+def test_le_impostazioni_hanno_una_regola_sola_sui_tipi():
+    """La rotta e la rilettura all'avvio devono accettare le stesse cose.
+
+    Ne avevano due: la copia in ``server/main`` rifiutava un ``true`` su un
+    campo intero, ``load_settings`` lo accettava (``isinstance(True, int)`` è
+    vero). Le due porte della stessa casa con due serrature diverse -- e quella
+    che decide davvero è la seconda, perché è quella che parla al prossimo
+    avvio.
+    """
+    from core import settings as settings_mod
+    from server import main as server_main
+
+    assert server_main._tipo_compatibile is settings_mod.tipo_compatibile
+    assert settings_mod.tipo_compatibile(True, 0) is False
+    assert settings_mod.tipo_compatibile(1, 0.5) is True
+    assert settings_mod.tipo_compatibile("grande", 0) is False
+    assert settings_mod.tipo_compatibile(True, False) is True
+
+
+def test_read_file_conta_le_righe_come_le_conta_un_editor(tmp_path):
+    """``text.count("\\n") + 1`` conta una riga in più su ogni file che finisce
+    con un a capo -- cioè su quasi tutti.
+
+    È il numero su cui il modello calcola ``start_line``/``end_line`` per la
+    lettura successiva: sbagliarlo di uno significa chiedere una riga che non
+    esiste e ricevere un intervallo vuoto, senza che niente spieghi perché.
+    """
+    from core.tools import ToolContext, dispatch
+
+    f = tmp_path / "tre_righe.py"
+    f.write_text("a = 1\nb = 2\nc = 3\n", encoding="utf-8")
+    ctx = ToolContext(workspace=str(tmp_path), sandbox="host")
+    esito = json.loads(dispatch(ctx, "read_file", {"filepath": "tre_righe.py"}))
+    assert esito["total_lines"] == 3
+
+
+def test_un_comando_che_contiene_observe_non_e_un_server():
+    """``"serve "`` come sottostringa combacia con «observe », «preserve ».
+
+    Il comando veniva rifiutato da ``run_command`` come se fosse un server che
+    non finisce mai: un no a un comando legittimo, e senza spiegazione.
+    """
+    from core.tools import looks_like_server
+
+    assert looks_like_server("npm run serve") is True
+    assert looks_like_server("npx serve -s build") is True
+    assert looks_like_server("grep preserve core/tools.py") is False
+    assert looks_like_server("python observe.py") is False

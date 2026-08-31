@@ -388,10 +388,58 @@ function aggiungiScambio(domanda, risposta) {
   if (risposta) addBubble("user", risposta, "risposta-scelta");
 }
 
+// I tre segni che l'agente usa in ogni risposta: **grassetto**, `codice` e gli
+// elenchi puntati. Il resto del markdown resta testo, ed e' voluto -- su uno
+// schermo da telefono i titoli e le tabelle non aggiungono niente.
+//
+// Si costruiscono **nodi**, mai HTML: niente `innerHTML`, niente escaping da
+// ricordarsi. Il testo del modello finisce sempre e solo in `textContent`,
+// quindi questa funzione non puo' reintrodurre la superficie che `textContent`
+// esisteva per chiudere. E' l'unica forma in cui valeva la pena farlo.
+function scriviFormattato(nodo, testo) {
+  nodo.textContent = "";
+  const righe = String(testo ?? "").split("\n");
+  righe.forEach((riga, i) => {
+    const punto = riga.match(/^\s*[-*+]\s+(.*)$/);
+    if (punto) {
+      // "• " al posto del trattino: e' un elenco, e sul telefono si vede.
+      nodo.appendChild(document.createTextNode("• "));
+      inline(nodo, punto[1]);
+    } else {
+      inline(nodo, riga);
+    }
+    if (i < righe.length - 1) nodo.appendChild(document.createTextNode("\n"));
+  });
+  return nodo;
+}
+
+function inline(nodo, testo) {
+  // Un'unica passata: chi combacia prima vince, e i due gruppi si escludono.
+  const re = /\*\*([^*\n]+)\*\*|`([^`\n]+)`/g;
+  let ultimo = 0;
+  let m;
+  while ((m = re.exec(testo)) !== null) {
+    if (m.index > ultimo) {
+      nodo.appendChild(document.createTextNode(testo.slice(ultimo, m.index)));
+    }
+    const tag = m[1] !== undefined ? "strong" : "code";
+    const el = document.createElement(tag);
+    el.textContent = m[1] !== undefined ? m[1] : m[2];
+    nodo.appendChild(el);
+    ultimo = m.index + m[0].length;
+  }
+  if (ultimo < testo.length) {
+    nodo.appendChild(document.createTextNode(testo.slice(ultimo)));
+  }
+}
+
 function addBubble(role, text, extraClass) {
   const div = document.createElement("div");
   div.className = `msg ${role}` + (extraClass ? ` ${extraClass}` : "");
-  div.textContent = text;
+  // Solo le risposte dell'agente: quello che scrive l'utente e' suo, e
+  // trasformargli due asterischi in grassetto sarebbe correggerlo.
+  if (role === "agent") scriviFormattato(div, text);
+  else div.textContent = text;
   $("messages").appendChild(div);
   scrollBottom();
   return div;
@@ -608,7 +656,20 @@ async function submitAnswer(answer) {
 }
 
 async function stopTurn() {
-  try { await jsonPost(`/api/stop/${currentId}`, {}); } catch (err) { toast(err.message); }
+  try {
+    await jsonPost(`/api/stop/${currentId}`, {});
+    // La POST e' andata: da qui in poi il turno **e' fermo**, e l'interfaccia
+    // deve dirlo subito. Prima si aspettava il frame `done` dallo stream, che
+    // e' esattamente cio' che puo' non arrivare -- filo caduto, telefono
+    // bloccato, server riavviato -- e la striscia "sta lavorando" restava
+    // accesa fino al turno successivo. Se il `done` arriva, rifa' le stesse
+    // due righe: sono idempotenti.
+    running = false;
+    updateComposer();
+    nascondiAttivita();
+  } catch (err) {
+    toast(err.message);
+  }
 }
 
 // ------------------------------------------------------------- streaming ----
@@ -730,7 +791,11 @@ function handleEvent(data) {
         ? (testoInCorso += data.append)
         : (testoInCorso = String(data.text ?? ""));
       const clean = stripThink(grezzo);
-      if (clean) bubble.textContent = clean;
+      // Assegnazione secca, non `if (clean)`: quando il modello passa dal
+      // testo al ragionamento, `stripThink` torna vuoto e la bolla restava con
+      // il testo di prima -- una frase vecchia congelata sotto "sta scrivendo".
+      // Il desktop fa gia' cosi'.
+      scriviFormattato(bubble, clean);
       // Il messaggio sta arrivando: i passi hanno finito di servire.
       chiudiGruppoPassi();
       mostraAttivita("sta scrivendo");
@@ -750,7 +815,7 @@ function handleEvent(data) {
       bubble.dataset.passo = String(contaPassi);
       bubble.classList.remove("live");
       const clean = stripThink(data.content ?? "");
-      bubble.textContent = clean || bubble.textContent;
+      if (clean) scriviFormattato(bubble, clean);
       if (!clean && !bubble.textContent) bubble.remove();
       chiudiGruppoPassi();
       scrollBottom();

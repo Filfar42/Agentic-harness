@@ -284,3 +284,40 @@ def test_fra_coda_e_metadati_vince_chi_ha_piu_messaggi(archivio):
     riletto: dict = {}
     session_mod.load_session(riletto, "s1")
     assert [m["content"] for m in riletto["messages"]] == ["uno", "due"]
+
+
+def test_una_riga_tronca_sparisce_dal_file_al_salvataggio_dopo(tmp_path, monkeypatch):
+    """Scartata alla lettura, ma sul disco restava.
+
+    La riga rotta la lascia un processo morto durante l'append. La lettura la
+    salta -- giusto -- ma poi registrava «risultano scritti N messaggi», e la
+    scrittura successiva accodava **dopo** la riga rotta: quella restava lì per
+    sempre, e ogni lettura futura pagava lo stesso scarto.
+    """
+    from core import session as sess
+
+    monkeypatch.setattr(sess, "DATA_DIR", tmp_path)
+    sess.ensure_dirs()
+    sess.dimentica_coda()
+
+    stato = {
+        "current_session_id": "s1",
+        "title": "Prova",
+        "messages": [{"role": "user", "content": "uno"}],
+    }
+    sess.save_session(stato, force=True)
+    coda = sess.messages_path("s1")
+    with open(coda, "a", encoding="utf-8") as fh:
+        fh.write('{"role": "assistant", "cont')      # morto a metà append
+
+    sess.dimentica_coda()
+    riletti = sess._leggi_messaggi("s1")
+    assert len(riletti) == 1, "la riga rotta non è stata scartata"
+
+    stato["messages"] = [*riletti, {"role": "assistant", "content": "due"}]
+    sess.save_session(stato, force=True)
+
+    righe = [r for r in coda.read_text(encoding="utf-8").splitlines() if r.strip()]
+    assert len(righe) == 2, righe
+    for r in righe:
+        json.loads(r)     # solleva se la riga rotta è ancora lì

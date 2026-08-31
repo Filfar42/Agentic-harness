@@ -205,7 +205,15 @@ viene riassunta e i dettagli spariscono: le note restano.
 #   * contesto occupato ad ogni singola richiesta (quanto, lo dice
 #     ``costi_del_prefisso()`` qui sotto: i numeri scritti a mano invecchiano
 #     da soli mentre i testi crescono, ed e' successo -- il commento diceva
-#     "612 token" per un prompt che ne occupa 3.001);
+#     "612 token" per un prompt che, misurato, ne occupava 3.001);
+#
+#     Il 31/08/2026 sono tornati 2.822: la sezione "Chiedi tutto quello che ti
+#     serve in una volta" ripeteva per intero la regola sul raggruppamento
+#     gia' data sotto "Un passo alla volta" -- stessa istruzione, due volte,
+#     pagata due volte -- e chiudeva con una statistica sulle sessioni passate
+#     di questo harness, che non e' un invariante e non dice al modello cosa
+#     fare. Un prompt che dice due volte la stessa cosa non insegna il doppio;
+#
 #   * istruzioni che competono con il compito. Un modello capace che legge
 #     "cosa c'e' nel progetto -> list_files" tende a *eseguire la tabella*
 #     invece di ragionare sul problema.
@@ -235,9 +243,22 @@ in tre passi e' fatto meglio dello stesso compito chiuso in dieci. Due cose \
 lo accorciano piu' di ogni altra.
 
 **Chiedi insieme quello che non dipende l'uno dall'altro.** Le tool call di \
-uno stesso passo vengono eseguite tutte prima che tu torni a decidere: tre \
-read_file di tre file che ti servono comunque sono un passo, non tre. Vale \
-per le letture, per le ricerche, per i comandi indipendenti.
+uno stesso passo vengono eseguite tutte prima che tu torni a decidere, e i \
+risultati ti tornano insieme: tre file che ti servono comunque sono tre \
+read_file in un passo, non tre passi -- lo stesso lavoro in un terzo del \
+tempo, e piu' facile da capire, perche' li vedi affiancati invece che uno \
+alla volta. Vale per tutto cio' che non dipende da altro, non solo per le \
+letture: quattro file da creare che non si guardano fra loro sono quattro \
+write_file nello stesso passo, e manage_plan action='complete' viaggia \
+insieme all'ultima azione che chiude il punto -- chiudere un punto non e' \
+lavoro, e' contabilita', e non deve costare un giro. Non vale quando il \
+secondo passo dipende davvero dal primo: cosa cercare lo sai solo dopo aver \
+letto, quale test lanciare solo dopo aver visto la struttura, e li' \
+incatenare e' corretto.
+
+Non rileggere un file che hai gia' letto in questa conversazione e che non \
+hai toccato: il contenuto e' ancora quello. Il tool te lo dice ("invariato") \
+e quella e' una risposta valida, non un errore.
 
 **Non ripensare quello che hai gia' deciso.** Se ti accorgi di star \
 riscrivendo una conclusione a cui eri gia' arrivato, quella conclusione e' \
@@ -275,32 +296,6 @@ turno: quella struttura ce l'hai gia', non serve list_files per riscoprirla. Il 
 e' l'errore che costa di piu'. Prima di modificare un file esistente leggilo: \
 write_file rifiuta comunque di sovrascrivere un file che non hai letto in questa \
 conversazione.
-
-# Chiedi tutto quello che ti serve in una volta
-Le chiamate che emetti in uno stesso passo vengono eseguite tutte, e i loro \
-risultati ti tornano insieme. Quindi quando ti servono tre file, chiamali con \
-tre read_file nello stesso passo invece di leggerne uno, ragionare, leggere il \
-secondo: e' lo stesso lavoro in un terzo del tempo, ed e' anche piu' facile \
-ragionarci sopra, perche' li vedi affiancati invece che uno per volta.
-
-Vale per **tutto** cio' che non dipende da altro, non solo per le letture: \
-quattro file da creare che non si guardano fra loro sono quattro write_file \
-nello stesso passo, non quattro passi. E vale per il piano: manage_plan \
-action='complete' viaggia insieme all'ultima azione che chiude il punto, non \
-in un passo suo. Chiudere un punto non e' lavoro, e' contabilita': non deve \
-costare un giro.
-
-Non vale quando il secondo passo dipende davvero dal primo -- cosa cercare lo \
-sai solo dopo aver letto, quale test lanciare lo sai solo dopo aver visto la \
-struttura: li' incatenare e' corretto, non e' una perdita di tempo.
-
-Su una sessione misurata di questo harness, 13 passi su 31 non contenevano \
-altro che chiamate al piano, e 27 passi su 31 avevano una sola chiamata \
-dentro. Il lavoro vero stava in meno della meta' dei passi spesi.
-
-Non rileggere un file che hai gia' letto in questa conversazione e che non hai \
-toccato: il contenuto e' ancora quello. Il tool te lo dice ("invariato") e \
-quella e' una risposta valida, non un errore.
 
 # Verificare non e' facoltativo
 Dopo ogni modifica al codice esegui un comando di verifica (`pytest -q`, \
@@ -746,12 +741,6 @@ PLAN_NUDGE = (
     "-- una chiamata in piu' in quel passo, non un passo in piu'."
 )
 
-# Iniettato quando il modello sta esplorando a mano da parecchi passi senza
-# aver mai delegato. Misurato il 23/08/2026: l'esplorazione fatta dal padre --
-# read_file, search_files, list_files -- vale il 46% dei token di risultato che
-# restano in contesto per sempre, mentre `esplora` compare in 4 sessioni su 24.
-# Il tool c'e' e funziona: quello che manca e' che qualcuno lo nomini nel
-# momento in cui servirebbe.
 # Il turno ha esaurito i passi senza scrivere una parola. Non e' un sollecito:
 # e' il prompt di sistema di **una chiamata sola e senza tool**, perche' un
 # sollecito avrebbe bisogno di un passo successivo e non ce n'e' piu' uno.
@@ -781,6 +770,12 @@ Niente preamboli, niente scuse, niente elenchi di intenzioni. Non promettere \
 di fare qualcosa adesso: adesso e' finita.\
 """
 
+# Iniettato quando il modello sta esplorando a mano da parecchi passi senza
+# aver mai delegato. Misurato il 23/08/2026: l'esplorazione fatta dal padre --
+# read_file, search_files, list_files -- vale il 46% dei token di risultato che
+# restano in contesto per sempre, mentre `esplora` compare in 4 sessioni su 24.
+# Il tool c'e' e funziona: quello che manca e' che qualcuno lo nomini nel
+# momento in cui servirebbe.
 DELEGA_NUDGE = (
     "Sono {quante} letture di fila senza scrivere niente: stai esplorando. "
     "Ogni file che apri resta nel tuo contesto per tutto il resto del lavoro, "

@@ -17,6 +17,7 @@ per vLLM, llama.cpp server, LM Studio o qualunque endpoint compatibile.
 from __future__ import annotations
 
 import json
+import threading
 import time
 from dataclasses import dataclass
 from typing import Any, Literal
@@ -27,6 +28,61 @@ import httpx
 from .config import GenParams
 
 EventKind = Literal["content", "reasoning", "tool_call", "usage", "error"]
+
+
+# ---------------------------------------------------------------------------
+# Il client condiviso
+# ---------------------------------------------------------------------------
+#
+# Tutte le richieste di questo modulo passano di qui. Prima erano dodici
+# ``httpx.get``/``httpx.post``/``httpx.stream`` di modulo, e ognuna di quelle
+# funzioni costruisce un client usa-e-getta: apre una connessione TCP, manda
+# una richiesta, chiude. Sembra irrilevante perche' il backend e' su localhost,
+# ed e' esattamente il contrario -- su localhost la richiesta non costa quasi
+# niente, quindi *tutto* il tempo e' l'apertura. Misurato su 200 richieste a un
+# server locale:
+#
+#     senza client condiviso: 80.12 ms l'una
+#     con client condiviso:    1.51 ms l'una
+#
+# 78.6 ms di handshake pagati a ogni sonda, e le sonde non sono rare:
+# ``props()`` gira da ``gen_params()``, cioe' a ogni turno; ``version()`` e
+# ``status()`` a ogni apertura di pannello; ``model_info`` a ogni lettura di
+# sessione quando la cache e' fredda.
+#
+# Il client e' di **modulo, non di istanza**, per la stessa ragione della cache
+# di ``model_info`` due sezioni piu' sotto: il server ricostruisce il backend a
+# ogni richiesta HTTP, quindi un pool di istanza non verrebbe riusato mai --
+# cioe' non sarebbe un pool.
+_client: httpx.Client | None = None
+# I turni girano in thread separati (un worker per conversazione): senza lock
+# due turni che partono insieme costruirebbero due client, e uno dei due
+# resterebbe orfano con le sue connessioni aperte. ``httpx.Client`` e' invece
+# thread-safe *nell'uso*, che e' la parte che conta.
+_client_lock = threading.Lock()
+
+
+def get_client() -> httpx.Client:
+    """Il client condiviso del processo, costruito alla prima richiesta."""
+    global _client  # noqa: PLW0603 - singleton di modulo, vedi sopra
+    if _client is None:
+        with _client_lock:
+            if _client is None:
+                # Nessun ``timeout`` di default: ogni chiamata passa il suo,
+                # e sono molto diversi fra loro (4 s per una sonda, minuti per
+                # una generazione). Un default qui sarebbe solo il valore che
+                # si applica quando qualcuno dimentica di passarlo.
+                _client = httpx.Client(timeout=None)
+    return _client
+
+
+def chiudi_client() -> None:
+    """Chiude il client e le sue connessioni. La chiama la lifespan del server."""
+    global _client  # noqa: PLW0603 - l'altra meta' di ``get_client``
+    with _client_lock:
+        if _client is not None:
+            _client.close()
+            _client = None
 
 
 @dataclass(slots=True)
@@ -227,7 +283,7 @@ class OllamaBackend:
         if self._version_cache is not None and not refresh:
             return self._version_cache
         try:
-            resp = httpx.get(f"{self.base_url}/api/version", timeout=4.0)
+            resp = get_client().get(f"{self.base_url}/api/version", timeout=4.0)
             resp.raise_for_status()
             self._version_cache = str(resp.json().get("version", ""))
         except Exception:  # noqa: BLE001
@@ -251,7 +307,7 @@ class OllamaBackend:
         aggiungere informazione.
         """
         try:
-            resp = httpx.get(f"{self.base_url}/api/tags", timeout=4.0)
+            resp = get_client().get(f"{self.base_url}/api/tags", timeout=4.0)
             resp.raise_for_status()
             models = sorted(m.get("name", "") for m in resp.json().get("models", []))
             return True, f"{len(models)} modelli disponibili", models
@@ -278,7 +334,7 @@ class OllamaBackend:
         aprire il pannello delle impostazioni.
         """
         try:
-            resp = httpx.get(f"{self.base_url}/api/ps", timeout=4.0)
+            resp = get_client().get(f"{self.base_url}/api/ps", timeout=4.0)
             resp.raise_for_status()
             models = resp.json().get("models", [])
         except Exception:  # noqa: BLE001
@@ -305,7 +361,7 @@ class OllamaBackend:
                 # Ha appena fallito: non si ripaga il timeout adesso.
                 return {}
         try:
-            resp = httpx.post(
+            resp = get_client().post(
                 f"{self.base_url}/api/show", json={"model": model}, timeout=6.0
             )
             resp.raise_for_status()
@@ -326,7 +382,12 @@ class OllamaBackend:
         if isinstance(caps, list):
             return "tools" in caps
         template = str(info.get("template", ""))
-        return "tools" in template.lower() or None
+        # ``None`` e non ``False``: il template e' un indizio, non una
+        # dichiarazione. Uno che non nomina i tool puo' semplicemente non
+        # nominarli, e rispondere "non li supporta" toglierebbe gli schemi a
+        # un modello capacissimo di usarli. ``x or None`` diceva gia' questo,
+        # ma si legge come una svista.
+        return True if "tools" in template.lower() else None
 
     def supports_thinking(self, model: str) -> bool | None:
         """Il modello ha un canale di ragionamento separato? None = ignoto.
@@ -353,7 +414,7 @@ class OllamaBackend:
         primo messaggio, quando sta gia' aspettando una risposta.
         """
         try:
-            resp = httpx.post(
+            resp = get_client().post(
                 f"{self.base_url}/api/chat",
                 json={"model": model, "messages": [], "keep_alive": keep_alive},
                 timeout=self.timeout_s,
@@ -475,7 +536,7 @@ class OllamaBackend:
         """
         payload = self.build_payload(messages, tools, params, stream=False)
         try:
-            resp = httpx.post(
+            resp = get_client().post(
                 f"{self.base_url}/api/chat",
                 json=payload,
                 timeout=httpx.Timeout(self.timeout_s, connect=10.0),
@@ -517,8 +578,14 @@ class OllamaBackend:
         payload = self.build_payload(messages, tools, params, stream=True)
 
         tool_index = 0
+        # Il secondo tentativo si fa **fuori** dal ``with``, e per questo esiste
+        # questo flag. Prima la ricorsione stava dentro: la risposta fallita
+        # restava aperta per tutta la durata del secondo tentativo -- cioe' per
+        # tutta una generazione -- e con il client condiviso quello e' un
+        # posto del pool tenuto occupato da una risposta gia' letta e buttata.
+        riprova = False
         try:
-            with httpx.stream(
+            with get_client().stream(
                 "POST",
                 f"{self.base_url}/api/chat",
                 json=payload,
@@ -532,31 +599,32 @@ class OllamaBackend:
                     # ha appena messo il flag a False, quindi il payload del
                     # secondo giro non ha piu' una stringa e la condizione non
                     # puo' ripresentarsi.
-                    if self._livello_rifiutato(payload, body):
-                        yield from self.stream(messages, tools, params)
+                    if not self._livello_rifiutato(payload, body):
+                        yield StreamEvent(
+                            "error", text=f"HTTP {resp.status_code}: {body}"
+                        )
                         return
-                    yield StreamEvent("error", text=f"HTTP {resp.status_code}: {body}")
-                    return
+                    riprova = True
+                else:
+                    for line in resp.iter_lines():
+                        if not line:
+                            continue
+                        try:
+                            chunk = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
 
-                for line in resp.iter_lines():
-                    if not line:
-                        continue
-                    try:
-                        chunk = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
+                        if chunk.get("error"):
+                            yield StreamEvent("error", text=str(chunk["error"]))
+                            return
 
-                    if chunk.get("error"):
-                        yield StreamEvent("error", text=str(chunk["error"]))
-                        return
+                        events, tool_index = self._emit_message(
+                            chunk.get("message") or {}, tool_index
+                        )
+                        yield from events
 
-                    events, tool_index = self._emit_message(
-                        chunk.get("message") or {}, tool_index
-                    )
-                    yield from events
-
-                    if chunk.get("done"):
-                        yield self._usage_event(chunk)
+                        if chunk.get("done"):
+                            yield self._usage_event(chunk)
         except httpx.TimeoutException:
             yield StreamEvent(
                 "error",
@@ -567,6 +635,10 @@ class OllamaBackend:
             )
         except httpx.HTTPError as exc:
             yield StreamEvent("error", text=f"Errore di rete verso Ollama: {exc}")
+        if riprova:
+            # La connessione del primo tentativo e' chiusa: qui il ``with`` e'
+            # gia' uscito.
+            yield from self.stream(messages, tools, params)
 
     # -- diagnostica -------------------------------------------------------
 
@@ -602,7 +674,7 @@ class OpenAICompatBackend:
         senza accorgersene.
         """
         try:
-            resp = httpx.get(
+            resp = get_client().get(
                 f"{self.base_url}/models", headers=self._auth_headers(), timeout=4.0
             )
             resp.raise_for_status()
@@ -640,7 +712,15 @@ class OpenAICompatBackend:
     def _extra_body(self, params: GenParams) -> dict[str, Any]:
         """Campi fuori dallo standard OpenAI da mettere in ``extra_body``."""
         # vLLM legge questo campo; Ollama lo ignora (per quello esiste il
-        # transport nativo qui sopra).
+        # transport nativo qui sopra). Va a **tutti** gli endpoint compatibili,
+        # OpenRouter compreso, che non lo conosce: gli endpoint che non lo
+        # conoscono lo ignorano, ed e' il comportamento normale per un campo
+        # extra. Resta perche' l'alternativa e' peggio: senza, su vLLM la
+        # finestra torna quella del modello e l'harness tara i budget su un
+        # numero che il server non rispetta -- lo stesso guasto silenzioso per
+        # cui esiste ``clamp_num_ctx`` su llama.cpp. Se un giorno un endpoint
+        # lo rifiuta con un 400, il posto dove toglierlo e' una sottoclasse
+        # come ``LlamaCppBackend``, non questo metodo.
         return {"max_model_len": params.num_ctx}
 
     def _extra_usage(self, chunk: Any) -> dict[str, Any]:  # noqa: ARG002
@@ -837,7 +917,7 @@ class LlamaCppBackend(OpenAICompatBackend):
             # (che all'avvio e' vuoto, ed e' l'informazione giusta).
             return self._props
         try:
-            resp = httpx.get(
+            resp = get_client().get(
                 f"{self.root_url}/props", headers=self._auth_headers(), timeout=4.0
             )
             resp.raise_for_status()
@@ -879,7 +959,7 @@ class LlamaCppBackend(OpenAICompatBackend):
         come si formano le richieste per tutta la sessione.
         """
         try:
-            resp = httpx.get(
+            resp = get_client().get(
                 f"{self.root_url}/props", headers=self._auth_headers(), timeout=4.0
             )
             resp.raise_for_status()
@@ -897,7 +977,7 @@ class LlamaCppBackend(OpenAICompatBackend):
         errori: list[str] = []
         for rotta, detail in self.SONDE:
             try:
-                resp = httpx.get(
+                resp = get_client().get(
                     f"{self.root_url}{rotta}", headers=self._auth_headers(), timeout=4.0
                 )
                 resp.raise_for_status()
@@ -949,7 +1029,7 @@ class LlamaCppBackend(OpenAICompatBackend):
         # Ripiego: /slots dichiara n_ctx per slot. Esiste solo se il server e'
         # partito con --slots, quindi puo' mancare senza che sia un problema.
         try:
-            resp = httpx.get(
+            resp = get_client().get(
                 f"{self.root_url}/slots",
                 headers=self._auth_headers(),   # come /props: stessa regola
                 timeout=4.0,
@@ -987,7 +1067,7 @@ class LlamaCppBackend(OpenAICompatBackend):
             return any(bool(v) for v in segnali)
         template = str(self.props().get("chat_template", ""))
         if template:
-            return "tools" in template.lower() or None
+            return True if "tools" in template.lower() else None
         return None
 
     def supports_thinking(self, model: str) -> bool | None:  # noqa: ARG002
@@ -1006,7 +1086,7 @@ class LlamaCppBackend(OpenAICompatBackend):
             return any(bool(v) for v in segnali)
         template = str(self.props().get("chat_template", ""))
         if template:
-            return "think" in template.lower() or None
+            return True if "think" in template.lower() else None
         return None
 
     # -- dialetto ---------------------------------------------------------

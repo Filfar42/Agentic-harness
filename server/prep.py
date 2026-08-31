@@ -118,8 +118,13 @@ class Job:
                 return
             self._set(OK if riuscito else ERROR, detail, log)
 
-        self._thread = threading.Thread(target=runner, daemon=True)
-        self._thread.start()
+        # Sotto lo stesso lucchetto che protegge ``state``: fuori, due
+        # chiamate vicine potevano vedere ``state == RUNNING`` una dopo
+        # l'altra e sovrascrivere ``_thread``, lasciando il primo thread vivo
+        # e non piu' raggiungibile da nessuno.
+        with self._lock:
+            self._thread = threading.Thread(target=runner, daemon=True)
+            self._thread.start()
         return True
 
 
@@ -172,7 +177,6 @@ class Prep:
             return True, f"Immagine {tag} pronta.", log
 
         return self.image.start(work)
-
 
     # -- container ---------------------------------------------------------
 

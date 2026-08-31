@@ -666,3 +666,36 @@ def test_lo_scarto_dei_turni_e_lineare_non_quadratico():
         f"costo per messaggio: {piccolo * 1000:.4f} ms a 100 messaggi, "
         f"{grande * 1000:.4f} ms a 800 -- sembra ancora quadratico"
     )
+
+
+# ---------------------------------------------------------------------------
+# Il risultato compattato resta leggibile
+# ---------------------------------------------------------------------------
+
+
+def test_un_errore_lungo_resta_json_valido_dopo_la_compattazione():
+    """Si accorcia il campo, non la busta.
+
+    ``json.dumps(payload)[:400]`` -- com'era -- taglia la stringa serializzata:
+    un errore lungo arrivava al modello come `{"error": "Traceback (most rec`,
+    JSON invalido in mezzo a risultati tutti ben formati. E capitava esattamente
+    nel caso peggiore, perche' l'unico messaggio che il modello non riusciva a
+    leggere era quello che gli spiegava cosa fosse andato storto.
+    """
+    from core.agent import _compact_tool_result
+
+    lungo = {"error": "Traceback (most recent call last):\n" + "  File x, line 1\n" * 60}
+    out = _compact_tool_result(json.dumps(lungo, ensure_ascii=False), full=False)
+    ricostruito = json.loads(out)  # solleva se la busta e' rotta
+    assert "Traceback" in ricostruito["error"]
+    assert len(out) < 600, f"{len(out)} caratteri: la compattazione non ha compattato"
+
+
+def test_un_errore_non_testuale_non_rompe_la_busta():
+    """``error`` non e' sempre una stringa: certi tool ci mettono un oggetto."""
+    from core.agent import _compact_tool_result
+
+    out = _compact_tool_result(
+        json.dumps({"error": {"code": 12, "msg": "x" * 900}}), full=False
+    )
+    assert isinstance(json.loads(out)["error"], str)

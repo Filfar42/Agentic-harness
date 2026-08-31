@@ -39,6 +39,11 @@
   --mono: "JetBrains Mono", "SF Mono", "Cascadia Mono", "Roboto Mono", Menlo, Consolas, monospace;
   --sidebar-w: 252px;
   --panel-w: 288px;
+  /* Quanto larga puo' farsi una bolla dell'utente. Le tre regole che la usano
+     (la bolla, gli allegati sotto, la striscia di chip) devono restare
+     allineate per costruzione: erano tre numeri uguali scritti a mano in tre
+     punti lontani, e allinearli era un lavoro di ricerca. */
+  --bolla-max: 78%;
 }
 
 html[data-theme="dark"] {
@@ -184,7 +189,10 @@ html[data-theme="dark"] .logo .logo-scuro { display: block; }
 .row-grip:hover::after { background: var(--accent); }
 /* Durante il trascinamento il cursore non deve tornare freccia uscendo dagli
    8px della maniglia: la stessa regola che gia' vale per le colonne. */
-body.resizing-rows, body.resizing-rows * { cursor: ns-resize !important; user-select: none; }
+/* La regola e' una sola; cambia solo il cursore, e quello arriva da una
+   proprieta'. Erano due copie identiche a 700 righe di distanza, e chi ne
+   correggeva una non aveva modo di sapere dell'altra. */
+body.resizing-rows { --cursore-trascina: ns-resize; }
 
 /* La sezione Vault vive in fondo alla colonna, sopra il footer: elenco
    compatto nello stile delle conversazioni, piu' la casella per registrare
@@ -514,7 +522,7 @@ body.resizing-rows, body.resizing-rows * { cursor: ns-resize !important; user-se
 .msg { margin-bottom: 14px; }
 
 .bubble-user {
-  margin-left: auto; width: fit-content; max-width: 78%;
+  margin-left: auto; width: fit-content; max-width: var(--bolla-max);
   background: var(--surface); border: 1px solid var(--border);
   border-radius: 14px 14px 4px 14px; padding: 9px 13px;
   box-shadow: var(--shadow-sm); white-space: pre-wrap; word-break: break-word;
@@ -526,8 +534,20 @@ body.resizing-rows, body.resizing-rows * { cursor: ns-resize !important; user-se
 .assistant p { margin: 0 0 10px; }
 .assistant ul, .assistant ol { margin: 0 0 10px; padding-left: 22px; }
 .assistant li { margin-bottom: 3px; }
-.assistant h1, .assistant h2, .assistant h3 {
-  font-size: 15px; font-weight: 600; margin: 16px 0 7px; letter-spacing: -0.015em;
+/* Sei livelli, non tre: il renderer conserva il livello del markdown, e i
+   report che l'agente scrive hanno una gerarchia vera. Le taglie restano
+   vicine di proposito -- in una bolla di chat un h1 da 28px sarebbe un titolo
+   di giornale -- ma non identiche, o la gerarchia si vedrebbe solo nel
+   sorgente. */
+.assistant h1, .assistant h2, .assistant h3,
+.assistant h4, .assistant h5, .assistant h6 {
+  font-weight: 600; margin: 16px 0 7px; letter-spacing: -0.015em;
+}
+.assistant h1 { font-size: 17px; }
+.assistant h2 { font-size: 16px; }
+.assistant h3 { font-size: 15px; }
+.assistant h4, .assistant h5, .assistant h6 {
+  font-size: 14px; color: var(--text-muted);
 }
 .assistant code {
   font-family: var(--mono); font-size: 0.85em;
@@ -904,7 +924,7 @@ details.drawer.failed { border-color: color-mix(in srgb, var(--err) 40%, var(--b
   flex: none;
   width: var(--preview-w, 50%);
   min-width: 260px;
-  max-width: 78%;
+  max-width: var(--bolla-max);
   display: flex;
   background: var(--bg);
 }
@@ -937,7 +957,12 @@ details.drawer.failed { border-color: color-mix(in srgb, var(--err) 40%, var(--b
 /* Durante il trascinamento il puntatore esce dalla maniglia: senza questa
    classe sul body il cursore tornerebbe a freccia e la selezione del testo
    evidenzierebbe mezza pagina. */
-body.resizing, body.resizing * { cursor: ew-resize !important; user-select: none !important; }
+body.resizing { --cursore-trascina: ew-resize; }
+body.resizing, body.resizing *,
+body.resizing-rows, body.resizing-rows * {
+  cursor: var(--cursore-trascina, ew-resize) !important;
+  user-select: none !important;
+}
 .preview-bar {
   display: flex; align-items: center; gap: 9px;
   padding: 8px 12px; border-bottom: 1px solid var(--border);
@@ -1009,7 +1034,7 @@ body.resizing, body.resizing * { cursor: ew-resize !important; user-select: none
    sopra la bolla e allineate al suo bordo destro. */
 .att-chips {
   display: flex; flex-wrap: wrap; justify-content: flex-end;
-  gap: 6px; margin: 0 0 6px auto; max-width: 78%;
+  gap: 6px; margin: 0 0 6px auto; max-width: var(--bolla-max);
 }
 .att-chips .att-chip { background: var(--surface); }
 
@@ -1058,6 +1083,21 @@ body.turn-live .att-del { display: none; }
 
 .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 15px 22px; }
 @media (max-width: 720px) { .grid2 { grid-template-columns: 1fr; } }
+
+/* Finestra stretta: le colonne laterali si **stringono**, non spariscono.
+   Erano fisse a 252px e 288px a qualunque larghezza, e su una finestra da 900
+   alla conversazione ne restavano meno di 400 -- cioe' la parte che conta era
+   la piu' piccola delle tre. Stringere e non nascondere e' voluto: il footer
+   della barra laterale e' l'unica strada per le impostazioni, e una finestra
+   stretta non deve toglierla. Chi vuole tutto lo spazio ha gia' i due
+   interruttori in alto, e quelli continuano a funzionare come prima. */
+@media (max-width: 1100px) {
+  #app { --sidebar-w: 200px; --panel-w: 232px; }
+}
+@media (max-width: 900px) {
+  #app { --sidebar-w: 168px; --panel-w: 0px; }
+  #app #panel, #app #panel-grip { display: none; }
+}
 
 .field { margin-bottom: 12px; }
 .field label { display: block; font-size: 12.5px; font-weight: 500; color: var(--text-muted); margin-bottom: 4px; }

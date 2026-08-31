@@ -12,6 +12,7 @@ import json
 import re
 import time
 from dataclasses import dataclass, field, replace
+from pathlib import PurePath
 from typing import Any
 from collections.abc import Callable, Iterator, Sequence
 
@@ -33,7 +34,6 @@ from .compaction import (
     taglio,
     trascrizione,
 )
-from pathlib import PurePath
 
 from . import delega as delega_mod
 from . import deposito as deposito_mod
@@ -294,6 +294,10 @@ class AgentError:
     guasto_backend: bool = False
 
 
+# Tutto cio' che ``run_turn`` puo' emettere, e serve che sia **tutto**: e' il
+# contratto su cui il server scrive ``event_to_sse``, e un evento che non
+# compare qui e' un evento che chi legge non sa di dover gestire.
+# ``HistoryCompacted`` e ``NotesUpdated`` mancavano pur essendo emessi da anni.
 AgentEvent = (
     StepStarted
     | ReasoningDelta
@@ -302,6 +306,8 @@ AgentEvent = (
     | ToolStarted
     | ToolFinished
     | AwaitingUserInput
+    | HistoryCompacted
+    | NotesUpdated
     | PlanUpdated
     | PreviewUpdated
     | TurnFinished
@@ -322,6 +328,13 @@ def _compact_tool_result(
     Un risultato di ``read_file`` vecchio di 5 passi e' morto: il modello ha
     gia' estratto quello che gli serviva, ma continua a costare token in ogni
     richiesta successiva. Lo si riduce a un sommario strutturale.
+
+    Il ``json.loads`` gira su **ogni** risultato fuori finestra a ogni passo, e
+    sembra il posto giusto per una cache. Misurato (31/08/2026): su una
+    cronologia di 60 passi con risultati da 12 kB l'una, ``build_api_messages``
+    intera costa 2,8 ms, di cui 1,5 ms di ``json.loads``. Un passo agentico
+    costa secondi: la cache aggiungerebbe una chiave da invalidare per
+    guadagnare un millesimo del turno, e la si e' lasciata stare.
     """
     budgets = budgets or Budgets()
     if full:
@@ -338,7 +351,19 @@ def _compact_tool_result(
         return smart_truncate(raw, 400, label="risultato tool (compattato)")
 
     if "error" in payload:
-        return json.dumps(payload, ensure_ascii=False)[:400]
+        # Si accorcia il **messaggio**, non la busta. Tagliare il JSON gia'
+        # serializzato -- ``json.dumps(payload)[:400]``, com'era -- produce JSON
+        # invalido proprio nel caso peggiore: un errore lungo. Il modello
+        # riceveva `{"error": "Traceback (most recent ca` in mezzo a risultati
+        # tutti ben formati, e l'unico messaggio che non riusciva a leggere era
+        # quello che spiegava cosa fosse andato storto.
+        errore = payload["error"]
+        testo = errore if isinstance(errore, str) else json.dumps(errore, ensure_ascii=False)
+        margine = len(json.dumps({"error": ""}, ensure_ascii=False))
+        return json.dumps(
+            {"error": smart_truncate(testo, max(80, 400 - margine), label="errore")},
+            ensure_ascii=False,
+        )
 
     keep = {}
     for key in ("status", "action", "filepath", "returncode", "match_count", "folder"):
@@ -668,6 +693,15 @@ GATE_PIANO = "gate_piano"
 PUNTI_PER_IL_CANCELLO = 6
 
 
+# Nota di misura (30/08/2026), per chi fosse tentato di metterci una cache.
+#
+# Un passo agentico esegue tre stime complete della richiesta: la pressione per
+# la compattazione, quella per lo sfondamento, e il tetto di generazione. Su una
+# cronologia da 241 messaggi con un prompt da 24.000 caratteri, ``build_api_
+# messages`` costa **2,4 ms** e una stima dei token **0,3 ms**: circa 7 ms per
+# passo, contro secondi di generazione. Memoizzarle vorrebbe dire una cache da
+# invalidare a ogni messaggio aggiunto -- cioe' un difetto silenzioso in
+# cambio di niente.
 def context_pressure(api_messages: Sequence[dict], num_ctx: int) -> float:
     if num_ctx <= 0:
         return 0.0
@@ -1507,14 +1541,24 @@ def riepilogo_finale(
     )
     if len(api) < 2:
         return ""
-    p = replace(
-        params,
-        think=False,
-        temperature=0.2,
-        max_tokens=min(
-            int(getattr(params, "max_tokens", 2048) or 2048), MAX_TOKEN_RIEPILOGO
-        ),
+    # Il tetto passa da ``tetto_per_la_finestra`` come i passi normali.
+    #
+    # Questa chiamata arriva a passi esauriti, cioe' nel momento in cui la
+    # cronologia e' al suo massimo: chiedere ``max_tokens`` pieni sulla finestra
+    # piu' piena del turno e' esattamente il caso per cui quella funzione
+    # esiste. Senza, il server tagliava il riepilogo dove capitava -- e un
+    # riepilogo tagliato a meta' frase e' peggio di nessun riepilogo, perche'
+    # sembra completo.
+    tetto, _spazio = tetto_per_la_finestra(
+        api,
+        int(getattr(params, "num_ctx", 0) or 0),
+        min(int(getattr(params, "max_tokens", 2048) or 2048), MAX_TOKEN_RIEPILOGO),
     )
+    if tetto < TETTO_INUTILE:
+        # Non c'e' spazio nemmeno per un riepilogo: meglio niente che una
+        # frase mozzata.
+        return ""
+    p = replace(params, think=False, temperature=0.2, max_tokens=tetto)
     pezzi: list[str] = []
     try:
         for evento in backend.stream(api, None, p):
@@ -2353,13 +2397,7 @@ def run_turn(
                     count_nudge("coverage")
                     passi_di_servizio += 1
                     elenco = ", ".join(f"{n} (in {f})" for n, f in scoperti[:5])
-                    ui_messages.append(
-                        {
-                            "role": "assistant",
-                            "content": _wrap(reasoning, answer),
-                            "ts": time.time(),
-                        }
-                    )
+                    _registra_il_detto(ui_messages, reasoning, answer)
                     ui_messages.append(
                         {
                             "role": "user",
@@ -2396,14 +2434,7 @@ def run_turn(
                 # gli altri rami: senza, un turno che si e' fermato a meta'
                 # sparisce dalla cronologia e dal file di sessione, e capire
                 # *perche'* si e' fermato diventa impossibile.
-                if reasoning or answer:
-                    ui_messages.append(
-                        {
-                            "role": "assistant",
-                            "content": _wrap(reasoning, answer),
-                            "ts": time.time(),
-                        }
-                    )
+                _registra_il_detto(ui_messages, reasoning, answer)
                 if red:
                     testo = FAILED_SUMMARY_NUDGE
                 elif tool_ctx.plan:
@@ -2437,13 +2468,7 @@ def run_turn(
                     nudged = True
                     count_nudge("ask")
                     passi_di_servizio += 1
-                    ui_messages.append(
-                        {
-                            "role": "assistant",
-                            "content": _wrap(reasoning, answer),
-                            "ts": time.time(),
-                        }
-                    )
+                    _registra_il_detto(ui_messages, reasoning, answer)
                     ui_messages.append(
                         {"role": "user", "content": ASK_NUDGE, "hidden": True}
                     )
@@ -2461,13 +2486,7 @@ def run_turn(
                 nudged = True
                 count_nudge("tool")
                 passi_di_servizio += 1
-                ui_messages.append(
-                    {
-                        "role": "assistant",
-                        "content": _wrap(reasoning, answer),
-                        "ts": time.time(),
-                    }
-                )
+                _registra_il_detto(ui_messages, reasoning, answer)
                 ui_messages.append({"role": "user", "content": TOOL_NUDGE, "hidden": True})
                 yield AssistantTurn(content=answer, reasoning=reasoning, has_tool_calls=False)
                 continue
@@ -2641,7 +2660,7 @@ def run_turn(
             # verifica rossa aperta: qui e' l'unico punto che lo sa.
             red_now = verification.unresolved
             tool_ctx.red_command = red_now[0] if red_now else None
-            if call["name"] == "run_command" and '"esito": "ok"' not in result[:200]:
+            if call["name"] == "run_command" and not _comando_riuscito(result):
                 # Rossa sia per una verifica fallita sia per un comando che non
                 # esiste: sono problemi diversi, ma entrambi l'utente li vuole
                 # vedere senza aprire la tendina.
@@ -3117,6 +3136,26 @@ class VerificationTracker:
         return (command, count, code)
 
 
+def _comando_riuscito(result: str) -> bool:
+    """Il comando e' andato a buon fine? Come ``_esito_del_tool``, sulla busta.
+
+    Prima: ``'"esito": "ok"' not in result[:200]``. Due modi di sbagliare, e
+    tutti e due dipingono di rosso una tendina verde. Il campo ``esito`` viene
+    dopo ``command`` e ``stdout`` nella busta di ``run_command``: con un
+    comando lungo o un output che comincia subito, a 200 caratteri non ci si
+    arriva e ogni comando riuscito veniva contato come fallito. E al contrario,
+    un output che contiene ``"esito": "ok"`` per conto suo -- il log di un
+    altro turno, un JSON di prova -- lo faceva passare per riuscito.
+    """
+    try:
+        payload = json.loads(result)
+    except (json.JSONDecodeError, TypeError):
+        return '"esito": "ok"' in result[:200]
+    if not isinstance(payload, dict):
+        return True
+    return payload.get("esito") == "ok"
+
+
 def _esito_del_tool(result: str) -> bool:
     """Il tool e' andato bene? Leggendo la busta, non cercando una parola.
 
@@ -3139,6 +3178,27 @@ def _esito_del_tool(result: str) -> bool:
     if not isinstance(payload, dict):
         return True
     return "error" not in payload
+
+
+def _registra_il_detto(
+    ui_messages: list[dict[str, Any]], reasoning: str, answer: str
+) -> None:
+    """Mette in cronologia quello che il modello ha detto, **se** ha detto qualcosa.
+
+    I tre rami dei solleciti (coverage, ask, tool) lo accodavano senza guardare:
+    quando il modello non produce ne' pensiero ne' risposta -- e succede, e' il
+    caso stesso che fa scattare il sollecito -- la sessione si riempiva di
+    messaggi ``assistant`` con contenuto vuoto. Al modello non arrivano
+    (``build_api_messages`` scarta un assistant senza contenuto ne' tool call),
+    ma restano nel file e nella UI, dove somigliano a risposte perdute.
+
+    Il ramo del riepilogo la guardia ce l'aveva gia': questa funzione e' quella
+    guardia, scritta una volta sola.
+    """
+    if reasoning or answer:
+        ui_messages.append(
+            {"role": "assistant", "content": _wrap(reasoning, answer), "ts": time.time()}
+        )
 
 
 def _wrap(reasoning: str, answer: str) -> str:

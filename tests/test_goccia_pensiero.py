@@ -32,8 +32,10 @@ def _ultimo_payload(client, session_id: str, **extra) -> dict:
     """
     import tests.test_agent_loop as fake
 
-    # Le richieste si accumulano nella lista di classe fra un test e l'altro:
-    # svuotala, altrimenti "l'ultima" e' quella del test precedente.
+    # Fra un test e l'altro ci pensa la fixture ``fake_ollama``, che riazzera
+    # ``calls`` all'ingresso. Questo svuotamento serve per le chiamate multiple
+    # DENTRO lo stesso test: senza, "l'ultima richiesta" e' l'ultima del turno
+    # precedente e l'asserzione guarda il payload sbagliato.
     fake._Handler.calls.clear()
     corpo: dict[str, Any] = {"session_id": session_id, "prompt": "ciao"}
     corpo.update(extra)

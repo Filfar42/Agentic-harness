@@ -184,6 +184,15 @@ def cerca_nel_vault(
         compito = f"{blocco_stato}\n\n{compito}"
     messaggi: list[dict[str, Any]] = [{"role": "user", "content": compito}]
     passi = 0
+    # Import locale per la stessa ragione della delega: ``core.agent`` importa
+    # questo modulo, quindi in testa si chiuderebbe l'anello. E ``isinstance``
+    # invece del confronto sul nome della classe: quello smetteva di funzionare
+    # in silenzio a un rinominamento, e qui il silenzio costava il doppio --
+    # senza ``AssistantTurn`` il cercatore non torna nessun referto e chi chiama
+    # legge "la ricerca non ha prodotto una risposta", che descrive un modello
+    # muto invece di un confronto che non combacia piu'.
+    from .agent import AssistantTurn, StepStarted
+
     for evento in run_turn(
         backend=backend,
         params=replace(params, think=False),
@@ -198,10 +207,10 @@ def cerca_nel_vault(
         # ``ToolFinished``, cioe' le **chiamate**, e lo stesso campo ``passi``
         # significava due cose diverse nei due referti -- un passo con tre
         # letture ne dichiarava tre.
-        if evento.__class__.__name__ == "StepStarted":
+        if isinstance(evento, StepStarted):
             passi += 1
             continue
-        if evento.__class__.__name__ == "AssistantTurn":
+        if isinstance(evento, AssistantTurn):
             testo = getattr(evento, "content", "") or ""
             if not str(testo).strip():
                 continue

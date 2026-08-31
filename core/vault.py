@@ -60,7 +60,7 @@ from __future__ import annotations
 
 import json
 import os
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, fields, replace
 from datetime import date
 from pathlib import Path
 
@@ -218,13 +218,43 @@ def leggi_config(workspace: str | Path) -> VaultConfig:
     )
 
 
+def _attributo(valore: str) -> str:
+    """Il nome del vault reso innocuo dentro un attributo dei blocchi in coda.
+
+    I blocchi che il modello legge sono pseudo-XML, e il nome del vault e'
+    testo scritto dall'utente: uno che contiene una virgoletta chiude
+    l'attributo, e da li' in poi quello che segue viene letto come marcatura.
+    Non e' una falla di sicurezza -- e' l'utente che nomina la propria
+    cartella -- ma e' un blocco che dice una cosa diversa da quella che
+    intendeva, ed e' il genere di cosa su cui il modello poi agisce.
+    """
+    return (
+        str(valore or "")
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+    )
+
+
+def _taglia_nota(testo: str) -> str:
+    """Il taglio di una nota di vault, con il marcatore. Un posto solo."""
+    if len(testo) <= MAX_NOTA_VAULT_CHARS:
+        return testo
+    return testo[: MAX_NOTA_VAULT_CHARS - 1].rstrip() + "…"
+
+
 def _ripulisci_note(grezze: object) -> tuple[str, ...]:
     """Note valide, senza doppioni, entro i tetti. Non solleva mai."""
     fuori: list[str] = []
     if not isinstance(grezze, list):
         return ()
     for voce in grezze:
-        testo = " ".join(str(voce or "").split())[:MAX_NOTA_VAULT_CHARS]
+        # Stesso taglio di ``aggiungi_nota``, marcatore compreso: prima uno
+        # tagliava a MAX-1 mettendo "…" e l'altro a MAX senza niente, cosi' la
+        # stessa nota cambiava di un carattere a ogni giro di lettura e
+        # riscrittura -- e non sembrava piu' un doppione di se stessa.
+        testo = _taglia_nota(" ".join(str(voce or "").split()))
         if testo and testo not in fuori:
             fuori.append(testo)
     return tuple(fuori[:MAX_NOTE_VAULT])
@@ -263,10 +293,22 @@ def scrivi_config(workspace: str | Path, config: VaultConfig) -> VaultConfig:
     return pulito
 
 
+# I nomi dei campi di ``VaultConfig``, presi dalla dataclass e non scritti a
+# mano: e' il filtro di ``aggiorna_config``, e una copia scritta qui sotto
+# resterebbe indietro alla prima aggiunta di un campo.
+_CAMPI_CONFIG = frozenset(f.name for f in fields(VaultConfig))
+
+
 def aggiorna_config(workspace: str | Path, **campi: object) -> VaultConfig:
-    """Cambia solo i campi passati. Gli altri restano quelli che erano."""
+    """Cambia solo i campi passati. Gli altri restano quelli che erano.
+
+    Il filtro guarda i **campi**, non ``hasattr``: quest'ultimo dice di si'
+    anche per i metodi, quindi ``aggiorna_config(ws, as_dict="x")`` arrivava
+    fino a ``replace()`` e sollevava un ``TypeError`` grezzo invece di essere
+    ignorato come qualunque altra chiave sconosciuta.
+    """
     corrente = leggi_config(workspace)
-    noti = {k: v for k, v in campi.items() if v is not None and hasattr(corrente, k)}
+    noti = {k: v for k, v in campi.items() if v is not None and k in _CAMPI_CONFIG}
     return scrivi_config(workspace, replace(corrente, **noti))
 
 
@@ -276,25 +318,32 @@ def scaffold(base: Path) -> list[str]:
     Non sovrascrive mai nulla di esistente: su un vault gia' avviato e' una
     no-op completa. Lo schema di parte (CLAUDE.md, index.md) viene scritto
     solo se assente, cosi' le convenzioni co-evolute con l'utente sopravvivono.
+
+    Non solleva: torna cio' che e' riuscito a creare. Su una cartella di sola
+    lettura -- un vault su un disco esterno smontato, una cartella di rete
+    caduta -- l'eccezione risaliva fino alla rotta che apre il vault, e
+    l'utente vedeva un 500 al posto di una wiki incompleta ma leggibile. Il
+    resto del modulo e' scritto per non fallire mai; questa funzione era
+    l'eccezione, in tutti i sensi.
     """
     creati: list[str] = []
-    for rel in (RAW_DIR, ASSETS_DIR, WIKI_DIR):
-        target = base / rel
-        if not target.is_dir():
-            target.mkdir(parents=True, exist_ok=True)
-            creati.append(rel)
-    schema = base / SCHEMA_FILE
-    if not schema.exists():
-        schema.write_text(SCHEMA_DEFAULT, encoding="utf-8")
-        creati.append(SCHEMA_FILE)
-    indice = base / INDEX_FILE
-    if not indice.exists():
-        indice.write_text(INDEX_DEFAULT, encoding="utf-8")
-        creati.append(INDEX_FILE)
-    log = base / LOG_FILE
-    if not log.exists():
-        log.write_text("", encoding="utf-8")
-        creati.append(LOG_FILE)
+    try:
+        for rel in (RAW_DIR, ASSETS_DIR, WIKI_DIR):
+            target = base / rel
+            if not target.is_dir():
+                target.mkdir(parents=True, exist_ok=True)
+                creati.append(rel)
+        for nome, contenuto in (
+            (SCHEMA_FILE, SCHEMA_DEFAULT),
+            (INDEX_FILE, INDEX_DEFAULT),
+            (LOG_FILE, ""),
+        ):
+            target = base / nome
+            if not target.exists():
+                target.write_text(contenuto, encoding="utf-8")
+                creati.append(nome)
+    except OSError:
+        return creati
     return creati
 
 
@@ -612,8 +661,7 @@ def aggiungi_nota(workspace: str | Path, testo: str) -> VaultConfig:
     pulito = " ".join(str(testo or "").split())
     if not pulito:
         raise NotaVaultError("La nota e' vuota.")
-    if len(pulito) > MAX_NOTA_VAULT_CHARS:
-        pulito = pulito[: MAX_NOTA_VAULT_CHARS - 1].rstrip() + "…"
+    pulito = _taglia_nota(pulito)
     corrente = leggi_config(workspace)
     if pulito in corrente.note:
         # Riscrivere la stessa nota e' un sintomo di un modello che gira a
@@ -667,7 +715,7 @@ def blocco_note(config: VaultConfig) -> str:
     righe = [f"- {n}" for n in config.note]
     return "\n".join(
         [
-            f"<memoria_del_vault nome=\"{config.nome}\">",
+            f'<memoria_del_vault nome="{_attributo(config.nome)}">',
             *righe,
             "</memoria_del_vault>",
             "",
@@ -690,7 +738,7 @@ def blocco_istruzioni(config: VaultConfig) -> str:
     if not testo:
         return ""
     return (
-        f"\n\n<vault nome=\"{config.nome}\">\n"
+        f'\n\n<vault nome="{_attributo(config.nome)}">\n'
         "Istruzioni scritte dall'utente per il lavoro in questa cartella. "
         "Valgono per tutta la conversazione.\n"
         f"{testo}\n"

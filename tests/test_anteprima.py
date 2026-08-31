@@ -606,8 +606,15 @@ def test_un_backend_che_non_risponde_ripiega_sullo_statico(tmp_path, monkeypatch
     # Il processo parte e muore subito: la porta resta libera per sempre.
     monkeypatch.setattr(sandbox, "port_state", lambda *a, **k: sandbox.PORT_FREE)
 
+    # ``wait_s`` corto: la porta non si apre mai, e con il default (12 s) questo
+    # solo test costava dodici secondi su quattordici dell'intero file. E'
+    # attesa reale, non lavoro -- il ripiego provato e' lo stesso.
     payload = json.loads(
-        dispatch(_ctx_docker(tmp_path), PREVIEW_TOOL, {"action": "file", "path": "index.html"})
+        dispatch(
+            _ctx_docker(tmp_path),
+            PREVIEW_TOOL,
+            {"action": "file", "path": "index.html", "wait_s": 1},
+        )
     )
     assert payload["preview"]["kind"] == "render"
     assert "statico" in payload["note"]

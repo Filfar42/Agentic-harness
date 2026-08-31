@@ -24,6 +24,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from core import agent as agent_mod
 from core import backend as backend_mod
 
+ROOT = Path(__file__).resolve().parents[1]
 WEB = Path(__file__).resolve().parents[1] / "web"
 WEB_MOBILE = Path(__file__).resolve().parents[1] / "web_mobile"
 
@@ -140,7 +141,7 @@ def test_una_sonda_fallita_non_si_ripaga_ad_ogni_lettura(monkeypatch):
         tentativi.append(1)
         raise OSError("macchina spenta")
 
-    monkeypatch.setattr(backend_mod.httpx, "post", finta_post)
+    monkeypatch.setattr(backend_mod.get_client(), "post", finta_post)
     b = backend_mod.OllamaBackend("http://spenta:11434")
     for _ in range(5):
         assert b.model_info("qwen") == {}
@@ -153,7 +154,7 @@ def test_la_sonda_a_mano_dimentica_anche_i_fallimenti(monkeypatch):
     backend_mod.forget_model_info()
     tentativi = []
     monkeypatch.setattr(
-        backend_mod.httpx, "post",
+        backend_mod.get_client(), "post",
         lambda *a, **k: tentativi.append(1) or (_ for _ in ()).throw(OSError("giu'")),
     )
     b = backend_mod.OllamaBackend("http://spenta:11434")
@@ -172,7 +173,7 @@ def test_un_successo_cancella_il_fallimento_ricordato(monkeypatch):
         def json(self): return {"capabilities": ["tools"]}
 
     monkeypatch.setattr(
-        backend_mod.httpx, "post",
+        backend_mod.get_client(), "post",
         lambda *a, **k: (_ for _ in ()).throw(OSError("giu'")),
     )
     assert b.model_info("qwen") == {}
@@ -181,7 +182,7 @@ def test_un_successo_cancella_il_fallimento_ricordato(monkeypatch):
     backend_mod._MODEL_INFO_FALLITI[("http://ora-accesa:11434", "qwen")] = (
         time.monotonic() - backend_mod.MODEL_INFO_FALLIMENTO_TTL_S - 1
     )
-    monkeypatch.setattr(backend_mod.httpx, "post", lambda *a, **k: Risposta())
+    monkeypatch.setattr(backend_mod.get_client(), "post", lambda *a, **k: Risposta())
     assert b.model_info("qwen") == {"capabilities": ["tools"]}
     assert ("http://ora-accesa:11434", "qwen") not in backend_mod._MODEL_INFO_FALLITI
 
@@ -443,7 +444,7 @@ def test_props_non_ritenta_a_ogni_turno_con_il_server_spento(monkeypatch):
         raise OSError("connection refused")
 
     b = LlamaCppBackend("http://spento:8080", "", 5.0)
-    monkeypatch.setattr(backend_mod.httpx, "get", _rifiuta)
+    monkeypatch.setattr(backend_mod.get_client(), "get", _rifiuta)
     for _ in range(5):
         assert b.props() == {}
     assert tentativi["n"] == 1, (
@@ -474,7 +475,7 @@ def test_slots_viaggia_con_l_autenticazione(monkeypatch):
         return _Vuota()
 
     b = LlamaCppBackend("http://server:8080", "chiave-segreta", 5.0)
-    monkeypatch.setattr(backend_mod.httpx, "get", _get)
+    monkeypatch.setattr(backend_mod.get_client(), "get", _get)
     b.server_num_ctx()
     slots = [v for v in visti if v["url"].endswith("/slots")]
     assert slots, "/slots non e' stato interrogato"
@@ -519,3 +520,46 @@ def test_il_container_verificato_non_si_riverifica_a_ogni_operazione(monkeypatch
         f"operazioni sullo stesso container"
     )
     sb.dimentica_container()
+
+
+# ---------------------------------------------------------------------------
+# Il client condiviso verso il backend
+# ---------------------------------------------------------------------------
+
+
+def test_tutte_le_richieste_al_backend_passano_dal_client_condiviso():
+    """Nessuna ``httpx.get``/``post``/``stream`` di modulo in ``core/backend``.
+
+    Ognuna di quelle funzioni costruisce un client usa-e-getta: apre una
+    connessione TCP, la usa una volta e la chiude. Su localhost -- dove sta il
+    backend nel caso normale -- l'apertura costa piu' della richiesta: misurate,
+    80.1 ms contro 1.5 ms. Una sola chiamata dimenticata qui non rompe niente e
+    non si vede: paga solo il suo handshake, in silenzio. Per questo la si
+    cerca nel sorgente invece di aspettarsi che salti fuori da sola.
+    """
+    import re
+
+    sorgente = (ROOT / "core" / "backend.py").read_text(encoding="utf-8")
+    fuori = re.findall(r"(?<!\.)\bhttpx\.(get|post|stream)\s*\(", sorgente)
+    assert not fuori, (
+        f"{len(fuori)} chiamate httpx di modulo ({', '.join(sorted(set(fuori)))}): "
+        f"vanno passate da get_client(), o non c'e' pooling"
+    )
+
+
+def test_il_client_e_lo_stesso_per_backend_diversi():
+    """Il pool serve solo se sopravvive all'istanza del backend.
+
+    Il server ricostruisce il backend a ogni richiesta HTTP -- e' la stessa
+    ragione per cui ``_MODEL_INFO_CACHE`` e' di modulo. Un client di istanza
+    verrebbe buttato insieme al backend che l'ha creato: sarebbe di nuovo una
+    connessione per richiesta, con in piu' l'illusione di avere un pool.
+    """
+    uno = backend_mod.OllamaBackend("http://localhost:11434")
+    due = backend_mod.OllamaBackend("http://altra-macchina:11434")
+    assert uno is not due
+    assert backend_mod.get_client() is backend_mod.get_client()
+    # E dopo la chiusura se ne costruisce uno nuovo, invece di usarne uno chiuso.
+    vecchio = backend_mod.get_client()
+    backend_mod.chiudi_client()
+    assert backend_mod.get_client() is not vecchio

@@ -2,12 +2,14 @@
 
 ## Il problema
 
-``SYSTEM_PROMPT_LEAN`` e' passato da poco piu' di duemila token a quasi
-duemilasettecento nel giro di poche sessioni: una sezione sulle note, una sul
-raggruppamento delle chiamate, una sul piano. Ogni sezione e' utile e ogni
-sezione si paga **ad ogni singola richiesta**, anche quando non c'entra niente
--- e su una finestra da 32k il prompt di sistema e' gia' l'8% del contesto
-prima che l'utente abbia scritto una parola.
+``SYSTEM_PROMPT_LEAN`` e' passato da poco piu' di duemila token a tremila nel
+giro di poche sessioni: una sezione sulle note, una sul raggruppamento delle
+chiamate, una sul piano. Ogni sezione e' utile e ogni sezione si paga **ad
+ogni singola richiesta**, anche quando non c'entra niente -- e su una finestra
+da 32k il prompt di sistema e' gia' l'8% del contesto prima che l'utente abbia
+scritto una parola. (Il 31/08/2026 e' sceso a 2.822 togliendo una sezione che
+ripeteva quella sopra: il numero cala quando qualcuno guarda, e nel frattempo
+cresce da solo. E' il motivo per cui serve un meccanismo, non una potatura.)
 
 Una skill e' un pezzo di istruzioni con dei termini che la richiamano. I
 termini stanno sempre in contesto (una riga per skill); il corpo entra solo
@@ -126,6 +128,12 @@ def carica(cartelle: list[tuple[Path, str]]) -> list[Skill]:
     Un file malformato non deve impedire di aprire una conversazione: e'
     materiale scritto a mano, e la modalita' di guasto normale e' un trattino
     di troppo nell'intestazione.
+
+    **L'ordine di ``cartelle`` e' significativo**: a parita' di nome vince
+    l'ultima, e chi chiama deve quindi passarle dalla piu' generale alla piu'
+    specifica (l'harness, poi il progetto). Era vero anche prima ma stava
+    scritto solo in un commento a meta' del ciclo, dove non lo legge chi la
+    chiama -- e chi la chiama e' l'unico che puo' sbagliarlo.
     """
     trovate: dict[str, Skill] = {}
     for cartella, origine in cartelle:

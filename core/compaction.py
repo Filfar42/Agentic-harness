@@ -250,8 +250,12 @@ def _argomenti_brevi(fn: dict[str, Any]) -> str:
 def _esito_breve(raw: str) -> str:
     try:
         payload = json.loads(raw)
-    except json.JSONDecodeError:
-        return raw[:200]
+    except (json.JSONDecodeError, TypeError, ValueError):
+        # ``TypeError`` se un giorno qui arriva un ``bytes`` invece di una
+        # stringa: oggi non succede, ma questa funzione gira **dentro la
+        # compattazione**, e un'eccezione qui fa saltare il riassunto di tutta
+        # la cronologia -- si perde molto piu' di un risultato illeggibile.
+        return str(raw)[:200]
     if not isinstance(payload, dict):
         return raw[:200]
     if "error" in payload:

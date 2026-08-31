@@ -124,3 +124,73 @@ def test_hide_azzecca_lo_stato_per_la_prossima_domanda() -> None:
     ctx.eval("showQuestionCard({question: 'Q'}, false); hideQuestionCard();")
     assert ctx.eval("__el['question-card'].dataset.domanda") == ""
     assert ctx.eval("__nascosta") is True
+
+
+# ---------------------------------------------------------------------------
+# Il markdown minimo delle bolle
+# ---------------------------------------------------------------------------
+
+
+def _formattatore():
+    """`scriviFormattato` + `inline` su un DOM finto che registra i nodi."""
+    sorgente = APP_JS.read_text(encoding="utf-8")
+    stub = """
+var __creati = [];
+var document = {
+  createElement(tag) {
+    var n = {tag: tag, textContent: '', figli: []};
+    __creati.push(n);
+    return n;
+  },
+  createTextNode(t) { return {tag: '#text', textContent: t, figli: []}; },
+};
+function nuovoNodo() {
+  return {
+    tag: 'div', textContent: '', figli: [],
+    appendChild(c) { this.figli.push(c); this.textContent += c.textContent; },
+  };
+}
+"""
+    ctx = quickjs.Context()
+    ctx.eval(stub)
+    ctx.eval(_funzione(sorgente, "inline"))
+    ctx.eval(_funzione(sorgente, "scriviFormattato"))
+    # appendChild sui nodi creati da createElement: serve dopo la definizione
+    ctx.eval("""
+function reset() { __creati = []; }
+""")
+    return ctx
+
+
+def test_grassetto_e_codice_diventano_nodi_veri():
+    """Il markdown dell'agente arrivava sul telefono come testo grezzo:
+    `**grassetto**` con gli asterischi, in ogni risposta, tutti i giorni."""
+    ctx = _formattatore()
+    ctx.eval("var n = nuovoNodo(); scriviFormattato(n, 'usa **questo** e `pip install`');")
+    tag = ctx.eval("n.figli.map(function (f) { return f.tag; }).join(',')")
+    assert tag == "#text,strong,#text,code"
+    assert ctx.eval("n.textContent") == "usa questo e pip install"
+
+
+def test_il_testo_del_modello_finisce_solo_in_textContent():
+    """La ragione per cui questa formattazione si poteva fare.
+
+    Si costruiscono nodi, mai HTML: niente `innerHTML` da nessuna parte, quindi
+    non c'è escaping da ricordarsi e la superficie che `textContent` chiudeva
+    resta chiusa.
+    """
+    sorgente = APP_JS.read_text(encoding="utf-8")
+    for nome in ("scriviFormattato", "inline"):
+        corpo = _funzione(sorgente, nome)
+        assert "innerHTML" not in corpo, f"{nome} costruisce HTML"
+
+    ctx = _formattatore()
+    ctx.eval("var n = nuovoNodo(); scriviFormattato(n, '<img src=x onerror=alert(1)>');")
+    assert ctx.eval("n.figli.length") == 1
+    assert ctx.eval("n.figli[0].tag") == "#text"
+
+
+def test_gli_elenchi_prendono_il_punto():
+    ctx = _formattatore()
+    ctx.eval("var n = nuovoNodo(); scriviFormattato(n, '- uno\\n- due');")
+    assert ctx.eval("n.textContent") == "• uno\n• due"

@@ -154,7 +154,15 @@ def esempio_riuscito(base: Path) -> str:
 
 
 def tasso_esaurimento(base: Path) -> tuple[int, int]:
-    """Quante esplorazioni su quante hanno finito i passi senza rispondere."""
+    """Quante esplorazioni su quante hanno finito i passi senza rispondere.
+
+    ``(0, 0)`` significa **"non c'e' abbastanza storia per dirlo"**, e non
+    "zero esaurimenti su zero": sotto ``MIN_PER_UN_TASSO`` un tasso sarebbe una
+    percentuale calcolata su tre casi, cioe' un numero che sembra una misura e
+    non lo e'. Chi chiama distingue i due controllando il totale -- ed e'
+    l'unica cosa da sapere di questa funzione, quindi sta scritta qui invece
+    che nella testa di chi l'ha scritta.
+    """
     fatti = leggi(base)
     if len(fatti) < MIN_PER_UN_TASSO:
         return (0, 0)

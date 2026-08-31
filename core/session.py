@@ -51,8 +51,10 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import time
 import uuid
+from collections import OrderedDict
 from collections.abc import Iterable
 from datetime import datetime
 from pathlib import Path
@@ -118,6 +120,7 @@ def _leggi_messaggi(session_id: str) -> list[dict[str, Any]] | None:
         return None
     messaggi: list[dict[str, Any]] = []
     ultima = ""
+    sporca = False
     try:
         with open(path, encoding="utf-8") as fh:
             for grezza in fh:
@@ -131,11 +134,20 @@ def _leggi_messaggi(session_id: str) -> list[dict[str, Any]] | None:
                     # processo e' morto durante l'append: si scarta quella e
                     # si tiene tutto il resto. Con un file unico, la stessa
                     # morte rendeva illeggibile **tutta** la conversazione.
+                    sporca = True
                     continue
                 ultima = riga
     except OSError:
         return None
-    _scritti[session_id] = (len(messaggi), ultima)
+    if sporca:
+        # Scartata alla lettura, ma **sul disco c'e' ancora**: senza questa
+        # riga il file si portava dietro la riga rotta per sempre, perche' la
+        # scrittura successiva accodava dopo di lei. Dimenticare cosa risulta
+        # scritto forza una riscrittura completa al prossimo salvataggio, che
+        # e' l'unico gesto che la toglie.
+        _scritti.pop(session_id, None)
+    else:
+        _scritti[session_id] = (len(messaggi), ultima)
     return messaggi
 
 
@@ -184,7 +196,15 @@ def _scrivi_messaggi(
 
 
 def derive_title(messages: list[dict]) -> str:
+    """Il titolo e' il primo messaggio **visibile** dell'utente.
+
+    ``hidden`` va saltato: i solleciti che l'harness accoda hanno ruolo
+    ``user``, e una conversazione ripresa da un sollecito prendeva per titolo
+    il testo del sollecito -- che parla all'agente, non descrive il lavoro.
+    """
     for msg in messages:
+        if msg.get("hidden"):
+            continue
         if msg.get("role") == "user" and msg.get("content"):
             title = " ".join(str(msg["content"]).split())
             return (title[:44] + "...") if len(title) > 44 else title
@@ -241,6 +261,12 @@ def save_session(state: Any, *, force: bool = False, riscrivi: bool = False) -> 
         # nella cartella 'allegati/' del workspace.
         "attachments": list(state.get("attachments", [])),
         "workspace_dir": state.get("workspace_dir", os.getcwd()),
+        # Scritto e mai riletto, **di proposito**: dice con che modello e' stata
+        # fatta questa conversazione, e serve a chi apre il file per capire
+        # perche' un turno di due mesi fa e' andato come e' andato. Rimetterlo
+        # in ``state`` al caricamento sarebbe un'altra cosa -- cambierebbe il
+        # modello selezionato sotto le mani dell'utente ogni volta che apre una
+        # chat vecchia -- e non e' quello che questo campo vuole essere.
         "model_name": state.get("model_name", ""),
     }
     if not coda_ok:
@@ -255,6 +281,25 @@ def save_session(state: Any, *, force: bool = False, riscrivi: bool = False) -> 
     except OSError:
         pass  # il salvataggio non deve mai far crashare la UI
 
+
+# Un lucchetto per tutte e due le cache di questo modulo.
+#
+# I turni girano in thread di sfondo (``RUNNERS``) e le rotte di FastAPI
+# sincrone girano nel threadpool: due ricerche insieme, o una ricerca e un
+# ``elenca`` che pota le conversazioni cancellate, sono normali. Le singole
+# operazioni su un dict sono atomiche sotto il GIL, ma le **sequenze** no, e
+# qui ce ne sono due che rompono davvero:
+#
+#   * ``get`` seguito da ``move_to_end``: se nel frattempo un altro thread ha
+#     sfrattato quella voce, ``move_to_end`` alza ``KeyError`` -- e la ricerca
+#     dell'utente muore con un 500 su una cache, cioe' su un'ottimizzazione;
+#   * ``elenca`` che pota mentre una ricerca inserisce: la voce appena messa
+#     puo' sparire subito, e la volta dopo si rilegge il file. Innocuo, ma
+#     senza lucchetto e' indistinguibile dal caso sopra.
+#
+# Il lavoro pesante -- aprire e parsare i file -- resta **fuori** dal lucchetto:
+# dentro ci stanno solo le poche righe di contabilita' della cache.
+_cache_lock = threading.Lock()
 
 _index_cache: dict[str, tuple[float, int, dict[str, Any]]] = {}
 
@@ -272,7 +317,8 @@ def _session_summary(path: Path) -> dict[str, Any] | None:
         stat = path.stat()
     except OSError:
         return None
-    cached = _index_cache.get(path.name)
+    with _cache_lock:
+        cached = _index_cache.get(path.name)
     if cached and cached[0] == stat.st_mtime and cached[1] == stat.st_size:
         return cached[2]
     try:
@@ -304,7 +350,8 @@ def _session_summary(path: Path) -> dict[str, Any] | None:
         # era gia' salvato e non veniva letto da nessuno.
         "workspace_dir": str(data.get("workspace_dir") or ""),
     }
-    _index_cache[path.name] = (stat.st_mtime, stat.st_size, summary)
+    with _cache_lock:
+        _index_cache[path.name] = (stat.st_mtime, stat.st_size, summary)
     return summary
 
 
@@ -350,9 +397,10 @@ def list_sessions(
         if fuori and casa in fuori:
             continue
         out.append(summary)
-    for stale in set(_index_cache) - live:      # conversazioni cancellate
-        _index_cache.pop(stale, None)
-        _search_cache.pop(stale, None)
+    with _cache_lock:
+        for stale in set(_index_cache) - live:  # conversazioni cancellate
+            _index_cache.pop(stale, None)
+            _search_cache.pop(stale, None)
     out.sort(key=lambda item: item.get("updated_at", ""), reverse=True)
     return out[:limit]
 
@@ -420,7 +468,15 @@ def _pezzi_cercabili(
 
 # Indice di ricerca, con la stessa chiave di validita' dell'indice della
 # sidebar: il contenuto di un file cambia solo quando lo riscriviamo noi.
-_search_cache: dict[str, tuple[float, int, dict[str, str]]] = {}
+#
+# Con un tetto, e non e' pignoleria: ogni voce tiene fino a 2 x MAX_INDEX_CHARS
+# (240 kB) di testo estratto, e la potatura in ``elenca`` toglie solo le
+# conversazioni **cancellate**. Su un archivio di cinquecento chat una ricerca
+# che le tocca tutte lasciava in memoria piu' di cento megabyte per il resto
+# della vita del processo. Il tetto e' a uso recente: chi cerca due volte di
+# fila sulla stessa chat la ritrova in cache, che e' il caso che conta.
+MAX_SEARCH_CACHE = 120
+_search_cache: OrderedDict[str, tuple[float, int, dict[str, str]]] = OrderedDict()
 
 
 def _cercabile(path: Path) -> dict[str, str] | None:
@@ -438,9 +494,11 @@ def _cercabile(path: Path) -> dict[str, str] | None:
         chiave = (stat.st_mtime + s2.st_mtime, stat.st_size + s2.st_size)
     except OSError:
         chiave = (stat.st_mtime, stat.st_size)
-    cached = _search_cache.get(path.name)
-    if cached and cached[0] == chiave[0] and cached[1] == chiave[1]:
-        return cached[2]
+    with _cache_lock:
+        cached = _search_cache.get(path.name)
+        if cached and cached[0] == chiave[0] and cached[1] == chiave[1]:
+            _search_cache.move_to_end(path.name)   # e' appena servita
+            return cached[2]
     try:
         with open(path, encoding="utf-8") as fh:
             data = json.load(fh)
@@ -466,7 +524,11 @@ def _cercabile(path: Path) -> dict[str, str] | None:
         except OSError:
             messaggi = []
     pezzi = _pezzi_cercabili(data, messaggi)
-    _search_cache[path.name] = (chiave[0], chiave[1], pezzi)
+    with _cache_lock:
+        _search_cache[path.name] = (chiave[0], chiave[1], pezzi)
+        _search_cache.move_to_end(path.name)
+        while len(_search_cache) > MAX_SEARCH_CACHE:
+            _search_cache.popitem(last=False)  # la meno usata di recente
     return pezzi
 
 

@@ -44,6 +44,15 @@ from typing import Any
 
 # Immagine di default: piccola, con Python e i coreutils. Chi ha bisogno di
 # altro (nodejs, compilatori) punta l'impostazione a un'immagine propria.
+#
+# Un tag e non un digest, di proposito -- ed e' la scelta opposta a quella
+# fatta per il binario di ttyd venti righe piu' giu', quindi vale la pena dire
+# perche'. Il digest darebbe build riproducibili: due ricostruzioni a un mese
+# di distanza danno la stessa immagine. Ma questa immagine e' il recinto in cui
+# gira l'agente, si ricostruisce di rado, e un digest fissato oggi vuol dire
+# restare su una Debian senza le patch di sicurezza dei mesi successivi finche'
+# qualcuno non si ricorda di aggiornarlo. Per ttyd non c'e' il dilemma: quello
+# e' un binario preso da internet e la verifica non costa niente in aggiornabilita'.
 DEFAULT_IMAGE = "python:3.12-slim"
 WORKDIR = "/work"
 LABEL = "local-agent-harness"
@@ -374,6 +383,20 @@ def ensure_container(
         # Nessun privilegio in piu' di quelli necessari a compilare ed eseguire.
         "--security-opt", "no-new-privileges",
         "--cap-drop", "ALL",
+        # Manca il ``--user``, e non e' una dimenticanza.
+        #
+        # Il container gira come root. Su Linux questo lascia di root i file
+        # che l'agente crea nel workspace montato -- fastidioso, e il motivo
+        # per cui la voce e' segnata nell'audit. Ma passare l'uid dell'host
+        # (``--user 1000:1000``) cambia il container in un modo che non si
+        # ripaga: quell'uid dentro l'immagine non ha una voce in /etc/passwd
+        # ne' una home scrivibile, e soprattutto ``pip install`` -- che
+        # l'agente usa davvero, dentro un turno -- fallisce con un errore di
+        # permessi su /usr/lib/python3. Si scambierebbe un fastidio sui
+        # permessi dei file con un tool che smette di funzionare a meta'
+        # lavoro. Farlo bene vuol dire home scrivibile, PIP_USER e un venv
+        # nell'immagine, e va provato su un host Linux vero: finche' non lo
+        # e' stato, root con ``--cap-drop ALL`` e' la scelta piu' onesta.
     ]
     if ports and network:
         lo, hi = ports
@@ -837,6 +860,12 @@ def kill_port_listener(
     di porta -- e va bene perche' l'ambito e' strettissimo: questo container
     serve un solo workspace e le porte pubblicate esistono solo per le
     anteprime. Fuori da quell'intervallo non si tocca niente.
+
+    Il perimetro e' il **container**, non la macchina: lo script gira dentro,
+    quindi "ogni processo la cui riga di comando contiene il numero" vuol dire
+    ogni processo di questo workspace. Il ``websockify`` di un'altra anteprima
+    che ci finisse dentro sarebbe di questo stesso workspace, ed e' proprio
+    quello che va raccolto.
     """
     if not ports or not (ports[0] <= int(port) <= ports[1]):
         return False
@@ -974,15 +1003,29 @@ RUN apt-get update \\
 
 # ttyd: se la distribuzione lo ha, si prende quello; altrimenti il binario
 # statico ufficiale. Non si da' per scontato ne' l'uno ne' l'altro.
+#
+# Il ripiego scarica un eseguibile da internet e lo rende eseguibile **dentro
+# l'immagine in cui gira l'agente**: e' il punto piu' delicato di tutto il
+# Dockerfile, e senza verifica ci si fida di chiunque stia in mezzo alla
+# connessione al momento della build. Gli SHA-256 qui sotto sono quelli dei
+# due artefatti della release 1.7.7, calcolati sui file veri il 31/08/2026.
+# Se cambia la versione vanno ricalcolati: la build fallisce rumorosamente,
+# che e' esattamente cio' che deve fare.
 RUN (apt-get update && apt-get install -y --no-install-recommends ttyd \\
      && rm -rf /var/lib/apt/lists/*) \\
  || ( arch="$(dpkg --print-architecture)" \\
-      && case "$arch" in amd64) f=ttyd.x86_64 ;; arm64) f=ttyd.aarch64 ;; \\
-         *) echo "architettura $arch senza binario ttyd" >&2; exit 1 ;; esac \\
+      && case "$arch" in \\
+           amd64) f=ttyd.x86_64; \\
+                  sha=8a217c968aba172e0dbf3f34447218dc015bc4d5e59bf51db2f2cd12b7be4f55 ;; \\
+           arm64) f=ttyd.aarch64; \\
+                  sha=b38acadd89d1d396a0f5649aa52c539edbad07f4bc7348b27b4f4b7219dd4165 ;; \\
+           *) echo "architettura $arch senza binario ttyd" >&2; exit 1 ;; esac \\
       && apt-get update && apt-get install -y --no-install-recommends wget \\
-      && wget -qO /usr/local/bin/ttyd \\
+      && wget -qO /tmp/ttyd \\
          "https://github.com/tsl0922/ttyd/releases/download/1.7.7/$f" \\
-      && chmod +x /usr/local/bin/ttyd \\
+      && echo "$sha  /tmp/ttyd" | sha256sum -c - \\
+      && install -m 0755 /tmp/ttyd /usr/local/bin/ttyd \\
+      && rm -f /tmp/ttyd \\
       && rm -rf /var/lib/apt/lists/* )
 
 # Verifica, non dichiarazione: se una di queste tre cose non c'e', a fallire e'
@@ -999,16 +1042,81 @@ WORKDIR /work
 """
 
 
+# Il contesto di build e' **tutto il workspace** (``docker build ... <ws>``), e
+# il Dockerfile ne copia tre file. Tutto il resto viene impacchettato e spedito
+# al demone per essere buttato: su un progetto con ``node_modules`` o ``.venv``
+# sono gigabyte, e la barra resta ferma su "invio del contesto" per minuti prima
+# che la build cominci davvero.
+#
+# Il nome non e' ``.dockerignore`` di proposito. Docker cerca prima
+# ``<nome-del-dockerfile>.dockerignore`` e solo dopo ``.dockerignore`` del
+# contesto: cosi' questo file vale per **questa** build e non tocca i
+# ``docker build`` che l'utente fa per conto suo nella stessa cartella --
+# scriverne uno chiamato ``.dockerignore`` sarebbe entrare nel suo progetto.
+# Sulle versioni che non conoscono quel nome il file viene semplicemente
+# ignorato: si torna al comportamento di prima, non a una build rotta.
+#
+# Si escludono cartelle, non ``*``: chi personalizza il Dockerfile -- ed e'
+# previsto, ``write_dockerfile`` non lo sovrascrive mai -- aggiunge le sue COPY
+# e deve trovarcele. Queste cartelle in un contesto di build non servono a
+# nessuno, neanche a lui.
+SANDBOX_DOCKERIGNORE = f"{SANDBOX_DOCKERFILE}.dockerignore"
+
+DOCKERIGNORE_TEMPLATE = """\
+# Cosa NON spedire al demone Docker quando si costruisce l'immagine della
+# sandbox. Vale solo per Dockerfile.sandbox: i tuoi build non lo leggono.
+.git/
+.hg/
+.svn/
+node_modules/
+.venv/
+venv/
+env/
+__pycache__/
+*.pyc
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.tox/
+.cache/
+dist/
+build/
+target/
+.next/
+.nuxt/
+.gradle/
+.idea/
+.vscode/
+"""
+
+
 def dockerfile_path(workspace: str | Path) -> Path:
     return Path(workspace).resolve() / SANDBOX_DOCKERFILE
+
+
+def dockerignore_path(workspace: str | Path) -> Path:
+    return Path(workspace).resolve() / SANDBOX_DOCKERIGNORE
 
 
 def has_dockerfile(workspace: str | Path) -> bool:
     return dockerfile_path(workspace).is_file()
 
 
+def scrivi_dockerignore(workspace: str | Path, *, overwrite: bool = False) -> Path:
+    """Mette la lista delle esclusioni accanto al Dockerfile, se non c'e' gia'."""
+    path = dockerignore_path(workspace)
+    if overwrite or not path.exists():
+        path.write_text(DOCKERIGNORE_TEMPLATE, encoding="utf-8")
+    return path
+
+
 def write_dockerfile(workspace: str | Path, *, overwrite: bool = False) -> Path:
-    """Scrive il Dockerfile di partenza nel workspace, se non c'e' gia'."""
+    """Scrive il Dockerfile di partenza nel workspace, se non c'e' gia'.
+
+    Insieme al suo ``.dockerignore``: sono una cosa sola, e un Dockerfile senza
+    la sua lista di esclusioni e' proprio la build che impiega minuti a partire.
+    """
+    scrivi_dockerignore(workspace, overwrite=overwrite)
     path = dockerfile_path(workspace)
     if path.exists() and not overwrite:
         return path
@@ -1047,6 +1155,12 @@ def build_image(workspace: str | Path) -> tuple[str, str]:
             "costruire l'immagine."
         )
     tag = image_tag(workspace_path)
+    # Anche qui, e non solo in ``write_dockerfile``: un workspace preparato da
+    # una versione precedente dell'harness ha il Dockerfile ma non le
+    # esclusioni, e ``build_image`` non passa da li' -- si ferma prima, perche'
+    # il Dockerfile c'e' gia'. E' il caso in cui la build lenta rimarrebbe
+    # lenta per sempre.
+    scrivi_dockerignore(workspace_path)
     proc = _run_docker(
         ["build", "-f", str(dockerfile_path(workspace_path)), "-t", tag, str(workspace_path)],
         timeout=900,        # la prima build scarica e compila: puo' essere lunga

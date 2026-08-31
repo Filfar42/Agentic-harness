@@ -68,6 +68,14 @@ class _Stato:
     radice: Path | None = None
     porta: int = 0
     server: uvicorn.Server | None = None
+    # Il thread che lo fa girare. Serve a una domanda sola, che ``server`` da
+    # solo non sa rispondere: e' ancora vivo? ``should_exit`` dice se qualcuno
+    # gli ha chiesto di fermarsi, non se e' morto -- un'eccezione dentro
+    # ``server.run`` lascia il flag a False e ``ensure_running`` continuava a
+    # tornare l'origine di un server che non risponde piu'. L'anteprima si
+    # apriva su un indirizzo morto, e non c'era modo di farla ripartire senza
+    # riavviare l'harness.
+    filo: threading.Thread | None = None
     lucchetto: threading.Lock = field(default_factory=threading.Lock)
 
 
@@ -128,7 +136,13 @@ def ensure_running(base_port: int = 8124) -> str | None:
     if base_port <= 0:
         return None
     with _STATO.lucchetto:
-        if _STATO.server is not None and not _STATO.server.should_exit:
+        vivo = (
+            _STATO.server is not None
+            and not _STATO.server.should_exit
+            and _STATO.filo is not None
+            and _STATO.filo.is_alive()
+        )
+        if vivo:
             return origin()
         sock = _apri_socket(int(base_port))
         if sock is None:
@@ -147,9 +161,10 @@ def ensure_running(base_port: int = 8124) -> str | None:
             except (KeyboardInterrupt, SystemExit):
                 pass
 
-        threading.Thread(
+        _STATO.filo = threading.Thread(
             target=gira, daemon=True, name="anteprima-statica"
-        ).start()
+        )
+        _STATO.filo.start()
         return origin()
 
 
@@ -202,6 +217,16 @@ async def servi(request: Request) -> Response:
 
 # Nessun CORS, di proposito: da qualunque altra origine (l'harness compreso)
 # questa roba si puo' chiedere ma non leggere.
+#
+# E nessuna ``Content-Security-Policy``, che e' una scelta e non una
+# dimenticanza. Qui si servono pagine **scritte dal modello**, e il loro
+# mestiere e' funzionare: script inline, fogli di stile, librerie da un CDN.
+# Una CSP stretta le romperebbe tutte -- l'anteprima resterebbe bianca e non
+# direbbe perche' -- e una CSP larga abbastanza da lasciarle funzionare
+# (``default-src *``) non vieta niente: sarebbe una riga che sembra una
+# difesa. Cio' che protegge davvero e' gia' qui e non e' un'intestazione:
+# origine separata, nessun cookie, nessun CORS, ``nosniff``, e la radice
+# confinata da ``resolve_path``. Su questa origine non c'e' niente da rubare.
 app = Starlette(
     routes=[
         Route("/", servi, methods=["GET", "HEAD"]),

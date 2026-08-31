@@ -137,7 +137,13 @@ def pota(base: Path, max_mb: int = MAX_MB_DEFAULT) -> int:
         return 0
     tetto = int(max_mb) * 1024 * 1024
     try:
-        files = [(p.stat().st_mtime, p.stat().st_size, p) for p in cart.glob("*.txt")]
+        # Una ``stat`` per file, non due: la comprehension la chiamava una volta
+        # per il tempo e una per la dimensione, e su un deposito pieno sono il
+        # doppio delle syscall per la stessa risposta.
+        files = []
+        for p in cart.glob("*.txt"):
+            st = p.stat()
+            files.append((st.st_mtime, st.st_size, p))
     except OSError:
         return 0
     totale = sum(size for _, size, _ in files)

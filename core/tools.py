@@ -60,7 +60,13 @@ BINARY_SUFFIXES = {
 # rimozione ricorsiva o forzata viene rifiutata, perche' li' un percorso
 # relativo puo' puntare ovunque.
 DANGEROUS_PATTERNS = (
-    re.compile(r"\brm\s+(-[a-zA-Z]*\s+)*-{0,2}[a-zA-Z]*[rf]", re.I),
+    # Il ``-`` davanti al gruppo che contiene ``r``/``f`` e' obbligatorio: senza,
+    # ``[a-zA-Z]*[rf]`` combaciava con il **nome del file**, e ``rm file.txt``
+    # o ``rm requirements.txt`` chiedevano conferma come un ``rm -rf /``.
+    # Verificato su tredici casi. Una guardia che scatta sulle cancellazioni
+    # ordinarie insegna a premere "sì" senza leggere, che e' il modo in cui una
+    # conferma smette di proteggere.
+    re.compile(r"\brm\s+(?:-[a-zA-Z-]+\s+)*-(?:[a-zA-Z]*[rf]|-(?:recursive|force))", re.I),
     re.compile(r"\bdel\s+/[sqf]", re.I),
     re.compile(r"\bformat\s+[a-z]:", re.I),
     re.compile(r"\bmkfs\b", re.I),
@@ -233,7 +239,8 @@ class ToolContext:
     # non nel ciclo agentico, ma per una ragione in piu': e' cio' che deve
     # restare quando la cronologia viene compattata.
     notes: Notes = field(default_factory=Notes)
-    on_memories_changed: Callable[[list[dict[str, str]]], None] | None = None
+    # Torna False se il salvataggio e' fallito: vedi ``memories_changed``.
+    on_memories_changed: Callable[[list[dict[str, str]]], bool | None] | None = None
     on_plan_changed: Callable[[Plan], None] | None = None
     on_notes_changed: Callable[[Notes], None] | None = None
     # Come si esegue una delega. Lo inietta il ciclo agentico, che ha in mano
@@ -370,9 +377,16 @@ class ToolContext:
             self.touched_files.add(rel)
         return rel
 
-    def memories_changed(self) -> None:
-        if self.on_memories_changed:
-            self.on_memories_changed(self.memories)
+    def memories_changed(self) -> bool:
+        """True se il cambiamento e' arrivato dove doveva.
+
+        Il gancio puo' non esserci (sotto-turni, test) e allora non c'e' niente
+        da salvare: e' un successo. Se c'e' e torna ``False``, il salvataggio e'
+        fallito e chi ha chiamato deve dirlo invece di rispondere "ok".
+        """
+        if not self.on_memories_changed:
+            return True
+        return self.on_memories_changed(self.memories) is not False
 
     def plan_changed(self) -> None:
         if self.on_plan_changed:
@@ -874,7 +888,12 @@ def resolve_path(workspace: str | Path, target: str) -> Path:
     else:
         resolved = (base / candidate).resolve()
 
-    if resolved != base and not resolved.is_relative_to(base):
+    # Un solo controllo: ``resolved != base`` era morto, perche'
+    # ``base.is_relative_to(base)`` e' gia' vero e la seconda clausola copre da
+    # sola anche il caso della radice. Due condizioni per una domanda sola su un
+    # controllo di sicurezza sono peggio di una: chi legge si chiede quale delle
+    # due sta facendo il lavoro.
+    if not resolved.is_relative_to(base):
         raise WorkspaceError(
             f"Accesso negato: '{target}' e' fuori dal workspace ({base}). "
             "Usa esclusivamente percorsi relativi alla radice del workspace."
@@ -1088,7 +1107,12 @@ def tool_read_file(
         )
     ctx.read_cache[rel_key] = (digest, ctx.step)
 
-    total_lines = text.count("\n") + 1
+    # ``splitlines`` e non ``count("\n") + 1``: quest'ultimo conta una riga in
+    # piu' per ogni file che finisce con un a capo -- cioe' per quasi tutti. E'
+    # il numero su cui il modello calcola ``start_line``/``end_line`` per la
+    # lettura successiva, quindi sbagliarlo di uno significa chiedere una riga
+    # che non esiste e ricevere un intervallo vuoto.
+    total_lines = len(text.splitlines())
     sliced = False
     if start_line or end_line:
         all_lines = text.splitlines()
@@ -1278,8 +1302,13 @@ def tool_edit_file(
             "action": "modificato",
             "filepath": rel,
             "replacements": quante,
-            "removed_lines": (old_string.count("\n") + 1) * quante,
-            "added_lines": ((new_string or "").count("\n") + 1) * quante,
+            # Righe del frammento cercato e di quello messo al suo posto,
+            # moltiplicate per le sostituzioni: non e' un diff, e i nomi
+            # ``removed_lines``/``added_lines`` lo facevano credere. Chi legge
+            # e' il modello, e su un nome cosi' avrebbe smesso di guardare il
+            # file per fidarsi del conteggio.
+            "righe_del_vecchio": len(old_string.splitlines()) * quante,
+            "righe_del_nuovo": len((new_string or "").splitlines()) * quante,
         }
     )
 
@@ -1345,6 +1374,9 @@ def tool_search_files(
     # buttare via il risultato. Con il deposito acceso invece il walk prosegue,
     # e quello che oggi il tetto fa sparire finisce su disco.
     oltre: list[str] = []
+    # Corrispondenze viste oltre il tetto, depositate o no: e' cio' che
+    # distingue "completo" da "troncato".
+    scartate = 0
     per_file: dict[str, int] = {}
     files_scanned = 0
     troncato = False
@@ -1381,11 +1413,21 @@ def tool_search_files(
                         voce = f"{rel}:{i + 1}: {line.rstrip()[:200]}"
                     if len(matches) < tetto:
                         matches.append(voce)
-                    elif continua and len(oltre) < MAX_OLTRE_TETTO:
-                        oltre.append(voce)
+                    else:
+                        # Vista e non entrata: e' questa che dice se il
+                        # risultato e' davvero incompleto.
+                        scartate += 1
+                        if continua and len(oltre) < MAX_OLTRE_TETTO:
+                            oltre.append(voce)
                 if modo == "files":
                     break  # basta sapere che il file contiene qualcosa
-            if modo == "content" and len(matches) >= tetto:
+            # "Troncato" vuol dire che qualcosa e' rimasto fuori, non che il
+            # tetto e' stato raggiunto: con **esattamente** ``tetto``
+            # corrispondenze e niente oltre il risultato e' completo, e
+            # dichiararlo troncato mandava il modello a cercare un resto che
+            # non c'era. Il conto delle scartate distingue i due casi anche col
+            # deposito spento, dove ``oltre`` resta vuota per costruzione.
+            if modo == "content" and scartate:
                 troncato = True
                 # Senza deposito ci si ferma qui, come si e' sempre fatto. Con
                 # il deposito si prosegue, ma non all'infinito: oltre il tetto
@@ -1709,12 +1751,20 @@ def tool_manage_memory(ctx: ToolContext, action: str, content: str = "") -> str:
     if action == "add":
         ok, message = add_memory(ctx.memories, content)
         if ok:
-            ctx.memories_changed()
+            if not ctx.memories_changed():
+                return _err(
+                    "La memoria non e' stata scritta su disco.",
+                    hint="Vale per questa conversazione, ma sparisce alla chiusura.",
+                )
             return _ok({"status": "ok", "saved": message})
         return _ok({"status": "skipped", "reason": message})
     if action == "remove":
         if remove_memory(ctx.memories, content):
-            ctx.memories_changed()
+            if not ctx.memories_changed():
+                return _err(
+                    "La memoria non e' stata tolta dal disco.",
+                    hint="Alla riapertura sara' di nuovo li'.",
+                )
             return _ok({"status": "ok", "removed": content})
         return _err("Memoria non trovata.", hint="Chiama manage_memory con action='list'.")
     if action == "list":
@@ -1743,13 +1793,22 @@ PREVIEW_TEXTUAL = {
 _SERVER_PATTERNS = (
     "http.server", "uvicorn", "gunicorn", "flask run", "fastapi dev",
     "npm run dev", "npm start", "yarn dev", "pnpm dev", "vite", "next dev",
-    "streamlit run", "gradio", "serve ", "manage.py runserver", "rails s",
+    "streamlit run", "gradio", "manage.py runserver", "rails s",
 )
+
+
+# ``serve`` sta a parte: come sottostringa combacia con "observe", "preserve",
+# "conserve" -- e un comando che contiene una di quelle parole veniva scambiato
+# per un server e rifiutato da ``run_command``, che e' un no a un comando
+# legittimo e senza spiegazione. Qui vuole i confini di parola.
+_SERVER_PAROLE = re.compile(r"\b(serve|serving)\b", re.I)
 
 
 def looks_like_server(command: str) -> bool:
     lowered = (command or "").lower()
-    return any(p in lowered for p in _SERVER_PATTERNS)
+    if any(p in lowered for p in _SERVER_PATTERNS):
+        return True
+    return bool(_SERVER_PAROLE.search(lowered))
 
 
 def preview_kind(path: str) -> str:
@@ -3377,6 +3436,20 @@ TOOLS_SCHEMA: list[dict[str, Any]] = [
                             "radice (es. '/docs')."
                         ),
                     },
+                    # Era gia' in ``_ALLOWED_ARGS`` e gia' letto da
+                    # ``tool_preview``, ma non dichiarato qui: una manopola che
+                    # esisteva e che il modello non poteva girare. Con un
+                    # server lento a partire l'unica cosa che poteva fare era
+                    # riprovare -- cioe' spendere un altro passo per aspettare
+                    # gli stessi dodici secondi.
+                    "wait_s": {
+                        "type": "integer",
+                        "description": (
+                            "Secondi di attesa perche' la porta risponda "
+                            "(default 12, massimo 60). Alzalo solo se sai che "
+                            "quel server ci mette di piu' a partire."
+                        ),
+                    },
                 },
                 "required": ["action"],
             },
@@ -3766,7 +3839,6 @@ LEAN_TOOL_DESCRIPTIONS: dict[str, str] = {
         "e i dettagli spariscono: le note restano, e sono l'unica cosa scritta "
         "da te che sopravvive parola per parola."
     ),
-
     PREVIEW_TOOL: (
         "Mostra qualcosa all'utente. action='file' con path per un documento "
         "del workspace: se e' una pagina HTML l'harness ne serve tutta la "

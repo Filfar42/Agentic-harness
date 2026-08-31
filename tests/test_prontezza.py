@@ -59,6 +59,12 @@ def client(fake_ollama, tmp_path, monkeypatch):
             "image_autobuild": False,
         }
     )
+    # I controlli costosi restano in cache cinque secondi, e in produzione la
+    # fotografia si butta da sola: ogni cosa che cambia il verdetto passa da
+    # una rotta che chiama ``dimentica_prontezza``. Qui no -- i test cambiano
+    # ``STATE.settings`` e ``sandbox_mod`` a mano, alle spalle delle rotte --
+    # e senza questa riga il secondo test leggerebbe il verdetto del primo.
+    server_main.dimentica_prontezza()
     with TestClient(server_main.app) as c:
         c.server = server_main
         c.ws = ws
@@ -412,3 +418,78 @@ def test_cambiare_cartella_non_chiama_docker_sul_filo_della_richiesta(
 
     client.post("/api/workspace", json={"path": str(nuova)})
     assert visto == [], f"chiamate a docker sul filo della richiesta: {visto}"
+
+
+# ---------------------------------------------------------------------------
+# La fotografia dei controlli costosi
+# ---------------------------------------------------------------------------
+
+
+def _conta_sonde(monkeypatch) -> dict:
+    """Conta le ``status()`` vere che partono verso il server dei modelli."""
+    from core import backend as backend_mod
+
+    conteggio = {"n": 0}
+    vero = backend_mod.OllamaBackend.status
+
+    def _contata(self):
+        conteggio["n"] += 1
+        return vero(self)
+
+    monkeypatch.setattr(backend_mod.OllamaBackend, "status", _contata)
+    return conteggio
+
+
+def test_aprire_due_chat_di_fila_non_risonda_l_ambiente(client, monkeypatch):
+    """La rotta parte all'apertura di **ogni** chat vuota.
+
+    Con il server dei modelli spento ``status()`` costa quattro secondi di
+    timeout: pagarli due volte per due chat aperte di fila e' latenza pura,
+    perche' in quei due secondi non e' cambiato niente.
+    """
+    conteggio = _conta_sonde(monkeypatch)
+    client.get("/api/readiness")
+    client.get("/api/readiness")
+    client.get("/api/readiness")
+    assert conteggio["n"] == 1, f"{conteggio['n']} sonde per tre richieste ravvicinate"
+
+
+def test_cambiare_endpoint_rifa_i_controlli_subito(client, monkeypatch):
+    """Cinque secondi di cache non devono mettersi fra un rimedio e la verifica.
+
+    Chi cambia endpoint guarda questa schermata *per sapere se adesso va*: una
+    risposta vecchia di due secondi qui e' peggio di una lenta, perche' dice il
+    contrario di quello che e' appena successo.
+    """
+    conteggio = _conta_sonde(monkeypatch)
+    assert check(client.get("/api/readiness").json(), "ollama")["state"] == "ok"
+    client.server.STATE.settings["api_base"] = "http://127.0.0.1:1"
+    client.server.STATE.forget_backend()
+    dati = client.get("/api/readiness").json()
+    assert conteggio["n"] == 2, "il cambio di endpoint non ha buttato la fotografia"
+    assert check(dati, "ollama")["state"] == "error"
+
+
+def test_con_un_lavoro_in_corso_la_cache_si_salta(client, monkeypatch):
+    """E' il momento in cui l'ambiente cambia sotto gli occhi di chi guarda:
+    il client richiede ogni 2,5 s proprio per vedere il cambiamento."""
+    conteggio = _conta_sonde(monkeypatch)
+    client.get("/api/readiness")
+    fermo = conteggio["n"]
+
+    lavoro = client.server.PREP.docker
+    monkeypatch.setattr(lavoro, "snapshot", lambda: {
+        "name": "docker", "state": "running", "detail": "", "log": "", "started_at": 0.0,
+    })
+    client.get("/api/readiness")
+    client.get("/api/readiness")
+    assert conteggio["n"] == fermo + 2, "con un lavoro in corso la risposta era in cache"
+
+
+def test_i_lavori_non_finiscono_mai_in_cache(client):
+    """``jobs`` e' la barra di avanzamento: si guarda proprio mentre gli altri
+    controlli sono fermi sulla fotografia."""
+    client.get("/api/readiness")
+    client.server.PREP.docker.detail = "un dettaglio nuovo"
+    dati = client.get("/api/readiness").json()
+    assert dati["jobs"]["docker"]["detail"] == "un dettaglio nuovo"

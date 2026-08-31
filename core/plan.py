@@ -199,9 +199,17 @@ class Plan:
         return bool(self.steps) and not self.open_steps
 
     def counts(self) -> dict[str, int]:
+        """Quanti punti per stato. Uno stato ignoto si conta come ``todo``.
+
+        ``from_list`` normalizza gia' gli stati letti da disco, ma un ``Plan``
+        costruito a mano -- nei test, o da un pezzo di codice nuovo -- puo'
+        portarsi dentro qualsiasi stringa, e ``out[step.status] += 1`` alzava
+        ``KeyError`` sul **pannello**: il piano spariva dall'interfaccia per un
+        punto scritto storto.
+        """
         out = dict.fromkeys(STATUSES, 0)
         for step in self.steps:
-            out[step.status] += 1
+            out[step.status if step.status in out else TODO] += 1
         return out
 
     # --- mutazioni ---------------------------------------------------------
@@ -389,13 +397,20 @@ def render_block(plan: Plan, *, steps_left: int | None = None) -> str:
     # della conversazione -- il difetto che il piano esisteva per togliere.
     chiusi = plan.closed_steps
     nascosti = max(0, len(chiusi) - CLOSED_IN_BLOCK)
-    mostrati = set(map(id, chiusi[nascosti:]))
+    # L'identita' e' l'``id`` del punto, non ``id()`` dell'oggetto Python.
+    # Funzionavano tutti e due, perche' ``closed_steps`` restituisce gli stessi
+    # oggetti che stanno in ``plan.steps``; ma il giorno in cui uno dei due
+    # elenchi passa da una copia -- una ``from_list`` in mezzo, un ``replace``
+    # -- il confronto per ``id()`` smette di combaciare in silenzio e il blocco
+    # perde tutti i punti chiusi. L'``id`` del punto e' l'identita' che il
+    # modello usa gia' per parlarne.
+    mostrati = {s.id for s in chiusi[nascosti:]}
 
     righe = []
     if nascosti:
         righe.append(f"({nascosti} punti chiusi prima di questi, non ripeterli)")
     for step in plan.steps:
-        if step.status in (DONE, SKIPPED) and id(step) not in mostrati:
+        if step.status in (DONE, SKIPPED) and step.id not in mostrati:
             continue
         nota = f"  -> {step.note}" if step.note else ""
         righe.append(f"{step.id}. [{_LABELS[step.status]}] {step.text}{nota}")

@@ -85,6 +85,13 @@ class _Handler(BaseHTTPRequestHandler):
     drop_tool_calls_when_streaming = False
     # Ritardo per chunk: serve ai test che devono agire *mentre* il turno gira.
     delay = 0.0
+    # Ritardo applicato **una volta sola**, prima del primo chunk del primo
+    # passo del turno. Modella la cosa che serve davvero a chi prova le corse
+    # ("il turno e' ancora in volo mentre arriva la richiesta successiva")
+    # senza rallentare tutto lo stream: con ``delay`` a 0,25 quei tre test
+    # costavano 1,85 s l'uno, perche' il copione di serie ha sette chunk e si
+    # dormiva dopo ognuno. Qui si dorme una volta.
+    ritardo_primo_passo = 0.0
 
     def log_message(self, *args):  # silenzia il logging su stderr
         pass
@@ -130,6 +137,8 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", "application/x-ndjson")
         self.end_headers()
+        if type(self).ritardo_primo_passo and idx == 0:
+            time.sleep(type(self).ritardo_primo_passo)
         for grezzo in chunks:
             chunk = json.loads(json.dumps(grezzo))  # copia: non mutare lo script
             chunk.setdefault("done", False)
@@ -143,14 +152,27 @@ class _Handler(BaseHTTPRequestHandler):
         self.wfile.flush()
 
 
+# Il copione di serie, messo da parte alla definizione. Sedici test di questo
+# file e altri sei file lo sostituiscono con il loro, e ognuno lo rimetteva a
+# posto da se' -- ``global SCRIPT``, ``original = SCRIPT``, ``try/finally``.
+# Il ripristino sta invece nella fixture qui sotto: e' l'unica cosa che tutti
+# quei test chiedono comunque, e cosi' non c'e' piu' niente da ricordarsi.
+# ``SCRIPT`` viene letto dal thread del server finto, e un copione rimasto
+# addosso non rompe il test che l'ha lasciato: rompe il primo che arriva dopo.
+_SCRIPT_DI_SERIE = SCRIPT
+
+
 @pytest.fixture()
 def fake_ollama():
+    global SCRIPT  # vedi _SCRIPT_DI_SERIE
+    SCRIPT = _SCRIPT_DI_SERIE
     _Handler.calls = []
     _Handler.hits = []          # ogni percorso richiesto, non solo /api/chat
     _Handler.step = 0
     _Handler.version = "0.12.0"
     _Handler.drop_tool_calls_when_streaming = False
     _Handler.delay = 0.0
+    _Handler.ritardo_primo_passo = 0.0
     server = HTTPServer(("127.0.0.1", 0), _Handler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()

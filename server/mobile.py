@@ -318,7 +318,16 @@ def manifest() -> Response:
     scaduto o e' stato ripulito. Servito da qui e non come file statico
     perche' la chiave si sa solo a processo avviato.
     """
-    dati = json.loads((WEB_MOBILE_DIR / "manifest.webmanifest").read_text(encoding="utf-8"))
+    # Il file manca solo se l'installazione e' incompleta, e allora un 500 e'
+    # la risposta sbagliata: il telefono smette di installare l'app e non dice
+    # perche'. Un manifest minimo lo tiene installabile, e il nome che compare
+    # sotto l'icona dice gia' che qualcosa non e' a posto.
+    try:
+        dati = json.loads(
+            (WEB_MOBILE_DIR / "manifest.webmanifest").read_text(encoding="utf-8")
+        )
+    except (OSError, json.JSONDecodeError):
+        dati = {"name": "Harness (manifest mancante)", "display": "standalone"}
     dati["start_url"] = f"/?k={token()}"
     return Response(
         json.dumps(dati, ensure_ascii=False, indent=2),

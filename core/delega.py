@@ -144,8 +144,14 @@ def budget_stretti(budgets: Any) -> Any:
             MIN_TOOL_RESULT_CHARS,
             int(budgets.command_stdout_max_chars * FATTORE_BUDGET_FIGLIO),
         ),
-        command_stderr_max_chars=int(
-            budgets.command_stderr_max_chars * FATTORE_BUDGET_FIGLIO
+        # Il pavimento c'e' anche qui, come sugli altri quattro. Senza, con una
+        # finestra piccola lo stderr del figlio si riduceva a poche centinaia di
+        # caratteri -- ed e' proprio il campo che si legge quando qualcosa e'
+        # andato storto: il messaggio d'errore sta in fondo, ed e' la prima
+        # cosa che sparisce quando il budget si stringe.
+        command_stderr_max_chars=max(
+            MIN_TOOL_RESULT_CHARS // 2,
+            int(budgets.command_stderr_max_chars * FATTORE_BUDGET_FIGLIO),
         ),
         # Le liste gia' crescono piu' piano dei testi: qui basta la meta'.
         list_files_max_entries=max(30, int(budgets.list_files_max_entries // 2)),
@@ -322,6 +328,11 @@ def esegui(
         from .config import budgets_for
 
         budgets_padre = budgets_for(int(getattr(params_figlio, "num_ctx", 0) or 0))
+    # Calcolati **una volta**: erano tre chiamate identiche che producevano tre
+    # oggetti distinti, e il ciclo li confronta per decidere se qualcuno ha
+    # allargato la finestra sotto i piedi del figlio. Tre oggetti uguali ma non
+    # identici sono il modo piu' silenzioso di far sbagliare quel confronto.
+    budgets_figlio = budget_stretti(budgets_padre)
 
     # Contesto figlio: stesso workspace e stesse regole, ma senza il piano,
     # le note e la cronologia del padre. E' tutto il punto -- se ereditasse il
@@ -336,7 +347,7 @@ def esegui(
         read_cache={},
         new_symbols={},
         step=0,
-        budgets=budget_stretti(budgets_padre),
+        budgets=budgets_figlio,
         # Il perimetro di sola lettura, come **dato** e non come schema.
         # ``schema_ridotto`` dice al figlio quali tool esistono; questo gli
         # impedisce di usarne altri. Non e' ridondanza: le chiamate che il
@@ -354,6 +365,19 @@ def esegui(
 
     messaggi: list[dict[str, Any]] = [{"role": "user", "content": compito}]
     passi = 0
+    # Import locale, non di modulo: ``core.agent`` importa *questo* modulo, e
+    # in testa qui si chiuderebbe l'anello. Quando ``esegui`` gira, ``agent``
+    # e' gia' importato per intero, quindi costa una voce in ``sys.modules``.
+    #
+    # Ed e' un ``isinstance`` e non il confronto sul nome della classe che c'era
+    # prima (``type(evento).__name__ == "StepStarted"``): quel confronto
+    # sopravvive a un rinominamento di ``StepStarted`` senza dire niente --
+    # smette semplicemente di contare, e il referto dichiara zero passi. Il
+    # prezzo e' che i finti ``run_turn`` dei test devono cedere gli eventi veri
+    # invece di sosia con lo stesso nome: e' un guadagno, perche' erano proprio
+    # quei sosia a rendere invisibile il rinominamento.
+    from .agent import StepStarted
+
     # Quanto tempo gli resta, a ogni passo. E' la stessa leva che sul padre ha
     # gia' funzionato -- il blocco del piano dice quanti passi agentici
     # restano perche' senza il modello pianificava come se ne avesse infiniti
@@ -379,7 +403,7 @@ def esegui(
         # I budget stretti vanno passati qui, non solo nel ctx: run_turn
         # ricalcola budgets_for(num_ctx) e sovrascriverebbe tool_ctx.budgets
         # al primo passo, annullando la strettata.
-        budgets=budget_stretti(budgets_padre),
+        budgets=budgets_figlio,
         # Tutte le reti di sicurezza del padre qui sono rumore: non c'e' un
         # piano da pretendere, non c'e' niente da verificare, non c'e' nessuno
         # a cui chiedere, e la finestra del figlio non fa in tempo a riempirsi.
@@ -396,7 +420,7 @@ def esegui(
         # che nessuno ha visto.
         libreria_attiva=False,
     ):
-        if type(evento).__name__ == "StepStarted":
+        if isinstance(evento, StepStarted):
             passi += 1
 
     from .textutils import strip_think
@@ -431,7 +455,7 @@ def esegui(
             backend=backend,
             params=params_figlio,
             build_messages=build_messages,
-            budgets=budget_stretti(budgets_padre),
+            budgets=budgets_figlio,
         )
         chiuso_a_forza = bool(referto)
 

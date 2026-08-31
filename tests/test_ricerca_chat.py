@@ -284,3 +284,62 @@ def test_l_icona_della_scheda_e_il_robottino_senza_riquadro():
         larghezza, altezza = unpack(">II", testa[16:24])
         assert testa[25] == 6, "il PNG non ha il canale alfa"
         assert larghezza == altezza == int(nome.split("-")[1].split(".")[0])
+
+
+def test_la_cache_di_ricerca_regge_due_thread(tmp_path, monkeypatch):
+    """`get` e `move_to_end` sono due operazioni, non una.
+
+    Se fra le due un altro thread sfratta quella voce, `move_to_end` alza
+    `KeyError` e la ricerca dell'utente muore con un 500 -- su una cache, cioè
+    su un'ottimizzazione. E succede: i turni girano in thread di sfondo e le
+    rotte sincrone nel threadpool, quindi due ricerche insieme sono la
+    normalità.
+
+    La finestra è strettissima, quindi il test la allarga invece di sperare:
+    due sole conversazioni e una cache che ne tiene **una**, così ogni ricerca
+    sfratta quella dell'altro thread, più uno switch interval al minimo perché
+    il cambio di thread cada davvero lì in mezzo. Senza lucchetto fallisce; con
+    il lucchetto no.
+    """
+    import sys
+    import threading
+
+    from core import session as sess
+
+    cartella = tmp_path / "sessions"
+    cartella.mkdir()
+    monkeypatch.setattr(sess, "DATA_DIR", cartella)
+    monkeypatch.setattr(sess, "MAX_SEARCH_CACHE", 1)
+    sess._index_cache.clear()
+    sess._search_cache.clear()
+    for i in range(2):
+        (cartella / f"c{i}.json").write_text(
+            json.dumps({
+                "id": f"c{i}",
+                "title": f"Chat {i}",
+                "updated_at": f"2026-08-0{i + 1}T10:00:00",
+                "messages": [{"role": "user", "content": "parola comune"}],
+            }, ensure_ascii=False),
+            encoding="utf-8",
+        )
+
+    vecchio = sys.getswitchinterval()
+    sys.setswitchinterval(1e-6)
+    errori: list[BaseException] = []
+
+    def martella():
+        try:
+            for _ in range(400):
+                sess.search_sessions("comune", limit=10)
+        except BaseException as exc:   # è proprio ciò che si misura
+            errori.append(exc)
+
+    try:
+        fili = [threading.Thread(target=martella) for _ in range(6)]
+        for f in fili:
+            f.start()
+        for f in fili:
+            f.join()
+    finally:
+        sys.setswitchinterval(vecchio)
+    assert not errori, f"{type(errori[0]).__name__}: {errori[0]}"

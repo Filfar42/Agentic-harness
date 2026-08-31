@@ -25,7 +25,19 @@ TIMEOUT_SPEGNIMENTO = 5
 
 
 def ip_lan() -> str:
-    """L'indirizzo con cui il telefono ci vede, senza generare traffico."""
+    """L'indirizzo con cui il telefono ci vede, senza generare traffico.
+
+    Il trucco: si "connette" un socket UDP a un indirizzo irraggiungibile e si
+    chiede al kernel quale interfaccia avrebbe usato. Non parte nessun
+    pacchetto -- UDP non fa handshake -- e non serve nessuna libreria.
+
+    Su una macchina senza default route (nessuna rete, o solo il loopback) la
+    connect fallisce e si torna ``127.0.0.1``: e' il ripiego giusto, perche' e'
+    letteralmente l'unico indirizzo su cui si e' raggiungibili. Ma allora il
+    QR e la riga stampata dicono al telefono di connettersi a se stesso, e chi
+    guarda non capisce perche' non funziona: e' l'unico caso in cui questo
+    valore va letto come "non lo so", non come un indirizzo.
+    """
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         s.connect(("10.255.255.255", 1))  # non invia nulla: serve al routing

@@ -89,12 +89,35 @@ def load_settings(path: Path | None = None) -> dict[str, Any]:
             # Il tipo del default e' la specifica: un valore salvato di tipo
             # incompatibile (file modificato a mano) viene ignorato invece di
             # far esplodere int(...) o bool(...) da qualche parte in seguito.
-            default = DEFAULTS[key]
-            if default is None or isinstance(value, type(default)) or (
-                isinstance(default, float) and isinstance(value, int)
-            ):
+            if tipo_compatibile(value, DEFAULTS[key]):
                 settings[key] = value
     return settings
+
+
+def tipo_compatibile(valore: Any, atteso: Any) -> bool:
+    """Il valore ha un tipo che queste impostazioni accettano?
+
+    Sta qui perche' qui c'e' la specifica -- ``DEFAULTS`` -- e la regola veniva
+    applicata in **due** posti con due testi diversi: la rilettura all'avvio
+    qui sopra e il controllo all'ingresso di ``/api/settings``, che ne aveva
+    una copia piu' stretta. Il commento della copia diceva "stessa regola di
+    ``load_settings``" e non lo era piu': un ``true`` mandato su un campo
+    intero veniva rifiutato dalla rotta e accettato dalla rilettura, cioe' le
+    due porte della stessa casa avevano due serrature diverse.
+
+    ``bool`` prima di ``int`` perche' ``isinstance(True, int)`` e' vero, ed e'
+    il caso che ci si scorda; ``int`` passa per ``float`` perche' JSON non
+    distingue ``1`` da ``1.0``.
+    """
+    if atteso is None:
+        return True
+    if isinstance(atteso, bool):
+        return isinstance(valore, bool)
+    if isinstance(atteso, int):
+        return isinstance(valore, int) and not isinstance(valore, bool)
+    if isinstance(atteso, float):
+        return isinstance(valore, (int, float)) and not isinstance(valore, bool)
+    return isinstance(valore, type(atteso))
 
 
 def save_settings(settings: dict[str, Any], path: Path | None = None) -> bool:
@@ -142,7 +165,11 @@ def pick_available_model(settings: dict[str, Any], models: list[str]) -> str | N
     if current in models:
         return None
     # Match indulgente sul tag: "qwen3.5" deve riconoscersi in "qwen3.5:latest".
+    # Una sola scansione: ``any`` seguito da ``next`` percorreva l'elenco due
+    # volte per rispondere alla stessa domanda.
     stem = current.split(":")[0]
-    if stem and any(m.split(":")[0] == stem for m in models):
-        return next(m for m in models if m.split(":")[0] == stem)
+    if stem:
+        simile = next((m for m in models if m.split(":")[0] == stem), None)
+        if simile:
+            return simile
     return models[0]

@@ -2,7 +2,23 @@
 <html lang="it" data-theme="light">
 <head>
 <meta charset="utf-8">
+<!-- Nessuna Content-Security-Policy, ed e' una scelta.
+     Questa pagina gira su localhost, la serve lo stesso processo che serve la
+     sua API, e non ci sono terze parti: niente CDN, nessuno script esterno,
+     nessun font remoto. La superficie che una CSP chiuderebbe qui e' il
+     markup che il modello scrive -- e quello passa gia' da `esc()` e da
+     `markdown()`, che costruiscono testo escapato e non HTML del modello (il
+     test `test_il_markup_del_modello_resta_escapato` e' li' per quello).
+     L'unico contenuto davvero non nostro, le anteprime scritte dall'agente,
+     vive su un'ALTRA origine (server/previewhost.py, porta sua, niente
+     cookie, niente CORS): e' li' che sta il confine, e un'intestazione qui
+     non lo sposterebbe di un millimetro. -->
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<!-- I due schemi sono entrambi veri: il tema lo sceglie l'utente con
+     `data-theme` sull'<html>. Senza questa riga i controlli nativi -- cursore
+     dei campi di testo, barre di scorrimento -- restano nello schema chiaro
+     anche quando la pagina e' scura. -->
+<meta name="color-scheme" content="dark light">
 <title>Local Agent Harness</title>
 <link rel="stylesheet" href="/static/style.css">
 <!-- Icona della scheda: il robottino ritagliato, senza il riquadro di fondo.
@@ -154,7 +170,7 @@
           <div class="model-menu ws-menu" id="ws-menu" role="menu" hidden></div>
         </div>
       </div>
-      <span class="pill wait" id="pill-status"><span class="dot"></span>controllo…</span>
+      <span class="pill wait" id="pill-status" role="status" aria-live="polite"><span class="dot"></span>controllo…</span>
       <span class="pill acc" id="pill-ctx">ctx</span>
       <span class="pill" id="pill-backend">—</span>
       <!-- Sapere se l'agente e' nel recinto o no deve costare un'occhiata,
@@ -407,16 +423,24 @@
       <button class="btn" id="close-settings">Chiudi</button>
     </div>
     <div class="modal-body">
-      <div class="tabs">
-        <button class="tab active" data-tab="conn">Connessione</button>
-        <button class="tab" data-tab="gen">Generazione</button>
-        <button class="tab" data-tab="eff">Efficienza</button>
-        <button class="tab" data-tab="prompt">System prompt</button>
-        <button class="tab" data-tab="mem">Memoria</button>
+      <!-- role/aria-selected: cinque <button> con una classe CSS diversa non
+           dicono niente a uno screen reader su quale scheda è aperta. Il
+           gestore in app.js sposta `aria-selected` insieme alla classe. -->
+      <div class="tabs" role="tablist" aria-label="Sezioni delle impostazioni">
+        <button class="tab active" data-tab="conn" role="tab" id="tabbtn-conn"
+                aria-controls="tab-conn" aria-selected="true">Connessione</button>
+        <button class="tab" data-tab="gen" role="tab" id="tabbtn-gen"
+                aria-controls="tab-gen" aria-selected="false">Generazione</button>
+        <button class="tab" data-tab="eff" role="tab" id="tabbtn-eff"
+                aria-controls="tab-eff" aria-selected="false">Efficienza</button>
+        <button class="tab" data-tab="prompt" role="tab" id="tabbtn-prompt"
+                aria-controls="tab-prompt" aria-selected="false">System prompt</button>
+        <button class="tab" data-tab="mem" role="tab" id="tabbtn-mem"
+                aria-controls="tab-mem" aria-selected="false">Memoria</button>
       </div>
 
       <!-- connessione -->
-      <section class="tab-panel active" id="tab-conn">
+      <section class="tab-panel active" id="tab-conn" role="tabpanel" aria-labelledby="tabbtn-conn">
         <div class="grid2">
           <div>
             <div class="field">
@@ -518,7 +542,7 @@
       </section>
 
       <!-- generazione -->
-      <section class="tab-panel" id="tab-gen">
+      <section class="tab-panel" id="tab-gen" role="tabpanel" aria-labelledby="tabbtn-gen">
         <div class="grid2">
           <div>
             <div class="field">
@@ -604,7 +628,7 @@
       </section>
 
       <!-- efficienza -->
-      <section class="tab-panel" id="tab-eff">
+      <section class="tab-panel" id="tab-eff" role="tabpanel" aria-labelledby="tabbtn-eff">
         <p class="help" style="margin-bottom:14px">Ogni interruttore qui sotto scambia qualcosa: contesto contro round-trip, oppure token contro riuso del KV cache.</p>
         <div class="switch">
           <input type="checkbox" id="s-strip">
@@ -717,7 +741,7 @@
       </section>
 
       <!-- system prompt -->
-      <section class="tab-panel" id="tab-prompt">
+      <section class="tab-panel" id="tab-prompt" role="tabpanel" aria-labelledby="tabbtn-prompt">
         <div class="field">
           <label for="s-prompt">System prompt</label>
           <textarea id="s-prompt" rows="22" placeholder="Vuoto: lo sceglie l'harness in base al modello."></textarea>
@@ -736,7 +760,7 @@
       </section>
 
       <!-- memoria -->
-      <section class="tab-panel" id="tab-mem">
+      <section class="tab-panel" id="tab-mem" role="tabpanel" aria-labelledby="tabbtn-mem">
         <div class="field" style="display:flex;gap:8px;align-items:flex-end">
           <div style="flex:1">
             <label for="mem-input">Nuova memoria</label>

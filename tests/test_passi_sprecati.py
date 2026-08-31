@@ -271,3 +271,37 @@ def test_l_esito_del_tool_non_si_legge_per_sottostringa(tmp_path):
     assert not _esito_del_tool(json.dumps({"error": "file non trovato"}))
     # e su un risultato che non e' JSON si ricade sul vecchio criterio
     assert _esito_del_tool("testo semplice senza buste")
+
+
+def test_la_regola_del_raggruppamento_e_scritta_una_volta_sola():
+    """Diceva la stessa cosa due volte, e si pagava due volte.
+
+    ``SYSTEM_PROMPT_LEAN`` aveva una sezione "Chiedi tutto quello che ti serve
+    in una volta" che ripeteva per intero la regola gia' data sotto "Un passo
+    alla volta": stessa istruzione, due paragrafi, ~180 token a ogni singola
+    richiesta. Un prompt che ripete non insegna il doppio -- e questo e' il
+    prompt che si chiama *snello*.
+    """
+    from core.prompts import SYSTEM_PROMPT_LEAN
+
+    quante = SYSTEM_PROMPT_LEAN.count("vengono eseguite tutte")
+    assert quante == 1, f"la regola del raggruppamento compare {quante} volte"
+    assert "# Chiedi tutto quello che ti serve in una volta" not in SYSTEM_PROMPT_LEAN
+
+
+def test_il_prompt_non_racconta_al_modello_le_statistiche_su_di_se():
+    """"Su una sessione misurata di questo harness, 13 passi su 31...".
+
+    Sono token pagati a ogni richiesta per raccontare al modello un aneddoto
+    su sessioni che non ha vissuto: non e' un invariante che non puo' dedurre,
+    e non gli dice niente da fare che l'istruzione sopra non dica gia'. Le
+    misure servono a *noi*, per decidere cosa scrivere nel prompt: stanno nei
+    commenti del sorgente, dove non costano contesto.
+    """
+    import re
+
+    from core.prompts import SYSTEM_PROMPT, SYSTEM_PROMPT_LEAN
+
+    for nome, testo in (("esteso", SYSTEM_PROMPT), ("snello", SYSTEM_PROMPT_LEAN)):
+        aneddoti = re.findall(r"\d+ passi su \d+|sessione misurata|sessioni misurate", testo)
+        assert not aneddoti, f"prompt {nome}: statistiche di sessione nel testo -- {aneddoti}"

@@ -148,18 +148,41 @@ class TurnRunner:
             if sub in self._subscribers:
                 self._subscribers.remove(sub)
 
+    def _residuo(self, sub: queue.Queue[str | None]) -> Iterator[str]:
+        """Quello che e' rimasto in coda, senza aspettare un istante.
+
+        Serve nei due punti in cui si esce perche' il turno risulta finito. Il
+        turno puo' finire **fra** lo scatto dell'arretrato e quel controllo: i
+        frame emessi in quella finestra sono gia' in questa coda -- si e' gia'
+        abbonati -- e uscire senza guardarla li butta via. Fra loro c'e'
+        ``done``, cioe' l'unico frame che dice al client che il turno e'
+        chiuso: il telefono restava con la risposta a meta' e la rotella che
+        gira. Si vedeva come un test intermittente, che e' il modo in cui una
+        corsa si presenta prima di presentarsi come un difetto.
+        """
+        while True:
+            try:
+                frame = sub.get_nowait()
+            except queue.Empty:
+                return
+            if frame is None:
+                return
+            yield frame
+
     def stream(self) -> Iterator[str]:
         """Arretrato completo, poi il flusso dal vivo fino alla fine."""
         backlog, sub = self.subscribe()
         try:
             yield from backlog
             if self.finished.is_set():
+                yield from self._residuo(sub)
                 return
             while not SPEGNIMENTO.is_set():
                 try:
                     frame = sub.get(timeout=_KEEPALIVE_S)
                 except queue.Empty:
                     if self.finished.is_set() or SPEGNIMENTO.is_set():
+                        yield from self._residuo(sub)
                         return
                     # Commento SSE: tiene viva la connessione senza toccare la UI.
                     yield ": keepalive\n\n"

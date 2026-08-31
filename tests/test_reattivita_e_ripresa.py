@@ -7,6 +7,7 @@ ipotesi, sono cose che sono successe e che si vedevano guardando lo schermo.
 
 from __future__ import annotations
 
+import json
 import re
 import sys
 from pathlib import Path
@@ -393,3 +394,34 @@ def test_nessun_avviso_di_sintassi_all_avvio():
             "exec",
         )
     assert not [a for a in avvisi if issubclass(a.category, SyntaxWarning)]
+
+
+def test_un_turno_che_finisce_mentre_ci_si_attacca_manda_comunque_il_done():
+    """La corsa fra lo scatto dell'arretrato e il controllo su ``finished``.
+
+    ``stream()`` fotografa l'arretrato, si abbona, e **poi** guarda se il turno
+    è finito. Fra quelle due cose il worker può emettere altri frame e
+    chiudere: quei frame sono già nella coda dell'abbonato, ma l'uscita rapida
+    li buttava via. Fra loro c'è ``done``, cioè l'unico frame che dice al
+    client che il turno è chiuso -- il telefono restava con la risposta a metà
+    e la rotella che gira, per sempre.
+
+    Il generatore rende la corsa deterministica: fino al primo ``next`` non è
+    successo niente, e il primo ``next`` si ferma esattamente dentro la
+    finestra.
+    """
+    from server.runner import TurnRunner
+
+    runner = TurnRunner("sessione", snapshot=[])
+    runner.emit("data: {\"type\": \"start\"}\n\n")
+    flusso = runner.stream()
+    primo = next(flusso)          # qui l'arretrato è appena stato fotografato
+
+    # ...e adesso, dentro la finestra, il turno finisce.
+    runner.emit("data: {\"type\": \"assistant\"}\n\n")
+    runner.emit("data: {\"type\": \"done\"}\n\n")
+    runner.close()
+
+    ricevuti = [primo, *flusso]
+    tipi = [json.loads(f[6:])["type"] for f in ricevuti if f.startswith("data: ")]
+    assert tipi == ["start", "assistant", "done"], tipi

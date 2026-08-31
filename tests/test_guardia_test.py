@@ -12,6 +12,7 @@ from pathlib import Path
 
 import pytest
 
+from tests.test_agent_loop import fake_ollama  # noqa: F401
 from core.tools import (
     ToolContext,
     assertion_signatures,
@@ -245,3 +246,85 @@ def test_il_lint_copre_le_regole_che_hanno_gia_trovato_difetti():
     select = set(dati["tool"]["ruff"]["lint"]["select"])
     for regola in ("RUF", "BLE", "PLW"):
         assert regola in select, f"il linter non applica {regola}"
+
+
+def test_ogni_argomento_consentito_e_dichiarato_nello_schema():
+    """La lista dei permessi e lo schema devono dire la stessa cosa.
+
+    ``_ALLOWED_ARGS`` decide cosa ``dispatch`` lascia passare; lo schema decide
+    cosa il modello sa di poter mandare. Un argomento nella prima e non nel
+    secondo e' una manopola che esiste e che nessuno puo' girare -- era il caso
+    di ``preview(wait_s=...)``: il codice lo leggeva, il modello non poteva
+    saperlo, e con un server lento a partire l'unica mossa che gli restava era
+    spendere un altro passo per riaspettare gli stessi dodici secondi.
+
+    Al contrario, un argomento dichiarato e non consentito e' peggio: il
+    modello lo manda perche' glielo abbiamo promesso, e ``dispatch`` lo scarta
+    in silenzio.
+    """
+    from core.tools import _ALLOWED_ARGS, TOOLS_SCHEMA, WEB_SEARCH_TOOLS
+
+    schemi = {
+        s["function"]["name"]: set(s["function"]["parameters"].get("properties") or {})
+        for s in [*TOOLS_SCHEMA, *WEB_SEARCH_TOOLS]
+    }
+    disallineati = {}
+    for nome, consentiti in _ALLOWED_ARGS.items():
+        dichiarati = schemi.get(nome)
+        assert dichiarati is not None, f"{nome} non ha uno schema"
+        if consentiti != dichiarati:
+            disallineati[nome] = (
+                sorted(consentiti - dichiarati),
+                sorted(dichiarati - consentiti),
+            )
+    assert not disallineati, (
+        "argomenti disallineati (solo consentiti / solo dichiarati): " + repr(disallineati)
+    )
+
+
+# ---------------------------------------------------------------------------
+# Il finto modello non si porta dietro il copione del test precedente
+# ---------------------------------------------------------------------------
+#
+# I due test qui sotto vanno in coppia e **in quest'ordine**: il primo sporca
+# il globale di proposito e non lo rimette a posto, il secondo verifica di
+# averlo trovato pulito. È l'unico modo di provare l'isolamento: una fixture
+# che ripulisce non si può osservare da dentro il test che la usa.
+
+
+def test_uno_sporca_il_copione_e_non_lo_rimette_a_posto(fake_ollama):
+    import tests.test_agent_loop as fake
+
+    fake.SCRIPT = [[{"message": {"content": "copione sporco"}}]]
+    assert fake.SCRIPT != fake._SCRIPT_DI_SERIE
+
+
+def test_due_lo_trova_pulito(fake_ollama):
+    """Sedici test di ``test_agent_loop`` e sei altri file sostituiscono
+    ``SCRIPT``. Finché il ripristino era a carico di ognuno di loro, bastava
+    dimenticare un ``try/finally`` per rompere il **primo test successivo** --
+    che non ha niente a che vedere col colpevole ed è quello che si va a
+    guardare."""
+    import tests.test_agent_loop as fake
+
+    assert fake.SCRIPT == fake._SCRIPT_DI_SERIE
+
+
+def test_ogni_evento_del_ciclo_ha_un_nome_sul_filo():
+    """``AgentEvent`` e ``_EVENT_NAMES`` devono elencare le stesse classi.
+
+    Il primo è il contratto scritto, il secondo quello che viaggia davvero:
+    ``event_to_sse`` traduce un evento sconosciuto in ``"unknown"`` e lo manda
+    lo stesso, quindi un evento nuovo non rompe niente -- arriva al browser
+    come un tipo che nessun ramo gestisce, e sparisce. ``HistoryCompacted`` e
+    ``NotesUpdated`` mancavano dall'unione pur essendo emessi da sempre.
+    """
+    from core import agent as agent_mod
+    from server import main as server_main
+
+    dichiarati = set(agent_mod.AgentEvent.__args__)
+    tradotti = set(server_main._EVENT_NAMES)
+    assert dichiarati == tradotti, (
+        f"solo in AgentEvent: {sorted(c.__name__ for c in dichiarati - tradotti)}; "
+        f"solo in _EVENT_NAMES: {sorted(c.__name__ for c in tradotti - dichiarati)}"
+    )

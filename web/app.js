@@ -137,14 +137,25 @@ async function api(path, options = {}) {
 // codice inline, grassetto/corsivo, titoli, elenchi, link. L'HTML viene
 // sempre escapato prima, quindi il markup del modello non puo' iniettare nulla.
 
+// Il segnaposto usa un carattere di CONTROLLO (\u0000) e non `%%BLOCK<n>%%`.
+// Quello era testo semplice, e un documento che lo conteneva davvero se lo
+// vedeva sostituire col primo blocco di codice — mentre `%%BLOCK99%%` senza un
+// blocco 99 stampava la stringa `undefined`. Un NUL non può comparire in un
+// messaggio scritto a mano né in un file di testo, e sopravvive a `esc()`.
+const SEGNA = '\u0000';
+const RE_SEGNA = /\u0000(\d+)\u0000/g;
+
 function markdown(source) {
   const blocks = [];
-  let text = String(source ?? '').replace(/\r\n/g, '\n');
+  // Il NUL viene tolto dall'ingresso prima di tutto: se un giorno ne arrivasse
+  // uno davvero (un file binario incollato), non deve poter fingersi un
+  // segnaposto nostro.
+  let text = String(source ?? '').replace(/\u0000/g, '').replace(/\r\n/g, '\n');
 
   // 1. blocchi recintati, messi da parte per non essere toccati dal resto
   text = text.replace(/```([\w+-]*)\n?([\s\S]*?)```/g, (_, lang, code) => {
     blocks.push(`<pre><code data-lang="${esc(lang)}">${esc(code.replace(/\n$/, ''))}</code></pre>`);
-    return `%%BLOCK${blocks.length - 1}%%`;
+    return `${SEGNA}${blocks.length - 1}${SEGNA}`;
   });
 
   text = esc(text);
@@ -152,11 +163,14 @@ function markdown(source) {
   // 2. codice inline, anch'esso protetto dalle regole successive
   text = text.replace(/`([^`\n]+)`/g, (_, code) => {
     blocks.push(`<code>${code}</code>`);
-    return `%%BLOCK${blocks.length - 1}%%`;
+    return `${SEGNA}${blocks.length - 1}${SEGNA}`;
   });
 
   text = text
-    .replace(/^\s*#{1,6}\s+(.+)$/gm, '<h3>$1</h3>')
+    // Il livello si conserva: `##` non è `######`, e l'agente scrive report
+    // con una gerarchia vera. Il CSS li rende simili, ma appiattirli qui
+    // buttava l'informazione **prima** che il CSS potesse decidere.
+    .replace(/^\s*(#{1,6})\s+(.+)$/gm, (_, h, testo) => `<h${h.length}>${testo}</h${h.length}>`)
     .replace(/\*\*([^*\n]+)\*\*/g, '<strong>$1</strong>')
     .replace(/(^|[\s(])\*([^*\n]+)\*/g, '$1<em>$2</em>')
     .replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
@@ -182,12 +196,15 @@ function markdown(source) {
     if (list) { out.push(`</${list}>`); list = null; }
 
     if (!line.trim()) continue;
-    if (/^<h3>/.test(line) || /^%%BLOCK\d+%%$/.test(line.trim())) out.push(line);
+    if (/^<h[1-6]>/.test(line) || /^\u0000\d+\u0000$/.test(line.trim())) out.push(line);
     else out.push(`<p>${line}</p>`);
   }
   if (list) out.push(`</${list}>`);
 
-  return out.join('\n').replace(/%%BLOCK(\d+)%%/g, (_, i) => blocks[Number(i)]);
+  // `?? ''` invece di `undefined` stampato nella pagina: un indice fuori
+  // elenco non può più succedere con questo segnaposto, ma se succedesse è
+  // meglio un buco che la parola 'undefined' in mezzo a una risposta.
+  return out.join('\n').replace(RE_SEGNA, (_, i) => blocks[Number(i)] ?? '');
 }
 
 function prettyJson(raw) {
@@ -991,6 +1008,14 @@ function aspettaOSvegliati(ms, signal) {
 function nuovoTurnoDiStream() {
   const turn = makeTurn();
   const status = el('div', 'turn-status', '<span class="spinner"></span><span>Avvio\u2026</span>');
+  // aria-live sulla riga di stato, come il mobile ce l'ha sulla striscia di
+  // attività (web_mobile/index.html:54). È la stessa domanda — "sta ancora
+  // lavorando o si è piantato?" — e senza questo il desktop non annunciava
+  // niente: né i passi né la risposta in arrivo. Sta qui e non sul thread
+  // perché il thread è tutta la conversazione: con `aria-live` lì sopra, uno
+  // screen reader rileggerebbe la risposta ad ogni incremento dello stream.
+  status.setAttribute('role', 'status');
+  status.setAttribute('aria-live', 'polite');
   turn.wrap.appendChild(status);
   turn.statusNode = status;
   return turn;
@@ -2007,6 +2032,14 @@ async function openPreview(payload) {
     return;
   }
 
+  // Da qui in giù si costruisce markup attorno a file **scritti dal modello**
+  // (o depositati dall'utente in `raw/`). Il percorso passa da `esc`, il
+  // markdown da `markdown()`, e nessuno dei due lascia entrare HTML altrui.
+  // Ma la difesa vera non è qui: è che tutto questo lo serve un'ALTRA origine
+  // (server/previewhost.py, porta sua, niente cookie, niente CORS) e che
+  // l'iframe qui sopra è `sandbox`ato senza `allow-same-origin` quando la
+  // pagina non è nostra. Chi tocca questo blocco tenga presente che l'esca è
+  // già passata due volte da un confine prima di arrivarci.
   if (IMG_EXT.includes(ext)) {
     body.innerHTML = `<div class="preview-pad"><img class="preview-img" src="${esc(url)}" alt=""></div>`;
     return;
@@ -3464,6 +3497,17 @@ async function boot() {
   bindField('#s-api-base', 'api_base');
   bindField('#s-gpu-vram', 'gpu_total_vram_mb', Number);
   bindField('#s-api-key', 'api_key');
+  // La mascheratura del campo API key è in CSS (`-webkit-text-security`) per
+  // non far entrare in ballo il gestore password di Chrome — il commento in
+  // index.html spiega perché. Ma quella proprietà in Firefox non esiste: lì il
+  // campo *sembrava* mascherato e mostrava la chiave in chiaro, che è peggio di
+  // un campo dichiaratamente visibile, perché nessuno pensa di coprire lo
+  // schermo. Dove la proprietà manca si torna a `type="password"`, che maschera
+  // davvero: l'unico motivo per evitarlo è il gestore password di Chrome, e in
+  // Chrome questo ramo non gira.
+  if (!(window.CSS && CSS.supports && CSS.supports('-webkit-text-security', 'disc'))) {
+    $('#s-api-key').type = 'password';
+  }
   bindField('#s-transport', 'transport');
   bindField('#s-stream-tools', 'stream_tools');
 
@@ -3625,9 +3669,17 @@ function wireUi() {
 
   $$('.tab').forEach((tab) => {
     tab.onclick = () => {
-      $$('.tab').forEach((t) => t.classList.remove('active'));
+      $$('.tab').forEach((t) => {
+        t.classList.remove('active');
+        // `aria-selected` va spostato insieme alla classe: era la classe da
+        // sola a dire quale scheda è aperta, e una classe CSS uno screen
+        // reader non la legge. Con cinque bottoni tutti uguali, chi non vede
+        // lo schermo non aveva modo di sapere dove si trovava.
+        t.setAttribute('aria-selected', 'false');
+      });
       $$('.tab-panel').forEach((p) => p.classList.remove('active'));
       tab.classList.add('active');
+      tab.setAttribute('aria-selected', 'true');
       $('#tab-' + tab.dataset.tab).classList.add('active');
     };
   });
@@ -3800,10 +3852,27 @@ function wireUi() {
 
 wireUi();
 boot().catch((error) => {
-  document.body.innerHTML =
-    `<div style="padding:40px;font-family:system-ui">
-       <h2>Impossibile contattare il server</h2>
-       <p style="color:#888">${esc(error.message)}</p>
-       <p style="color:#888">Avvia l'harness con <code>python run.py</code>.</p>
+  // Un pannello SOPRA la pagina, non al posto della pagina.
+  // `document.body.innerHTML = ...` distruggeva tutto il DOM: dopo, nessun
+  // ascoltatore era più agganciato a niente e l'unico modo di riprovare era
+  // F5. E il caso tipico è il server che parte due secondi dopo il browser,
+  // cioè quello in cui basterebbe riprovare.
+  const pannello = document.createElement('div');
+  pannello.id = 'avvio-fallito';
+  pannello.style.cssText =
+    'position:fixed;inset:0;z-index:9999;display:flex;align-items:center;' +
+    'justify-content:center;background:rgba(16,20,24,.94);' +
+    'font-family:system-ui;text-align:center;padding:40px';
+  pannello.innerHTML =
+    `<div>
+       <h2 style="margin:0 0 8px">Impossibile contattare il server</h2>
+       <p style="color:#888;margin:0 0 4px">${esc(error.message)}</p>
+       <p style="color:#888;margin:0 0 18px">Avvia l'harness con <code>python run.py</code>.</p>
+       <button id="riprova-avvio" style="padding:8px 18px;border-radius:9px;cursor:pointer">Riprova</button>
      </div>`;
+  document.body.appendChild(pannello);
+  $('#riprova-avvio').onclick = () => {
+    pannello.remove();
+    boot().catch(() => document.body.appendChild(pannello));
+  };
 });

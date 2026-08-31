@@ -127,6 +127,15 @@ GENERIC_INSTRUCT = Profile(
 # mangerebbe. Attenzione al punto: in una regex `.` combacia con qualunque
 # carattere, quindi `qwen3.5` senza escape combacerebbe anche con `qwen3-5` e,
 # peggio, `qwen3\.5` non deve essere scritto come `qwen35`.
+#
+# Quattro voci e tutte Qwen, di proposito: sono i modelli su cui questo harness
+# e' stato **misurato**. Una regola per una famiglia che nessuno ha provato non
+# sarebbe una taratura, sarebbe un numero inventato con l'aria di saperne
+# qualcosa -- e i profili decidono max_tokens e temperatura, cioe' si vede
+# subito quando sono sbagliati. Tutto il resto (qwen3 generico compreso) cade
+# su ``GENERIC_*``, che sceglie fra budget largo e stretto guardando la
+# capability ``thinking`` dichiarata dal server: un indizio vero invece di una
+# congettura sul nome.
 _RULES: tuple[tuple[re.Pattern[str], Profile], ...] = (
     (re.compile(r"qwen-?3\.8", re.I), QWEN38_CODING),
     (re.compile(r"qwen-?3\.5", re.I), QWEN35_CODING),
@@ -251,6 +260,11 @@ def clamp_generation(max_tokens: int, num_ctx: int) -> int:
     ``num_predict`` e ``num_ctx`` condividono la stessa finestra: se il primo
     supera il secondo, il valore in eccesso e' pura fantasia e in piu' non
     lascia spazio al prompt. Meta' finestra e' il tetto ragionevole.
+
+    Vale per il **profilo consigliato**, cioe' per un valore proposto una volta
+    sola quando si sceglie un modello. Non e' il tetto per passo: quello lo
+    calcola ``agent.tetto_per_la_finestra`` sulla richiesta vera, che sa quanto
+    contesto e' gia' occupato -- qui la cronologia non si conosce ancora.
     """
     return max(512, min(int(max_tokens), int(num_ctx) // 2))
 

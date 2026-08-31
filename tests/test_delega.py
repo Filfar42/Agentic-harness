@@ -20,11 +20,12 @@ from core.tools import ToolContext
 # delega vive nel loop, non in questo modulo, e va provato dove vive.
 fake_ollama = fake.fake_ollama
 
-
-class StepStarted:
-    def __init__(self, step=0, total=0):
-        self.step = step
-        self.total = total
+# L'evento **vero**, non un sosia con lo stesso nome. ``esegui`` lo riconosce
+# con ``isinstance``: un doppione locale passava il confronto sul nome che
+# c'era prima, e quindi copriva esattamente il difetto che quel confronto ha
+# -- rinominare ``StepStarted`` in ``core/agent`` non avrebbe rotto niente
+# qui, mentre il conteggio dei passi nel referto sarebbe andato a zero.
+from core.agent import StepStarted
 
 
 def _fake_run_turn(*, referto=None, passi=1, legge=("core/config.py",), con_asistente=True):

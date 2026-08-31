@@ -59,7 +59,15 @@ def load_memories(path: Path | None = None) -> list[dict[str, str]]:
         return []
 
 
-def save_memories(memories: list[dict[str, str]], path: Path | None = None) -> None:
+def save_memories(memories: list[dict[str, str]], path: Path | None = None) -> bool:
+    """Scrive le memorie. Torna False se il disco ha detto di no.
+
+    Il ``pass`` sull'``OSError`` c'era per non far esplodere niente -- giusto --
+    ma nessuno sapeva piu' com'era andata: una memoria mai arrivata sul disco
+    e il modello che leggeva ``{"status": "ok"}``. La memoria a lungo termine e'
+    proprio la cosa di cui l'utente si accorge del guasto **la prossima
+    settimana**, quando non c'e' piu' modo di risalire a cosa e' successo.
+    """
     if path is None:
         path = MEMORY_FILE
     tmp = path.with_suffix(".json.tmp")
@@ -68,7 +76,8 @@ def save_memories(memories: list[dict[str, str]], path: Path | None = None) -> N
             json.dump(memories, fh, indent=2, ensure_ascii=False)
         os.replace(tmp, path)
     except OSError:
-        pass
+        return False
+    return True
 
 
 def add_memory(memories: list[dict[str, str]], text: str) -> tuple[bool, str]:
