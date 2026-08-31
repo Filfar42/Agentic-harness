@@ -16,16 +16,36 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0", "ruff>=0.6"]
+# quickjs non e' un extra facoltativo: e' l'unico modo in cui la suite ESEGUE
+# il JavaScript invece di cercarci dentro delle stringhe. Senza,
+# test_mobile_passi.py e test_mobile_ui.py -- diciannove test -- saltavano in
+# silenzio, e del frontend restava verificata solo la forma del sorgente.
+dev = ["pytest>=8.0", "ruff>=0.6", "quickjs>=1.19"]
 
 [tool.ruff]
 line-length = 100
 target-version = "py312"
-exclude = ["legacy"]
 
 [tool.ruff.lint]
-select = ["E4", "E7", "E9", "F", "B", "SIM", "UP", "C4", "RET", "ARG"]
-ignore = ["E501", "SIM105", "SIM102", "SIM108"]
+# RUF: prende fra l'altro la precedenza non parentesizzata fra `and` e `or`
+#      (RUF021) -- il difetto per cui list_files mostrava i dot-file mentre
+#      l'header d'ambiente li nascondeva. Trovato a mano; il linter lo avrebbe
+#      preso da solo.
+# BLE: rende vivi i 23 `# noqa: BLE001` gia' scritti nel codice. Senza `BLE`
+#      nel select quei noqa non sopprimono niente: la convenzione era scritta
+#      ma non applicata, e un catch cieco nuovo entrava senza giustificarsi.
+# PLW: lo stato globale mutabile (PLW0603) in un processo che gira i turni in
+#      thread di sfondo.
+# DTZ: i timestamp naïf, in un progetto che cura la stabilita' del prefisso.
+select = ["E4", "E7", "E9", "F", "B", "SIM", "UP", "C4", "RET", "ARG",
+          "RUF", "BLE", "PLW", "DTZ"]
+ignore = [
+    "E501", "SIM105", "SIM102", "SIM108",
+    # Gli orari mostrati all'utente sono ora locale, ed e' voluto.
+    "DTZ005", "DTZ011",
+    # subprocess.run senza check=: l'esito si legge da returncode, sempre.
+    "PLW1510",
+]
 # Idiom pytest sistematico: fixture importate da test_server e ri-esposte come
 # argomenti (F811), parametri di fixture con solo effetto collaterale (ARG001).
 # Valgono per i test, non per il resto del progetto. Tabella inline TOML:

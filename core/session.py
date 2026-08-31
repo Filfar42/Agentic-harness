@@ -120,8 +120,8 @@ def _leggi_messaggi(session_id: str) -> list[dict[str, Any]] | None:
     ultima = ""
     try:
         with open(path, encoding="utf-8") as fh:
-            for riga in fh:
-                riga = riga.strip()
+            for grezza in fh:
+                riga = grezza.strip()
                 if not riga:
                     continue
                 try:
@@ -455,8 +455,8 @@ def _cercabile(path: Path) -> dict[str, str] | None:
         messaggi = []
         try:
             with open(coda, encoding="utf-8") as fh:
-                for riga in fh:
-                    riga = riga.strip()
+                for grezza in fh:
+                    riga = grezza.strip()
                     if not riga:
                         continue
                     try:

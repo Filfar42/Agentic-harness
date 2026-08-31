@@ -18,8 +18,24 @@ RUN pip install --no-cache-dir pytest ruff
 # costruirebbe affatto. Con una sorgente che esiste sempre, i glob diventano
 # facoltativi. Il '|| true' copre il caso in cui il file non c'e'.
 COPY Dockerfile.sandbox requirements.txt* pyproject.toml* /tmp/deps/
+# Due sorgenti, perche' un progetto moderno dichiara le dipendenze in
+# pyproject.toml: prima quel file veniva copiato e mai guardato, quindi un
+# workspace senza requirements.txt otteneva un'immagine senza niente.
+#
+# E l'esito si scrive su disco invece di essere buttato con '|| true':
+# un'immagine costruita a meta' *sembrava* costruita bene, e l'agente lo
+# scopriva da un ImportError al terzo passo di un turno.
 RUN cd /tmp/deps \
- && (pip install --no-cache-dir -r requirements.txt || true) \
+ && { \
+      if [ -f requirements.txt ]; then \
+        pip install --no-cache-dir -r requirements.txt; \
+      elif [ -f pyproject.toml ]; then \
+        pip install --no-cache-dir /tmp/deps; \
+      else \
+        echo "nessun manifesto di dipendenze nel workspace"; \
+      fi; \
+    } 2>&1 | tee /var/log/harness-deps.log \
+ || echo "INSTALLAZIONE DIPENDENZE FALLITA" >> /var/log/harness-deps.log \
  && rm -rf /tmp/deps
 
 WORKDIR /work

@@ -22,18 +22,19 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from core import compaction  # noqa: E402
-from core.agent import (  # noqa: E402
+from core import compaction
+from core import config as config_mod
+from core.agent import (
     build_api_messages,
     compatta_cronologia,
     context_pressure,
 )
-from core.backend import StreamEvent  # noqa: E402
-from core.config import Budgets, GenParams, budgets_for  # noqa: E402
-from core.notes import MAX_NOTES, NoteError, Notes  # noqa: E402
-from core.notes import render_block as render_notes  # noqa: E402
-from core.textutils import estimate_messages_tokens  # noqa: E402
-from core.tools import NOTES_TOOL, ToolContext, dispatch  # noqa: E402
+from core.backend import StreamEvent
+from core.config import Budgets, GenParams, budgets_for
+from core.notes import MAX_NOTES, NoteError, Notes
+from core.notes import render_block as render_notes
+from core.textutils import estimate_messages_tokens
+from core.tools import NOTES_TOOL, ToolContext, dispatch
 
 
 # ---------------------------------------------------------------------------
@@ -529,15 +530,15 @@ def test_la_finestra_efficace_non_supera_il_tetto():
     decisione su un numero assoluto.
     """
     # Finestra piccola: il tetto non c'entra, decide num_ctx.
-    assert compaction.finestra_efficace(16_384, 32_768) == 16_384
+    assert config_mod.finestra_efficace(16_384, 32_768) == 16_384
     # Finestra grande: decide il tetto, e la soglia ci cade sopra esatta.
-    efficace = compaction.finestra_efficace(131_072, 32_768)
+    efficace = config_mod.finestra_efficace(131_072, 32_768)
     assert efficace < 131_072
     # La soglia in percentuale, applicata alla finestra efficace, ricade sul
     # tetto: e' tutto il senso dell'operazione.
     assert abs(efficace * compaction.SOGLIA_DEFAULT - 32_768) < 1
     # Tetto spento: si torna al comportamento di prima, senza sorprese.
-    assert compaction.finestra_efficace(131_072, 0) == 131_072
+    assert config_mod.finestra_efficace(131_072, 0) == 131_072
 
 
 def test_la_coda_tenuta_sta_sotto_la_soglia_che_ha_fatto_compattare():
@@ -548,7 +549,7 @@ def test_la_coda_tenuta_sta_sotto_la_soglia_che_ha_fatto_compattare():
     ha fatto scattare la compattazione (32k): si compatterebbe per ritrovarsi
     sopra soglia al passo successivo, per sempre.
     """
-    efficace = compaction.finestra_efficace(131_072, 32_768)
+    efficace = config_mod.finestra_efficace(131_072, 32_768)
     coda = efficace * compaction.CODA_DEFAULT
     assert coda < 32_768, "la coda tenuta deve stare sotto il tetto"
 

@@ -76,8 +76,8 @@ class Skill:
         doppio -- i suoi token piu' l'attenzione che ruba a quelli veri.
         """
         testo = richiesta.lower()
-        for termine in self.termini:
-            termine = termine.strip().lower()
+        for grezzo in self.termini:
+            termine = grezzo.strip().lower()
             if not termine:
                 continue
             # Confine da **entrambi** i lati. Con il solo ``(?<!\w)`` davanti,

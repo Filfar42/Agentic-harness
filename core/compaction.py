@@ -59,7 +59,6 @@ from .config import (
     CODA_COMPATTAZIONE,
     COMPACT_MAX_TOKENS,
     HISTORY_COMPACT_THRESHOLD,
-    finestra_efficace,
 )
 from .textutils import chars_for_tokens, smart_truncate, strip_think
 
@@ -128,11 +127,10 @@ MAX_TOKEN_RIASSUNTO = 700
 QUOTA_TRASCRIZIONE = 0.5
 
 
-# ``finestra_efficace`` e' importata da ``config``, dove vive accanto a
-# ``budgets_for``: sono le due politiche sullo stesso parametro, e finche'
-# stavano in moduli diversi non si conoscevano -- a 131k una diceva "tieni
-# 96.000 caratteri per file" e l'altra "compatta a 32.767 token". Resta
-# raggiungibile da qui, che e' da dove il resto del codice la prende.
+# ``finestra_efficace`` sta in ``core/config``, accanto a ``budgets_for``:
+# sono le due politiche sullo stesso parametro, e finche' stavano in moduli
+# diversi non si conoscevano -- a 131k una diceva "tieni 96.000 caratteri per
+# file" e l'altra "compatta a 32.767 token". Si importa da li'.
 
 
 @dataclass(slots=True)

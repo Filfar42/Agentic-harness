@@ -22,10 +22,12 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from core import config as config_mod  # noqa: E402
-from core import memory as memory_mod  # noqa: E402
-from core import settings as settings_mod  # noqa: E402
-from server import previewhost  # noqa: E402
+from core import config as config_mod
+from core import memory as memory_mod
+from core import sandbox as sandbox_mod
+from core import session as session_mod
+from core import settings as settings_mod
+from server import previewhost
 
 
 @pytest.fixture(autouse=True)
@@ -45,6 +47,17 @@ def preferenze_isolate(tmp_path, monkeypatch):
     # una porta vera in ascolto. Un test non deve mai farlo per sbaglio: qui
     # nasce spento, e chi lo prova lo accende da se' e lo spegne dopo.
     monkeypatch.setitem(config_mod.DEFAULTS, "preview_host_port", 0)
+    # Le conversazioni. Lo facevano le cinque fixture che creano un client --
+    # cioe' esattamente la ripetizione che questo file esiste per togliere -- e
+    # un test nuovo che tocchi ``session`` senza passare da quelle scriverebbe
+    # fra le chat vere dell'utente.
+    monkeypatch.setattr(session_mod, "DATA_DIR", tmp_path / "chat_sessions")
+    # E la memo dei container gia' verificati, che e' stato di modulo: vive
+    # oltre il singolo test, e i container dei test sono finti e cambiano
+    # istantaneamente. Tre secondi di TTL bastano a far passare per pronto un
+    # container che il test successivo si aspetta di dover creare.
+    sandbox_mod.dimentica_container()
     yield
+    sandbox_mod.dimentica_container()
     previewhost.shutdown()
     previewhost.set_root(tmp_path)

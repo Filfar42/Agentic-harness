@@ -77,7 +77,12 @@ _client: httpx.AsyncClient | None = None
 
 
 def get_client() -> httpx.AsyncClient:
-    global _client
+    # Singleton di modulo, e deve restarlo: il client tiene il pool di
+    # connessioni verso l'harness e ha una chiusura asincrona che il ciclo di
+    # vita dell'app chiama una volta sola. Farne un attributo di classe
+    # significherebbe un'istanza da passare a ogni rotta per non guadagnare
+    # niente.
+    global _client  # noqa: PLW0603 - vedi sopra
     if _client is None:
         _client = httpx.AsyncClient(
             base_url=f"{upstream_base()}/",
@@ -87,7 +92,7 @@ def get_client() -> httpx.AsyncClient:
 
 
 async def close_client() -> None:
-    global _client
+    global _client  # noqa: PLW0603 - la meta' dell'altro: si crea li', si chiude qui
     if _client is not None:
         await _client.aclose()
         _client = None

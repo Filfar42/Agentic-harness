@@ -17,9 +17,10 @@ from collections.abc import Callable, Iterator, Sequence
 
 from .backend import StreamEvent
 from .config import (
-    HISTORY_COMPACT_THRESHOLD,
     Budgets,
+    HISTORY_COMPACT_THRESHOLD,
     budgets_for,
+    finestra_efficace,
 )
 from .compaction import (
     CODA_DEFAULT,
@@ -27,7 +28,6 @@ from .compaction import (
     TETTO_TOKEN_DEFAULT,
     Compattazione,
     costruisci_riassunto,
-    finestra_efficace,
     render_messaggio,
     richieste_utente,
     taglio,

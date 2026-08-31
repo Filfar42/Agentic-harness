@@ -51,6 +51,7 @@ Parziale batte vuoto, e il padre ha comunque i percorsi da cui ripartire.
 from __future__ import annotations
 
 from dataclasses import replace
+from functools import lru_cache
 from typing import Any
 
 from . import spec_delega
@@ -142,17 +143,19 @@ def budget_stretti(budgets: Any) -> Any:
 # ``budget_stretti`` alla taratura di riferimento: una sola fonte, cosi' il
 # testo promesso al modello e il troncamento realmente applicato non possono
 # divergere quando qualcuno ritocca un fattore.
-_BUDGET_FIGLIO_RIFERIMENTO = None
-
-
+@lru_cache(maxsize=1)
 def budget_riferimento() -> Any:
-    """Il budget stretto calcolato sulla taratura base (finestra padre 16k)."""
-    global _BUDGET_FIGLIO_RIFERIMENTO
-    if _BUDGET_FIGLIO_RIFERIMENTO is None:
-        from .config import BASE_NUM_CTX, budgets_for
+    """Il budget stretto calcolato sulla taratura base (finestra padre 16k).
 
-        _BUDGET_FIGLIO_RIFERIMENTO = budget_stretti(budgets_for(BASE_NUM_CTX))
-    return _BUDGET_FIGLIO_RIFERIMENTO
+    ``lru_cache`` e non un global mutabile: il risultato dipende solo da
+    costanti, e in un processo che gira i turni in thread di sfondo uno stato
+    di modulo scritto a mano e' un rischio senza contropartita. (Il vecchio
+    ramo pigro era anche morto: le due costanti qui sotto chiamano questa
+    funzione a import-time, quindi nessun altro l'ha mai trovata a None.)
+    """
+    from .config import BASE_NUM_CTX, budgets_for
+
+    return budget_stretti(budgets_for(BASE_NUM_CTX))
 
 
 MAX_LETTURA_FIGLIO = int(budget_riferimento().read_file_max_chars)

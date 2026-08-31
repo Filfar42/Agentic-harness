@@ -8,6 +8,7 @@ era rossa) ha mandato il modello in stallo per decine di messaggi.
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 
@@ -197,3 +198,50 @@ def test_assert_su_piu_righe_conta_come_uno():
 
 def test_i_commenti_non_sono_asserzioni():
     assert assertion_signatures("# assert media([1]) == 1\nx = 2\n") == {}
+
+
+# ---------------------------------------------------------------------------
+# Il tier di esecuzione del frontend: acceso, non solo scritto
+# ---------------------------------------------------------------------------
+
+
+def test_quickjs_e_una_dipendenza_dichiarata():
+    """I diciannove test che ESEGUONO il JS del mobile saltavano sempre.
+
+    ``test_mobile_passi.py`` e ``test_mobile_ui.py`` caricano il vero
+    ``web_mobile/app.js`` in un contesto QuickJS e ne chiamano le funzioni: e'
+    l'unico posto in cui il frontend viene eseguito invece che cercato per
+    stringhe. ``pytest.importorskip`` li faceva saltare in silenzio, e
+    ``quickjs`` non era in nessun manifesto -- quindi su un'installazione
+    standard saltavano **sempre**, e del frontend restava verificata solo la
+    forma del sorgente. E' il buco da cui e' passato ``deposito_max_mb``.
+    """
+    import tomllib
+
+    radice = Path(__file__).resolve().parents[1]
+    dati = tomllib.loads((radice / "pyproject.toml").read_text(encoding="utf-8"))
+    dev = dati["project"]["optional-dependencies"]["dev"]
+    assert any(d.startswith("quickjs") for d in dev), (
+        "quickjs non e' fra le dipendenze di sviluppo: i test che eseguono il "
+        "JavaScript del mobile salteranno su ogni installazione pulita"
+    )
+
+
+def test_il_lint_copre_le_regole_che_hanno_gia_trovato_difetti():
+    """Tre convenzioni erano scritte nel codice e non applicate dal linter.
+
+    - ``RUF021`` (precedenza fra ``and`` e ``or``) trova da solo il difetto per
+      cui ``list_files`` mostrava i dot-file mentre l'header d'ambiente li
+      nascondeva.
+    - ``BLE`` rende vivi i ``# noqa: BLE001`` gia' scritti: senza, non
+      sopprimevano niente e un catch cieco nuovo entrava senza giustificarsi.
+    - ``PLW0603`` lo stato globale mutabile, in un processo che gira i turni in
+      thread di sfondo.
+    """
+    import tomllib
+
+    radice = Path(__file__).resolve().parents[1]
+    dati = tomllib.loads((radice / "pyproject.toml").read_text(encoding="utf-8"))
+    select = set(dati["tool"]["ruff"]["lint"]["select"])
+    for regola in ("RUF", "BLE", "PLW"):
+        assert regola in select, f"il linter non applica {regola}"

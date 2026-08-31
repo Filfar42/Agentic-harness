@@ -58,7 +58,7 @@ class ThinkStreamParser:
         tramite :meth:`feed_reasoning`.
     """
 
-    __slots__ = ("reasoning", "answer", "_buf", "_in_think", "_open", "_close", "_saw_any")
+    __slots__ = ("_buf", "_close", "_in_think", "_open", "_saw_any", "answer", "reasoning")
 
     def __init__(self, open_tag: str = THINK_OPEN, close_tag: str = THINK_CLOSE) -> None:
         self.reasoning: str = ""
@@ -312,9 +312,11 @@ def truncate_lines(text: str, max_lines: int, *, label: str = "elenco") -> str:
     tail_n = max_lines - head_n
     omitted = len(lines) - head_n - tail_n
     return "\n".join(
-        lines[:head_n]
-        + [f"[... {label}: {omitted:,} righe omesse ...]"]
-        + lines[-tail_n:]
+        [
+            *lines[:head_n],
+            f"[... {label}: {omitted:,} righe omesse ...]",
+            *lines[-tail_n:],
+        ]
     )
 
 

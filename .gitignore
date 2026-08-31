@@ -17,4 +17,8 @@ agent_settings.json
 
 # archivi e istantanee: pesano e si rigenerano
 *.zip
+# Istantanea del progetto del 19/08/2026: uno zip senza estensione, creato per
+# sbaglio con un nome casuale. Ignorato perche' pesa e si rigenera, come gli
+# altri archivi qui sopra -- il nome sta scritto perche' senza estensione la
+# regola *.zip non lo prende.
 ziln0aV3
