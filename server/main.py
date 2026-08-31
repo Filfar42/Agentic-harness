@@ -43,23 +43,23 @@ from starlette.datastructures import MutableHeaders
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from core import agent as agent_mod  # noqa: E402
-from core import memory as memory_mod  # noqa: E402
-from core import notes as notes_mod  # noqa: E402
-from core import skills as skills_mod  # noqa: E402
-from core import plan as plan_mod  # noqa: E402
-from core import profiles  # noqa: E402
-from core import sandbox as sandbox_mod  # noqa: E402
-from core import session as session_mod  # noqa: E402
-from core import settings as settings_mod  # noqa: E402
-from core import vault as vault_mod  # noqa: E402
-from server import previewhost  # noqa: E402
-from core.backend import (  # noqa: E402
+from core import agent as agent_mod
+from core import memory as memory_mod
+from core import notes as notes_mod
+from core import skills as skills_mod
+from core import plan as plan_mod
+from core import profiles
+from core import sandbox as sandbox_mod
+from core import session as session_mod
+from core import settings as settings_mod
+from core import vault as vault_mod
+from server import previewhost
+from core.backend import (
     build_backend,
     forget_model_info,
     normalise_base_url,
 )
-from core.config import (  # noqa: E402
+from core.config import (
     SKILLS_DIR,
     SKILLS_SUBDIR_WORKSPACE,
     APP_NAME,
@@ -69,7 +69,7 @@ from core.config import (  # noqa: E402
     resolve_think,
     resolve_tristate,
 )
-from core.prompts import (  # noqa: E402
+from core.prompts import (
     SYSTEM_PROMPT,
     build_attachments_block,
     build_env_header,
@@ -78,8 +78,8 @@ from core.prompts import (  # noqa: E402
     is_stock_prompt,
     pick_system_prompt,
 )
-from core.textutils import estimate_messages_tokens, estimate_tokens  # noqa: E402
-from core.tools import (  # noqa: E402
+from core.textutils import estimate_messages_tokens, estimate_tokens
+from core.tools import (
     ATTACHMENTS_DIR,
     MAX_IMAGE_BYTES,
     MAX_IMAGES_IN_CONTEXT,
@@ -96,10 +96,10 @@ from core.tools import (  # noqa: E402
     resolve_path,
     store_attachment,
 )
-from server.nativedialog import DialogUnavailable, pick_folder  # noqa: E402
-from server.prep import Prep  # noqa: E402
-from server import runner as runner_mod  # noqa: E402
-from server.runner import RunnerRegistry, TurnRunner  # noqa: E402
+from server.nativedialog import DialogUnavailable, pick_folder
+from server.prep import Prep
+from server import runner as runner_mod
+from server.runner import RunnerRegistry, TurnRunner
 
 WEB_DIR = Path(__file__).resolve().parents[1] / "web"
 # Il conto dei token degli schemi dipende da quale versione si sta mandando.
@@ -2675,7 +2675,7 @@ def open_workspace(request: OpenRequest | None = None) -> dict[str, Any]:
             # che lo contiene, che e' il 90% del valore della scorciatoia.
             cartella = target.parent if target is not None else base
             if system == "Windows":
-                os.startfile(str(cartella))  # noqa: S606
+                os.startfile(str(cartella))
             elif system == "Darwin":
                 subprocess.run(["open", str(cartella)], check=False)
             else:
@@ -2987,4 +2987,4 @@ def gpu() -> JSONResponse:
     })
 
 
-__all__ = ["app", "STATE", "RUNNERS"]
+__all__ = ["RUNNERS", "STATE", "app"]

@@ -175,7 +175,7 @@ def _pick_tk(initial: str | None) -> str | None:
 
     try:
         root = tk.Tk()
-    except Exception as exc:  # noqa: BLE001 - tipicamente: nessun display
+    except Exception as exc:
         raise DialogUnavailable(f"Nessun ambiente grafico disponibile ({exc}).") from exc
 
     try:
@@ -207,5 +207,5 @@ def pick_folder(initial: str | None = None) -> str | None:
         return _pick_linux(initial)
     except DialogUnavailable:
         raise
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         raise DialogUnavailable(f"{type(exc).__name__}: {exc}") from exc
