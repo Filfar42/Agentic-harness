@@ -18,7 +18,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from core.plan import MAX_TEXT_CHARS, Plan, pulisci_testo  # noqa: E402
+from core.plan import MAX_TEXT_CHARS, Plan, pulisci_testo
 
 WEB = Path(__file__).resolve().parents[1] / "web"
 

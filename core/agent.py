@@ -1779,7 +1779,13 @@ def run_turn(
         si invalidava sull'operazione per cui la modalita' wiki esiste, e non
         di 1.670 token ma dal token zero.
         """
-        cartella = getattr(tool_ctx, "vault_dir", "") or ""
+        # Il **workspace**, non ``vault_dir``: quest'ultimo si valorizza solo
+        # se la cartella ha un ``.vault.json``, mentre la modalita' wiki si
+        # accende anche sui vault nati prima di quel file, riconosciuti dalla
+        # struttura ``raw/`` + ``wiki/``. Usando vault_dir, proprio quelli
+        # avrebbero perso l'indice che prima ricevevano nel prompt di sistema.
+        # La condizione e' la stessa che il server usa per il prompt.
+        cartella = getattr(tool_ctx, "workspace", "") or ""
         if not cartella or not vault_mod.is_modalita_vault(cartella):
             return ""
         return vault_mod.blocco_stato(cartella)

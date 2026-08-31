@@ -20,13 +20,13 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from core import agent as agent_mod  # noqa: E402
-from core import libreria, pensiero  # noqa: E402
-from core.backend import StreamEvent  # noqa: E402
-from core.config import GenParams  # noqa: E402
-from core.plan import Plan  # noqa: E402
-from core.prompts import PROMPT_ESTRATTO_PENSIERO  # noqa: E402
-from core.tools import ToolContext  # noqa: E402
+from core import agent as agent_mod
+from core import libreria, pensiero
+from core.backend import StreamEvent
+from core.config import GenParams
+from core.plan import Plan
+from core.prompts import PROMPT_ESTRATTO_PENSIERO
+from core.tools import ToolContext
 
 # Sopra `pensiero.MIN_CHARS_PENSIERO`: sotto quella soglia non si chiama
 # nessuno, ed e' proprio uno dei comportamenti sotto test.
@@ -211,7 +211,7 @@ def test_niente_estratto_se_il_pensiero_e_corto():
     gia' preteso dice quanto c'era da dire."""
 
     class MaiChiamato:
-        def stream(self, *a, **k):  # noqa: ARG002
+        def stream(self, *a, **k):
             raise AssertionError("non si doveva chiamare il modello")
 
     assert pensiero.estrai(["corto"], punto="x", backend=MaiChiamato(), params=GenParams(model="f")) == ""

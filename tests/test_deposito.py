@@ -15,10 +15,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from core import deposito  # noqa: E402
-from core.config import Budgets  # noqa: E402
-from core.textutils import smart_truncate  # noqa: E402
-from core.tools import ToolContext, tool_run_command, tool_search_files  # noqa: E402
+from core import deposito
+from core.config import Budgets
+from core.textutils import smart_truncate
+from core.tools import ToolContext, tool_run_command, tool_search_files
 
 
 def _ctx(tmp_path, **kw):

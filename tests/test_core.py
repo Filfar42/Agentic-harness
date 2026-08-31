@@ -15,19 +15,19 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from core.agent import (  # noqa: E402
+from core.agent import (
     build_api_messages,
     looks_like_unexecuted_action,
     parse_text_tool_call,
 )
-from core.textutils import (  # noqa: E402
+from core.textutils import (
     ThinkStreamParser,
     estimate_messages_tokens,
     smart_truncate,
     split_think,
     strip_think,
 )
-from core.tools import (  # noqa: E402
+from core.tools import (
     ToolContext,
     WorkspaceError,
     dispatch,

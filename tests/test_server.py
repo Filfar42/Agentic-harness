@@ -18,8 +18,8 @@ from fastapi.testclient import TestClient
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-import tests.test_agent_loop as fake  # noqa: E402  (riusa il finto Ollama)
-from core import config as config_mod  # noqa: E402
+import tests.test_agent_loop as fake
+from core import config as config_mod
 
 
 @pytest.fixture()
@@ -273,7 +273,7 @@ def test_changing_chat_stops_previews_and_frees_the_ports(client, monkeypatch):
     """
     stops = []
 
-    def _stop_background(*_args, **_kwargs):  # noqa: ARG002 - firma finta
+    def _stop_background(*_args, **_kwargs):
         return False      # niente processi in background: la catena arriva a stop()
 
     def _stop(workspace):
@@ -307,7 +307,7 @@ def test_changing_chat_without_previews_does_not_probe_the_sandbox(client, monke
     bg_calls = []
     stops = []
 
-    def _stop_background(*_args, **_kwargs):  # noqa: ARG002 - firma finta
+    def _stop_background(*_args, **_kwargs):
         bg_calls.append(1)
         return False
 
@@ -339,7 +339,7 @@ def test_chat_switch_with_live_mark_stops_the_app_per_slot(client, monkeypatch):
     calls_bg = []
     stops = []
 
-    def _stop_background(*_args, **_kwargs):  # noqa: ARG002 - firma finta
+    def _stop_background(*_args, **_kwargs):
         calls_bg.append(1)
         return False
 
@@ -552,7 +552,7 @@ def test_known_files_survive_across_turns(client):
     assert "esistente.py" not in fresh.known_files
 
 
-def test_thinking_is_enabled_only_for_reasoning_models(client, monkeypatch):  # noqa: ARG001
+def test_thinking_is_enabled_only_for_reasoning_models(client, monkeypatch):
     """Con 'auto' il canale nativo si accende solo se il modello ce l'ha."""
     from server import main as server_main
 
@@ -590,7 +590,7 @@ def test_thinking_is_enabled_only_for_reasoning_models(client, monkeypatch):  # 
     assert state.thinking_enabled() is False
 
 
-def test_prompt_drops_the_think_clause_for_reasoning_models(client):  # noqa: ARG001
+def test_prompt_drops_the_think_clause_for_reasoning_models(client):
     """Con il canale nativo, chiedere anche <think> nel prompt e' rumore."""
     from server import main as server_main
 

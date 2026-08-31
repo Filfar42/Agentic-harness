@@ -11,8 +11,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from core import profiles  # noqa: E402
-from core.config import GenParams, resolve_think  # noqa: E402
+from core import profiles
+from core.config import GenParams, resolve_think
 
 
 # --- riconoscimento della famiglia ------------------------------------------

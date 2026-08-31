@@ -19,10 +19,10 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from core import agent as agent_mod  # noqa: E402
-from core.backend import OllamaBackend  # noqa: E402
-from core.config import GenParams  # noqa: E402
-from core.tools import TOOLS_SCHEMA, ToolContext  # noqa: E402
+from core import agent as agent_mod
+from core.backend import OllamaBackend
+from core.config import GenParams
+from core.tools import TOOLS_SCHEMA, ToolContext
 
 # Copione delle risposte del finto modello, un elemento per passo agentico.
 SCRIPT: list[list[dict]] = [
@@ -130,8 +130,8 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", "application/x-ndjson")
         self.end_headers()
-        for chunk in chunks:
-            chunk = json.loads(json.dumps(chunk))  # copia: non mutare lo script
+        for grezzo in chunks:
+            chunk = json.loads(json.dumps(grezzo))  # copia: non mutare lo script
             chunk.setdefault("done", False)
             if type(self).drop_tool_calls_when_streaming:
                 (chunk.get("message") or {}).pop("tool_calls", None)
@@ -160,7 +160,7 @@ def fake_ollama():
 
 
 def test_full_turn_thinking_toolcall_answer(fake_ollama, tmp_path):
-    url, handler = fake_ollama
+    url, _handler = fake_ollama
     (tmp_path / "hello.py").write_text("print('ciao')\n", encoding="utf-8")
 
     backend = OllamaBackend(url, timeout_s=20)
@@ -365,7 +365,7 @@ def test_manual_override_forces_non_streaming(fake_ollama, tmp_path):
     assert handler.calls[0]["stream"] is False
 def test_auto_nudge_when_model_answers_in_words(fake_ollama, tmp_path):
     """L'utente chiede un'azione, il modello risponde a parole: l'harness insiste."""
-    url, handler = fake_ollama
+    url, _handler = fake_ollama
     # il modello non chiama mai tool: solo testo
     global SCRIPT
     original = SCRIPT
@@ -414,7 +414,7 @@ def test_leaked_tool_call_is_executed_and_kept_out_of_chat(fake_ollama, tmp_path
       2. il turno e' marcato come 'recovered';
       3. il JSON non compare nel testo mostrato in chat.
     """
-    url, handler = fake_ollama
+    url, _handler = fake_ollama
     leak = json.dumps(
         {
             "name": "write_file",
@@ -537,7 +537,7 @@ def test_agent_suspends_on_question_and_resumes_with_answer(fake_ollama, tmp_pat
 
 def test_question_is_asked_last_so_other_tools_complete(fake_ollama, tmp_path):
     """Se il modello mescola una domanda con altri tool, gli altri girano prima."""
-    url, handler = fake_ollama
+    url, _handler = fake_ollama
     (tmp_path / "a.py").write_text("x\n", encoding="utf-8")
     global SCRIPT
     original = SCRIPT
@@ -581,7 +581,7 @@ def test_question_is_asked_last_so_other_tools_complete(fake_ollama, tmp_path):
 
 def test_silent_turn_gets_a_forced_summary(fake_ollama, tmp_path):
     """Il turno usa un tool e finisce muto: l'harness chiede il riepilogo."""
-    url, handler = fake_ollama
+    url, _handler = fake_ollama
     (tmp_path / "a.py").write_text("x\n", encoding="utf-8")
     global SCRIPT
     original = SCRIPT
@@ -618,7 +618,7 @@ def test_silent_turn_gets_a_forced_summary(fake_ollama, tmp_path):
 
 def test_summary_not_forced_when_no_tool_was_used(fake_ollama, tmp_path):
     """Una risposta puramente conversazionale non va sollecitata."""
-    url, handler = fake_ollama
+    url, _handler = fake_ollama
     global SCRIPT
     original = SCRIPT
     SCRIPT = [[{"message": {"content": "TCP garantisce l'ordine, UDP no."}}]]
@@ -645,7 +645,7 @@ def test_summary_not_forced_when_no_tool_was_used(fake_ollama, tmp_path):
 
 def test_faked_tool_response_does_not_suppress_the_summary(fake_ollama, tmp_path):
     """Il turno chiudeva in silenzio perche' <tool_response> contava come risposta."""
-    url, handler = fake_ollama
+    url, _handler = fake_ollama
     (tmp_path / "a.py").write_text("x\n", encoding="utf-8")
     global SCRIPT
     original = SCRIPT
@@ -684,7 +684,7 @@ def test_leak_nudge_fires_once_and_after_the_tool_results(fake_ollama, tmp_path)
     con le tool_calls e i relativi risultati: molti chat template li vogliono
     contigui, e romperli confonde il modello.
     """
-    url, handler = fake_ollama
+    url, _handler = fake_ollama
     (tmp_path / "a.py").write_text("x\n", encoding="utf-8")
     leak = json.dumps({"name": "list_files", "arguments": {"subfolder": "."}})
     global SCRIPT
@@ -731,7 +731,7 @@ def _cmd(command):
 
 
 def test_failed_command_is_marked_red_and_carries_instructions(fake_ollama, tmp_path):
-    url, handler = fake_ollama
+    url, _handler = fake_ollama
     global SCRIPT
     original = SCRIPT
     SCRIPT = [[_cmd('python -c "raise SystemExit(3)"')], [{"message": {"content": "Fatto."}}]]
@@ -767,7 +767,7 @@ def _write_fix():
 
 def test_agent_is_pushed_to_repair_a_red_verification(fake_ollama, tmp_path):
     """Il modello si accontenta e chiude: l'harness lo rimanda a lavorare."""
-    url, handler = fake_ollama
+    url, _handler = fake_ollama
     global SCRIPT
     original = SCRIPT
     SCRIPT = [
@@ -798,7 +798,7 @@ def test_agent_is_pushed_to_repair_a_red_verification(fake_ollama, tmp_path):
 
 def test_repeated_identical_failure_switches_to_a_different_advice(fake_ollama, tmp_path):
     """Ripetere lo stesso comando rotto non lo aggiusta: va detto."""
-    url, handler = fake_ollama
+    url, _handler = fake_ollama
     global SCRIPT
     original = SCRIPT
     broken = _cmd('python -c "raise SystemExit(1)"')
@@ -820,7 +820,7 @@ def test_repeated_identical_failure_switches_to_a_different_advice(fake_ollama, 
 
 def test_a_green_rerun_clears_the_red_and_lets_the_turn_close(fake_ollama, tmp_path):
     """Se il modello ripara da solo, l'harness non deve intromettersi."""
-    url, handler = fake_ollama
+    url, _handler = fake_ollama
     global SCRIPT
     original = SCRIPT
     SCRIPT = [
@@ -849,7 +849,7 @@ def test_a_different_green_command_does_not_clear_the_red(fake_ollama, tmp_path)
     Lanciare un sotto-test che passa non dimostra che la suite completa passi,
     quindi la verifica rossa resta aperta e l'harness continua a insistere.
     """
-    url, handler = fake_ollama
+    url, _handler = fake_ollama
     global SCRIPT
     original = SCRIPT
     SCRIPT = [
@@ -874,7 +874,7 @@ def test_a_different_green_command_does_not_clear_the_red(fake_ollama, tmp_path)
 
 def test_giving_up_on_red_still_forces_an_honest_summary(fake_ollama, tmp_path):
     """Se resta rosso, il riepilogo deve dirlo invece di arrotondare."""
-    url, handler = fake_ollama
+    url, _handler = fake_ollama
     global SCRIPT
     original = SCRIPT
     broken = _cmd('python -c "raise SystemExit(1)"')
@@ -916,7 +916,7 @@ def test_verification_tracker_forgets_a_command_once_it_goes_green():
 
 def test_the_red_command_reaches_the_tools(fake_ollama, tmp_path):
     """Il guard sui test vive nei tool, ma solo il ciclo sa cosa e' rosso."""
-    url, handler = fake_ollama
+    _url, handler = fake_ollama
     handler.step = 0
     ctx = ToolContext(workspace=str(tmp_path), timeout_s=10, sandbox="host")
     assert ctx.red_command is None
@@ -937,7 +937,7 @@ def test_una_richiesta_analitica_blocca_la_scrittura_dal_ciclo(fake_ollama, tmp_
     """Il caso reale: 'Analizza... suggerisci come ottimizzarla' e il modello
     si mette a scrivere sul disco. Il divieto lo imposta il ciclo, non i tool:
     solo lui sa qual era la richiesta."""
-    url, handler = fake_ollama
+    url, _handler = fake_ollama
     global SCRIPT
     original = SCRIPT
     SCRIPT = [
@@ -972,7 +972,7 @@ def test_una_richiesta_analitica_blocca_la_scrittura_dal_ciclo(fake_ollama, tmp_
 
 def test_una_funzione_nuova_senza_test_non_chiude_il_turno(fake_ollama, tmp_path):
     """La verifica vacua: pytest verde su codice che non e' quello nuovo."""
-    url, handler = fake_ollama
+    url, _handler = fake_ollama
     global SCRIPT
     original = SCRIPT
     SCRIPT = [

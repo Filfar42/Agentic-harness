@@ -23,13 +23,13 @@ from fastapi.testclient import TestClient
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-import tests.test_agent_loop as fake  # noqa: E402
-import tests.test_sandbox as sbox  # noqa: E402
-from core import agent as agent_mod  # noqa: E402
-from core import config as config_mod  # noqa: E402
-from core import sandbox  # noqa: E402
-from core.prompts import build_env_header  # noqa: E402
-from core.tools import (  # noqa: E402
+import tests.test_agent_loop as fake
+import tests.test_sandbox as sbox
+from core import agent as agent_mod
+from core import config as config_mod
+from core import sandbox
+from core.prompts import build_env_header
+from core.tools import (
     PREVIEW_TOOL,
     ToolContext,
     dispatch,
@@ -38,7 +38,7 @@ from core.tools import (  # noqa: E402
     preview_kind,
     preview_root,
 )
-from server import previewhost  # noqa: E402
+from server import previewhost
 
 fake_ollama = fake.fake_ollama
 fake_docker = sbox.fake_docker

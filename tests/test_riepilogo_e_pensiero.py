@@ -21,10 +21,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from core import agent as agent_mod  # noqa: E402
-from core.backend import StreamEvent  # noqa: E402
-from core.config import GenParams  # noqa: E402
-from core.tools import ToolContext  # noqa: E402
+from core import agent as agent_mod
+from core.backend import StreamEvent
+from core.config import GenParams
+from core.tools import ToolContext
 
 
 class BackendMuto:
@@ -42,7 +42,7 @@ class BackendMuto:
         self.riepiloghi = 0
         self.params_riepilogo = None
 
-    def stream(self, messages, tools, params):  # noqa: ARG002
+    def stream(self, messages, tools, params):
         if tools is None:
             self.riepiloghi += 1
             self.params_riepilogo = params
@@ -63,7 +63,7 @@ class BackendMuto:
 class BackendCheRisponde(BackendMuto):
     """Come sopra, ma l'ultimo passo dice qualcosa."""
 
-    def stream(self, messages, tools, params):  # noqa: ARG002
+    def stream(self, messages, tools, params):
         if tools is None:
             self.riepiloghi += 1
             yield StreamEvent("content", text="riepilogo che non doveva servire")
@@ -141,7 +141,7 @@ def test_senza_lavoro_niente_riepilogo(tmp_path):
     il referto sarebbe una generazione per farsi inventare una risposta."""
 
     class BackendCheNonFaNiente(BackendMuto):
-        def stream(self, messages, tools, params):  # noqa: ARG002
+        def stream(self, messages, tools, params):
             if tools is None:
                 self.riepiloghi += 1
                 yield StreamEvent("content", text="x")

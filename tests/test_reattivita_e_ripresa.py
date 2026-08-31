@@ -13,9 +13,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-import tests.test_agent_loop as fake  # noqa: E402
-import tests.test_server as server_tests  # noqa: E402
-from core import agent as agent_mod  # noqa: E402
+import tests.test_agent_loop as fake
+import tests.test_server as server_tests
+from core import agent as agent_mod
 
 # Le due fixture del server HTTP sono gia' scritte: riusarle e' l'unico modo
 # perche' un cambio nell'attrezzatura valga anche qui.

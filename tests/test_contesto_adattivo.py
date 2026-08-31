@@ -24,14 +24,14 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from core import agent as agent_mod  # noqa: E402
-from core import config as config_mod  # noqa: E402
-from core import profiles  # noqa: E402
-from core.backend import OllamaBackend  # noqa: E402
-from core.config import GenParams, budgets_for, context_scale  # noqa: E402
-from core.tools import TOOLS_SCHEMA, ToolContext, dispatch  # noqa: E402
+from core import agent as agent_mod
+from core import config as config_mod
+from core import profiles
+from core.backend import OllamaBackend
+from core.config import GenParams, budgets_for, context_scale
+from core.tools import TOOLS_SCHEMA, ToolContext, dispatch
 
-import tests.test_agent_loop as fake  # noqa: E402
+import tests.test_agent_loop as fake
 
 fake_ollama = fake.fake_ollama
 
@@ -263,7 +263,7 @@ def test_allargare_la_finestra_non_fa_compattare_prima():
     quando = [quando_compatta(n) for n in finestre]
     assert quando == sorted(quando), (
         "allargare la finestra fa compattare prima: "
-        + ", ".join(f"{n}->{q}" for n, q in zip(finestre, quando))
+        + ", ".join(f"{n}->{q}" for n, q in zip(finestre, quando, strict=True))
     )
 
 

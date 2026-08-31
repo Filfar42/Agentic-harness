@@ -24,13 +24,13 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-import tests.test_agent_loop as fake  # noqa: E402
-from core import agent as agent_mod  # noqa: E402
-from core.backend import OllamaBackend  # noqa: E402
-from core.config import GenParams  # noqa: E402
-from core.plan import DOING, DONE, Plan, PlanError, render_block, render_summary  # noqa: E402
-from core.textutils import chars_for_tokens  # noqa: E402
-from core.tools import PLAN_TOOL, TOOLS_SCHEMA, ToolContext, dispatch  # noqa: E402
+import tests.test_agent_loop as fake
+from core import agent as agent_mod
+from core.backend import OllamaBackend
+from core.config import GenParams
+from core.plan import DOING, DONE, Plan, PlanError, render_block, render_summary
+from core.textutils import chars_for_tokens
+from core.tools import PLAN_TOOL, TOOLS_SCHEMA, ToolContext, dispatch
 
 fake_ollama = fake.fake_ollama
 
@@ -512,7 +512,7 @@ def test_il_watchdog_si_puo_spegnere(fake_ollama, tmp_path, monkeypatch):
 def test_un_ragionamento_normale_non_viene_toccato(fake_ollama, tmp_path):
     """Il watchdog deve essere invisibile finche' il modello si comporta."""
     url, _ = fake_ollama
-    ui, eventi = esegui(
+    _ui, eventi = esegui(
         url, tmp_path,
         prompt="cosa c'e' nel progetto?",
         params=GenParams(model="fake:latest", max_tokens=8192),
@@ -524,7 +524,7 @@ def test_un_ragionamento_normale_non_viene_toccato(fake_ollama, tmp_path):
 
 def test_la_generazione_troncata_viene_riconosciuta(fake_ollama, tmp_path, monkeypatch):
     """Il done_reason arrivava da Ollama dal primo giorno: mancava chi lo leggesse."""
-    url, handler = fake_ollama
+    url, _handler = fake_ollama
     monkeypatch.setattr(fake, "SCRIPT", [[{"message": {"content": "<think>a meta' del pensier"}}]])
     monkeypatch.setattr(
         fake, "_DONE_CHUNK", {**fake._DONE_CHUNK, "done_reason": "length"}

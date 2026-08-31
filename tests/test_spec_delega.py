@@ -19,8 +19,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from core import libreria, spec_delega  # noqa: E402
-from core.prompts import DELEGA_ESEMPIO, DELEGA_NUDGE  # noqa: E402
+from core import libreria, spec_delega
+from core.prompts import DELEGA_ESEMPIO, DELEGA_NUDGE
 
 
 def _riempi(tmp_path, quanti, **kw):

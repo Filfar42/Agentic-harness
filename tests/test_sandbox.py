@@ -20,8 +20,8 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from core import sandbox  # noqa: E402
-from core.tools import ToolContext, dispatch  # noqa: E402
+from core import sandbox
+from core.tools import ToolContext, dispatch
 
 STUB = '''#!/usr/bin/env python3
 import json, os, sys
@@ -190,7 +190,7 @@ def test_the_timeout_runs_inside_the_container(fake_docker, workspace):
     )
 
 
-def test_a_timeout_is_reported_as_such(fake_docker, workspace):  # noqa: ARG001
+def test_a_timeout_is_reported_as_such(fake_docker, workspace):
     result = sandbox.run("SCADI", workspace, timeout_s=1)
     assert result.timed_out is True
 
@@ -199,7 +199,7 @@ def test_a_timeout_is_reported_as_such(fake_docker, workspace):  # noqa: ARG001
 
 
 def test_without_docker_the_command_does_not_run_on_the_host(
-    fake_docker, workspace, monkeypatch  # noqa: ARG001
+    fake_docker, workspace, monkeypatch
 ):
     """Il punto di tutta la funzione: se il recinto manca, non si esegue."""
     monkeypatch.setenv("DOCKER_BROKEN", "1")
@@ -217,7 +217,7 @@ def test_without_docker_the_command_does_not_run_on_the_host(
     assert not sentinel.exists(), "il comando e' stato eseguito sull'host!"
 
 
-def test_the_error_explains_how_to_get_out_of_it(fake_docker, workspace, monkeypatch):  # noqa: ARG001
+def test_the_error_explains_how_to_get_out_of_it(fake_docker, workspace, monkeypatch):
     monkeypatch.setenv("DOCKER_BROKEN", "1")
     result = json.loads(
         dispatch(ctx_for(workspace, sandbox="docker"), "run_command", {"command": "ls"})
@@ -238,7 +238,7 @@ def test_run_command_goes_through_docker_when_the_sandbox_is_on(fake_docker, wor
     assert any(c[0] == "exec" for c in fake_docker())
 
 
-def test_a_failure_in_the_container_still_drives_self_correction(fake_docker, workspace):  # noqa: ARG001
+def test_a_failure_in_the_container_still_drives_self_correction(fake_docker, workspace):
     """Il ciclo di riparazione deve funzionare identico dentro la sandbox."""
     result = json.loads(
         dispatch(ctx_for(workspace, sandbox="docker"), "run_command", {"command": "FALLISCI"})
@@ -306,7 +306,7 @@ def test_quello_che_non_e_un_file_resta_vietato_ovunque(fake_docker, workspace):
 # comando di verifica dell'agente risponde "not found" e sembra un bug nostro.
 
 
-def test_the_default_image_is_declared_incomplete_to_the_ui(fake_docker, workspace):  # noqa: ARG001
+def test_the_default_image_is_declared_incomplete_to_the_ui(fake_docker, workspace):
     info = sandbox.status(workspace)
     assert info["dockerfile"] is None            # non c'e' ancora
     assert info["project_image"].endswith("-img")
@@ -328,8 +328,8 @@ def test_an_existing_dockerfile_is_never_overwritten(workspace):
     assert path.read_text(encoding="utf-8") == "FROM mia-immagine\n"
 
 
-def test_building_without_a_dockerfile_says_so(fake_docker, workspace):  # noqa: ARG001
-    with pytest.raises(sandbox.SandboxError, match="Dockerfile.sandbox"):
+def test_building_without_a_dockerfile_says_so(fake_docker, workspace):
+    with pytest.raises(sandbox.SandboxError, match=r"Dockerfile.sandbox"):
         sandbox.build_image(workspace)
 
 

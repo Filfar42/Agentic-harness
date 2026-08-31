@@ -17,8 +17,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-import tests.test_agent_loop as fake  # noqa: E402
-from tests.test_server import (  # noqa: E402,F401
+import tests.test_agent_loop as fake
+from tests.test_server import (  # noqa: F401
     client,
     current_session,
     fake_ollama,

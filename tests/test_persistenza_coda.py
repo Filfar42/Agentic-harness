@@ -21,7 +21,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from core import session as session_mod  # noqa: E402
+from core import session as session_mod
 
 
 @pytest.fixture()

@@ -83,13 +83,13 @@ class FintoBackend:
         self.testo = testo
         self.chiamate: list[tuple[list[dict], object]] = []
 
-    def stream(self, messages, tools, params):  # noqa: ARG002
+    def stream(self, messages, tools, params):
         self.chiamate.append((messages, params))
         yield StreamEvent("content", text=self.testo)
 
 
 class BackendRotto:
-    def stream(self, messages, tools, params):  # noqa: ARG002
+    def stream(self, messages, tools, params):
         yield StreamEvent("error", text="il modello non risponde")
 
 
@@ -146,20 +146,7 @@ def test_la_potatura_dice_dove_ritrovare_il_testo():
 def test_gli_argomenti_leggeri_non_si_toccano():
     """Un comando o un percorso costano poco e dicono cosa e' successo:
     riscrivere il messaggio per risparmiarli costerebbe piu' di quanto rende."""
-    msgs = [
-        {"role": "user", "content": "prova"},
-        {
-            "role": "assistant",
-            "content": "",
-            "tool_calls": [{
-                "id": "x", "type": "function",
-                "function": {"name": "run_command",
-                             "arguments": json.dumps({"command": "pytest -q"})},
-            }],
-        },
-        {"role": "tool", "tool_call_id": "x", "name": "run_command",
-         "content": json.dumps({"status": "ok", "returncode": 0}), "ok": True},
-    ] + cronologia(4)[1:]
+    msgs = [{"role": "user", "content": "prova"}, {"role": "assistant", "content": "", "tool_calls": [{"id": "x", "type": "function", "function": {"name": "run_command", "arguments": json.dumps({"command": "pytest -q"})}}]}, {"role": "tool", "tool_call_id": "x", "name": "run_command", "content": json.dumps({"status": "ok", "returncode": 0}), "ok": True}, *cronologia(4)[1:]]
     api = build_api_messages(
         msgs, system_prompt="", env_header=None,
         compact_old_tools=True, budgets=Budgets(tool_result_full_window=1),
@@ -429,7 +416,7 @@ class BackendDiTurno:
         self.riassunti = 0
         self.turni = 0
 
-    def stream(self, messages, tools, params):  # noqa: ARG002
+    def stream(self, messages, tools, params):
         if tools is None:
             self.riassunti += 1
             yield StreamEvent("content", text="FATTO:\n- sette moduli scritti")

@@ -17,10 +17,10 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from core import delega as delega_mod  # noqa: E402
-from core import skills as skills_mod  # noqa: E402
-from core.agent import PUNTI_PER_IL_CANCELLO  # noqa: E402
-from core.tools import TOOLS_SCHEMA, ToolContext, dispatch  # noqa: E402
+from core import delega as delega_mod
+from core import skills as skills_mod
+from core.agent import PUNTI_PER_IL_CANCELLO
+from core.tools import TOOLS_SCHEMA, ToolContext, dispatch
 
 
 @pytest.fixture()

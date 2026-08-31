@@ -17,9 +17,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from core import libreria  # noqa: E402
-from core.compaction import render_messaggio, trascrizione  # noqa: E402
-from core.textutils import estimate_tokens  # noqa: E402
+from core import libreria
+from core.compaction import render_messaggio, trascrizione
+from core.textutils import estimate_tokens
 
 RIASSUNTO = (
     "FATTO: aggiunto budgets_for in core/config.py, chiamato da core/agent.py.\n"

@@ -24,12 +24,12 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from core.agent import (  # noqa: E402
+from core.agent import (
     MIN_ARTEFATTI,
     artefatti_nominati,
     looks_multi_step,
 )
-from core.tools import (  # noqa: E402
+from core.tools import (
     ROSSI_PRIMA_DI_DUBITARE,
     ToolContext,
     dubita_della_verifica,

@@ -218,7 +218,6 @@ def test_il_sommario_vivo_dice_passo_e_strumenti_del_passo(js_sommario) -> None:
     """Il testo era 'x passi | y strumenti' col totale del turno: a meta'
     lavoro quel numero non torna con le righe aperte sotto. Ora e' 'passo N
     · M strumenti' e M conta i tool del SOLO passo corrente."""
-    import json as _json
 
     ctx = js_sommario
     ctx.eval("""

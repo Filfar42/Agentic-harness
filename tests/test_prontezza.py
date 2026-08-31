@@ -21,10 +21,10 @@ from fastapi.testclient import TestClient
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-import tests.test_agent_loop as fake  # noqa: E402
-from core import config as config_mod  # noqa: E402
-from core import sandbox as sandbox_mod  # noqa: E402
-from server import prep as prep_mod  # noqa: E402
+import tests.test_agent_loop as fake
+from core import config as config_mod
+from core import sandbox as sandbox_mod
+from server import prep as prep_mod
 
 fake_ollama = fake.fake_ollama
 

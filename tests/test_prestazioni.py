@@ -21,8 +21,8 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from core import agent as agent_mod  # noqa: E402
-from core import backend as backend_mod  # noqa: E402
+from core import agent as agent_mod
+from core import backend as backend_mod
 
 WEB = Path(__file__).resolve().parents[1] / "web"
 WEB_MOBILE = Path(__file__).resolve().parents[1] / "web_mobile"

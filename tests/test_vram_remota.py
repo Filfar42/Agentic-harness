@@ -17,12 +17,12 @@ from fastapi.testclient import TestClient
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-import tests.test_agent_loop as fake  # noqa: E402
-from core import agent as agent_mod  # noqa: E402
-from core import config as config_mod  # noqa: E402
-from core.backend import OllamaBackend  # noqa: E402
-from core.config import GenParams  # noqa: E402
-from core.tools import TOOLS_SCHEMA, ToolContext  # noqa: E402
+import tests.test_agent_loop as fake
+from core import agent as agent_mod
+from core import config as config_mod
+from core.backend import OllamaBackend
+from core.config import GenParams
+from core.tools import TOOLS_SCHEMA, ToolContext
 
 fake_ollama = fake.fake_ollama
 

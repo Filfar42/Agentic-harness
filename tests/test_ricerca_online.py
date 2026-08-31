@@ -17,10 +17,10 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from core import tools as tools_mod  # noqa: E402
-from core.prompts import append_web_search_clause  # noqa: E402
-from core.tools import ToolContext  # noqa: E402
-from tests.test_server import (  # noqa: E402,F401
+from core import tools as tools_mod
+from core.prompts import append_web_search_clause
+from core.tools import ToolContext
+from tests.test_server import (  # noqa: F401
     client,
     fake_ollama,
     read_sse,
@@ -155,7 +155,7 @@ def test_una_pagina_senza_risultati_torna_il_suggerimento_giusto(monkeypatch):
     """
     import httpx
 
-    def bot_check(url, **kwargs):  # noqa: ARG001 - la firma e' quella di httpx.post
+    def bot_check(url, **kwargs):
         return _RispostaFinta("<html><body>nessun risultato</body></html>")
 
     monkeypatch.setattr(httpx, "post", bot_check)

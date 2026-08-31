@@ -24,8 +24,8 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from core.backend import LlamaCppBackend, OpenAICompatBackend, build_backend  # noqa: E402
-from core.config import GenParams  # noqa: E402
+from core.backend import LlamaCppBackend, OpenAICompatBackend, build_backend
+from core.config import GenParams
 
 CHUNKS = [
     {"choices": [{"index": 0, "delta": {"reasoning_content": "ci penso"}}]},
@@ -282,7 +282,7 @@ def test_i_tool_spenti_sono_il_sintomo_di_jinja_mancante(finto_llama):
 
 def test_il_modello_si_ricava_dai_props_se_l_elenco_e_vuoto(finto_llama):
     """Un elenco vuoto lascia l'utente a indovinare cosa scrivere."""
-    url, handler = finto_llama
+    url, _handler = finto_llama
 
     class SenzaModelli(_Handler):
         pass

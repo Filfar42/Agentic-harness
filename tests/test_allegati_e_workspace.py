@@ -16,9 +16,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-import pytest  # noqa: E402
+import pytest
 
-from tests.test_server import (  # noqa: E402,F401
+from tests.test_server import (  # noqa: F401
     client,
     current_session,
     fake_ollama,

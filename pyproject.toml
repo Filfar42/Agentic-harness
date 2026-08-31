@@ -46,11 +46,21 @@ ignore = [
     # subprocess.run senza check=: l'esito si legge da returncode, sempre.
     "PLW1510",
 ]
-# Idiom pytest sistematico: fixture importate da test_server e ri-esposte come
-# argomenti (F811), parametri di fixture con solo effetto collaterale (ARG001).
-# Valgono per i test, non per il resto del progetto. Tabella inline TOML:
-# obbligatoria su una riga sola (le graffe multi-riga non sono sintassi valida).
-per-file-ignores = { "tests/*.py" = ["F811", "ARG001"] }
+# Idiomi di pytest, sistematici e voluti. Valgono per i test, non per il resto
+# del progetto. Tabella inline TOML: obbligatoria su una riga sola (le graffe
+# multi-riga non sono sintassi valida).
+#
+#   F811    fixture importate da test_server e ri-esposte come argomenti
+#   ARG001/2/5  parametri di fixture e lambda-doppio con solo effetto collaterale
+#   PLW0603 lo script del finto Ollama e' un globale di modulo, mutato dai test
+#           con try/finally: e' il seam su cui e' costruita meta' della suite
+#   RUF012  gli attributi di classe dei fake (liste di chiamate, code) sono
+#           mutabili apposta -- e' il modo in cui il test li ispeziona
+#   BLE001  un `except Exception` in un test che verifica che qualcosa NON
+#           esploda e' il punto del test
+#   E402    l'import dopo `sys.path.insert`, che rende i test lanciabili
+#           direttamente
+per-file-ignores = { "tests/*.py" = ["F811", "ARG001", "ARG002", "ARG005", "PLW0603", "RUF012", "BLE001", "E402"] }
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -21,7 +21,7 @@ from core.tools import ToolContext
 fake_ollama = fake.fake_ollama
 
 
-class StepStarted:  # noqa: N801 -- il loop conta solo ``type(evento).__name__``
+class StepStarted:
     def __init__(self, step=0, total=0):
         self.step = step
         self.total = total

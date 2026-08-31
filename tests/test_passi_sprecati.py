@@ -30,8 +30,8 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from core.plan import Plan  # noqa: E402
-from core.tools import PLAN_TOOL, ToolContext, dispatch  # noqa: E402
+from core.plan import Plan
+from core.tools import PLAN_TOOL, ToolContext, dispatch
 
 
 @pytest.fixture()

@@ -11,14 +11,14 @@ from __future__ import annotations
 
 import sys
 import time
+from typing import Any
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-import pytest  # noqa: E402
+import pytest
 
-from core import config as config_mod  # noqa: E402
-from tests.test_server import client, current_session, fake_ollama  # noqa: E401,F401
+from tests.test_server import client, current_session, fake_ollama  # noqa: F401
 
 WEB = Path(__file__).resolve().parents[1] / "web"
 
@@ -54,7 +54,8 @@ def script_risposta(monkeypatch):
     """Lo script piu' corto: un passo, una risposta, fine."""
     import tests.test_agent_loop as fake
 
-    original = fake.SCRIPT
+    # Nessun salva/ripristina a mano: lo fa ``monkeypatch``, ed e' il motivo
+    # per cui questa fixture lo usa invece dell'assegnazione diretta.
     monkeypatch.setattr(fake, "SCRIPT", [[{"message": {"content": "Fatto."}}]])
     yield
 

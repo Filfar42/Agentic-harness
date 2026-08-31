@@ -18,7 +18,7 @@ from fastapi.testclient import TestClient
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from core import config as config_mod  # noqa: E402
+from core import config as config_mod
 
 RADICE = Path(__file__).resolve().parents[1]
 WEB = RADICE / "web"

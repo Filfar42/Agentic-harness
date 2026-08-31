@@ -20,9 +20,9 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-import tests.test_sandbox as sbox  # noqa: E402
-from core import sandbox  # noqa: E402
-from core.tools import PREVIEW_TOOL, ToolContext, dispatch  # noqa: E402
+import tests.test_sandbox as sbox
+from core import sandbox
+from core.tools import PREVIEW_TOOL, ToolContext, dispatch
 
 fake_docker = sbox.fake_docker
 workspace = sbox.workspace

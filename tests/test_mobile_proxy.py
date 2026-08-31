@@ -20,8 +20,8 @@ from fastapi.testclient import TestClient
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-import tests.test_agent_loop as fake  # noqa: E402  (riusa il finto Ollama)
-from core import config as config_mod  # noqa: E402
+import tests.test_agent_loop as fake
+from core import config as config_mod
 
 
 # Chiave del ponte usata da tutti i test: fissa e nota, invece di quella

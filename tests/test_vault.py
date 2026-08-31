@@ -22,6 +22,10 @@ from pathlib import Path
 
 import pytest
 
+import tests.test_agent_loop as _fake_loop
+
+fake_ollama = _fake_loop.fake_ollama
+
 from core import vault as vault_mod
 from core import vault_search
 from core.tools import TOOLS_SCHEMA, ToolContext
@@ -411,7 +415,7 @@ def test_vault_pick_dialogo_non_disponibile_501(client_vault, monkeypatch):
 
 
 def test_prompt_di_sistema_diventa_manutentore_su_vault(client_vault):
-    client, st, td = client_vault
+    _client, st, td = client_vault
     from server.main import AppState
 
     kv = td / "mio_vault"
@@ -440,7 +444,7 @@ def test_lo_stato_della_wiki_non_entra_nel_prompt_di_sistema(client_vault):
     """
     from server.main import AppState
 
-    client, st, td = client_vault
+    _client, st, td = client_vault
     kv = td / "mio_vault"
     vault_mod.scaffold(kv)
     st.settings["workspace_dir"] = str(kv)
@@ -1073,3 +1077,53 @@ def test_wiki_esplicitamente_nullo_ricade_sulla_struttura(tmp_path):
         _json.dumps({"nome": "kv", "wiki": None}), encoding="utf-8"
     )
     assert vault_mod.leggi_config(base).wiki is True
+
+
+def test_lo_stato_della_wiki_arriva_al_modello_in_coda(tmp_path, fake_ollama):
+    """Uscito dal prompt di sistema, deve comunque arrivare -- e in coda.
+
+    E deve arrivare anche ai vault nati **prima** di ``.vault.json``, che la
+    modalita' wiki riconosce dalla struttura: quelli non hanno ``vault_dir``, e
+    leggerlo da li' li avrebbe lasciati senza indice.
+    """
+    from core import agent as agent_mod
+    from core.backend import OllamaBackend
+    from core.config import GenParams
+    from core.tools import TOOLS_SCHEMA, ToolContext
+
+    url, _ = fake_ollama
+    base = tmp_path / "wiki_vecchia"
+    vault_mod.scaffold(base)                      # raw/ + wiki/, niente .vault.json
+    (base / ".vault.json").unlink(missing_ok=True)
+    assert not vault_mod.is_registrato(base)
+    assert vault_mod.is_modalita_vault(base)      # riconosciuta dalla struttura
+    (base / "wiki" / "index.md").write_text(
+        "# Indice\n- [[Memex]] la macchina di Bush\n", encoding="utf-8"
+    )
+
+    import tests.test_agent_loop as fake
+
+    fake._Handler.calls.clear()
+    ctx = ToolContext(workspace=str(base), sandbox="host")
+    messaggi = [{"role": "user", "content": "che dice la wiki del memex?"}]
+    list(
+        agent_mod.run_turn(
+            backend=OllamaBackend(url, timeout_s=20),
+            params=GenParams(model="fake:latest"),
+            tools_schema=TOOLS_SCHEMA,
+            tool_ctx=ctx,
+            ui_messages=messaggi,
+            system_prompt="SYS",
+            env_header=None,
+            max_steps=1,
+        )
+    )
+    # La **prima** chiamata: l'ultima e' il riepilogo forzato di fine passi,
+    # che costruisce un array di messaggi tutto suo.
+    prima = fake._Handler.calls[0]
+    coda = [m for m in prima["messages"] if m.get("role") == "user"][-1]["content"]
+    assert "stato_del_vault" in coda
+    assert "Memex" in coda
+    # ...e non in testa: il prefisso deve restare byte-identico fra i passi
+    sistema = " ".join(m["content"] for m in prima["messages"] if m.get("role") == "system")
+    assert "Memex" not in sistema

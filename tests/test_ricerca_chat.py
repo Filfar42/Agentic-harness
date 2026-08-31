@@ -17,8 +17,8 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from core import session as session_mod  # noqa: E402
-from tests.test_server import client, fake_ollama  # noqa: E402,F401
+from core import session as session_mod
+from tests.test_server import client, fake_ollama  # noqa: F401
 
 WEB = Path(__file__).resolve().parents[1] / "web"
 
