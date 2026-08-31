@@ -89,18 +89,44 @@ def add_memory(memories: list[dict[str, str]], text: str) -> tuple[bool, str]:
     return True, text
 
 
+class MemoriaAmbigua(ValueError):
+    """Il riferimento corrisponde a piu' di una memoria."""
+
+    def __init__(self, candidate: list[dict[str, str]]):
+        self.candidate = candidate
+        elenco = "; ".join(f"[{m['id']}] {m['text'][:50]}" for m in candidate[:4])
+        super().__init__(
+            f"'{len(candidate)}' memorie corrispondono: {elenco}. "
+            "Cita l'id esatto per dire quale."
+        )
+
+
 def remove_memory(memories: list[dict[str, str]], needle: str) -> bool:
-    """Rimuove per id esatto, oppure per testo (match case-insensitive)."""
+    """Rimuove per id esatto, oppure per testo esatto (case-insensitive).
+
+    Il ripiego per **sottostringa** e' stato tolto. Cancellava la prima memoria
+    che conteneva il testo citato: con "Filip preferisce le risposte brevi" e
+    "Filip preferisce le risposte brevi nei riepiloghi", un ``remove`` sul testo
+    della seconda cancellava la prima. Sono i fatti stabili dell'utente,
+    accumulati per mesi, e la cancellazione non ha un annulla.
+
+    Resta il match per **prefisso**, che copre il caso vero per cui il ripiego
+    era stato scritto -- il modello che cita una memoria troncandola -- ma solo
+    se e' univoco: se ne combaciano due, si solleva invece di indovinare.
+    """
     needle_l = needle.strip().lower()
+    if not needle_l:
+        return False
     for idx, mem in enumerate(memories):
         if mem["id"] == needle.strip() or mem["text"].lower() == needle_l:
             memories.pop(idx)
             return True
-    # fallback: match parziale, utile quando il modello cita la memoria a memoria
-    for idx, mem in enumerate(memories):
-        if needle_l and needle_l in mem["text"].lower():
-            memories.pop(idx)
-            return True
+    candidate = [m for m in memories if m["text"].lower().startswith(needle_l)]
+    if len(candidate) > 1:
+        raise MemoriaAmbigua(candidate)
+    if candidate:
+        memories.remove(candidate[0])
+        return True
     return False
 
 

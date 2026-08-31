@@ -1043,3 +1043,101 @@ def test_la_versione_e_la_stessa_in_pyproject():
     dichiarata = re.search(r'^version\s*=\s*"([^"]+)"', testo, re.M)
     assert dichiarata, "pyproject.toml non dichiara nessuna version"
     assert dichiarata.group(1) == APP_VERSION
+
+
+# ---------------------------------------------------------------------------
+# Correzioni dell'audit del 30/08/2026
+# ---------------------------------------------------------------------------
+
+
+def test_una_memoria_non_si_cancella_per_sottostringa():
+    """Il ripiego cancellava la prima memoria che *conteneva* il testo citato.
+
+    Con "preferisce le risposte brevi" e "preferisce le risposte brevi nei
+    riepiloghi", un remove sul testo della seconda cancellava la prima. Sono i
+    fatti stabili dell'utente, accumulati per mesi, e non c'e' un annulla.
+    """
+    from core.memory import MemoriaAmbigua, add_memory, remove_memory
+
+    memorie: list[dict[str, str]] = []
+    add_memory(memorie, "preferisce le risposte brevi")
+    add_memory(memorie, "preferisce le risposte brevi nei riepiloghi")
+
+    # il testo esatto toglie quella giusta
+    assert remove_memory(memorie, "preferisce le risposte brevi nei riepiloghi")
+    assert [m["text"] for m in memorie] == ["preferisce le risposte brevi"]
+
+    # e una citazione che ne combacia due si rifiuta invece di indovinare
+    add_memory(memorie, "preferisce le risposte brevi nei riepiloghi")
+    with pytest.raises(MemoriaAmbigua):
+        remove_memory(memorie, "preferisce le risposte")
+    assert len(memorie) == 2
+
+
+def test_un_termine_di_skill_non_combacia_a_meta_parola():
+    """Il docstring prometteva il confine di parola, il regex ne aveva uno solo.
+
+    ``(?<!\\w)test`` controlla che prima non ci sia una lettera, non che dopo la
+    parola finisca: cercando "test" si prendeva "testo", e una skill caricata a
+    sproposito costa il doppio -- i suoi token piu' l'attenzione che ruba.
+    """
+    from core.skills import Skill
+
+    s = Skill(nome="prove", descrizione="", termini=("test",), corpo="...",
+              origine="harness")
+    assert s.combacia("lancia i test del progetto")
+    assert not s.combacia("il testo del file e' cambiato")
+    assert not s.combacia("questo e' il contesto")
+
+
+def test_una_skill_lunga_non_nasconde_quelle_dopo():
+    """``break`` sul tetto faceva sparire tutte le procedure successive."""
+    from core.skills import MAX_TOTALE_CHARS, Skill, scegli
+
+    # Piu' grande del tetto: da sola non ci sta, e prima ``break`` faceva
+    # sparire anche tutte quelle che venivano dopo.
+    lunga = Skill(nome="lunga", descrizione="", termini=("deploy",),
+                  corpo="x" * (MAX_TOTALE_CHARS + 1), origine="harness")
+    corta = Skill(nome="corta", descrizione="", termini=("deploy",), corpo="breve",
+                  origine="harness")
+    scelte = [s.nome for s in scegli([lunga, corta], "fai il deploy")]
+    assert scelte == ["corta"]
+
+
+def test_il_conto_dei_token_non_dimentica_le_immagini():
+    """Contarle zero faceva credere libero uno spazio occupato."""
+    from core.textutils import TOKEN_PER_IMMAGINE, estimate_messages_tokens
+
+    senza = [{"role": "user", "content": "guarda"}]
+    con = [{"role": "user", "content": "guarda", "images": ["b64", "b64"]}]
+    assert estimate_messages_tokens(con) - estimate_messages_tokens(senza) == (
+        2 * TOKEN_PER_IMMAGINE
+    )
+
+
+def test_il_conto_dei_token_include_i_campi_del_template():
+    """``name`` e ``tool_call_id`` stanno su ogni risultato di tool."""
+    from core.textutils import estimate_messages_tokens
+
+    nudo = [{"role": "tool", "content": "ok"}]
+    vestito = [{"role": "tool", "content": "ok", "name": "read_file",
+                "tool_call_id": "call_abc123def456"}]
+    assert estimate_messages_tokens(vestito) > estimate_messages_tokens(nudo)
+
+
+def test_il_piano_non_perde_il_punto_in_corso_in_silenzio():
+    """Un ``set`` che non lo rinomina lo lasciava fuori senza dire niente."""
+    from core.plan import Plan, PlanError
+
+    piano = Plan()
+    piano.set_steps(["leggere il modulo", "scrivere il test", "lanciare la suite"])
+    piano.avanza()
+    assert piano.current is not None
+
+    with pytest.raises(PlanError) as errore:
+        piano.set_steps(["tutt'altro piano", "senza il punto aperto"])
+    assert piano.current.id in str(errore.value)
+
+    # ...ma riscriverlo tenendolo dentro resta legittimo
+    piano.set_steps([piano.current.text, "un punto nuovo"])
+    assert piano.current is not None

@@ -346,6 +346,16 @@ def chars_for_tokens(tokens: float) -> int:
     return max(0, int(float(tokens) * _CHARS_PER_TOKEN))
 
 
+# Quanto pesa un'immagine in contesto, in token.
+#
+# Non e' una stima del formato -- dipende dal modello e dalla risoluzione -- ma
+# un ordine di grandezza onesto: su una vision-language da 7-8B un riquadro
+# standard costa fra i 600 e i 1.500 token. Contarla **zero** era il difetto:
+# quattro immagini allegate sparivano dal conto, e la barra del contesto
+# diceva che c'era spazio dove non ce n'era.
+TOKEN_PER_IMMAGINE = 1_000
+
+
 def estimate_messages_tokens(messages: Iterable[dict]) -> int:
     """Stima i token di un array di messaggi in formato OpenAI, tool call incluse."""
     total = 0
@@ -358,6 +368,15 @@ def estimate_messages_tokens(messages: Iterable[dict]) -> int:
             for part in content:
                 if isinstance(part, dict):
                     total += estimate_tokens(str(part.get("text", "")))
+        # I campi che il template mette nel prompt e che il conto ignorava.
+        # ``name`` e ``tool_call_id`` compaiono su ogni risultato di tool --
+        # cioe' sui messaggi piu' numerosi di una conversazione agentica.
+        total += estimate_tokens(str(msg.get("name", "")))
+        total += estimate_tokens(str(msg.get("tool_call_id", "")))
+        # Le immagini: contarle zero faceva credere libero uno spazio occupato.
+        immagini = msg.get("images")
+        if isinstance(immagini, list):
+            total += TOKEN_PER_IMMAGINE * len(immagini)
         for call in msg.get("tool_calls") or []:
             fn = call.get("function", {}) if isinstance(call, dict) else {}
             total += estimate_tokens(str(fn.get("name", "")))

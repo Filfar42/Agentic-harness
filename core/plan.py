@@ -248,6 +248,21 @@ class Plan:
             # sott'occhio nel pannello mentre l'agente ci sta lavorando.
             nuovi_aperti.append(vecchio if vecchio is not None else PlanStep(id="", text=testo))
 
+        # Il punto DOING non puo' sparire in silenzio. Un ``set`` che non lo
+        # rinomina lo lascerebbe fuori dall'elenco nuovo: il pannello
+        # dell'utente perde il punto in corso, il blocco di coda che il modello
+        # rilegge ad ogni passo non lo cita piu', e nessuno dice che e'
+        # successo. Riscrivere il piano a meta' lavoro e' legittimo; perdere il
+        # segno di dove si e' arrivati no.
+        in_corso = self.current
+        if in_corso is not None and in_corso not in nuovi_aperti:
+            raise PlanError(
+                f"Il punto in corso ({in_corso.id}: «{in_corso.text}») non "
+                "compare nel piano nuovo. Se e' finito chiudilo con "
+                "action='complete'; se non si fa piu' usa action='skip' con "
+                "una nota; se e' solo cambiato, riscrivilo nell'elenco."
+            )
+
         if len(nuovi_aperti) > MAX_STEPS:
             raise PlanError(
                 f"Troppi punti aperti ({len(nuovi_aperti)}): il massimo e' "

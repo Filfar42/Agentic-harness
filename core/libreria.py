@@ -225,14 +225,31 @@ def _scrivi(base: Path, *, titolo: str, corpo: list[str]) -> Voce | None:
         marker = cart / ".gitignore"
         if not marker.exists():
             marker.write_text("*\n", encoding="utf-8")
-        destinazione = cart / nome
-        if destinazione.exists():
-            # Non si sovrascrive mai. Se il nome e' occupato -- due tratti con
-            # lo stesso titolo -- si aggiunge, non si sostituisce.
-            with open(destinazione, "a", encoding="utf-8") as fh:
-                fh.write("\n---\n\n" + "\n".join(righe[1:]))
+        # Il numero si ricava prima e si scrive dopo: fra le due cose ci puo'
+        # stare un altro turno. ``RUNNERS`` fa girare i turni in thread di
+        # sfondo e due archiviazioni vicine leggevano lo stesso ultimo numero,
+        # producendo lo stesso nome. Qui si prova a creare in modo esclusivo e,
+        # se il nome e' gia' occupato **da qualcun altro**, si passa al
+        # successivo invece di accodarsi al suo file.
+        for tentativo in range(numero, numero + 20):
+            nome = f"{tentativo:03d}-{_slug(titolo)}.md"
+            destinazione = cart / nome
+            try:
+                with open(destinazione, "x", encoding="utf-8") as fh:
+                    fh.write("\n".join(righe))
+                numero = tentativo
+                break
+            except FileExistsError:
+                # Stesso numero **e** stesso titolo: e' il caso previsto dal
+                # commento originale -- due tratti sullo stesso punto -- e li'
+                # accodare e' giusto.
+                if destinazione.read_text(encoding="utf-8").startswith(f"# {titolo}"):
+                    with open(destinazione, "a", encoding="utf-8") as fh:
+                        fh.write("\n---\n\n" + "\n".join(righe[1:]))
+                    numero = tentativo
+                    break
         else:
-            destinazione.write_text("\n".join(righe), encoding="utf-8")
+            return None
     except OSError:
         return None
     return Voce(numero=numero, nome=nome, titolo=titolo)

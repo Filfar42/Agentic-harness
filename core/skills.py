@@ -80,7 +80,11 @@ class Skill:
             termine = termine.strip().lower()
             if not termine:
                 continue
-            if re.search(rf"(?<!\w){re.escape(termine)}", testo):
+            # Confine da **entrambi** i lati. Con il solo ``(?<!\w)`` davanti,
+            # cercare "test" trovava "testo": il lookbehind controlla che prima
+            # non ci sia una lettera, non che dopo la parola finisca. Il
+            # docstring qui sopra promette il contrario da sempre.
+            if re.search(rf"(?<!\w){re.escape(termine)}(?!\w)", testo):
                 return True
         return False
 
@@ -149,8 +153,14 @@ def scegli(skills: list[Skill], richiesta: str) -> list[Skill]:
     for skill in skills:
         if not skill.combacia(richiesta):
             continue
-        if len(scelte) >= MAX_SKILL_ATTIVE or speso + len(skill.corpo) > MAX_TOTALE_CHARS:
+        if len(scelte) >= MAX_SKILL_ATTIVE:
             break
+        if speso + len(skill.corpo) > MAX_TOTALE_CHARS:
+            # ``continue`` e non ``break``: una skill lunga che non ci sta non
+            # deve impedire a quelle corte dopo di lei di entrare. Con ``break``
+            # bastava un file grosso in mezzo all'elenco per far sparire tutte
+            # le procedure successive, senza che niente lo dicesse.
+            continue
         scelte.append(skill)
         speso += len(skill.corpo)
     return scelte

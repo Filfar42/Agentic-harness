@@ -101,9 +101,23 @@ def deposita(base: Path, testo: str, *, etichetta: str, intestazione: str = "") 
         marker = cart / ".gitignore"
         if not marker.exists():
             marker.write_text("*\n", encoding="utf-8")
-        nome = f"{_prossimo_numero(cart):03d}-{_slug(etichetta)}.txt"
         corpo = f"# {intestazione}\n\n{testo}" if intestazione else testo
-        (cart / nome).write_text(corpo, encoding="utf-8")
+        # ``open(..., "x")`` e non ``write_text``: fra il calcolo del numero e
+        # la scrittura ci puo' stare un altro turno -- ``RUNNERS`` li fa girare
+        # in thread di sfondo -- e ``write_text`` sovrascriveva in silenzio il
+        # deposito appena creato da quell'altro. Qui il primo che arriva tiene
+        # il nome e il secondo prende il successivo.
+        primo = _prossimo_numero(cart)
+        for tentativo in range(primo, primo + 50):
+            nome = f"{tentativo:03d}-{_slug(etichetta)}.txt"
+            try:
+                with open(cart / nome, "x", encoding="utf-8") as fh:
+                    fh.write(corpo)
+                break
+            except FileExistsError:
+                continue
+        else:
+            return None
     except OSError:
         return None
     return f"{SCHEDARIO}/{nome}"

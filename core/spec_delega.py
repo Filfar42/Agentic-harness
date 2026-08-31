@@ -45,6 +45,7 @@ i ``*.md`` -- non lo vede nemmeno. Una cartella nascosta sola invece di due.
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -111,9 +112,16 @@ def registra(
         marker = percorso.parent / ".gitignore"
         if not marker.exists():
             marker.write_text("*\n", encoding="utf-8")
-        percorso.write_text(
+        # tmp + replace, come le preferenze: ``write_text`` tronca il file e
+        # poi scrive, quindi un'interruzione a meta' -- o due turni che
+        # archiviano insieme, e ``RUNNERS`` li fa girare in thread di sfondo --
+        # lascia un JSON monco. Al giro dopo ``_leggi`` non lo parsa e i fatti
+        # accumulati spariscono tutti insieme, in silenzio.
+        tmp = percorso.with_suffix(percorso.suffix + ".tmp")
+        tmp.write_text(
             json.dumps(fatti[-MAX_FATTI:], ensure_ascii=False, indent=1), encoding="utf-8"
         )
+        os.replace(tmp, percorso)
     except OSError:
         return
 
