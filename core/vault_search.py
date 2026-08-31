@@ -197,7 +197,10 @@ def cerca_nel_vault(
                 continue
             referto = str(testo).strip()
             if len(referto) > MAX_REFERTO_CHARS:
-                referto = referto[:MAX_REFERTO_CHARS]
+                # Il marcatore, come in ``delega.esegui``: senza, il padre
+                # riceve una risposta che finisce a meta' frase e non ha modo
+                # di sapere che manca qualcosa -- la tratta come completa.
+                referto = referto[:MAX_REFERTO_CHARS].rstrip() + "\n[referto troncato]"
             return {
                 "vault": nome_usato,
                 "query": query,
@@ -221,8 +224,14 @@ def referto_compatto(esito: dict[str, Any], max_chars: int = 0) -> str:
         "passi": esito.get("passi", 0),
         "referto": esito.get("referto", ""),
     }
-    testo = json.dumps(out, ensure_ascii=False)
     tetto = max_chars or (MAX_REFERTO_CHARS + 200)
+    testo = json.dumps(out, ensure_ascii=False)
     if len(testo) > tetto:
-        testo = testo[:tetto]
+        # Si accorcia il **campo**, non la busta: tagliare il JSON serializzato
+        # produce JSON invalido, e il modello riceve qualcosa che non sa
+        # leggere proprio quando il referto e' abbondante.
+        margine = len(testo) - len(out["referto"])
+        spazio = max(0, tetto - margine - len("\n[referto troncato]"))
+        out["referto"] = out["referto"][:spazio].rstrip() + "\n[referto troncato]"
+        testo = json.dumps(out, ensure_ascii=False)
     return testo

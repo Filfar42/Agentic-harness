@@ -617,9 +617,32 @@ function stopStream() {
   if (source) { source.close(); source = null; }
 }
 
+/** Toglie dal DOM il turno in corso, prima che l'arretrato lo ridisegni.
+ *
+ *  Solo il turno vivo: i messaggi dei turni chiusi sono cronologia, li ha gia'
+ *  scritti refreshChat e nessun frame dell'arretrato li ripete.
+ */
+function pulisciTurnoVivo() {
+  document.querySelectorAll(".msg.agent.live").forEach((n) => n.remove());
+  if (gruppoPassi && gruppoPassi.isConnected) gruppoPassi.remove();
+  gruppoPassi = null;
+  testoInCorso = "";
+  contaPassi = 0;
+  contaTool = 0;
+  contaToolPasso = 0;
+}
+
 function attachStream() {
   if (!currentId) return;
   stopStream();
+  // Il server manda tutto l'arretrato ad ogni sottoscrizione (runner.py:
+  // "prima tutto l'arretrato e poi il flusso dal vivo"). Al riaggancio -- rete
+  // che torna, schermo riacceso, i 1,5 s dopo un onerror -- quel backlog viene
+  // rigiocato: senza ripulire, liveBubble non trova piu' la bolla (l'evento
+  // 'assistant' le ha tolto .live) e ne crea una seconda, e ogni tool_start
+  // accoda una riga che c'e' gia'. Il turno appariva due volte. Il desktop lo
+  // risolve gia' cosi', in web/app.js (`vecchio.wrap.remove()`).
+  pulisciTurnoVivo();
   source = new EventSource(`/api/stream/${currentId}`);
 
   source.onmessage = (ev) => {
@@ -718,7 +741,13 @@ function handleEvent(data) {
       // Fine del passo: la versione autorevole arriva sempre intera, e da qui
       // l'accumulo riparte da zero per il passo successivo.
       testoInCorso = "";
+      // Un 'assistant' per un passo gia' reso arriva solo dall'arretrato di un
+      // riaggancio: e' lo stesso testo, e va ignorato. ``pulisciTurnoVivo`` da
+      // sola non basta -- la bolla chiusa non ha piu' .live, quindi non la
+      // tocca -- e senza questo l'arretrato ne creerebbe comunque una nuova.
+      if (document.querySelector(`.msg.agent[data-passo="${contaPassi}"]`)) break;
       const bubble = liveBubble();
+      bubble.dataset.passo = String(contaPassi);
       bubble.classList.remove("live");
       const clean = stripThink(data.content ?? "");
       bubble.textContent = clean || bubble.textContent;

@@ -131,3 +131,53 @@ def test_una_copia_vecchia_nel_campo_blocca_le_modifiche_al_prompt():
         "una copia di un nostro prompt vecchio passa per personalizzata: "
         "e' voluto, ma per questo il campo deve poter tornare vuoto"
     )
+
+
+def test_ogni_campo_numerico_converte_prima_di_salvare():
+    """Un ``<input type="number">`` restituisce una STRINGA.
+
+    Salvarla cosi' funziona per tutta la sessione -- ``int("128")`` non da'
+    errore -- e si annulla da sola al riavvio successivo, quando
+    ``load_settings`` scarta il valore perche' il tipo non combacia col default
+    e rimette il default senza dirlo a nessuno. E' il difetto peggiore da
+    diagnosticare: l'utente alza il tetto del deposito, lo vede funzionare,
+    riavvia, e ritrova 64.
+
+    Osservato su ``deposito_max_mb``, l'unico campo numerico su quattordici a
+    cui mancava ``Number`` -- e il test che copriva questo file verificava il
+    *meccanismo* BOUND_FIELDS, non la trasformazione.
+    """
+    sorgente = js()
+    html = (WEB / "index.html").read_text(encoding="utf-8")
+    numerici = set(re.findall(r'<input[^>]*type="number"[^>]*id="([^"]+)"', html))
+    numerici |= set(re.findall(r'<input[^>]*type="range"[^>]*id="([^"]+)"', html))
+    assert numerici, "nessun campo numerico trovato: il regex e' da rivedere"
+    scoperti = []
+    for campo in sorted(numerici):
+        riga = re.search(rf"bindField\('#{re.escape(campo)}',[^)]*\)", sorgente)
+        if riga and "Number" not in riga.group(0):
+            scoperti.append(campo)
+    assert not scoperti, (
+        "questi campi numerici si salvano come stringa e torneranno al valore "
+        f"di serie al prossimo riavvio, senza avvisare: {scoperti}"
+    )
+
+
+def test_la_palette_non_ha_variabili_fantasma():
+    """Una custom property non definita e senza ripiego diventa `unset`.
+
+    Per una proprieta' ereditabile come ``color`` significa "eredita", non
+    "usa il default": ``--text-dim`` era usata tre volte e definita zero, e le
+    righe dei vault nascevano gia' a colore pieno -- quindi :hover e .active,
+    che portano a ``var(--text)``, non cambiavano niente di visibile.
+    """
+    css = (WEB / "style.css").read_text(encoding="utf-8")
+    # Solo gli usi **senza ripiego**: `var(--preview-w, 50%)` e' il modo giusto
+    # di leggere una variabile che scrive il JS, e non e' un difetto.
+    senza_ripiego = set(re.findall(r"var\(\s*(--[a-z0-9-]+)\s*\)", css))
+    definite = set(re.findall(r"^\s*(--[a-z0-9-]+)\s*:", css, re.M))
+    fantasma = sorted(senza_ripiego - definite)
+    assert not fantasma, (
+        "custom property usate senza definizione e senza ripiego: la "
+        f"dichiarazione diventa `unset` e il valore viene ereditato: {fantasma}"
+    )

@@ -13,6 +13,12 @@
   --text: #1f1e1d;
   --text-muted: #6e6a62;
   --text-faint: #98938a;
+  /* Alias storico. C'e' stato un momento in cui la palette aveva un quarto
+     grigio, e tre regole continuavano a chiedere `var(--text-dim)`: senza
+     ripiego la dichiarazione diventa `unset` e il colore viene EREDITATO.
+     Le righe dei vault nascevano gia' a colore pieno, quindi :hover e .active
+     -- che portano a var(--text) -- non cambiavano niente di visibile. */
+  --text-dim: var(--text-muted);
   --accent: #c96442;
   --accent-hover: #b4573a;
   --accent-soft: #f7ece7;
@@ -149,7 +155,10 @@ html[data-theme="dark"] .logo .logo-scuro { display: block; }
    Quanto valga "meta'" lo decide la maniglia: `--vaults-h` e' l'altezza della
    sezione, e le due parti scorrono per conto loro -- risalire fra i vault non
    deve trascinare via le conversazioni, e viceversa. */
-#sessions { flex: 1 1 auto; }
+/* Le proprieta' di #sessions stanno tutte insieme piu' sotto, nella sezione
+   dell'elenco conversazioni: qui c'era un secondo blocco con `flex: 1 1 auto`
+   che l'altro sovrascriveva 113 righe dopo -- e il commento sopra spiegava il
+   disegno riferendosi a una regola morta. */
 .vaults-sec {
   flex: 0 0 var(--vaults-h, 50%); min-height: 0;
   display: flex; flex-direction: column;
@@ -193,6 +202,8 @@ body.resizing-rows, body.resizing-rows * { cursor: ns-resize !important; user-se
 .vault-add input::placeholder { color: var(--text-faint); }
 
 .vault {
+  position: relative;   /* per ::before: senza, si posiziona su .vault-node,
+                           che include anche il ramo delle chat */
   display: flex; align-items: center; gap: 8px; width: 100%;
   text-align: left; font: inherit; font-size: 12px; color: var(--text-dim);
   background: none; border: 0; border-radius: 8px;
@@ -200,9 +211,11 @@ body.resizing-rows, body.resizing-rows * { cursor: ns-resize !important; user-se
 }
 .vault:hover { background: rgba(127, 122, 112, 0.11); color: var(--text); }
 .vault.active { background: rgba(127, 122, 112, 0.16); color: var(--text); font-weight: 500; }
+/* Centrata verticalmente come la gemella .session.active::before, che lo
+   faceva gia': due elementi con la stessa funzione avevano due comportamenti. */
 .vault.active::before {
-  content: ''; width: 3px; height: 16px; border-radius: 2px;
-  background: var(--accent); position: absolute; left: 4px;
+  content: ''; position: absolute; left: 4px; top: 50%; transform: translateY(-50%);
+  width: 3px; height: 16px; border-radius: 2px; background: var(--accent);
 }
 .vault-name {
   flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
@@ -1263,7 +1276,7 @@ table.grid td.no { color: var(--text-faint); }
   margin-left: auto; font: inherit; font-size: 10px; font-weight: 600;
   text-transform: uppercase; letter-spacing: 0.06em;
   color: var(--text-faint); background: none; border: 0; cursor: pointer;
-  padding: 0; text-transform: uppercase;
+  padding: 0;
 }
 .section-back:hover { color: var(--accent); }
 

@@ -3517,7 +3517,7 @@ async function boot() {
   bindField('#s-estratto-pensiero', 'estratto_pensiero');
   bindField('#s-spec-delega', 'spec_delega');
   bindField('#s-deposito', 'deposito_risultati');
-  bindField('#s-deposito-max-mb', 'deposito_max_mb');
+  bindField('#s-deposito-max-mb', 'deposito_max_mb', Number);
   bindField('#s-envhdr', 'auto_env_header');
   bindField('#s-docker-autostart', 'docker_autostart');
   bindField('#s-image-autobuild', 'image_autobuild');

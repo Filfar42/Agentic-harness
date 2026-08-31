@@ -908,6 +908,20 @@ def _err(message: str, *, hint: str = "") -> str:
 # ---------------------------------------------------------------------------
 
 
+def _da_saltare(nome: str) -> bool:
+    """Voci che nessun walk dell'harness mostra al modello.
+
+    Vale per ``list_files``, ``find``, ``grep_files`` e l'header d'ambiente. I
+    quattro seguivano tre politiche diverse: ``list_files`` aveva
+    ``nome in IGNORED_DIRS or nome.startswith(".") and entry.is_dir()``, che per
+    la precedenza di ``and`` su ``or`` significa "salta i dot-file solo se sono
+    anche cartelle" -- cioe' mai. I ``.env`` e i ``.vault.json`` finivano
+    nell'elenco mentre l'header d'ambiente li nascondeva: due risposte diverse
+    alla stessa domanda, date allo stesso modello nello stesso turno.
+    """
+    return nome in IGNORED_DIRS or nome.startswith(".")
+
+
 def _cerca_per_nome(ctx: ToolContext, root: Path, subfolder: str, pattern: str) -> str:
     """Percorsi che corrispondono a un modello di nome, a qualunque profondita'.
 
@@ -917,9 +931,9 @@ def _cerca_per_nome(ctx: ToolContext, root: Path, subfolder: str, pattern: str) 
     """
     trovati: list[tuple[float, str]] = []
     for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = [d for d in dirnames if d not in IGNORED_DIRS and not d.startswith(".")]
+        dirnames[:] = [d for d in dirnames if not _da_saltare(d)]
         for name in filenames:
-            if not fnmatch.fnmatch(name, pattern):
+            if _da_saltare(name) or not fnmatch.fnmatch(name, pattern):
                 continue
             fpath = Path(dirpath) / name
             try:
@@ -990,7 +1004,7 @@ def tool_list_files(
             if n_entries >= ctx.budgets.list_files_max_entries:
                 truncated = True
                 return
-            if entry.name in IGNORED_DIRS or entry.name.startswith(".") and entry.is_dir():
+            if _da_saltare(entry.name):
                 continue
             n_entries += 1
             if entry.is_dir():
@@ -1141,7 +1155,11 @@ def tool_write_file(ctx: ToolContext, filepath: str, content: str = "") -> str:
     previous_text = ""
     if existed:
         try:
-            previous_text = path.read_text(encoding="utf-8")
+            # ``errors="replace"``: il ``except OSError`` qui attorno non
+            # copre ``UnicodeDecodeError``, che e' una ValueError. Un file
+            # salvato in latin-1 faceva uscire l'eccezione dal tool e arrivare
+            # al dispatch come "errore interno".
+            previous_text = path.read_text(encoding="utf-8", errors="replace")
         except OSError:
             previous_text = ""
     refusal = _refuse_test_edit(ctx, filepath, previous_text, content or "")
@@ -1212,7 +1230,9 @@ def tool_edit_file(
         )
 
     try:
-        text = path.read_text(encoding="utf-8")
+        # Stessa ragione della lettura in edit_file: UnicodeDecodeError non e'
+        # una OSError e sfuggiva al ramo d'errore di questo tool.
+        text = path.read_text(encoding="utf-8", errors="replace")
     except OSError as exc:
         return _err(f"Impossibile leggere '{filepath}': {exc}")
 
@@ -1332,9 +1352,9 @@ def tool_search_files(
     stop = False
 
     for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = [d for d in dirnames if d not in IGNORED_DIRS and not d.startswith(".")]
+        dirnames[:] = [d for d in dirnames if not _da_saltare(d)]
         for name in sorted(filenames):
-            if not fnmatch.fnmatch(name, glob or "*"):
+            if _da_saltare(name) or not fnmatch.fnmatch(name, glob or "*"):
                 continue
             fpath = Path(dirpath) / name
             if _is_probably_binary(fpath):
@@ -2397,8 +2417,26 @@ def tool_manage_plan(
             # una decisione che non ha alternative.
             aperto = ctx.plan.avanza()
         elif action == "add":
-            testo = str(steps or note or step_id or "")
-            ctx.plan.add(testo)
+            # ``steps`` puo' arrivare come lista: e' il tipo che ``set`` usa, e
+            # un modello che ha appena scritto il piano ci ricasca. ``str()``
+            # su una lista produceva un punto chiamato letteralmente ``['x']``.
+            if isinstance(steps, (list, tuple)):
+                nuovi = [str(s).strip() for s in steps if str(s).strip()]
+                if not nuovi:
+                    return _err(
+                        "Nessun punto da aggiungere.",
+                        hint="Passa steps=['testo del punto'] oppure note='...'.",
+                    )
+                for testo in nuovi:
+                    ctx.plan.add(testo)
+            else:
+                testo = str(steps or note or step_id or "").strip()
+                if not testo:
+                    return _err(
+                        "Nessun punto da aggiungere.",
+                        hint="Passa steps=['testo del punto'] oppure note='...'.",
+                    )
+                ctx.plan.add(testo)
         elif action == "start":
             ctx.plan.start(step_id)
         elif action == "complete":
@@ -2452,6 +2490,33 @@ def tool_manage_plan(
             _annota_chiusura(ctx, chiuso, saltato=False, era_gia_chiuso=gia_chiuso)
             aperto = ctx.plan.avanza()
         elif action == "skip":
+            # ``skip`` azzera la verifica rossa esattamente come ``ignore_red``,
+            # ma senza chiedere niente e senza contare: era l'uscita a costo
+            # zero accanto a quella che pretende una frase di dodici caratteri.
+            # Su questo progetto la differenza fra un rito e un invito e'
+            # misurata, e un'uscita gratuita da un guard-rail smette di essere
+            # un'uscita e diventa la strada.
+            motivo = str(note or "").strip()
+            if ctx.red_command and len(motivo) < 12:
+                return _err(
+                    f"Per saltare il punto {step_id} con `{ctx.red_command}` "
+                    "ancora rosso serve il motivo.",
+                    hint=(
+                        "Riprova con note='...' e una frase intera: perche' "
+                        "questo punto non si fa? La nota resta nel piano, ed e' "
+                        "quello che l'utente leggera' al posto del lavoro."
+                    ),
+                )
+            if ctx.red_command:
+                # Contato come gli altri rossi archiviati: un turno che ne usa
+                # tre non e' un turno andato bene, e senza questo elenco la
+                # differenza fra "tutto verde" e "tre rossi saltati" non si
+                # vedrebbe da nessuna parte.
+                ctx.rossi_ignorati.append(
+                    {"step": str(step_id), "comando": ctx.red_command,
+                     "motivo": motivo, "via": "skip"}
+                )
+                note = f"[saltato con verifica rossa: {ctx.red_command}] {motivo}"
             gia_chiuso = _e_chiuso(ctx, step_id)
             chiuso = ctx.plan.skip(step_id, note)
             _annota_chiusura(ctx, chiuso, saltato=True, era_gia_chiuso=gia_chiuso)
@@ -2861,7 +2926,22 @@ def tool_web_search(
             "run_command (curl/python), oppure affidati allo snippet."
         ),
     }
-    return smart_truncate(_ok(payload), ctx.budgets.tool_result_max_chars)
+    # Si tronca **dentro**, non la busta: ``smart_truncate`` su un JSON gia'
+    # serializzato produce JSON invalido, e il modello riceve qualcosa che non
+    # sa leggere proprio quando il risultato e' abbondante. Qui si tagliano i
+    # risultati finche' la busta ci sta, e si dice quanti ne mancano.
+    tetto = ctx.budgets.tool_result_max_chars
+    fuori = 0
+    while len(_ok(payload)) > tetto and len(payload["results"]) > 1:
+        payload["results"].pop()
+        fuori += 1
+    if fuori:
+        payload["troncati"] = fuori
+        payload["nota"] = (
+            f"{fuori} risultati non entrano nel budget di questo turno e sono "
+            "stati tolti. " + str(payload["nota"])
+        )
+    return _ok(payload)
 
 
 # ---------------------------------------------------------------------------
@@ -2967,15 +3047,28 @@ def dispatch(ctx: ToolContext, name: str, args: dict[str, Any]) -> str:
     dropped = sorted(set((args or {}).keys()) - allowed)
     try:
         result = impl(ctx, **clean)
-    except TypeError as exc:
-        return _err(
-            f"Argomenti non validi per '{name}': {exc}",
-            hint=f"Parametri ammessi: {sorted(allowed)}",
-        )
     except WorkspaceError as exc:
         return _err(str(exc), hint=getattr(exc, "hint", ""))
-    except Exception as exc:  # pragma: no cover - rete di sicurezza
-        return _err(f"Errore imprevisto in '{name}': {type(exc).__name__}: {exc}")
+    except Exception as exc:  # noqa: BLE001 - rete di sicurezza del dispatch
+        # C'era un ramo ``except TypeError`` separato che diceva al modello
+        # "argomenti non validi" e gli allegava l'elenco dei parametri ammessi.
+        # Ma ``clean`` e' gia' filtrato su ``_ALLOWED_ARGS`` due righe sopra,
+        # quindi un TypeError da firma sbagliata non arriva quasi mai qui --
+        # mentre ci arriva **ogni** TypeError sollevato DENTRO
+        # l'implementazione: un None in un confronto, una concatenazione fra
+        # tipi diversi trenta righe piu' giu'.
+        #
+        # Al modello arrivava un ordine esplicito e falso, e il modello faceva
+        # la cosa che gli era stata detta: riprovare con altri argomenti. E ci
+        # riprovava finche' non finivano i passi, per un difetto dell'harness
+        # con cui gli argomenti non c'entravano niente. Un messaggio falso e
+        # generico verrebbe ignorato; uno falso e *specifico* viene seguito.
+        return _err(
+            f"Errore interno nel tool '{name}': {type(exc).__name__}: {exc}",
+            hint="Non e' un problema degli argomenti: non riprovare la stessa "
+            "chiamata cambiandoli. Prova un'altra strada, oppure segnala il "
+            "guasto nella risposta.",
+        )
 
     if dropped:
         try:
@@ -3784,7 +3877,7 @@ def workspace_snapshot(
         except OSError:
             return
         for entry in entries:
-            if entry.name in IGNORED_DIRS or entry.name.startswith("."):
+            if _da_saltare(entry.name):
                 continue
             if len(lines) >= max_entries:
                 truncated = True
