@@ -279,6 +279,19 @@ class PreviewUpdated:
 @dataclass(slots=True)
 class AgentError:
     message: str
+    # Questo errore indica un backend da ricostruire?
+    #
+    # ``AgentError`` non e' un errore fatale: e' il canale con cui il ciclo
+    # racconta all'utente cosa sta succedendo. Lo emettono il watchdog del
+    # pensiero, la risposta troncata, la finestra quasi piena, il finto
+    # ``<tool_response>`` -- tutte cose in cui il backend sta benissimo. Il
+    # server buttava via l'istanza su **tutti**, e con essa le capability
+    # rilevate e la memoria dei fallimenti di ``model_info``: un watchdog del
+    # pensiero rimetteva in conto sei secondi di timeout al turno dopo.
+    #
+    # Il flag e' un dato e non una parola da cercare nel testo: chi emette
+    # l'evento sa se il backend e' rotto, chi lo legge no.
+    guasto_backend: bool = False
 
 
 AgentEvent = (
@@ -2183,7 +2196,8 @@ def run_turn(
                 yield AgentError(
                     f"Chiamata al modello interrotta ({stream_error}) — riprendo "
                     f"da dove eravamo, tentativo {riprese_stream} di "
-                    f"{MAX_RIPRESE_STREAM}."
+                    f"{MAX_RIPRESE_STREAM}.",
+                    guasto_backend=True,
                 )
                 # Una pausa breve, non per educazione: il caso piu' frequente e'
                 # il modello che sta entrando in VRAM, e ripartire nello stesso
@@ -2191,7 +2205,7 @@ def run_turn(
                 if PAUSA_RIPRESA_S:
                     time.sleep(PAUSA_RIPRESA_S)
                 continue
-            yield AgentError(stream_error)
+            yield AgentError(stream_error, guasto_backend=True)
             yield fine("error", step)
             return
 

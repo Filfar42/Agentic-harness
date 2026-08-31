@@ -18,7 +18,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import pytest  # noqa: E402
 
-from tests.test_server import client, current_session, fake_ollama  # noqa: E402,F401
+from tests.test_server import (  # noqa: E402,F401
+    client,
+    current_session,
+    fake_ollama,
+    read_sse,
+    run_and_collect,
+)
 
 WEB = Path(__file__).resolve().parents[1] / "web"
 
@@ -337,3 +343,58 @@ def test_le_gocce_degli_allegati_hanno_una_forma_sola(regola):
 def test_la_croce_sparisce_finche_l_agente_lavora():
     js = (WEB / "app.js").read_text(encoding="utf-8")
     assert re.search(r"classList\.toggle\('turn-live', busyHere\)", js)
+
+
+# ---------------------------------------------------------------------------
+# Gli allegati che non entrano in contesto
+# ---------------------------------------------------------------------------
+
+
+def test_un_allegato_escluso_viene_detto(client, monkeypatch):
+    """Il silenzio era la modalita' di guasto peggiore per un allegato.
+
+    ``load_images_b64`` calcolava gia' quali file non erano entrati e il suo
+    docstring dice perche' ("l'utente deve sapere che non sono in contesto");
+    ``turn_images`` la propagava; la UI ha il commento che promette l'avviso.
+    Il server spacchettava la lista e la buttava. Chi allegava quattro immagini
+    e ne vedeva commentare tre non aveva modo di accorgersene.
+    """
+    from core.tools import MAX_IMAGE_BYTES
+    from server import main as server_main
+
+    # Vision accesa: senza, ``turn_images`` ritorna due liste vuote e non c'e'
+    # niente da escludere.
+    monkeypatch.setattr(server_main.AppState, "vision_enabled", lambda self: True)
+
+    session_id = current_session(client)
+    _allega(client, session_id, "piccola.png", b"\x89PNG" + b"\x00" * 64)
+    _allega(client, session_id, "enorme.png", b"\x89PNG" + b"\x00" * MAX_IMAGE_BYTES)
+    client.post(
+        "/api/chat",
+        json={
+            "session_id": session_id,
+            "prompt": "che vedi?",
+            "attachments": ["piccola.png", "enorme.png"],
+        },
+    )
+    eventi = read_sse(client.get(f"/api/stream/{session_id}"))
+    note = [e for e in eventi if e.get("type") == "note"]
+    assert note, "nessun avviso sull'allegato rimasto fuori dal contesto"
+    messaggio = note[0]["message"]
+    assert "enorme.png" in messaggio
+    assert "piccola.png" not in messaggio
+
+
+def test_senza_esclusi_non_si_dice_niente(client, monkeypatch):
+    """Un avviso che compare sempre smette di essere un avviso."""
+    from server import main as server_main
+
+    monkeypatch.setattr(server_main.AppState, "vision_enabled", lambda self: True)
+    session_id = current_session(client)
+    _allega(client, session_id, "unica.png", b"\x89PNG" + b"\x00" * 64)
+    eventi = run_and_collect(client, session_id, "che vedi?")
+    esclusi = [
+        e for e in eventi
+        if e.get("type") == "note" and "non sono entrati in contesto" in e.get("message", "").lower()
+    ]
+    assert not esclusi

@@ -184,6 +184,19 @@ def image_exists(tag: str) -> bool:
     return proc.returncode == 0 and bool(proc.stdout.strip())
 
 
+# Container gia' verificati: nome -> (impronta, quando). Vedi ``ensure_container``.
+_CONTAINER_OK: dict[str, tuple[str, float]] = {}
+_CONTAINER_OK_TTL_S = 3.0
+
+
+def dimentica_container(name: str | None = None) -> None:
+    """Invalida la memo: dopo un remove, un restart o un cambio di immagine."""
+    if name is None:
+        _CONTAINER_OK.clear()
+    else:
+        _CONTAINER_OK.pop(name, None)
+
+
 def container_name(workspace: str | Path) -> str:
     """Nome stabile per workspace: due cartelle diverse non si mescolano."""
     digest = hashlib.sha256(str(Path(workspace).resolve()).encode()).hexdigest()[:10]
@@ -191,6 +204,15 @@ def container_name(workspace: str | Path) -> str:
 
 
 def _run_docker(args: list[str], timeout: float = _DOCKER_TIMEOUT) -> subprocess.CompletedProcess:
+    """Un comando docker. Il binario si lascia risolvere a ``subprocess``.
+
+    Memorizzare il percorso assoluto con ``shutil.which`` sembra un
+    risparmio -- le chiamate sono tante -- ma **il PATH non e' costante per
+    tutta la vita del processo**, e qui cambia davvero: la suite mette un finto
+    ``docker`` in testa al PATH per ogni test, e un percorso assoluto messo in
+    cache lo scavalcherebbe. Quello che costa non e' trovare il binario: e'
+    avviare il processo, e a quello risponde la memo di ``ensure_container``.
+    """
     try:
         return subprocess.run(
             ["docker", *args], capture_output=True, text=True,
@@ -210,6 +232,7 @@ def _is_running(name: str) -> bool:
 
 
 def _remove(name: str) -> None:
+    dimentica_container(name)
     _run_docker(["rm", "--force", name], timeout=30)
 
 
@@ -311,8 +334,25 @@ def ensure_container(
 
     name = container_name(workspace_path)
     impronta = _fingerprint(image, network, ports, MEM_LIMIT, PIDS_LIMIT)
+
+    # Memo cortissima: "questo container, con questa impronta, girava un
+    # istante fa".
+    #
+    # Ogni operazione della sandbox chiama ``ensure_container``, e ognuna
+    # costava due processi ``docker`` (``ps`` e ``inspect``) prima ancora di
+    # fare qualcosa. Il caso peggiore misurato e' ``_attendi_stato``, che
+    # ripete fino a quaranta giri a 0,3 s: un solo ``preview action='serve'``
+    # avviava circa centoventi processi docker per aspettare che una porta
+    # rispondesse. Tre secondi bastano: piu' corti di qualunque operazione
+    # utile, piu' lunghi di un giro di polling.
+    adesso = time.monotonic()
+    fresco = _CONTAINER_OK.get(name)
+    if fresco is not None and fresco[0] == impronta and adesso - fresco[1] < _CONTAINER_OK_TTL_S:
+        return name
+
     if _is_running(name):
         if _running_fingerprint(name) == impronta:
+            _CONTAINER_OK[name] = (impronta, adesso)
             return name
         # Gli argomenti sono cambiati: il container va rifatto. E' senza stato
         # -- il lavoro vive nel volume del workspace -- quindi non si perde

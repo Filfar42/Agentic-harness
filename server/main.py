@@ -81,6 +81,8 @@ from core.prompts import (  # noqa: E402
 from core.textutils import estimate_messages_tokens, estimate_tokens  # noqa: E402
 from core.tools import (  # noqa: E402
     ATTACHMENTS_DIR,
+    MAX_IMAGE_BYTES,
+    MAX_IMAGES_IN_CONTEXT,
     TOOLS_SCHEMA,
     TOOLS_SCHEMA_LEAN,
     VAULT_SEARCH_TOOL,
@@ -484,7 +486,11 @@ class AppState:
         key = (self.settings["api_base"], self.settings["model_name"])
         if self._think is not None and self._think[0] == key:
             return self._think[1]
-        backend = self.backend()
+        backend = self._backend_se_gia_pronto()
+        if backend is None:
+            # Nessun backend costruito: qui non si costruisce. Vedi
+            # ``_backend_se_gia_pronto``.
+            return resolve_tristate("auto", None)
         detected = (
             backend.supports_thinking(self.settings["model_name"])
             if hasattr(backend, "supports_thinking")
@@ -549,6 +555,24 @@ class AppState:
                     stream_tools=s["stream_tools"],
                 )
                 self._backend_key = key
+            return self._backend
+
+    def _backend_se_gia_pronto(self):
+        """Il backend, ma solo se esiste gia'. Non lo costruisce.
+
+        Costruirlo con ``transport: auto`` -- il valore di serie -- costa due
+        sonde di rete da quattro secondi, e le due capability (pensiero,
+        visione) venivano interrogate anche da ``/api/bootstrap``, cioe' dalla
+        richiesta che serve a **disegnare la pagina**. Erano fino a otto
+        secondi di pagina bianca dentro la funzione il cui docstring promette
+        "niente di remoto".
+
+        Una capability non vale il prezzo di costruire il backend: chi la
+        chiede prima che il backend esista riceve la risposta prudente, e la
+        sonda vera la fa ``/api/backend`` a pagina gia' viva -- dopo di che
+        l'istanza c'e' e la capability si rileva normalmente.
+        """
+        with self._lock:
             return self._backend
 
     def forget_backend(self) -> None:
@@ -682,7 +706,9 @@ class AppState:
         key = (self.settings["api_base"], self.settings["model_name"])
         if self._vision is not None and self._vision[0] == key:
             return self._vision[1]
-        backend = self.backend()
+        backend = self._backend_se_gia_pronto()
+        if backend is None:
+            return False
         detected = (
             backend.supports_vision(self.settings["model_name"])
             if hasattr(backend, "supports_vision")
@@ -821,6 +847,26 @@ _EVENT_NAMES = {
 
 def sse(event_type: str, payload: dict[str, Any]) -> str:
     return f"data: {json.dumps({'type': event_type, **payload}, ensure_ascii=False)}\n\n"
+
+
+def _e_un_guasto_del_backend(event: Any) -> bool:
+    """Questo errore giustifica di buttare via l'istanza del backend?
+
+    Lo dice il flag che chi emette l'evento ha impostato, non una parola
+    cercata nel testo: il ciclo sa se la connessione e' caduta, il server non
+    lo sa. Un elenco di parole avrebbe preso "Il modello ha pensato troppo a
+    lungo" e buttato via un backend perfettamente sano.
+
+    Prima li giustificava **tutti**, e ``AgentError`` non e' un errore fatale:
+    e' il canale con cui il ciclo racconta all'utente cosa sta succedendo. Lo
+    emettono il watchdog del pensiero, la risposta troncata, il finto
+    ``<tool_response>``, la finestra quasi piena -- tutte cose in cui il
+    backend sta benissimo. E ``forget_backend`` non e' gratis: azzera
+    l'istanza, le capability di pensiero e visione, e chiama
+    ``forget_model_info()``, cioe' svuota proprio la memoria dei fallimenti
+    introdotta per non pagare sei secondi di timeout ad ogni turno.
+    """
+    return bool(getattr(event, "guasto_backend", False))
 
 
 def event_to_sse(event: Any) -> str:
@@ -965,7 +1011,11 @@ def contesto_usato(session_id: str) -> int:
     header = STATE.context_header(session_id)
     strip = bool(STATE.settings["strip_think_from_context"])
     compatta = bool(STATE.settings["compact_old_tool_results"])
-    chiave = (len(messages), len(prompt), len(header), strip, compatta)
+    # ``header or ""``: con ``auto_env_header`` spento ``context_header``
+    # ritorna None, e ``len(None)`` sollevava un TypeError ad **ogni**
+    # ``session_stats`` -- cioe' ad ogni apertura di chat, fine turno, invio e
+    # riallineamento. La barra del contesto spariva e nessuno sapeva perche'.
+    chiave = (len(messages), len(prompt), len(header or ""), strip, compatta)
 
     sessione = STATE.session(session_id)
     memo = sessione.get("_contesto_memo")
@@ -1070,10 +1120,28 @@ def start_turn(
     messages = STATE.messages(session_id)
     snapshot = [dict(m) for m in messages]
 
-    images, skipped = STATE.turn_images(session_id)
+    images, esclusi = STATE.turn_images(session_id)
 
     def work(runner: TurnRunner) -> None:
         runner.emit(sse("start", {"session_id": session_id}))
+        # Gli allegati che non sono entrati in contesto si dicono, e si dicono
+        # PRIMA che il modello parli.
+        #
+        # ``load_images_b64`` calcolava gia' questa lista e il suo docstring
+        # dice perche' ("l'utente deve sapere che non sono in contesto"),
+        # ``turn_images`` la propagava, e la UI ha da sempre il commento che
+        # promette l'avviso ("immagini entrate in contesto, allegati esclusi").
+        # Mancava solo chi lo mandasse: la variabile veniva spacchettata e
+        # buttata. Si allegavano quattro immagini, una pesava troppo, il
+        # modello ne riceveva tre e rispondeva come se fossero tutte.
+        if esclusi:
+            runner.emit(sse("note", {"message":
+                f"Non sono entrati in contesto ({len(esclusi)}): "
+                + ", ".join(esclusi)
+                + f". Il tetto e' {MAX_IMAGES_IN_CONTEXT} immagini per "
+                f"turno e {MAX_IMAGE_BYTES // (1024 * 1024)} MB "
+                "ciascuna; anche un file illeggibile finisce qui."
+            }))
         try:
             # Il livello della goccia e' un override puntuale: sostituisce
             # ``native_think`` per questo turno soltanto, senza toccare le
@@ -1117,7 +1185,9 @@ def start_turn(
                 think_watchdog=bool(STATE.settings["think_watchdog"]),
             )
             for event in events:
-                if isinstance(event, agent_mod.AgentError):
+                if isinstance(event, agent_mod.AgentError) and _e_un_guasto_del_backend(
+                    event
+                ):
                     STATE.forget_backend()
                 if isinstance(event, agent_mod.PreviewUpdated):
                     STATE.store_preview(session_id, event.payload)
@@ -1291,6 +1361,23 @@ def index() -> Response:
     )
 
 
+_NOMI_TRANSPORT = {
+    "ollama": "Ollama",
+    "llamacpp": "llama.cpp",
+    "openai": "OpenAI-compatibile",
+}
+
+
+def _nome_transport(transport: str) -> str:
+    """Il nome del transport senza toccare la rete.
+
+    Con ``auto`` non si sa ancora, e dirlo e' piu' onesto che scoprirlo con due
+    sonde da quattro secondi mentre l'utente guarda una pagina bianca: la sonda
+    vera la fa ``/api/backend``, che gira a pagina gia' disegnata.
+    """
+    return _NOMI_TRANSPORT.get((transport or "auto").lower(), "in rilevamento")
+
+
 @app.get("/api/bootstrap")
 def bootstrap() -> dict[str, Any]:
     """Tutto quello che serve a disegnare la pagina, e **niente di remoto**.
@@ -1308,14 +1395,23 @@ def bootstrap() -> dict[str, Any]:
     pagina gia' viva.
     """
     session_id = STATE.last_opened
-    backend = STATE.backend()
+    # **Non** ``STATE.backend()``: con ``transport: auto`` -- che e' il valore
+    # di serie -- costruire il backend fa due sonde di rete, ``ping()`` e
+    # ``parla_llamacpp()``, quattro secondi di timeout ciascuna. Erano fino a
+    # otto secondi di pagina bianca, dentro la funzione il cui docstring
+    # promette "niente di remoto".
+    #
+    # Il nome del transport si sa senza chiedere a nessuno: e' l'impostazione,
+    # e con ``auto`` la risposta onesta e' "lo sto ancora decidendo" -- che e'
+    # esattamente lo stato che la goccia sa gia' disegnare.
+    nome_backend = _nome_transport(STATE.settings["transport"])
     return {
         "app": {"name": APP_NAME, "version": APP_VERSION},
         "settings": STATE.settings,
         "session": open_payload(session_id),
         "memories": STATE.memories,
         "backend": {
-            "name": backend.name,
+            "name": nome_backend,
             # None = non ancora chiesto. La goccia sa gia' disegnare i tre
             # stati (in attesa, online, offline).
             "online": None,

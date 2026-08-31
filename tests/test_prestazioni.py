@@ -420,3 +420,102 @@ def test_il_prompt_snello_e_piu_lungo_di_quello_esteso():
         "SYSTEM_PROMPT_LEAN e' diventato davvero piu' corto di SYSTEM_PROMPT: "
         "aggiorna questo test e i commenti che spiegano la differenza"
     )
+
+
+# ---------------------------------------------------------------------------
+# Le cache che mancavano
+# ---------------------------------------------------------------------------
+
+
+def test_props_non_ritenta_a_ogni_turno_con_il_server_spento(monkeypatch):
+    """La cache teneva solo i successi.
+
+    ``clamp_num_ctx`` chiama ``props`` da ``gen_params()``, cioe' a ogni turno:
+    con llama-server spento erano quattro secondi di timeout prima che partisse
+    qualsiasi cosa. E' la stessa correzione gia' fatta per ``model_info``.
+    """
+    from core.backend import LlamaCppBackend
+
+    tentativi = {"n": 0}
+
+    def _rifiuta(*_a, **_k):
+        tentativi["n"] += 1
+        raise OSError("connection refused")
+
+    b = LlamaCppBackend("http://spento:8080", "", 5.0)
+    monkeypatch.setattr(backend_mod.httpx, "get", _rifiuta)
+    for _ in range(5):
+        assert b.props() == {}
+    assert tentativi["n"] == 1, (
+        f"{tentativi['n']} tentativi per cinque chiamate: il fallimento non e' "
+        f"memorizzato"
+    )
+
+
+def test_slots_viaggia_con_l_autenticazione(monkeypatch):
+    """``/props`` mandava l'Authorization e ``/slots`` no, contro la sua regola."""
+    from core.backend import LlamaCppBackend
+
+    visti: list[dict] = []
+
+    class _Vuota:
+        status_code = 200
+
+        @staticmethod
+        def raise_for_status():
+            return None
+
+        @staticmethod
+        def json():
+            return {}
+
+    def _get(url, **kw):
+        visti.append({"url": url, "headers": kw.get("headers")})
+        return _Vuota()
+
+    b = LlamaCppBackend("http://server:8080", "chiave-segreta", 5.0)
+    monkeypatch.setattr(backend_mod.httpx, "get", _get)
+    b.server_num_ctx()
+    slots = [v for v in visti if v["url"].endswith("/slots")]
+    assert slots, "/slots non e' stato interrogato"
+    assert slots[0]["headers"], "/slots parte senza header di autenticazione"
+
+
+def test_il_container_verificato_non_si_riverifica_a_ogni_operazione(monkeypatch):
+    """``_attendi_stato`` faceva fino a 40 giri, e ognuno due processi docker.
+
+    Un solo ``preview action='serve'`` avviava circa centoventi processi docker
+    per aspettare che una porta rispondesse.
+    """
+    import tempfile
+    from pathlib import Path as _P
+
+    from core import sandbox as sb
+
+    ws = _P(tempfile.mkdtemp())
+    sb.dimentica_container()
+    chiamate = {"n": 0}
+
+    def _finto(args, timeout=None):
+        chiamate["n"] += 1
+
+        class _P2:
+            returncode = 0
+            stdout = "id-finto" if args[:1] == ["ps"] else ""
+            stderr = ""
+
+        return _P2()
+
+    monkeypatch.setattr(sb, "_run_docker", _finto)
+    monkeypatch.setattr(sb, "_running_fingerprint", lambda _n: sb._fingerprint(
+        sb.DEFAULT_IMAGE, True, None, sb.MEM_LIMIT, sb.PIDS_LIMIT
+    ))
+    sb.ensure_container(ws)
+    dopo_il_primo = chiamate["n"]
+    for _ in range(10):
+        sb.ensure_container(ws)
+    assert chiamate["n"] == dopo_il_primo, (
+        f"{chiamate['n'] - dopo_il_primo} processi docker in piu' per dieci "
+        f"operazioni sullo stesso container"
+    )
+    sb.dimentica_container()

@@ -789,6 +789,10 @@ class LlamaCppBackend(OpenAICompatBackend):
     # riavvia, ed e' proprio riavviandolo che si cambia ``-c``. Una cache
     # eterna farebbe credere all'harness una finestra che non esiste piu'.
     PROPS_TTL_S = 60.0
+    # Quanto si aspetta prima di riprovare dopo un fallimento. Piu' corto del
+    # TTL dei successi: un server che torna su deve essere visto in fretta,
+    # ma non al prezzo di un timeout da quattro secondi ad ogni turno.
+    PROPS_FALLIMENTO_TTL_S = 30.0
 
     # Nomi possibili dei contatori del draft. La README di llama.cpp non li
     # documenta e la PR che porta DFlash2 e' ancora aperta: si accettano gli
@@ -806,14 +810,31 @@ class LlamaCppBackend(OpenAICompatBackend):
         self.root_url = self.base_url[: -len("/v1")]
         self._props: dict[str, Any] = {}
         self._props_at: float = 0.0
+        self._props_falliti_at: float = 0.0
 
     # -- introspezione ----------------------------------------------------
 
     def props(self, *, refresh: bool = False) -> dict[str, Any]:
-        """``GET /props``, con una cache a scadenza. Non solleva mai."""
+        """``GET /props``, con una cache a scadenza. Non solleva mai.
+
+        Memorizza anche i **fallimenti**, con un TTL piu' corto. Prima la cache
+        teneva solo i successi: con llama-server spento ogni chiamata riprovava
+        e aspettava il timeout, e ``clamp_num_ctx`` chiama ``props`` da
+        ``gen_params()``, cioe' a ogni turno. Sono i quattro secondi che
+        l'utente vede prima che parta qualsiasi cosa. E' la stessa correzione
+        gia' fatta per ``model_info`` (``_MODEL_INFO_FALLITI``): qui mancava.
+        """
         adesso = time.monotonic()
         fresca = self._props and (adesso - self._props_at) < self.PROPS_TTL_S
         if fresca and not refresh:
+            return self._props
+        if (
+            not refresh
+            and self._props_falliti_at
+            and (adesso - self._props_falliti_at) < self.PROPS_FALLIMENTO_TTL_S
+        ):
+            # Ha appena fallito: non si riprova subito, si torna l'ultimo noto
+            # (che all'avvio e' vuoto, ed e' l'informazione giusta).
             return self._props
         try:
             resp = httpx.get(
@@ -822,7 +843,9 @@ class LlamaCppBackend(OpenAICompatBackend):
             resp.raise_for_status()
             dati = resp.json()
         except Exception:  # noqa: BLE001 - diagnostica, non un errore di turno
+            self._props_falliti_at = adesso
             return self._props      # meglio l'ultimo noto che niente
+        self._props_falliti_at = 0.0
         if isinstance(dati, dict):
             self._props = dati
             self._props_at = adesso
@@ -926,7 +949,11 @@ class LlamaCppBackend(OpenAICompatBackend):
         # Ripiego: /slots dichiara n_ctx per slot. Esiste solo se il server e'
         # partito con --slots, quindi puo' mancare senza che sia un problema.
         try:
-            resp = httpx.get(f"{self.root_url}/slots", timeout=4.0)
+            resp = httpx.get(
+                f"{self.root_url}/slots",
+                headers=self._auth_headers(),   # come /props: stessa regola
+                timeout=4.0,
+            )
             resp.raise_for_status()
             slots = resp.json()
         except Exception:  # noqa: BLE001

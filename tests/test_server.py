@@ -560,19 +560,29 @@ def test_thinking_is_enabled_only_for_reasoning_models(client, monkeypatch):  # 
     state.forget_backend()
     state.settings["native_think"] = "auto"
 
+    # Il backend si costruisce qui, esplicitamente. Da quando una capability
+    # non giustifica di costruirlo -- erano otto secondi di pagina bianca in
+    # /api/bootstrap con transport 'auto' -- senza istanza ``thinking_enabled``
+    # risponde prudente e non mette niente in cache.
+    assert state._backend_se_gia_pronto() is None
+    assert state.thinking_enabled() is False      # prudente, e non memorizzato
+    assert state._think is None
+
+    state.backend()                                # ...adesso l'istanza c'e'
     # il finto Ollama dichiara solo ["completion", "tools"]
     assert state.thinking_enabled() is False
+    assert state._think is not None                # e stavolta e' memorizzato
 
     class Reasoning:
         def supports_thinking(self, _model):
             return True
 
-    monkeypatch.setattr(state, "backend", lambda: Reasoning())
+    monkeypatch.setattr(state, "_backend", Reasoning())
     # Il rilevamento e' in cache: cambiare backend sotto banco non basta,
     # serve invalidarla - ed e' esattamente cio' che fanno il salvataggio
     # delle impostazioni e la sonda manuale.
     assert state.thinking_enabled() is False
-    state.forget_backend()
+    state._think = None
     assert state.thinking_enabled() is True
 
     # l'impostazione manuale ha comunque la precedenza
@@ -1393,3 +1403,72 @@ def test_la_goccia_ha_una_rotta_sua_che_non_scrive_niente(client):
     assert dati["online"] is True
     assert "detail" in dati and dati["name"]
     assert stato.settings["model_name"] == "fake:latest"
+
+
+# ---------------------------------------------------------------------------
+# Correzioni dell'audit del 30/08/2026
+# ---------------------------------------------------------------------------
+
+
+def test_le_statistiche_reggono_l_intestazione_spenta(client):
+    """``len(None)`` sollevava un TypeError su ogni session_stats.
+
+    Con ``auto_env_header`` spento ``context_header`` ritorna None, e la chiave
+    di cache lo misurava con ``len()``: la barra del contesto spariva a ogni
+    apertura di chat, fine turno, invio e riallineamento, senza che niente
+    dicesse perche'.
+    """
+    session_id = current_session(client)
+    r = client.post("/api/settings", json={"values": {"auto_env_header": False}})
+    assert r.status_code == 200, r.text
+    stats = client.get(f"/api/sessions/{session_id}")
+    assert stats.status_code == 200, stats.text
+    assert "stats" in stats.json()
+
+
+def test_il_bootstrap_non_tocca_la_rete(client, monkeypatch):
+    """Il docstring prometteva "niente di remoto" e la funzione chiamava STATE.backend().
+
+    Con ``transport: auto`` -- il valore di serie -- costruire il backend fa due
+    sonde da quattro secondi: erano fino a otto secondi di pagina bianca dentro
+    la funzione che serve a disegnare la pagina.
+    """
+    from server import main as server_main
+
+    def _vietato(*_a, **_k):
+        raise AssertionError("il bootstrap ha costruito il backend")
+
+    monkeypatch.setattr(server_main.AppState, "backend", _vietato)
+    r = client.get("/api/bootstrap")
+    assert r.status_code == 200, r.text
+    dati = r.json()
+    assert dati["backend"]["online"] is None      # "controllo...", come prima
+    assert dati["backend"]["name"]                 # ...e un nome c'e' comunque
+
+
+def test_un_watchdog_non_butta_via_il_backend():
+    """``forget_backend`` scattava su OGNI AgentError.
+
+    AgentError non e' un errore fatale: e' il canale con cui il ciclo racconta
+    cosa succede. Lo emettono il watchdog del pensiero, la risposta troncata,
+    la finestra quasi piena -- tutte cose in cui il backend sta benissimo. E
+    ``forget_backend`` chiama ``forget_model_info()``, cioe' svuota proprio la
+    memoria dei fallimenti che evita sei secondi di timeout per turno.
+    """
+    from core import agent as agent_mod
+    from server.main import _e_un_guasto_del_backend
+
+    innocui = [
+        "Il modello ha pensato troppo a lungo: interrompo il ragionamento.",
+        "Il modello ha esaurito i token generabili mentre ragionava.",
+        "Finestra quasi piena: restano 300 token su 32768.",
+        "Passi di servizio esauriti (4 di 12).",
+    ]
+    for messaggio in innocui:
+        assert not _e_un_guasto_del_backend(agent_mod.AgentError(messaggio)), messaggio
+
+    # E chi il guasto lo conosce lo dichiara, invece di sperare che il testo
+    # contenga la parola giusta: un elenco di parole avrebbe preso "Il modello
+    # ha pensato troppo a lungo" e buttato via un backend sano.
+    rotto = agent_mod.AgentError("connessione rifiutata", guasto_backend=True)
+    assert _e_un_guasto_del_backend(rotto)

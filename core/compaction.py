@@ -321,14 +321,26 @@ def costruisci_riassunto(
         {"role": "user", "content": trascritto},
     ]
     pezzi: list[str] = []
-    for evento in backend.stream(messaggi, None, p):
-        if evento.kind == "content":
-            pezzi.append(evento.text)
-        elif evento.kind == "error":
-            # Un riassunto mancato non deve far fallire il turno: si torna
-            # vuoto e il chiamante rinuncia alla compattazione, che e' sempre
-            # meglio che buttare la cronologia senza averla riassunta.
-            return ""
+    try:
+        for evento in backend.stream(messaggi, None, p):
+            if evento.kind == "content":
+                pezzi.append(evento.text)
+            elif evento.kind == "error":
+                # Un riassunto mancato non deve far fallire il turno: si torna
+                # vuoto e il chiamante rinuncia alla compattazione, che e'
+                # sempre meglio che buttare la cronologia senza averla
+                # riassunta.
+                return ""
+    except Exception:  # noqa: BLE001 - vale la stessa regola del ramo "error"
+        # Il ramo qui sopra copre l'errore che il backend *dichiara*; questo
+        # copre quello che **solleva** -- connessione caduta, timeout, JSON
+        # malformato. Senza, un'eccezione qui uccideva il turno intero nel
+        # momento peggiore: la compattazione scatta quando il contesto e'
+        # pieno, cioe' dopo che il lavoro e' gia' stato fatto.
+        #
+        # ``pensiero.estrai`` e ``agent.riepilogo_finale`` -- le altre due
+        # chiamate di servizio al modello -- lo facevano gia'.
+        return ""
     return strip_think("".join(pezzi)).strip()
 
 
