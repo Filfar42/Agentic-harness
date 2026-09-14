@@ -259,10 +259,32 @@ SUMMARY_NUDGE = (
 VERIFY_NUDGE = (
     "Il comando `{command}` e' fallito (exit code {code}) e non l'hai ancora "
     "sistemato: il lavoro non e' finito.\n"
-    "Rileggi lo stderr del risultato qui sopra, individua file e riga, correggi "
-    "con edit_file (se non ricordi il contenuto esatto, prima read_file) e poi "
-    "riesegui ESATTAMENTE lo stesso comando `{command}`.\n"
+    "Rileggi lo stderr del risultato qui sopra, individua file e riga e correggi "
+    "con edit_file (se non ricordi il contenuto esatto, prima read_file). "
+    "Rilancia `{command}` **dopo** aver cambiato qualcosa: rieseguirlo identico "
+    "senza una modifica in mezzo ti ridara' lo stesso rosso, e ti costa un passo.\n"
+    "Se questo rosso e' il risultato che ti aspettavi -- un test scritto apposta "
+    "per riprodurre un bug prima di correggerlo -- non ti blocca: il piano puo' "
+    "andare avanti lo stesso, e la verifica resta segnata finche' non e' verde.\n"
     "Fallo adesso, con una chiamata a tool: non rispondere a parole."
+)
+
+# Iniettato quando le ultime chiamate non hanno cambiato niente: stesso errore
+# o stesso rifiuto, nessuna modifica in mezzo.
+#
+# E' il buco che restava fra gli altri due solleciti. ``LOOP_NUDGE`` guarda un
+# comando che fallisce e ``RIPETIZIONE_NUDGE`` una chiamata che riesce e viene
+# rifatta; il caso osservato -- ``manage_plan`` rifiutato, rilanciato, rifiutato
+# di nuovo -- non era ne' l'uno ne' l'altro, perche' le chiamate **fallite** non
+# entravano affatto nel conteggio delle ripetizioni.
+STALLO_NUDGE = (
+    "Hai chiamato `{tool}` {quante} volte di fila con lo stesso esito e senza "
+    "cambiare niente in mezzo: ripetere non lo sbloccera'.\n"
+    "Scegline una: (1) leggi con read_file il file che l'errore indica e cambia "
+    "il codice; (2) isola il problema con un comando piu' piccolo -- un singolo "
+    "test, un import; (3) se la decisione spetta all'utente, chiedi con "
+    "ask_user_question. Se non si applica nessuna delle tre, chiudi il turno "
+    "dicendo cosa resta rosso e perche'."
 )
 
 # Iniettato quando lo stesso comando fallisce piu' volte allo stesso modo:
@@ -299,7 +321,8 @@ RIPETIZIONE_NUDGE = (
 # il riepilogo deve dire la verita', non arrotondare.
 FAILED_SUMMARY_NUDGE = (
     "Chiudi adesso con un messaggio breve, e sii esplicito sul fatto che la "
-    "verifica NON passa:\n"
+    "verifica NON passa. Queste sono rimaste rosse:\n"
+    "{verifiche}\n"
     "Fatto: i punti che hai chiuso, con i file toccati.\n"
     "Verifica: come li hai verificati -- comando ed esito reale. Se e' rosso dillo.\n"
     "Poi: i punti rimasti aperti, e quale affronteresti per primo.\n"

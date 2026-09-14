@@ -47,6 +47,7 @@ from . import pensiero
 from . import spec_delega as spec_delega_mod
 from . import vault as vault_mod
 from . import vault_search as vault_search_mod
+from . import verifiche as verifiche_mod
 from .notes import render_block as render_notes
 from .plan import render_block, render_summary
 from .prompts import (
@@ -61,6 +62,7 @@ from .prompts import (
     PLAN_SUMMARY_NUDGE,
     PROMPT_RIEPILOGO_FINALE,
     RIPETIZIONE_NUDGE,
+    STALLO_NUDGE,
     SUMMARY_NUDGE,
     THINK_WATCHDOG_NUDGE,
     TOOL_NUDGE,
@@ -84,7 +86,6 @@ from .tools import (
     ToolContext,
     dispatch,
     looks_like_readonly_request,
-    looks_like_server,
     normalise_question,
     preview_kind,
     preview_root,
@@ -232,6 +233,13 @@ class TurnFinished:
     steps: int
     usage: dict[str, Any] = field(default_factory=dict)
     telemetry: dict[str, Any] = field(default_factory=dict)
+    # Stato delle verifiche alla fine del turno. ``reason`` dice **come si e'
+    # fermato il turno**, non se il lavoro e' riuscito: "completed" significava
+    # anche "ha esaurito i solleciti con due test rossi aperti", e da fuori le
+    # due cose erano indistinguibili. Qui c'e' l'altra meta': cosa risulta
+    # verificato, cosa e' rimasto rosso e cosa e' stato giustificato per
+    # iscritto. Vedi ``core/verifiche.py``.
+    qualita: dict[str, Any] = field(default_factory=dict)
     # I file creati o modificati nel turno non passano di qui: la UI li ricava
     # dai risultati di write_file/edit_file che gia' riceve (vedi fileTocca in
     # web/app.js). Cosi' la stessa regola vale sia in diretta sia quando una
@@ -1742,6 +1750,8 @@ def run_turn(
     leak_nudged = False
     ripetizione_nudged = False
     ripetizione_dovuta: tuple[str, int] | None = None
+    stallo_nudged = False
+    stallo_dovuto: tuple[str, int] | None = None
     ripetizioni = RipetizioniTool()
     summary_requested = False
     coverage_nudged = False
@@ -2017,7 +2027,8 @@ def run_turn(
                 usage[target] = totals[source]
         usage["model_wall_ms"] = totals["wall_time_ms"]
         usage["total_ms"] = telemetry["turn_wall_ms"]
-        return TurnFinished(reason=reason, steps=passi, usage=usage, telemetry=telemetry)
+        return TurnFinished(reason=reason, steps=passi, usage=usage,
+                            telemetry=telemetry, qualita=verification.riepilogo())
 
     def halt(step: int, reasoning: str = "", answer: str = "") -> Iterator[AgentEvent]:
         """Chiude il turno salvando quel che il modello aveva gia' prodotto."""
@@ -2562,7 +2573,18 @@ def run_turn(
                 # *perche'* si e' fermato diventa impossibile.
                 _registra_il_detto(ui_messages, reasoning, answer)
                 if red:
-                    testo = FAILED_SUMMARY_NUDGE
+                    # L'elenco per nome: il riepilogo deve poter dire *quali*
+                    # verifiche restano rosse, non che "la verifica non passa".
+                    # Da quando il piano non si blocca piu' su un rosso, un
+                    # turno puo' chiudersi con piu' di uno, e un riepilogo che
+                    # ne nomina zero e' quello che l'utente legge al posto di
+                    # una verifica verde.
+                    righe = "\n".join(
+                        f"  - `{v.comando}` (exit {v.returncode}, "
+                        f"{v.tentativi} tentativ{'o' if v.tentativi == 1 else 'i'})"
+                        for v in verification.pendenti
+                    ) or f"  - `{red[0]}` (exit {red[2]})"
+                    testo = FAILED_SUMMARY_NUDGE.format(verifiche=righe)
                 elif tool_ctx.plan:
                     # Con un piano il riepilogo non si fa a memoria: c'e' gia'
                     # scritto cosa e' stato chiuso e cosa no, e un riassunto
@@ -2816,13 +2838,24 @@ def run_turn(
             if ok:
                 if call["name"] in ("write_file", "edit_file"):
                     # Una scrittura invalida le letture: dopo, rileggere lo
-                    # stesso file ha senso e non e' una ripetizione.
+                    # stesso file ha senso e non e' una ripetizione. E invalida
+                    # i fallimenti: fra un tentativo e l'altro e' cambiato
+                    # qualcosa, quindi riprovare non e' piu' girare a vuoto.
                     ripetizioni.dimentica_letture()
+                    ripetizioni.dimentica_fallimenti()
                 else:
                     quante = ripetizioni.registra(call["name"], args)
                     if quante >= RipetizioniTool.SOGLIA and not ripetizione_nudged:
                         ripetizione_nudged = True
                         ripetizione_dovuta = (call["name"], quante)
+            else:
+                # La chiamata e' stata rifiutata o e' fallita. Finora finiva
+                # qui e basta, e lo stallo piu' comune -- stesso rifiuto, stessa
+                # riga, tre volte -- non veniva visto da nessuna delle difese.
+                quante = ripetizioni.registra_fallita(call["name"], args)
+                if quante >= RipetizioniTool.SOGLIA_STALLO and not stallo_nudged:
+                    stallo_nudged = True
+                    stallo_dovuto = (call["name"], quante)
             verification.record(call["name"], result)
             # Il guard sui file di test ha bisogno di sapere se c'e' una
             # verifica rossa aperta: qui e' l'unico punto che lo sa.
@@ -3004,6 +3037,22 @@ def run_turn(
                 {
                     "role": "user",
                     "content": RIPETIZIONE_NUDGE.format(tool=nome_tool, quante=quante),
+                    "hidden": True,
+                }
+            )
+
+        # Lo stallo ha la precedenza sul resto dei solleciti solo nel senso che
+        # arriva insieme a loro: il modello deve leggere "quello che stai
+        # facendo non cambia niente" nello stesso passo in cui legge l'ennesimo
+        # rifiuto, non due passi dopo.
+        if stallo_dovuto is not None:
+            nome_tool, quante = stallo_dovuto
+            stallo_dovuto = None
+            count_nudge("stallo")
+            ui_messages.append(
+                {
+                    "role": "user",
+                    "content": STALLO_NUDGE.format(tool=nome_tool, quante=quante),
                     "hidden": True,
                 }
             )
@@ -3193,7 +3242,22 @@ MAX_TRUNCATED_NUDGES = 2
 # vuoto e va dirottato invece che spronato.
 LOOP_THRESHOLD = 3
 # Exit code che segnalano un comando sbagliato, non un progetto rotto.
-SHELL_NOT_A_VERIFICATION = frozenset({126, 127})
+# La definizione vive nel registro, insieme al resto delle regole su cosa conta
+# come verifica; qui resta il nome con cui il ciclo e i test la chiamano.
+SHELL_NOT_A_VERIFICATION = verifiche_mod.SHELL_NON_E_UNA_VERIFICA
+
+
+def _firma(name: str, args: dict[str, Any] | None) -> tuple[str, str]:
+    """Identita' di una chiamata a tool.
+
+    Gli argomenti si normalizzano ordinandoli: ``{"a":1,"b":2}`` e
+    ``{"b":2,"a":1}`` sono la stessa chiamata, e un modello che rigenera il JSON
+    non li mette sempre nello stesso ordine.
+    """
+    try:
+        return (name, json.dumps(args or {}, sort_keys=True, ensure_ascii=False))
+    except (TypeError, ValueError):
+        return (name, repr(args))
 
 
 class RipetizioniTool:
@@ -3208,26 +3272,36 @@ class RipetizioniTool:
     stessa.
     """
 
-    __slots__ = ("_viste",)
+    __slots__ = ("_falliti", "_viste")
 
     # Alla terza, non alla seconda: rileggere un file dopo averlo modificato e'
     # legittimo, e sollecitare li' sarebbe rumore su un comportamento corretto.
     SOGLIA = 3
 
+    # Stessa soglia per le chiamate che **falliscono**, e serviva un contatore
+    # separato. Le fallite non entravano affatto nel conteggio -- ``registra``
+    # veniva chiamata solo dentro un ``if ok:`` -- col ragionamento che rifare
+    # una chiamata fallita e' legittimo. Lo e', due volte: un timeout, un
+    # container che parte lento. Non lo e' alla terza, e il caso che ha fatto
+    # girare a vuoto un turno intero era proprio questo: ``manage_plan``
+    # rifiutato per una verifica rossa, richiamato identico, rifiutato di nuovo.
+    SOGLIA_STALLO = 3
+
     def __init__(self) -> None:
         self._viste: dict[tuple[str, str], int] = {}
+        self._falliti: dict[tuple[str, str], int] = {}
 
     def registra(self, name: str, args: dict[str, Any] | None) -> int:
         """Quante volte questa esatta chiamata e' gia' stata fatta nel turno."""
-        # Gli argomenti si normalizzano ordinandoli: ``{"a":1,"b":2}`` e
-        # ``{"b":2,"a":1}`` sono la stessa chiamata, e un modello che rigenera
-        # il JSON non li mette sempre nello stesso ordine.
-        try:
-            firma = (name, json.dumps(args or {}, sort_keys=True, ensure_ascii=False))
-        except (TypeError, ValueError):
-            firma = (name, repr(args))
+        firma = _firma(name, args)
         self._viste[firma] = self._viste.get(firma, 0) + 1
         return self._viste[firma]
+
+    def registra_fallita(self, name: str, args: dict[str, Any] | None) -> int:
+        """Quante volte **di fila** questa chiamata e' gia' fallita nel turno."""
+        firma = _firma(name, args)
+        self._falliti[firma] = self._falliti.get(firma, 0) + 1
+        return self._falliti[firma]
 
     def dimentica_letture(self) -> None:
         """Una scrittura invalida le letture: dopo, rileggere ha senso."""
@@ -3235,81 +3309,27 @@ class RipetizioniTool:
             k: v for k, v in self._viste.items() if k[0] not in TOOL_ESPLORATIVI
         }
 
+    def dimentica_fallimenti(self) -> None:
+        """Dopo una modifica riuscita, ritentare non e' piu' stallo.
 
-class VerificationTracker:
-    """Tiene il conto delle verifiche rosse ancora aperte nel turno.
-
-    Un ciclo di self-correction si riconosce da questo: dopo un ``run_command``
-    con exit code diverso da zero, il turno non puo' considerarsi concluso
-    finche' lo stesso comando non torna verde. Senza qualcuno che lo verifichi,
-    un modello piccolo riassume e chiude come se avesse finito.
-    """
-
-    def __init__(self) -> None:
-        # comando -> (numero di fallimenti consecutivi, ultimo exit code)
-        self.failing: dict[str, tuple[int, int]] = {}
-
-    def clear(self) -> None:
-        """Dimentica tutte le verifiche rosse aperte.
-
-        La chiama ``ToolContext.clear_red_command`` quando l'utente-modello
-        chiude un punto del piano dichiarando la verifica non pertinente
-        (``ignore_red``) o lo salta: da quel momento quel rosso non deve piu'
-        far scattare i solleciti, o il turno resta appeso a un fallimento che
-        e' gia' stato giudicato.
+        E' la meta' che rende il contatore dei fallimenti un rilevatore di
+        stallo invece di un tetto ai tentativi: quello che conta non e' quante
+        volte hai riprovato, e' se fra un tentativo e l'altro e' cambiato
+        qualcosa.
         """
-        self.failing.clear()
+        self._falliti.clear()
 
-    def record(self, name: str, result: str) -> None:
-        if name != "run_command":
-            return
-        try:
-            payload = json.loads(result)
-        except json.JSONDecodeError:
-            return
-        command = str(payload.get("command") or "").strip()
-        if not command:
-            # Le buste d'errore (``{"error": ..., "hint": ...}``) non portano
-            # il comando, ed e' cosi' che i guasti d'ambiente -- Docker spento,
-            # binario fuori dal PATH, comando bloccato dal recinto -- restano
-            # fuori dal tracker: per struttura del dato, non riconoscendo il
-            # testo del messaggio. Il fork ci aveva aggiunto un
-            # ``"SandboxError" in result`` qui sotto, che non e' mai potuto
-            # scattare perche' questo ritorno viene prima.
-            return
-        if looks_like_server(command):
-            # Un server non ha un "esito": non termina per progetto. Se compare
-            # qui e' perche' il timeout l'ha ucciso, e trattarlo come verifica
-            # rossa produce il ciclo osservato dal vivo: l'harness ordina di
-            # "riseguire ESATTAMENTE lo stesso comando", il comando riparte,
-            # viene ucciso di nuovo, e il turno gira a vuoto finche' l'utente
-            # non interviene. Il messaggio giusto glielo da' gia' run_command,
-            # e dice di usare il tool preview.
-            self.failing.pop(command, None)
-            return
-        code = payload.get("returncode")
-        if code == 0:
-            self.failing.pop(command, None)          # riparato
-        elif code in SHELL_NOT_A_VERIFICATION:
-            # 127 = comando inesistente, 126 = trovato ma non eseguibile.
-            # Non dicono niente sul codice del progetto: dicono che il comando
-            # era sbagliato. Trattarli come verifiche rosse produceva un
-            # sollecito assurdo ("rileggi lo stderr, correggi con edit_file")
-            # su un comando che l'agente aveva gia' giustamente abbandonato per
-            # una variante funzionante -- e siccome quella riga non veniva piu'
-            # rieseguita, il rosso restava aperto per sempre.
-            self.failing.pop(command, None)
-        elif isinstance(code, int):
-            previous = self.failing.get(command, (0, code))[0]
-            self.failing[command] = (previous + 1, code)
 
-    @property
-    def unresolved(self) -> tuple[str, int, int] | None:
-        """(comando, tentativi, exit code) della verifica rossa piu' insistente."""
-        if not self.failing:
-            return None
-        command, (count, code) = max(self.failing.items(), key=lambda kv: kv[1][0])
-        return (command, count, code)
+# Il registro delle verifiche vive in ``core/verifiche.py``. Stava qui dentro
+# come ``VerificationTracker``: un dizionario ``comando -> (tentativi, codice)``
+# che sapeva dire qual era il rosso piu' insistente e dimenticarli tutti insieme.
+# Erano due limiti. L'identita' per stringa faceva di ``pytest x -q`` e
+# ``python -m pytest x -q`` due verifiche diverse -- la seconda verde e la prima
+# rossa per sempre -- e ``clear()`` cancellava l'intero registro, cosi' che
+# dichiarare non pertinente **una** verifica ne faceva sparire anche altre.
+#
+# Il nome resta qui perche' e' quello che il ciclo e i test chiamano.
+VerificationTracker = verifiche_mod.RegistroVerifiche
 
 
 def _comando_riuscito(result: str) -> bool:

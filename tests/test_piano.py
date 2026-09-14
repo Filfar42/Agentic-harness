@@ -28,9 +28,10 @@ import tests.test_agent_loop as fake
 from core import agent as agent_mod
 from core.backend import OllamaBackend
 from core.config import GenParams
-from core.plan import DOING, DONE, Plan, PlanError, render_block, render_summary
+from core.plan import DONE, Plan, PlanError, render_block, render_summary
 from core.textutils import chars_for_tokens
 from core.tools import PLAN_TOOL, TOOLS_SCHEMA, ToolContext, dispatch
+from core.verifiche import RegistroVerifiche
 
 fake_ollama = fake.fake_ollama
 
@@ -178,6 +179,27 @@ def ctx_vuoto(tmp_path) -> ToolContext:
     return ToolContext(workspace=str(tmp_path), sandbox="host")
 
 
+def ctx_col_registro(tmp_path) -> tuple[ToolContext, RegistroVerifiche]:
+    """Come lo monta il ciclo agentico: il registro vive fuori dai tool.
+
+    Senza registro il ``ToolContext`` sa solo ``red_command``, cioe' un comando
+    per volta: basta per il guard sui file di test, non per distinguere due
+    rossi indipendenti. I test che parlano di *quali* verifiche restano aperte
+    devono montarlo, o misurerebbero la vista ridotta invece del contratto.
+    """
+    ctx = ToolContext(workspace=str(tmp_path), sandbox="host")
+    registro = RegistroVerifiche()
+    ctx.verification = registro
+    return ctx, registro
+
+
+def rosso(registro: RegistroVerifiche, ctx: ToolContext, comando: str, code: int = 1) -> None:
+    registro.record("run_command", json.dumps(
+        {"command": comando, "returncode": code, "esito": "FALLITO"}))
+    aperte = registro.pendenti
+    ctx.red_command = aperte[0].comando if aperte else None
+
+
 def test_il_tool_rifiuta_stringhe_al_posto_di_array(tmp_path):
     """Strict arguments must not silently coerce an invalid model call."""
     ctx = ctx_vuoto(tmp_path)
@@ -188,25 +210,33 @@ def test_il_tool_rifiuta_stringhe_al_posto_di_array(tmp_path):
     assert [s.text for s in ctx.plan.steps] == ["leggere", "correggere"]
 
 
-def test_non_si_dichiara_fatto_un_punto_con_una_verifica_rossa(tmp_path):
-    """Il gancio fra piano e ciclo di verifica.
+def test_un_punto_si_chiude_anche_con_una_verifica_rossa(tmp_path):
+    """Avanzamento e qualita' sono due fatti, e possono contraddirsi.
 
-    Senza, 'fatto' significherebbe 'credo di aver finito', e il piano
-    diventerebbe il posto dove dichiarare verde cio' che verde non e'.
+    Qui il piano si bloccava: nessun punto si chiudeva finche' esisteva un
+    comando rosso. Sembrava prudenza, era una confusione fra "ho finito questa
+    attivita'" e "la suite e' verde". In TDD il rosso iniziale **e'** il
+    risultato atteso di "riprodurre il bug": rifiutare quella chiusura
+    impediva al piano di dire la verita', e siccome se ne apre uno per volta il
+    modello restava senza mosse legittime. Osservato: rilanciava lo stesso
+    comando finche' i passi non finivano.
     """
-    ctx = ctx_vuoto(tmp_path)
-    dispatch(ctx, PLAN_TOOL, {"action": "set", "steps": ["far passare i test"]})
-    dispatch(ctx, PLAN_TOOL, {"action": "start", "step_id": "1"})
-    ctx.red_command = "pytest -q"
+    ctx, registro = ctx_col_registro(tmp_path)
+    dispatch(ctx, PLAN_TOOL, {"action": "set", "steps": ["riprodurre il bug", "correggerlo"]})
+    rosso(registro, ctx, "pytest tests/test_bug.py -q")
 
-    risposta = dispatch(ctx, PLAN_TOOL, {"action": "complete", "step_id": "1"})
-    assert "rosso" in risposta
-    assert ctx.plan.get("1").status == DOING
+    risposta = json.loads(dispatch(ctx, PLAN_TOOL, {"action": "complete", "step_id": "1"}))
+    assert risposta["status"] == "ok"
+    assert ctx.plan.get("1").status == DONE
 
-    # 'skip' resta possibile: rinunciare e' una cosa diversa dall'aver fatto,
-    # e murare anche quella lascerebbe il modello senza uscite.
-    dispatch(ctx, PLAN_TOOL, {"action": "skip", "step_id": "1", "note": "manca una dipendenza"})
-    assert ctx.plan.get("1").status == "skipped"
+    # Il rosso non e' sparito: viaggia accanto al risultato, dove il modello lo
+    # legge nello stesso passo in cui chiude il punto.
+    assert risposta["qualita"]["pendenti"][0]["comando"] == "pytest tests/test_bug.py -q"
+    assert any("ancora" in a and "rossa" in a for a in risposta["avvisi"])
+    assert registro.pendenti, "chiudere un punto non deve cancellare una verifica"
+
+    # E il punto successivo si apre da solo: era proprio la mossa che mancava.
+    assert risposta["aperto_in_automatico"]["id"] == "2"
 
 
 def test_il_risultato_non_rimanda_indietro_il_piano(tmp_path):
@@ -580,68 +610,87 @@ def test_il_piano_si_puo_pretendere_di_meno(fake_ollama, tmp_path):
     assert not any("manage_plan" in (m.get("content") or "") for m in ui)
 
 
-def test_skippare_uno_step_azzera_il_red_command(tmp_path):
-    ctx = ctx_vuoto(tmp_path)
-    dispatch(ctx, PLAN_TOOL, {"action": "set", "steps": ["step 1", "step 2"]})
-    dispatch(ctx, PLAN_TOOL, {"action": "start", "step_id": "1"})
-    ctx.red_command = "pytest -q"
-    assert ctx.red_command == "pytest -q"
+def test_saltare_un_punto_non_cancella_una_verifica(tmp_path):
+    """``skip`` azzerava il registro. Erano due fatti diversi cuciti insieme.
 
-    dispatch(ctx, PLAN_TOOL, {"action": "skip", "step_id": "1", "note": "non risolvibile nell'ambiente"})
-    assert ctx.plan.get("1").status == "skipped"
-    assert ctx.red_command is None
-
-
-def test_completa_step_con_ignore_red(tmp_path):
-    ctx = ctx_vuoto(tmp_path)
-    dispatch(ctx, PLAN_TOOL, {"action": "set", "steps": ["step 1", "step 2"]})
-    dispatch(ctx, PLAN_TOOL, {"action": "start", "step_id": "1"})
-    ctx.red_command = "pytest -q"
-
-    # Senza ignore_red fallisce
-    risposta = dispatch(ctx, PLAN_TOOL, {"action": "complete", "step_id": "1"})
-    assert "rosso" in risposta
-    assert ctx.plan.get("1").status == DOING
-
-    # Con ignore_red=True si azzera e si completa
-    risposta_ignore = dispatch(ctx, PLAN_TOOL, {"action": "complete", "step_id": "1", "ignore_red": True, "note": "test non pertinente"})
-    assert "ok" in risposta_ignore
-    assert ctx.plan.get("1").status == "done"
-    assert ctx.red_command is None
-
-
-
-def test_ignore_red_senza_motivo_viene_respinto(tmp_path):
-    """L'uscita di sicurezza si paga con una frase.
-
-    Su questo progetto la differenza fra un rito e un invito e' misurata: il
-    ``complete`` che *pretende* la nota ne ha ottenute 23 su 24 in tre
-    sessioni, il ``manage_notes`` che la propone e' stato usato 0 volte su 42
-    conversazioni. Un ``ignore_red`` gratuito smetterebbe di essere un'uscita
-    e diventerebbe la strada per chiudere qualunque punto rosso.
+    Rinunciare a un punto e' una decisione sul lavoro; com'e' andato un test e'
+    una misura. Usare la prima per far sparire la seconda era l'uscita a costo
+    zero accanto a quella che pretende una frase -- e su questo progetto
+    un'uscita gratuita da un guard-rail diventa la strada.
     """
-    ctx = ctx_vuoto(tmp_path)
-    dispatch(ctx, PLAN_TOOL, {"action": "set", "steps": ["step 1"]})
-    ctx.red_command = "pytest -q"
+    ctx, registro = ctx_col_registro(tmp_path)
+    dispatch(ctx, PLAN_TOOL, {"action": "set", "steps": ["step 1", "step 2"]})
+    rosso(registro, ctx, "pytest -q")
 
-    nudo = json.loads(dispatch(ctx, PLAN_TOOL, {"action": "complete", "step_id": "1", "ignore_red": True}))
-    assert "motivo" in nudo["error"]
-    assert ctx.plan.get("1").status == DOING
+    dispatch(ctx, PLAN_TOOL, {"action": "skip", "step_id": "1",
+                              "note": "non risolvibile nell'ambiente"})
+    assert ctx.plan.get("1").status == "skipped"
+    assert [v.comando for v in registro.pendenti] == ["pytest -q"]
     assert ctx.red_command == "pytest -q"
 
-    breve = json.loads(dispatch(
-        ctx, PLAN_TOOL, {"action": "complete", "step_id": "1", "ignore_red": True, "note": "boh"}
-    ))
-    assert "error" in breve
 
-    buono = json.loads(dispatch(
-        ctx, PLAN_TOOL,
-        {"action": "complete", "step_id": "1", "ignore_red": True,
-         "note": "Docker non disponibile in questo ambiente"},
-    ))
-    assert buono["status"] == "ok"
-    assert ctx.red_command is None
+def test_ignore_red_giustifica_una_verifica_sola(tmp_path):
+    """L'uscita era troppo larga: una frase archiviava l'intero registro.
+
+    Riprodotto: con due rossi indipendenti aperti, dichiararne non pertinente
+    uno li faceva sparire tutti e due, perche' ``clear_red_command`` chiamava
+    ``clear()`` sul tracker. Il secondo non lo aveva guardato nessuno.
+    """
+    ctx, registro = ctx_col_registro(tmp_path)
+    dispatch(ctx, PLAN_TOOL, {"action": "set", "steps": ["step 1", "step 2"]})
+    rosso(registro, ctx, "pytest -q")
+    rosso(registro, ctx, "pytest -q")          # due tentativi: e' la piu' insistente
+    rosso(registro, ctx, "ruff check .")
+
+    risposta = json.loads(dispatch(ctx, PLAN_TOOL, {
+        "action": "complete", "step_id": "1", "ignore_red": True,
+        "note": "la suite richiede il container Docker, qui non c'e'",
+    }))
+    assert risposta["status"] == "ok"
+    assert ctx.plan.get("1").status == DONE
+
+    stati = {v.identita: v.stato for v in registro.verifiche.values()}
+    assert stati["pytest"] == "giustificata"
+    assert stati["ruff . check"] == "rossa", "l'altro rosso non era in discussione"
+
     # Il rosso archiviato si conta e si vede: nel piano, dove l'utente legge.
-    assert buono["rossi_ignorati"] == 1
-    assert "verifica rossa ignorata" in ctx.plan.get("1").note
+    assert risposta["rossi_ignorati"] == 1
+    assert "verifica rossa giustificata" in ctx.plan.get("1").note
     assert ctx.rossi_ignorati[0]["comando"] == "pytest -q"
+
+
+def test_ignore_red_senza_motivo_non_giustifica_ma_non_blocca(tmp_path):
+    """La frase resta il prezzo di archiviare un rosso, non di andare avanti.
+
+    Prima ``ignore_red`` senza nota rifiutava la chiusura, e la coincidenza fra
+    "non sai dire perche' non conta" e "non puoi proseguire" era meta' dello
+    stallo. Adesso il punto si chiude e la verifica resta rossa: che e'
+    esattamente cio' che significa non saper dire perche' non conta.
+
+    Il prezzo dell'archiviazione resta misurato: il ``complete`` che *pretende*
+    la nota ne ha ottenute 23 su 24 in tre sessioni, il ``manage_notes`` che la
+    propone e' stato usato 0 volte su 42 conversazioni.
+    """
+    ctx, registro = ctx_col_registro(tmp_path)
+    dispatch(ctx, PLAN_TOOL, {"action": "set", "steps": ["step 1", "step 2"]})
+    rosso(registro, ctx, "pytest -q")
+
+    nudo = json.loads(dispatch(ctx, PLAN_TOOL, {
+        "action": "complete", "step_id": "1", "ignore_red": True}))
+    assert nudo["status"] == "ok"
+    assert ctx.plan.get("1").status == DONE
+    assert [v.comando for v in registro.pendenti] == ["pytest -q"]
+    assert any("non giustifica" in a for a in nudo["avvisi"])
+    assert "rossi_ignorati" not in nudo
+
+    breve = json.loads(dispatch(ctx, PLAN_TOOL, {
+        "action": "complete", "step_id": "2", "ignore_red": True, "note": "boh"}))
+    assert breve["status"] == "ok"
+    assert registro.pendenti, "'boh' non e' un motivo"
+
+    dispatch(ctx, PLAN_TOOL, {"action": "add", "steps": ["step 3"]})
+    buono = json.loads(dispatch(ctx, PLAN_TOOL, {
+        "action": "complete", "step_id": "3", "ignore_red": True,
+        "note": "Docker non disponibile in questo ambiente"}))
+    assert buono["rossi_ignorati"] == 1
+    assert not registro.pendenti

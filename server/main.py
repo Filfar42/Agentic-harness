@@ -1292,6 +1292,7 @@ def start_turn(
                     session_mod.record_turn_telemetry(
                         STATE.session(session_id), getattr(event, "telemetry", {}),
                         reason=event.reason, steps=event.steps,
+                        qualita=getattr(event, "qualita", None),
                     )
                     terminal_frame = event_to_sse(event)
                     continue

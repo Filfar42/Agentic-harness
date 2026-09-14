@@ -154,8 +154,15 @@ def bounded_turn_telemetry(value: Any) -> list[dict[str, Any]]:
     return list(reversed(kept))
 
 
-def record_turn_telemetry(state: Any, telemetry: Any, *, reason: str, steps: int) -> None:
-    """Attach a completed turn snapshot before the final session save."""
+def record_turn_telemetry(state: Any, telemetry: Any, *, reason: str, steps: int,
+                          qualita: Any = None) -> None:
+    """Attach a completed turn snapshot before the final session save.
+
+    ``qualita`` e' lo stato delle verifiche alla fine del turno. Sta qui e non
+    accanto ai messaggi perche' e' un fatto del **turno**: riaprendo la sessione
+    si deve poter vedere che quel turno si e' chiuso con due rossi aperti, e
+    non solo che si e' chiuso.
+    """
     if not isinstance(telemetry, dict) or not telemetry:
         return
     entry = {
@@ -164,6 +171,8 @@ def record_turn_telemetry(state: Any, telemetry: Any, *, reason: str, steps: int
         "steps": max(0, int(steps)),
         "recorded_at": datetime.now().isoformat(timespec="seconds"),
     }
+    if isinstance(qualita, dict) and qualita:
+        entry["qualita"] = qualita
     previous = state.get("turn_telemetry")
     state["turn_telemetry"] = bounded_turn_telemetry(
         [*(previous if isinstance(previous, list) else []), entry]

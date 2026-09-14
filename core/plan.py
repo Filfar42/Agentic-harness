@@ -425,7 +425,17 @@ def render_block(plan: Plan, *, steps_left: int | None = None) -> str:
             "l'hai qui sopra. Quando l'ultima azione del punto lo conclude, "
             "mettici accanto manage_plan action='complete' nello **stesso "
             "passo**: chiudere il punto non e' un passo a se', e il punto "
-            "successivo si apre da solo."
+            "successivo si apre da solo.\n"
+            # L'istruzione di sopra, presa alla lettera, chiedeva l'impossibile
+            # quando l'ultima azione era una verifica: il risultato non era
+            # ancora arrivato, quindi il completamento veniva deciso su un esito
+            # sconosciuto. Il caso non e' raro, e' il caso normale -- l'ultima
+            # azione di quasi ogni punto e' lanciare un test.
+            "Se pero' l'ultima azione e' una verifica, aspetta il suo esito e "
+            "chiudi il punto al passo dopo, senza rieseguire il comando che hai "
+            "gia' valutato. Un punto puo' chiudersi anche con una verifica "
+            "rossa, se il rosso e' cio' che il punto doveva dimostrare: lo stato "
+            "delle verifiche si tiene per conto suo e non si cancella chiudendo."
         )
     elif plan.open_steps:
         prossimo = plan.open_steps[0]

@@ -95,6 +95,38 @@ function el(tag, className, html) {
   return node;
 }
 
+/**
+ * Lo stato delle verifiche a fine turno, accanto al piano e non dentro.
+ *
+ * Il piano puo' essere tutto chiuso e la suite rossa: da quando chiudere un
+ * punto non cancella piu' una verifica, sono due fatti che possono
+ * contraddirsi, ed e' giusto che si vedano tutti e due.
+ */
+function renderQualita(qualita) {
+  const rosse = Array.isArray(qualita.pendenti) ? qualita.pendenti : [];
+  const box = el('div', 'notice');
+  const titolo = rosse.length === 1
+    ? 'Una verifica e\' rimasta rossa:'
+    : `${rosse.length} verifiche sono rimaste rosse:`;
+  box.appendChild(el('div', '', `<strong>${esc(titolo)}</strong>`));
+  const lista = el('ul', 'qualita-elenco');
+  rosse.forEach((v) => {
+    const ambito = v.ambito === 'suite' ? ' — suite intera'
+      : v.ambito === 'parziale' ? ' — selezione' : '';
+    const codice = Number.isInteger(v.returncode) ? ` (exit ${v.returncode})` : '';
+    lista.appendChild(el('li', '', `<code>${esc(String(v.comando || v.identita || ''))}</code>${esc(ambito + codice)}`));
+  });
+  box.appendChild(lista);
+  const giustificate = Array.isArray(qualita.giustificate) ? qualita.giustificate : [];
+  if (giustificate.length) {
+    const righe = giustificate
+      .map((v) => `${esc(String(v.comando || ''))}: ${esc(String(v.motivo || 'senza motivo scritto'))}`)
+      .join('<br>');
+    box.appendChild(el('div', '', `<strong>Archiviate con motivo:</strong><br>${righe}`));
+  }
+  return box;
+}
+
 function toast(message) {
   const node = $('#toast');
   node.textContent = message;
@@ -1318,11 +1350,21 @@ function handleEvent(event, turn, status, setStatus) {
         if (typeof window !== 'undefined') window.HarnessCompanion?.setState('error');
       }
       break;
-    case 'done':
+    case 'done': {
+      // `reason` dice come si e' fermato il ciclo, non se il lavoro e'
+      // riuscito: "completed" vale anche per un turno che ha esaurito i
+      // solleciti con due verifiche rosse aperte. `qualita` e' l'altra meta',
+      // e senza mostrarla qui la separazione fra piano e verifiche si
+      // ridurrebbe a nascondere i rossi meglio di prima.
+      const qualita = event.qualita && typeof event.qualita === 'object' ? event.qualita : null;
+      const rosse = qualita && Array.isArray(qualita.pendenti) ? qualita.pendenti : [];
       // A stop, question or step limit must never look like a successful delivery.
+      // Nemmeno una consegna con verifiche rosse: non e' un errore del turno,
+      // quindi non e' 'error', ma non e' un successo da festeggiare.
       if (typeof window !== 'undefined' && !turn.companionSettled) {
         turn.companionSettled = true;
         window.HarnessCompanion?.setState(turn.companionFailed || event.reason === 'error' ? 'error'
+          : rosse.length ? 'idle'
           : event.reason === 'completed' && event.steps > 1 ? 'success' : 'idle');
       }
       // Le gocce chiudono il ciclo: su una pausa per domanda il ciclo non e'
@@ -1335,8 +1377,10 @@ function handleEvent(event, turn, status, setStatus) {
         const tb = $('#composer-toolbar');
         if (tb) tb.hidden = false;
       }
+      if (rosse.length) turn.append(renderQualita(qualita));
       if (event.usage) renderUsage(event.usage);
       break;
+    }
     case 'state':
       applyStats(event);
       break;

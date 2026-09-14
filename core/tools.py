@@ -328,8 +328,11 @@ class ToolContext:
     # Servono a distinguere una verifica verde che misura il codice nuovo da
     # una che misura tutt'altro.
     new_symbols: dict[str, str] = field(default_factory=dict)
-    # Acknowledgment delle verifiche ancora irrisolte (opzione legacy
-    # ``ignore_red``): documentano una scelta, senza cancellare i fallimenti.
+    # Verifiche rosse chiuse dichiarandole non pertinenti (``ignore_red``):
+    # comando, punto del piano e motivo scritto dal modello. Sono l'uscita di
+    # sicurezza del guard-rail, quindi vanno **contate**: un turno che ne usa
+    # tre non e' un turno andato bene, e senza questo elenco la differenza fra
+    # "tutto verde" e "tre rossi archiviati" non si vedrebbe da nessuna parte.
     rossi_ignorati: list[dict[str, str]] = field(default_factory=list)
     # Punti di piano chiusi in questo passo, in attesa che ``agent`` ne
     # distilli il ragionamento. E' una **casella postale, non una callback**:
@@ -345,10 +348,9 @@ class ToolContext:
     # essere perduta. Vedi ``core/deposito.py``.
     deposito_attivo: bool = True
     deposito_max_mb: int = deposito_mod.MAX_MB_DEFAULT
-    # Il ciclo possiede il tracker; il piano ne mostra la qualita' senza mutarla.
+    # Tracker per le verifiche rosse, impostato da agent.py per permetterne
+    # l'azzeramento automatico o manuale quando un comando non e' pertinente.
     verification: Any = None
-    verification_state: dict[str, Any] = field(default_factory=dict)
-    on_verification_changed: Callable[[dict[str, Any]], None] | None = None
     # I tool che questo turno puo' eseguire. ``None`` = tutti (il turno
     # normale); un insieme = solo quelli, ed e' cosi' che i sotto-turni --
     # l'esploratore della delega e il cercatore del vault -- restano di sola
@@ -370,26 +372,69 @@ class ToolContext:
         return self.tool_consentiti is None or name in self.tool_consentiti
 
     def clear_red_command(self) -> None:
-        """Reset esplicito del tracker; le operazioni sul piano non lo usano."""
+        """Azzera l'intero registro delle verifiche.
+
+        **Le operazioni sul piano non la chiamano piu'.** La chiamavano
+        ``complete`` con ``ignore_red`` e ``skip``, e siccome il vecchio
+        ``clear()`` svuotava tutto, dichiarare non pertinente *una* verifica ne
+        cancellava anche altre: in prova, ignorarne una ne faceva sparire due.
+        Resta come reset esplicito -- un turno nuovo, un workspace cambiato --
+        dove buttare via tutto e' proprio quello che si vuole.
+        """
         self.red_command = None
         if self.verification is not None and hasattr(self.verification, "clear"):
             self.verification.clear()
 
     def quality_summary(self) -> dict[str, Any]:
-        """Qualita' delle verifiche, indipendente dalla chiusura dei punti."""
-        if self.verification is not None:
-            snapshot = getattr(self.verification, "snapshot", None)
-            if callable(snapshot):
-                return snapshot()
-            pending_checks = getattr(self.verification, "pending_checks", None)
-            if callable(pending_checks):
-                pending = pending_checks()
-                return {"status": "failing" if pending else "unverified", "pending": pending}
-        if self.verification_state:
-            return dict(self.verification_state)
-        pending = ([{"command": self.red_command, "returncode": None, "attempts": 0}]
-                   if self.red_command else [])
-        return {"status": "failing" if pending else "unverified", "pending": pending}
+        """Stato delle verifiche, indipendente dall'avanzamento del piano.
+
+        E' la lettura che il piano fa del registro: solo lettura. Chiudere un
+        punto non cambia com'e' andato un test, e questo metodo e' il posto dove
+        quella separazione si vede -- il piano guarda, non tocca.
+
+        Senza registro (sotto-turni, test che costruiscono un ``ToolContext`` a
+        mano) resta la vista minima ricavabile da ``red_command``: dice meno, ma
+        non mente.
+        """
+        registro = self.verification
+        if registro is not None and hasattr(registro, "riepilogo"):
+            return registro.riepilogo()
+        pendenti = ([{"comando": self.red_command, "identita": self.red_command,
+                      "stato": "rossa", "ambito": "ignoto", "returncode": None,
+                      "tentativi": 0}]
+                    if self.red_command else [])
+        return {
+            "stato": "rossa" if pendenti else "non_verificato",
+            "pendenti": pendenti,
+            "verdi": [], "giustificate": [], "sbagliate": [],
+            "suite_rossa": False,
+        }
+
+    def verifiche_pendenti(self) -> list[dict[str, Any]]:
+        """Le verifiche ancora rosse, come dizionari."""
+        return list(self.quality_summary().get("pendenti") or [])
+
+    def giustifica_verifica(self, motivo: str, via: str = "") -> dict[str, Any] | None:
+        """Attacca un motivo scritto alla verifica rossa piu' insistente.
+
+        **Una sola.** E' la differenza con il vecchio ``clear_red_command``: li'
+        una frase archiviava tutto il registro, qui archivia la verifica che i
+        messaggi hanno nominato, e le altre restano dove sono a farsi vedere.
+        """
+        registro = self.verification
+        if registro is None or not hasattr(registro, "giustifica"):
+            # Senza registro l'unica cosa che c'e' e' ``red_command``: si spegne
+            # quella, che e' quanto il vecchio codice faceva comunque.
+            spento = self.red_command
+            self.red_command = None
+            return {"comando": spento, "identita": spento, "motivo": motivo,
+                    "via": via} if spento else None
+        verifica = registro.giustifica(None, motivo, via)
+        if verifica is None:
+            return None
+        pendenti = registro.pendenti
+        self.red_command = pendenti[0].comando if pendenti else None
+        return verifica.to_dict()
 
     @property
     def base(self) -> Path:
@@ -2535,6 +2580,11 @@ def tool_manage_plan(
     # nel risultato e non lasciato al blocco del piano: li' il modello lo
     # leggerebbe un passo dopo, cioe' proprio nel passo che si vuole evitare.
     aperto: Any = None
+    # Quello che il modello deve sapere ma che non impedisce l'operazione. Da
+    # quando il piano non si blocca piu' su una verifica rossa, e' qui che
+    # passa la differenza fra "fatto" e "fatto bene": il punto si chiude, e
+    # accanto c'e' scritto cosa resta rosso.
+    avvisi: list[str] = []
     try:
         if action == "set":
             if isinstance(steps, str):
@@ -2576,87 +2626,65 @@ def tool_manage_plan(
         elif action == "start":
             ctx.plan.start(step_id)
         elif action == "complete":
-            # Il gancio con il ciclo di verifica. Senza, "fatto" significa
-            # "credo di aver finito", e il piano diventerebbe il posto dove
-            # dichiarare verde quello che verde non e'.
+            # Qui stava il gancio fra il piano e il ciclo di verifica: nessun
+            # punto si chiudeva finche' esisteva un comando rosso. Confondeva
+            # due cose diverse -- aver finito un'attivita' e avere la suite
+            # verde -- e su un lavoro in TDD la confusione costava il turno
+            # intero: il rosso iniziale **e'** il risultato atteso di
+            # "riprodurre il bug", il modello non poteva chiudere quel punto,
+            # non poteva aprire il successivo (un punto per volta, plan.py), e
+            # rilanciava lo stesso comando finche' i passi non finivano.
+            #
+            # Adesso il punto si chiude e la verifica resta rossa, scritta nel
+            # registro e allegata a questo risultato. Il controllo forte non
+            # sparisce: si sposta sulla chiusura del turno, dove il riepilogo
+            # deve dichiarare i rossi rimasti, e sul registro, che non li
+            # dimentica piu' quando un punto si chiude.
             ignore_red = bool(ignore_red)
-            if ctx.red_command and not ignore_red:
-                return _err(
-                    f"Non puoi dichiarare fatto il punto {step_id}: il comando "
-                    f"`{ctx.red_command}` e' ancora rosso.",
-                    hint=(
-                        "Sistema l'errore e rilancia esattamente lo stesso "
-                        "comando. Se la verifica rossa non e' pertinente al codice "
-                        "del progetto (es. vincolo o dipendenza di ambiente come "
-                        "Docker non disponibile, test obsoleto), imposta "
-                        "ignore_red=True fornendo il motivo nella nota, "
-                        "oppure usa action='skip'."
-                    ),
-                )
-            if ctx.red_command and ignore_red:
-                # L'uscita c'e', ma si paga con una frase. Su questo progetto
-                # la differenza fra un rito e un invito e' misurata: il
-                # `complete` che *pretende* la nota ne ha ottenute 23 su 24 in
-                # tre sessioni, il `manage_notes` che la propone e' stato usato
-                # 0 volte su 42 conversazioni. Un'uscita a costo zero da un
-                # guard-rail smette di essere un'uscita e diventa la strada.
-                motivo = str(note or "").strip()
+            motivo = str(note or "").strip()
+            rosso = ctx.red_command
+            if ignore_red and rosso:
                 if len(motivo) < 12:
-                    return _err(
-                        f"Per chiudere il punto {step_id} con ignore_red serve "
-                        f"il motivo: perche' `{ctx.red_command}` non riguarda "
-                        "il codice del progetto?",
-                        hint=(
-                            "Riprova con note='...' e una frase intera (es. "
-                            "'Docker non disponibile in questo ambiente, il "
-                            "test richiede il container'). La nota resta nel "
-                            "piano: e' quello che l'utente leggera' al posto "
-                            "di una verifica verde."
-                        ),
+                    # Non si rifiuta piu' la chiusura: si rifiuta la
+                    # **giustificazione**. Il punto si chiude lo stesso e la
+                    # verifica resta rossa, che e' esattamente cio' che accade
+                    # quando non si sa dire perche' non conta. La frase resta il
+                    # prezzo di archiviare un rosso, ma non e' piu' il prezzo di
+                    # andare avanti: era quella coincidenza a creare lo stallo.
+                    avvisi.append(
+                        f"`{rosso}` resta rossa: ignore_red senza un motivo "
+                        "scritto non giustifica niente. Se davvero non riguarda "
+                        "il codice del progetto, richiama complete con "
+                        "note='...' e una frase intera."
                     )
-                # Il rosso ignorato resta scritto nel piano, dove si vede: un
-                # punto chiuso cosi' non deve somigliare a uno chiuso davvero.
-                note = f"[verifica rossa ignorata: {ctx.red_command}] {motivo}"
-                ctx.rossi_ignorati.append(
-                    {"step": str(step_id), "comando": ctx.red_command, "motivo": motivo}
-                )
-                ctx.clear_red_command()
+                else:
+                    giustificata = ctx.giustifica_verifica(motivo, via="ignore_red")
+                    if giustificata is not None:
+                        comando = giustificata.get("comando") or rosso
+                        # Il rosso giustificato resta scritto nel piano, dove si
+                        # vede: un punto chiuso cosi' non deve somigliare a uno
+                        # chiuso davvero.
+                        note = f"[verifica rossa giustificata: {comando}] {motivo}"
+                        ctx.rossi_ignorati.append(
+                            {"step": str(step_id), "comando": comando,
+                             "motivo": motivo, "via": "ignore_red"}
+                        )
             gia_chiuso = _e_chiuso(ctx, step_id)
             chiuso = ctx.plan.complete(step_id, note)
             _annota_chiusura(ctx, chiuso, saltato=False, era_gia_chiuso=gia_chiuso)
             aperto = ctx.plan.avanza()
         elif action == "skip":
-            # ``skip`` azzera la verifica rossa esattamente come ``ignore_red``,
-            # ma senza chiedere niente e senza contare: era l'uscita a costo
-            # zero accanto a quella che pretende una frase di dodici caratteri.
-            # Su questo progetto la differenza fra un rito e un invito e'
-            # misurata, e un'uscita gratuita da un guard-rail smette di essere
-            # un'uscita e diventa la strada.
+            # ``skip`` azzerava il registro delle verifiche esattamente come
+            # ``ignore_red``, ma senza chiedere niente e senza contare. Adesso
+            # non lo tocca affatto: rinunciare a un punto e' una decisione sul
+            # lavoro, non un giudizio su un test, e usarla per far sparire un
+            # rosso era l'uscita a costo zero accanto a quella che pretende una
+            # frase. Su questo progetto la differenza fra un rito e un invito e'
+            # misurata, e un'uscita gratuita da un guard-rail diventa la strada.
             motivo = str(note or "").strip()
-            if ctx.red_command and len(motivo) < 12:
-                return _err(
-                    f"Per saltare il punto {step_id} con `{ctx.red_command}` "
-                    "ancora rosso serve il motivo.",
-                    hint=(
-                        "Riprova con note='...' e una frase intera: perche' "
-                        "questo punto non si fa? La nota resta nel piano, ed e' "
-                        "quello che l'utente leggera' al posto del lavoro."
-                    ),
-                )
-            if ctx.red_command:
-                # Contato come gli altri rossi archiviati: un turno che ne usa
-                # tre non e' un turno andato bene, e senza questo elenco la
-                # differenza fra "tutto verde" e "tre rossi saltati" non si
-                # vedrebbe da nessuna parte.
-                ctx.rossi_ignorati.append(
-                    {"step": str(step_id), "comando": ctx.red_command,
-                     "motivo": motivo, "via": "skip"}
-                )
-                note = f"[saltato con verifica rossa: {ctx.red_command}] {motivo}"
             gia_chiuso = _e_chiuso(ctx, step_id)
-            chiuso = ctx.plan.skip(step_id, note)
+            chiuso = ctx.plan.skip(step_id, motivo)
             _annota_chiusura(ctx, chiuso, saltato=True, era_gia_chiuso=gia_chiuso)
-            ctx.clear_red_command()
             aperto = ctx.plan.avanza()
         elif action == "show":
             return _ok({"plan": ctx.plan.to_list()})
@@ -2690,6 +2718,24 @@ def tool_manage_plan(
         # Torna al modello ad ogni operazione sul piano: se ne ha gia'
         # archiviati due, deve saperlo prima di archiviarne un terzo.
         esito["rossi_ignorati"] = len(ctx.rossi_ignorati)
+    # Lo stato della qualita' viaggia **accanto** all'avanzamento, non dentro.
+    # E' il punto dell'intera separazione: senza questo campo, "il piano non si
+    # blocca piu' sui rossi" vorrebbe dire solo che i rossi si vedono meno.
+    qualita = ctx.quality_summary()
+    pendenti = qualita.get("pendenti") or []
+    if pendenti:
+        esito["qualita"] = qualita
+        prima = pendenti[0]
+        comando = prima.get("comando") or prima.get("identita") or ""
+        avvisi.append(
+            f"Il punto e' aggiornato, la qualita' no: `{comando}` e' ancora "
+            f"rossa ({len(pendenti)} verifica/he pendenti). Non rieseguirla "
+            "senza aver cambiato qualcosa; se questo rosso e' il risultato "
+            "atteso di questo punto, vai avanti col piano e sistemalo dove "
+            "previsto. Il riepilogo finale dovra' dichiararlo."
+        )
+    if avvisi:
+        esito["avvisi"] = avvisi
     if aperto is not None:
         esito["aperto_in_automatico"] = {"id": aperto.id, "text": aperto.text}
         esito["next_step"] = (
