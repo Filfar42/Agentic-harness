@@ -1,0 +1,26 @@
+........................................................................ [  5%]
+........................................................................ [ 11%]
+...............s.................................................ss..... [ 17%]
+........................................................................ [ 23%]
+......s................................................................. [ 29%]
+........................................................................ [ 35%]
+............s........................................................... [ 41%]
+........................................................................ [ 47%]
+...s.................................................................... [ 53%]
+........................................................................ [ 59%]
+........................................................................ [ 65%]
+........................................................................ [ 71%]
+........................................................................ [ 77%]
+........................................................................ [ 83%]
+....................s................................................... [ 89%]
+........................................................................ [ 95%]
+..................................................                       [100%]
+=========================== short test summary info ===========================
+SKIPPED [1] tests\test_audit_runtime.py:79: Symlinks require Windows Developer Mode or privileges
+SKIPPED [1] tests\test_audit_tools.py:104: Filesystem cannot create symbolic links: [WinError 1314] Il privilegio richiesto non appartiene al client: 'C:\\Users\\filip\\AppData\\Local\\Temp\\pytest-of-filip\\pytest-23\\test_upload_does_not_follow_da0\\outside.txt' -> 'C:\\Users\\filip\\AppData\\Local\\Temp\\pytest-of-filip\\pytest-23\\test_upload_does_not_follow_da0\\workspace\\allegati\\same.txt'
+SKIPPED [1] tests\test_audit_tools.py:104: Filesystem cannot create symbolic links: [WinError 1314] Il privilegio richiesto non appartiene al client: 'C:\\Users\\filip\\AppData\\Local\\Temp\\pytest-of-filip\\pytest-23\\test_search_cannot_read_file_s0\\outside.txt' -> 'C:\\Users\\filip\\AppData\\Local\\Temp\\pytest-of-filip\\pytest-23\\test_search_cannot_read_file_s0\\workspace\\link.txt'
+SKIPPED [1] tests\test_avvio.py:204: Serve un gruppo di processi e un SIGINT vero: su Windows si fa con GenerateConsoleCtrlEvent e una console dedicata, che in una suite non si puo' allestire. Il gancio resta coperto dai test qui sopra.
+SKIPPED [1] tests\test_core.py:952: Semantica di shell POSIX: cmd.exe non usa 127 per 'comando inesistente'. Su Windows la strada supportata e' la sandbox Docker, dove la shell e' quella del container.
+SKIPPED [1] tests\test_guardie_lavoro.py:228: symlink non disponibili su questo sistema
+SKIPPED [1] tests\test_server.py:523: verifica specifica per l'ambiente di test headless
+1195 passed, 7 skipped in 273.20s (0:04:33)

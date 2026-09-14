@@ -4,14 +4,24 @@
  */
 
 :root {
-  --bg: #101418;
-  --panel: #171c22;
-  --bordo: #262d36;
-  --testo: #e6eaef;
-  --testo-dim: #93a0ad;
-  --accento: #4da3ff;
-  --utente: #2b527f;
-  --ok: #3ecf8e;
+  color-scheme: dark;
+  --bg: #11181b;
+  --panel: #192226;
+  --panel-hover: #223036;
+  --bordo: #304247;
+  --bordo-control: #70878b;
+  --testo: #edf3f3;
+  --testo-dim: #acbdbf;
+  --accento: #63d5c5;
+  --accento-hover: #83e1d3;
+  --accento-active: #50b9aa;
+  --su-accento: #102a28;
+  --utente: #244941;
+  --ok: #7fe0b6;
+  --errore: #ffb8ad;
+  --errore-bg: #39262a;
+  --stop: #e9a3a3;
+  --su-stop: #3b181c;
 }
 
 * { box-sizing: border-box; }
@@ -80,7 +90,7 @@ html, body {
 }
 
 .icon-btn {
-  border: 1px solid var(--bordo);
+  border: 1px solid var(--bordo-control);
   background: transparent;
   color: var(--testo);
   width: 38px;
@@ -91,7 +101,7 @@ html, body {
   display: grid;
   place-items: center;
 }
-.icon-btn:active { background: var(--bordo); }
+.icon-btn:active { background: var(--panel-hover); border-color: var(--accento); }
 
 /* ---------------------------------------------------------------- elenco */
 
@@ -99,8 +109,8 @@ html, body {
   margin: 10px 12px 0;
   padding: 10px 12px;
   border-radius: 10px;
-  background: #3a1f22;
-  color: #ffb4ae;
+  background: var(--errore-bg);
+  color: var(--errore);
   font-size: 14px;
 }
 
@@ -116,7 +126,7 @@ html, body {
   padding: 12px;
   margin-bottom: 8px;
   background: var(--panel);
-  border: 1px solid var(--bordo);
+  border: 1px solid var(--bordo-control);
   border-radius: 12px;
 }
 .session-list li:active { border-color: var(--accento); }
@@ -134,7 +144,7 @@ html, body {
   margin-left: 8px;
   padding: 2px 8px;
   border-radius: 999px;
-  background: rgba(62, 207, 142, 0.15);
+  background: #203f36;
   color: var(--ok);
   font-size: 11px;
   font-weight: 600;
@@ -144,7 +154,7 @@ html, body {
 
 @keyframes respira {
   0%, 100% { opacity: 1; }
-  50%      { opacity: 0.45; }
+  50%      { opacity: 0.88; }
 }
 
 /* -------------------------------------------------------- conversazione */
@@ -182,7 +192,7 @@ html, body {
   font-size: 0.88em;
   padding: 1px 4px;
   border-radius: 5px;
-  background: rgba(127, 127, 127, 0.18);
+  background: rgba(172, 189, 191, 0.12);
   word-break: break-all;
 }
 
@@ -195,21 +205,21 @@ html, body {
 
 .msg.pending {
   align-self: stretch;
-  background: rgba(77, 163, 255, 0.12);
+  background: rgba(99, 213, 197, 0.12);
   border: 1px solid var(--accento);
 }
 
 /* Una domanda a cui si e' gia' risposto e' cronologia, non una richiesta
    aperta: perde il bordo acceso e resta li' a dire cosa era stato chiesto. */
 .msg.pending.risposta-data {
-  background: rgba(77, 163, 255, 0.06);
+  background: rgba(99, 213, 197, 0.06);
   border-color: var(--bordo);
   color: var(--testo-dim);
 }
 
 .msg.user.risposta-scelta::before {
   content: "↳ ";
-  opacity: 0.6;
+  opacity: 1;
 }
 
 .msg.live::after {
@@ -255,7 +265,7 @@ html, body {
   display: inline-block;
   width: 12px;
   margin-right: 2px;
-  transition: transform 0.15s ease;
+  transition: transform 180ms ease-out;
 }
 .passi[open] > .passi-sommario::before { transform: rotate(90deg); }
 
@@ -280,13 +290,13 @@ html, body {
   width: 5px;
   height: 5px;
   border-radius: 50%;
-  background: var(--bordo);
+  background: var(--testo-dim);
   transform: translateY(-1px);
 }
 .passo.pensiero::before { background: transparent; box-shadow: inset 0 0 0 1px var(--testo-dim); }
-.passo.tool::before { background: var(--accento); opacity: 0.55; }
-.passo.male { color: #ffb4ae; }
-.passo.male::before { background: #ffb4ae; opacity: 1; }
+.passo.tool::before { background: var(--accento); opacity: 0.85; }
+.passo.male { color: var(--errore); }
+.passo.male::before { background: var(--errore); opacity: 1; }
 
 /* Il passo in corso pulsa: e' l'unica riga viva dell'elenco. */
 .passo.corso {
@@ -301,7 +311,7 @@ html, body {
 
 @keyframes pulsa {
   0%, 100% { transform: translateY(-1px) scale(1); opacity: 1; }
-  50%      { transform: translateY(-1px) scale(1.9); opacity: 0.45; }
+  50%      { transform: translateY(-1px) scale(1.9); opacity: 0.75; }
 }
 
 /* ------------------------------------------------------ striscia attivita' */
@@ -316,7 +326,7 @@ html, body {
   border: 1px solid var(--bordo);
   border-radius: 12px;
   background:
-    linear-gradient(90deg, transparent, rgba(77, 163, 255, 0.13), transparent)
+    linear-gradient(90deg, transparent, rgba(99, 213, 197, 0.13), transparent)
       0 0 / 45% 100% no-repeat,
     var(--panel);
   animation: scorre 1.9s linear infinite;
@@ -337,14 +347,14 @@ html, body {
   height: 8px;
   border-radius: 50%;
   background: var(--accento);
-  box-shadow: 0 0 0 0 rgba(77, 163, 255, 0.55);
+  box-shadow: 0 0 0 0 rgba(99, 213, 197, 0.45);
   animation: battito 1.4s ease-out infinite;
 }
 
 @keyframes battito {
-  0%   { box-shadow: 0 0 0 0 rgba(77, 163, 255, 0.55); }
-  70%  { box-shadow: 0 0 0 9px rgba(77, 163, 255, 0); }
-  100% { box-shadow: 0 0 0 0 rgba(77, 163, 255, 0); }
+  0%   { box-shadow: 0 0 0 0 rgba(99, 213, 197, 0.45); }
+  70%  { box-shadow: 0 0 0 9px rgba(99, 213, 197, 0); }
+  100% { box-shadow: 0 0 0 0 rgba(99, 213, 197, 0); }
 }
 
 .attivita-testo {
@@ -364,6 +374,11 @@ html, body {
 /* Chi ha chiesto meno animazioni al sistema operativo le ottiene: resta il
    colore, che basta a dire che qualcosa e' in corso. */
 @media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation: none !important;
+    transition: none !important;
+    scroll-behavior: auto !important;
+  }
   .attivita { animation: none; }
   .battito { animation: none; }
   .passo.corso::before { animation: none; }
@@ -392,11 +407,11 @@ button.primary {
   border: 0;
   border-radius: 10px;
   background: var(--accento);
-  color: #06121f;
+  color: var(--su-accento);
   font-weight: 700;
   font-size: 15px;
 }
-button.primary:active { filter: brightness(0.85); }
+button.primary:active { background: var(--accento-active); }
 
 /* -------------------------------------------------------------- composer */
 
@@ -415,18 +430,18 @@ button.primary:active { filter: brightness(0.85); }
   resize: none;
   max-height: 120px;
   padding: 10px 12px;
-  border: 1px solid var(--bordo);
+  border: 1px solid var(--bordo-control);
   border-radius: 12px;
   background: var(--bg);
   color: var(--testo);
   font: inherit;
 }
-.composer textarea:focus { outline: 1px solid var(--accento); }
+.composer textarea:focus { outline: 2px solid var(--accento); outline-offset: 2px; }
 
 .question-card textarea {
   resize: none;
   padding: 10px 12px;
-  border: 1px solid var(--bordo);
+  border: 1px solid var(--bordo-control);
   border-radius: 10px;
   background: var(--bg);
   color: var(--testo);
@@ -443,9 +458,10 @@ button.primary:active { filter: brightness(0.85); }
   display: grid;
   place-items: center;
 }
-.send { background: var(--accento); color: #06121f; }
-.stop { background: #a33b3b; color: #fff; }
-.send:active, .stop:active { filter: brightness(0.85); }
+.send { background: var(--accento); color: var(--su-accento); }
+.stop { background: var(--stop); color: var(--su-stop); }
+.send:active { background: var(--accento-active); }
+.stop:active { background: #d68d8d; }
 
 /* ------------------------------------------------------------ opzioni domanda */
 
@@ -460,7 +476,7 @@ button.primary:active { filter: brightness(0.85); }
 
 .option-btn {
   padding: 10px 14px;
-  border: 1px solid var(--bordo);
+  border: 1px solid var(--bordo-control);
   border-radius: 18px;
   background: var(--panel);
   color: var(--testo);
@@ -470,7 +486,36 @@ button.primary:active { filter: brightness(0.85); }
 .option-btn.on {
   border-color: var(--accento);
   background: var(--accento);
-  color: #06121f;
+  color: var(--su-accento);
+}
+
+/* Feedback cromatico: nessuna variazione delle misure o della posizione. */
+button, textarea, .session-list li, .passi-sommario {
+  transition: background-color 180ms ease-out, border-color 180ms ease-out,
+    color 180ms ease-out, box-shadow 180ms ease-out;
+}
+
+button { cursor: pointer; -webkit-tap-highlight-color: rgba(99, 213, 197, 0.16); }
+textarea { caret-color: var(--accento); }
+textarea::placeholder { color: var(--testo-dim); opacity: 1; }
+
+button:focus-visible, textarea:focus-visible,
+.session-list li:focus-visible, .passi-sommario:focus-visible {
+  outline: 2px solid var(--accento);
+  outline-offset: 3px;
+}
+
+button:disabled { cursor: default; }
+
+@media (hover: hover) and (pointer: fine) {
+  .icon-btn:hover:not(:disabled), .option-btn:hover:not(:disabled):not(.on),
+  .session-list li:hover {
+    background: var(--panel-hover);
+    border-color: var(--accento);
+  }
+  button.primary:hover:not(:disabled), .send:hover:not(:disabled),
+  .option-btn.on:hover:not(:disabled) { background: var(--accento-hover); }
+  .stop:hover:not(:disabled) { background: #f3b7b7; }
 }
 
 /* ----------------------------------------------------------------- toast */
@@ -482,8 +527,9 @@ button.primary:active { filter: brightness(0.85); }
   transform: translateX(-50%);
   max-width: 90vw;
   padding: 10px 16px;
-  background: #000c;
-  color: #fff;
+  background: #192226;
+  color: var(--testo);
+  box-shadow: 0 0 0 1px var(--bordo-control), 0 8px 24px rgba(0, 0, 0, 0.28);
   border-radius: 10px;
   font-size: 14px;
   z-index: 10;

@@ -11,12 +11,17 @@ from __future__ import annotations
 import json
 import re
 import time
+import logging
 from dataclasses import dataclass, field, replace
 from pathlib import PurePath
 from typing import Any
 from collections.abc import Callable, Iterator, Sequence
 
 from .backend import StreamEvent
+from .context import compact_result, deposit_references
+from .inference import service_text
+from .telemetry import track_backend
+from .jsonsafe import JsonBoundaryError, loads_object
 from .config import (
     Budgets,
     HISTORY_COMPACT_THRESHOLD,
@@ -67,7 +72,6 @@ from .textutils import (
     chars_for_tokens,
     estimate_messages_tokens,
     estimate_tokens,
-    smart_truncate,
     strip_think,
     strip_tool_wrappers,
 )
@@ -86,7 +90,11 @@ from .tools import (
     preview_root,
     reset_scratch,
     uncovered_symbols,
+    validate_tool_arguments,
 )
+
+logger = logging.getLogger(__name__)
+MAX_TOOL_CALLS_PER_STEP = 32
 
 # ---------------------------------------------------------------------------
 # Eventi
@@ -223,6 +231,7 @@ class TurnFinished:
     reason: str  # "completed" | "max_steps" | "error" | "awaiting_user"
     steps: int
     usage: dict[str, Any] = field(default_factory=dict)
+    telemetry: dict[str, Any] = field(default_factory=dict)
     # I file creati o modificati nel turno non passano di qui: la UI li ricava
     # dai risultati di write_file/edit_file che gia' riceve (vedi fileTocca in
     # web/app.js). Cosi' la stessa regola vale sia in diretta sia quando una
@@ -323,59 +332,8 @@ AgentEvent = (
 def _compact_tool_result(
     raw: str, *, full: bool, budgets: Budgets | None = None
 ) -> str:
-    """Riduce un risultato di tool gia' consumato dal modello.
-
-    Un risultato di ``read_file`` vecchio di 5 passi e' morto: il modello ha
-    gia' estratto quello che gli serviva, ma continua a costare token in ogni
-    richiesta successiva. Lo si riduce a un sommario strutturale.
-
-    Il ``json.loads`` gira su **ogni** risultato fuori finestra a ogni passo, e
-    sembra il posto giusto per una cache. Misurato (31/08/2026): su una
-    cronologia di 60 passi con risultati da 12 kB l'una, ``build_api_messages``
-    intera costa 2,8 ms, di cui 1,5 ms di ``json.loads``. Un passo agentico
-    costa secondi: la cache aggiungerebbe una chiave da invalidare per
-    guadagnare un millesimo del turno, e la si e' lasciata stare.
-    """
-    budgets = budgets or Budgets()
-    if full:
-        return smart_truncate(
-            raw, budgets.tool_result_max_chars, label="risultato tool"
-        )
-
-    try:
-        payload = json.loads(raw)
-    except json.JSONDecodeError:
-        return smart_truncate(raw, 400, label="risultato tool (compattato)")
-
-    if not isinstance(payload, dict):
-        return smart_truncate(raw, 400, label="risultato tool (compattato)")
-
-    if "error" in payload:
-        # Si accorcia il **messaggio**, non la busta. Tagliare il JSON gia'
-        # serializzato -- ``json.dumps(payload)[:400]``, com'era -- produce JSON
-        # invalido proprio nel caso peggiore: un errore lungo. Il modello
-        # riceveva `{"error": "Traceback (most recent ca` in mezzo a risultati
-        # tutti ben formati, e l'unico messaggio che non riusciva a leggere era
-        # quello che spiegava cosa fosse andato storto.
-        errore = payload["error"]
-        testo = errore if isinstance(errore, str) else json.dumps(errore, ensure_ascii=False)
-        margine = len(json.dumps({"error": ""}, ensure_ascii=False))
-        return json.dumps(
-            {"error": smart_truncate(testo, max(80, 400 - margine), label="errore")},
-            ensure_ascii=False,
-        )
-
-    keep = {}
-    for key in ("status", "action", "filepath", "returncode", "match_count", "folder"):
-        if key in payload:
-            keep[key] = payload[key]
-    for key in ("content", "tree", "stdout", "stderr", "matches"):
-        if key in payload:
-            body = payload[key]
-            body_str = body if isinstance(body, str) else json.dumps(body, ensure_ascii=False)
-            keep[key] = smart_truncate(body_str, 300, label=key)
-    keep["_compacted"] = True
-    return json.dumps(keep, ensure_ascii=False)
+    """Riduce i corpi conservando esiti, JSON e riferimenti recuperabili."""
+    return compact_result(raw, full=full, budgets=budgets or Budgets())
 
 
 # Argomenti che contengono il *corpo* di qualcosa, non un riferimento. Sono
@@ -423,8 +381,9 @@ def _prune_tool_call(call: dict[str, Any]) -> dict[str, Any]:
             continue
         righe = corpo.count("\n") + 1
         args[chiave] = (
-            f"<omesso: {righe} righe, {len(corpo)} caratteri gia' scritti su "
-            "disco. Se ti serve il testo esatto, rileggilo con read_file.>"
+            f"<omesso: {righe} righe, {len(corpo)} caratteri di una modifica "
+            "eseguita. read_file restituisce la versione attuale del file, "
+            "che puo' differire da questo contenuto storico.>"
         )
         potato = True
 
@@ -507,6 +466,21 @@ def build_api_messages(
     recent_call_ids = {
         str(ui_messages[i].get("tool_call_id") or "") for i in recent_tools
     }
+    successful_call_ids = {
+        str(message.get("tool_call_id") or "")
+        for message in ui_messages
+        if message.get("role") == "tool" and message.get("ok") is not False
+        and _esito_del_tool(str(message.get("content") or ""))
+    }
+    invalid_json_ids: set[str] = set()
+    for message in ui_messages:
+        if message.get("role") == "tool" and message.get("ok") is False:
+            try:
+                failure = loads_object(message.get("content", ""))
+            except JsonBoundaryError:
+                continue
+            if failure.get("error_code") == "invalid_json":
+                invalid_json_ids.add(str(message.get("tool_call_id") or ""))
 
     for idx, msg in enumerate(ui_messages):
         role = msg.get("role")
@@ -533,8 +507,18 @@ def build_api_messages(
                     call
                     if not compact_old_tools
                     or str(call.get("id") or "") in recent_call_ids
+                    or str(call.get("id") or "") not in successful_call_ids
                     else _prune_tool_call(call)
                     for call in msg["tool_calls"]
+                ]
+                # Ollama requires decoded objects even in historical calls.
+                # An invalid attempt gets an inert placeholder only in this
+                # API view; its exact input and failure remain in the tool result
+                # and original UI log. It has never been executed.
+                entry["tool_calls"] = [
+                    {**call, "function": {**call["function"], "arguments": "{}"}}
+                    if str(call.get("id") or "") in invalid_json_ids else call
+                    for call in entry["tool_calls"]
                 ]
             # Un assistant senza contenuto ne' tool call non aggiunge nulla.
             if entry["content"] or entry.get("tool_calls"):
@@ -546,7 +530,12 @@ def build_api_messages(
                     "role": "tool",
                     "tool_call_id": msg.get("tool_call_id", ""),
                     "name": msg.get("name", ""),
-                    "content": _compact_tool_result(
+                    # Una risposta umana e' un requisito, anche quando viaggia
+                    # come risultato di ask_user_question. Non la riduciamo
+                    # insieme ai log dei tool quando diventa meno recente.
+                    "content": str(msg.get("content", ""))
+                    if msg.get("answered") and msg.get("name") == ASK_USER_TOOL
+                    else _compact_tool_result(
                         str(msg.get("content", "")),
                         full=idx in recent_tools,
                         budgets=budgets,
@@ -702,10 +691,12 @@ PUNTI_PER_IL_CANCELLO = 6
 # passo, contro secondi di generazione. Memoizzarle vorrebbe dire una cache da
 # invalidare a ogni messaggio aggiunto -- cioe' un difetto silenzioso in
 # cambio di niente.
-def context_pressure(api_messages: Sequence[dict], num_ctx: int) -> float:
+def context_pressure(
+    api_messages: Sequence[dict], num_ctx: int, *, reserved_tokens: int = 0,
+) -> float:
     if num_ctx <= 0:
         return 0.0
-    return estimate_messages_tokens(api_messages) / num_ctx
+    return (estimate_messages_tokens(api_messages) + max(0, reserved_tokens)) / num_ctx
 
 
 def compatta_cronologia(
@@ -718,6 +709,7 @@ def compatta_cronologia(
     soglia_coda: float = CODA_DEFAULT,
     finestra: int | None = None,
     schedario: Any = None,
+    should_stop: Callable[[], bool] | None = None,
 ) -> Compattazione | None:
     """Riassume il tratto vecchio della cronologia e ne toglie la vista al modello.
 
@@ -736,6 +728,10 @@ def compatta_cronologia(
     # con il tetto assoluto attivo quella non e' ``num_ctx`` ma la finestra
     # efficace, e usare qui quella vera terrebbe una coda piu' grande della
     # soglia che ha appena fatto compattare -- cioe' compattare per niente.
+    from .compaction import limita_stato_attivo, riassunto_strutturato, stato_attivo
+
+    if should_stop is not None and should_stop():
+        return None
     num_ctx = int(finestra or 0) or int(getattr(params, "num_ctx", 0) or 0)
     if num_ctx <= 0:
         return None
@@ -760,25 +756,55 @@ def compatta_cronologia(
         (i for i, m in enumerate(ui_messages) if m.get("role") == "summary"),
         default=-1,
     )
-    cut = taglio(
-        ui_messages,
+    # La UI conserva gli eventi originali. Il riassuntore vede soltanto il
+    # tratto successivo al checkpoint, non tutta la cronologia dall'origine.
+    inizio_attivo = ultimo_riassunto + 1
+    cut_delta = taglio(
+        ui_messages[inizio_attivo:],
         costo=costo,
         budget_coda=int(num_ctx * soglia_coda),
     )
-    # Tagliare a monte di un riassunto gia' esistente non libererebbe niente:
-    # quel tratto e' gia' fuori dalla vista del modello.
-    if cut <= ultimo_riassunto + 1:
+    if not cut_delta:
         return None
-
-    vecchi = ui_messages[:cut]
+    cut = inizio_attivo + cut_delta
+    vecchi = ui_messages[inizio_attivo:cut]
     prima = costo(vecchi)
-    richieste = richieste_utente(vecchi)
+    # La specifica originale resta testuale anche al secondo checkpoint.
+    richieste = richieste_utente(ui_messages[:cut])
+    da_riassumere = list(vecchi)
+    stato_precedente = ""
+    fonte_precedente = ""
+    if ultimo_riassunto >= 0:
+        precedente = ui_messages[ultimo_riassunto]
+        testo_precedente = str(precedente.get("content") or "")
+        stato_precedente = stato_attivo(str(precedente.get("active_state", testo_precedente) or ""))
+        percorso = precedente.get("archive_path")
+        archiviato = False
+        if schedario and isinstance(percorso, str):
+            # Stesso criterio del recupero: un file dietro symlink/junction o
+            # fuori dalla libreria non rende il checkpoint recuperabile.
+            archiviato = any(v.percorso == percorso.replace("\\", "/")
+                             for v in libreria.voci(schedario))
+            if archiviato:
+                fonte_precedente = percorso
+        # Vecchie sessioni o archiviazione fallita: non perdere il solo
+        # riassunto disponibile. Il fallback riassume quello, mai i raw vecchi.
+        if not archiviato or not riassunto_strutturato(testo_precedente):
+            da_riassumere.insert(0, precedente)
+    trascritto = trascrizione(da_riassumere)
+    if stato_precedente:
+        trascritto = (
+            "[STATO ATTIVO PRECEDENTE: confronta con i nuovi eventi]\n"
+            + limita_stato_attivo(stato_precedente, fonte_precedente)
+            + "\n\n[NUOVI EVENTI]\n" + trascritto
+        )
     riassunto = costruisci_riassunto(
-        trascrizione(vecchi, archiviato=schedario is not None),
+        trascritto,
         backend=backend,
         params=params,
+        should_stop=should_stop,
     )
-    if not riassunto:
+    if not riassunto or (should_stop is not None and should_stop()):
         # Senza riassunto non si compatta, nemmeno tenendo le richieste
         # dell'utente: resterebbe la specifica e sparirebbe tutto il lavoro
         # fatto per soddisfarla, che e' il modo peggiore di liberare contesto.
@@ -790,20 +816,39 @@ def compatta_cronologia(
     # compattazione avviene lo stesso (``archivia`` torna None e basta), ma il
     # riassunto non deve mai finire in cronologia credendo di essere al sicuro
     # su disco quando non c'e'.
-    voce = libreria.archivia(schedario, riassunto=riassunto, richieste=richieste) if schedario else None
+    stato_completo = stato_attivo(stato_precedente, riassunto)
+    archivio = riassunto
+    if stato_completo:
+        archivio += "\n\n<stato_attivo>\n" + stato_completo + "\n</stato_attivo>"
+    if fonte_precedente:
+        # Catena recuperabile anche quando uno stato eccedente il budget e'
+        # stato abbreviato nel checkpoint precedente.
+        archivio += f"\n[Stato precedente: read_file {fonte_precedente}]"
+    voce = libreria.archivia(
+        schedario, riassunto=archivio, richieste=richieste_utente(vecchi)
+    ) if schedario else None
+    stato = limita_stato_attivo(stato_completo, voce.percorso if voce else "")
+    if stato != stato_completo and voce is None:
+        # Senza un archivio vero non si puo' promettere di recuperare le
+        # verifiche tagliate: conserviamo la vista precedente.
+        return None
 
-    testo = render_messaggio(riassunto, richieste, voce=voce)
+    testo = render_messaggio(riassunto, richieste, voce=voce, stato=stato)
     ui_messages.insert(
         cut,
         {
             "role": "summary",
             "content": testo,
             "replaced": cut - (ultimo_riassunto + 1),
+            "source_start": inizio_attivo,
+            "source_end": cut,
+            "archive_path": voce.percorso if voce is not None else None,
+            "active_state": stato,
             "ts": time.time(),
         },
     )
     return Compattazione(
-        messaggi_prima=cut,
+        messaggi_prima=cut_delta,
         messaggi_dopo=1,
         token_prima=prima,
         token_dopo=estimate_tokens(testo),
@@ -816,6 +861,8 @@ def drop_oldest_turns(
     api_messages: list[dict],
     num_ctx: int,
     soglia: float = HISTORY_COMPACT_THRESHOLD,
+    *,
+    reserved_tokens: int = 0,
 ) -> list[dict]:
     """Sliding window: elimina i turni piu' vecchi mantenendo system + coda.
 
@@ -832,7 +879,7 @@ def drop_oldest_turns(
     body = [m for m in api_messages if m.get("role") != "system"]
 
     costi = [estimate_messages_tokens([m]) for m in body]
-    totale = estimate_messages_tokens(head) + sum(costi)
+    totale = estimate_messages_tokens(head) + sum(costi) + max(0, reserved_tokens)
     tetto = num_ctx * soglia
     i = 0
     while i < len(body) and totale > tetto and len(body) - i > 2:
@@ -896,18 +943,29 @@ def extract_json_objects(text: str) -> list[tuple[int, int, dict[str, Any]]]:
     Restituisce ``(inizio, fine, oggetto)`` per ogni oggetto trovato, in ordine.
     """
     results: list[tuple[int, int, dict[str, Any]]] = []
+    if len(text) > 1_048_576:
+        return results
     index = 0
     length = len(text)
+    attempts = 0
     while index < length:
+        attempts += 1
+        if attempts > 128:
+            break
         start = text.find("{", index)
         if start == -1:
             break
         try:
             obj, end = _DECODER.raw_decode(text, start)
-        except ValueError:
+        except (ValueError, RecursionError):
             index = start + 1
             continue
         if isinstance(obj, dict):
+            try:
+                obj = loads_object(text[start:end])
+            except JsonBoundaryError:
+                index = end
+                continue
             results.append((start, end, obj))
             index = end
         else:
@@ -941,8 +999,8 @@ def _as_tool_call(data: dict[str, Any], seq: int) -> dict[str, Any] | None:
         args = {}
     if isinstance(args, str):
         try:
-            args = json.loads(args)
-        except json.JSONDecodeError:
+            args = loads_object(args)
+        except JsonBoundaryError:
             return None
     if not isinstance(args, dict):
         return None
@@ -1234,7 +1292,8 @@ TETTO_INUTILE = 512
 
 
 def tetto_per_la_finestra(
-    api_messages: Sequence[dict[str, Any]], num_ctx: int, max_tokens: int
+    api_messages: Sequence[dict[str, Any]], num_ctx: int, max_tokens: int,
+    *, reserved_tokens: int = 0,
 ) -> tuple[int, int]:
     """Il tetto di generazione che ci sta **davvero**, e lo spazio rimasto.
 
@@ -1256,7 +1315,7 @@ def tetto_per_la_finestra(
     """
     if num_ctx <= 0 or max_tokens <= 0:
         return max_tokens, 0
-    spazio = num_ctx - estimate_messages_tokens(api_messages) - MARGINE_FINESTRA
+    spazio = num_ctx - estimate_messages_tokens(api_messages) - MARGINE_FINESTRA - reserved_tokens
     return min(max_tokens, max(spazio, 0)), spazio
 
 
@@ -1524,6 +1583,7 @@ def riepilogo_finale(
     params: Any,
     budgets: Any,
     strip_thinking: bool,
+    should_stop: Callable[[], bool] | None = None,
 ) -> str:
     """Chiede al modello cosa e' successo, quando i passi sono gia' finiti.
 
@@ -1559,16 +1619,7 @@ def riepilogo_finale(
         # frase mozzata.
         return ""
     p = replace(params, think=False, temperature=0.2, max_tokens=tetto)
-    pezzi: list[str] = []
-    try:
-        for evento in backend.stream(api, None, p):
-            if evento.kind == "content":
-                pezzi.append(evento.text)
-            elif evento.kind == "error":
-                return ""
-    except Exception:  # noqa: BLE001
-        return ""
-    return strip_think("".join(pezzi)).strip()
+    return service_text(backend, api, p, should_stop=should_stop)
 
 
 def _nome_livello(think: Any) -> str:
@@ -1667,6 +1718,8 @@ def run_turn(
     abilita_delega: bool = True,
     should_stop: Callable[[], bool] | None = None,
     images: list[str] | None = None,
+    allow_text_tool_calls: bool = False,
+    initialize_workspace: bool = True,
 ) -> Iterator[AgentEvent]:
     """Esegue un turno completo. Muta ``ui_messages`` in-place via append.
 
@@ -1678,6 +1731,13 @@ def run_turn(
     eseguire ogni tool. Non si taglia mai *dentro* un tool gia' partito: un
     write_file interrotto a meta' lascerebbe un file monco sul disco.
     """
+    # Displayed examples are data. Native function calls are the default
+    # execution boundary; legacy recovery requires an explicit caller opt-in.
+    backend = track_backend(backend)
+    telemetry_offset = backend.collector.offset()
+    turn_started = time.monotonic()
+    allowed_tools = {schema["function"]["name"] for schema in tools_schema}
+    schema_tokens = estimate_tokens(json.dumps(tools_schema, ensure_ascii=False)) if tools_schema else 0
     nudged = False
     leak_nudged = False
     ripetizione_nudged = False
@@ -1720,17 +1780,18 @@ def run_turn(
     # Chi chiama puo' imporne uno suo (la delega passa al figlio i budget
     # stretti): se non arriva, si ricalcola dalla finestra come sempre.
     if budgets is None:
-        budgets = budgets_for(int(getattr(params, "num_ctx", 0) or 0))
+        budgets = budgets_for(int(getattr(params, "num_ctx", 0) or 0), compact_max_tokens)
     tool_ctx.budgets = budgets
 
     # La delega si monta qui e non nel ToolContext perche' backend e parametri
     # li conosce il ciclo, non i tool. Il figlio non riceve il tool di delega:
     # un esploratore che delega e' una ricorsione che nessuno ha chiesto.
-    if abilita_delega and tool_ctx.on_delega is None:
+    if abilita_delega and (tool_ctx.on_delega is None
+                          or getattr(tool_ctx.on_delega, "_harness_owned", False)):
         def _delega(compito: str) -> dict[str, Any]:
             return delega_mod.esegui(
                 compito,
-                backend=backend,
+                backend=backend.scope("delegate"),
                 params=params,
                 tools_schema=tools_schema,
                 tool_ctx=tool_ctx,
@@ -1741,28 +1802,32 @@ def run_turn(
                 # passi senza rispondere, si rilegge il suo contesto per
                 # ricavarne almeno un referto parziale.
                 build_messages=build_api_messages,
+                should_stop=should_stop,
             )
 
+        _delega._harness_owned = True
         tool_ctx.on_delega = _delega
 
     # vault_search si monta come la delega: backend e parametri li conosce il
     # ciclo, non i tool. Il cercatore non riceve ne' delega ne' vault_search
     # (lo schema del figlio e' filtrato a tre tool di lettura), quindi non c'e'
     # ricorsione possibile.
-    if tool_ctx.on_vault_search is None:
+    if tool_ctx.on_vault_search is None or getattr(tool_ctx.on_vault_search, "_harness_owned", False):
         def _vault_search(vault: str, query: str) -> dict[str, Any]:
             return vault_search_mod.cerca_nel_vault(
                 vault,
                 query,
-                backend=backend,
+                backend=backend.scope("vault_search"),
                 params=params,
                 tools_schema=tools_schema,
                 tool_ctx=tool_ctx,
                 env_header=env_header,
                 run_turn=run_turn,
                 registri=getattr(tool_ctx, "registri_vault", None),
+                should_stop=should_stop,
             )
 
+        _vault_search._harness_owned = True
         tool_ctx.on_vault_search = _vault_search
 
     plan_nudged = False
@@ -1781,8 +1846,8 @@ def run_turn(
 
     # --- libreria dei concetti -------------------------------------------
     # L'indice sta in coda, e il precarico d'ufficio ci si appoggia sopra: il
-    # recupero lo fa l'harness incrociando le parole del punto di piano aperto
-    # con i titoli, perche' la meta' che rilegge, se lasciata a un invito, non
+    # recupero lo fa l'harness cercando nel titolo e nel contenuto archiviato,
+    # perche' la meta' che rilegge, se lasciata a un invito, non
     # parte -- su questo progetto e' misurato (vedi ``core/libreria.py``).
     schedario = (
         tool_ctx.base if (libreria_attiva and getattr(tool_ctx, "base", None)) else None
@@ -1868,7 +1933,7 @@ def run_turn(
         last_user_request(ui_messages)
     ) and not answered_question_pending(ui_messages)
     tool_ctx.new_symbols.clear()
-    if not answered_question_pending(ui_messages):
+    if initialize_workspace and not answered_question_pending(ui_messages):
         # Il banco di prova riparte vuoto ad **ogni** turno, non solo davanti a
         # una richiesta di analisi. Il prompt dice al modello che `.analisi/`
         # "viene svuotata" e che non fa parte del progetto: finche' lo svuotava
@@ -1891,13 +1956,17 @@ def run_turn(
     # prova: un handle imbucato in un turno deve restare valido per tutta la
     # conversazione, o la cronologia porterebbe il puntatore a un file che non
     # esiste piu'.
-    if getattr(tool_ctx, "deposito_attivo", False) and getattr(tool_ctx, "base", None):
-        deposito_mod.pota(tool_ctx.base, int(getattr(tool_ctx, "deposito_max_mb", 0)))
+    if initialize_workspace and getattr(tool_ctx, "deposito_attivo", False) and getattr(tool_ctx, "base", None):
+        deposito_mod.pota(tool_ctx.base, int(getattr(tool_ctx, "deposito_max_mb", 0)),
+                          protetti=deposit_references(ui_messages))
     verification = VerificationTracker()
     tool_ctx.verification = verification
     tools_used = False
     total_usage: dict[str, Any] = {}
     stopped = should_stop or (lambda: False)
+    phase_key: tuple[str, str] | None = None
+    phase_step = 0
+    retry_reasoning = False
 
     # --- traccia del pensiero ---------------------------------------------
     # Misurato il 23/08/2026 sulle quattro sessioni qwen3.8: il pensiero **non**
@@ -1934,7 +2003,21 @@ def run_turn(
         """Chiude il turno. Passa da qui per non perdere la traccia dell'ultimo
         passo, che e' proprio quello dei turni che finiscono male."""
         marca_pensiero()
-        return TurnFinished(reason=reason, steps=passi, usage=total_usage)
+        telemetry = backend.collector.snapshot(since=telemetry_offset)
+        telemetry["turn_wall_ms"] = round((time.monotonic() - turn_started) * 1000, 3)
+        totals = telemetry["totals"]
+        usage = dict(total_usage)
+        for key in ("prompt_eval_ms", "eval_ms", "draft_n", "draft_accepted"):
+            if totals.get(key) is not None:
+                usage[key] = totals[key]
+        for source, target in (("usage_input_tokens", "prompt_tokens"),
+                               ("usage_output_tokens", "completion_tokens"),
+                               ("usage_total_tokens", "total_tokens")):
+            if totals.get(source) is not None:
+                usage[target] = totals[source]
+        usage["model_wall_ms"] = totals["wall_time_ms"]
+        usage["total_ms"] = telemetry["turn_wall_ms"]
+        return TurnFinished(reason=reason, steps=passi, usage=usage, telemetry=telemetry)
 
     def halt(step: int, reasoning: str = "", answer: str = "") -> Iterator[AgentEvent]:
         """Chiude il turno salvando quel che il modello aveva gia' prodotto."""
@@ -1961,6 +2044,18 @@ def run_turn(
         # farlo qui e' l'unico punto che li copre tutti senza toccarne otto.
         marca_pensiero()
         yield StepStarted(step=step, total=max_steps)
+
+        current = tool_ctx.plan.current if tool_ctx.plan else None
+        new_phase = (str(current.id), current.text) if current else None
+        phase_changed = new_phase != phase_key
+        phase_step = 1 if step == 1 or phase_changed or retry_reasoning else phase_step + 1
+        reasoning_phase = "recovery" if retry_reasoning else (
+            "decision" if phase_step == 1 else "execution"
+        )
+        phase_key = new_phase
+        retry_reasoning = False
+        if phase_changed:
+            blocco_libreria = _blocco_libreria()
 
         api_messages = build_api_messages(
             ui_messages,
@@ -1990,16 +2085,19 @@ def run_turn(
         # vera di oggi (131k) la soglia in percentuale non e' raggiungibile in
         # pratica -- vedi il commento a ``TETTO_TOKEN_DEFAULT``.
         finestra_compat = finestra_efficace(params.num_ctx, compact_max_tokens)
-        if compact_history and context_pressure(api_messages, finestra_compat) > soglia:
+        if compact_history and context_pressure(
+            api_messages, finestra_compat, reserved_tokens=schema_tokens,
+        ) > soglia:
             prima_tok = estimate_messages_tokens(api_messages)
             esito = compatta_cronologia(
                 ui_messages,
-                backend=backend,
+                backend=backend.scope("compaction"),
                 params=params,
                 budgets=budgets,
                 strip_thinking=strip_thinking,
                 finestra=finestra_compat,
                 schedario=schedario,
+                should_stop=stopped,
             )
             if esito is not None:
                 count_nudge("compattazione")
@@ -2021,6 +2119,7 @@ def run_turn(
                     notes_block=render_notes(tool_ctx.notes),
                     skills_block=skills_block,
                     libreria_block=blocco_libreria,
+                    vault_state_block=blocco_stato_vault(),
                     vault_notes_block=blocco_memoria_vault(),
                 )
                 # I due numeri si misurano qui e non dentro la compattazione:
@@ -2048,10 +2147,16 @@ def run_turn(
         # scattava PRIMA della compattazione: chi alzava la soglia per tenersi
         # piu' cronologia se la vedeva buttare via senza che nessuno l'avesse
         # riassunta, cioe' l'esatto contrario di quello che aveva chiesto.
+        if stopped():
+            yield from halt(step - 1)
+            return
         margine_sfondamento = max(HISTORY_COMPACT_THRESHOLD, float(soglia))
-        if context_pressure(api_messages, params.num_ctx) > margine_sfondamento:
+        if context_pressure(
+            api_messages, params.num_ctx, reserved_tokens=schema_tokens,
+        ) > margine_sfondamento:
             api_messages = drop_oldest_turns(
-                api_messages, params.num_ctx, soglia=margine_sfondamento
+                api_messages, params.num_ctx, soglia=margine_sfondamento,
+                reserved_tokens=schema_tokens,
             )
 
         # Il budget di servizio e' finito: si dice, invece di smettere in
@@ -2074,15 +2179,14 @@ def run_turn(
         # La soglia si ricalcola ad ogni passo: il primo di un turno ha diritto
         # a piu' pensiero degli altri, e su una finestra larga la sola quota del
         # budget non e' piu' un limite (vedi ``watchdog_chars_for_step``).
-        watchdog_chars = (
-            watchdog_chars_for_step(max_tokens_turno, step) if think_watchdog else 0
-        )
-
-        params_passo = params_for_step(params, tool_ctx.plan, step)
+        params_passo = params_for_step(params, tool_ctx.plan, phase_step)
         # Il tetto si taglia **dopo** la compattazione e il drop dei turni
         # vecchi: prima di quelli il prompt non e' ancora quello che partira'.
         tetto_passo, spazio_finestra = tetto_per_la_finestra(
-            api_messages, params.num_ctx, max_tokens_turno
+            api_messages, params.num_ctx, max_tokens_turno, reserved_tokens=schema_tokens
+        )
+        watchdog_chars = (
+            watchdog_chars_for_step(tetto_passo, phase_step) if think_watchdog else 0
         )
         if tetto_passo != max_tokens_turno:
             try:
@@ -2128,10 +2232,12 @@ def run_turn(
         # Un rubinetto per passo: cosa e' gia' arrivato alla UI vale per questa
         # generazione e non per la prossima, che riparte da testo vuoto.
         rubinetto = Rubinetto()
+        events: Iterator[StreamEvent] | None = None
         try:
-            events: Iterator[StreamEvent] = backend.stream(
-                api_messages, tools_schema, params_passo
-            )
+            stream_options = {"should_stop": stopped} if getattr(
+                backend, "supports_cancellation", False
+            ) else {}
+            events = backend.stream(api_messages, tools_schema, params_passo, **stream_options)
             for ev in events:
                 if stopped():
                     # Chiudere il generatore fa cadere la connessione HTTP
@@ -2150,6 +2256,9 @@ def run_turn(
                     if r_changed or a_changed:
                         yield from rubinetto.aggiorna(parser.reasoning, parser.answer)
                 elif ev.kind == "tool_call" and ev.tool_call:
+                    if len(tool_calls) >= MAX_TOOL_CALLS_PER_STEP:
+                        stream_error = "Protocol error: too many tool calls in one step"
+                        break
                     tool_calls.append(ev.tool_call)
                 elif ev.kind == "usage" and ev.usage:
                     step_done_reason = str(ev.usage.get("done_reason") or "")
@@ -2185,8 +2294,16 @@ def run_turn(
                     if callable(close):
                         close()
                     break
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
+            logger.exception("Model stream failed at step %s", step)
             stream_error = f"{type(exc).__name__}: {exc}"
+        finally:
+            close = getattr(events, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:
+                    logger.exception("Failed to close model stream")
 
         parser.finish()
 
@@ -2196,6 +2313,8 @@ def run_turn(
         traccia.update(
             {
                 "passo": step,
+                "fase": reasoning_phase,
+                "passo_nel_punto": phase_step,
                 "configurato": _nome_livello(getattr(params, "think", None)),
                 "usato": _nome_livello(getattr(params_passo, "think", None)),
                 "punto_aperto": bool(getattr(tool_ctx.plan, "current", None)),
@@ -2238,6 +2357,7 @@ def run_turn(
                 step < max_steps
                 and riprese_stream < MAX_RIPRESE_STREAM
                 and errore_riprovabile(stream_error)
+                and not getattr(backend, "manages_retries", False)
                 and passi_di_servizio < max_passi_di_servizio
             ):
                 riprese_stream += 1
@@ -2268,7 +2388,13 @@ def run_turn(
         if parser.answer:
             yield ContentDelta(text=parser.answer)
 
-        if watchdog_hit and passi_di_servizio < max_passi_di_servizio:
+        if watchdog_hit and passi_di_servizio >= max_passi_di_servizio:
+            yield AgentError("Ragionamento interrotto: budget dei recuperi esaurito.")
+            _registra_il_detto(ui_messages, parser.reasoning, parser.answer)
+            yield AssistantTurn(content=parser.answer, reasoning=parser.reasoning, has_tool_calls=False)
+            yield fine("reasoning_budget", step)
+            return
+        if watchdog_hit:
             watchdog_fires += 1
             count_nudge("think_watchdog")
             passi_di_servizio += 1
@@ -2306,7 +2432,7 @@ def run_turn(
         # nel canale testuale invece che con il function calling nativo. Qui lo
         # si esegue comunque, e il JSON esce dal flusso della chat.
         recovered = False
-        if not tool_calls and answer:
+        if allow_text_tool_calls and not tool_calls and answer:
             candidates, leftover = parse_text_tool_calls(answer)
             if candidates:
                 tool_calls = candidates
@@ -2499,6 +2625,27 @@ def run_turn(
             return
 
         # --- esecuzione dei tool -------------------------------------------
+        # Validate envelopes as a batch before any effect; duplicate ids make
+        # results ambiguous and malformed envelopes must never reach indexing.
+        seen_ids: set[str] = set()
+        malformed = False
+        for call in tool_calls:
+            if (
+                not isinstance(call, dict)
+                or not isinstance(call.get("id"), str)
+                or not call["id"]
+                or call["id"] in seen_ids
+                or not isinstance(call.get("name"), str)
+                or not isinstance(call.get("arguments"), str)
+            ):
+                malformed = True
+                break
+            seen_ids.add(call["id"])
+        if malformed:
+            yield AgentError("Protocol error: malformed or duplicate tool-call envelope")
+            yield fine("error", step)
+            return
+
         assistant_record: dict[str, Any] = {
             "role": "assistant",
             "content": _wrap(reasoning, answer),
@@ -2533,12 +2680,53 @@ def run_turn(
         asks = [c for c in tool_calls if c["name"] == ASK_USER_TOOL]
         ordered = [c for c in tool_calls if c["name"] != ASK_USER_TOOL] + asks
 
-        for call in ordered:
+        def reject_call(call: dict[str, Any], error: dict[str, Any]) -> ToolFinished:
+            """Close a call without execution, preserving the protocol pairing."""
+            result = json.dumps(error, ensure_ascii=False)
+            ui_messages.append({
+                "role": "tool", "tool_call_id": call["id"], "name": call["name"],
+                "content": result, "args": {}, "duration_s": 0.0,
+                "ok": False, "ts": time.time(),
+            })
+            return ToolFinished(call_id=call["id"], name=call["name"], args={},
+                                result=result, duration_s=0.0, ok=False)
+
+        def close_remaining(calls: list[dict[str, Any]]) -> Iterator[ToolFinished]:
+            for pending in calls:
+                yield reject_call(pending, {
+                    "error": "Chiamata non eseguita: il turno e' sospeso.",
+                    "error_code": "turn_suspended", "retryable": False,
+                    "hint": "Attendi la risposta dell'utente e rivaluta questa azione.",
+                })
+
+        for call_index, call in enumerate(ordered):
+            if call["name"] not in allowed_tools:
+                yield reject_call(call, {
+                    "error": f"Tool '{call['name']}' non disponibile in questo turno.",
+                    "error_code": "tool_not_allowed", "retryable": False,
+                    "hint": "Usa solo i tool presenti nello schema della richiesta corrente.",
+                })
+                continue
+            if stopped():
+                yield from close_remaining(ordered[call_index:])
+                yield from halt(step)
+                return
+            try:
+                validated_args = loads_object(call["arguments"])
+            except JsonBoundaryError as exc:
+                error = argomenti_illeggibili(
+                    call["arguments"], step_done_reason,
+                    int(getattr(params_passo, "max_tokens", 0) or 0),
+                )
+                error.update(error_code="invalid_json", retryable=False,
+                             details=[{"path": "$", "message": str(exc)}])
+            else:
+                error = validate_tool_arguments(call["name"], validated_args)
+            if error:
+                yield reject_call(call, error)
+                continue
             if call["name"] == ASK_USER_TOOL:
-                try:
-                    raw_args = json.loads(call["arguments"] or "{}")
-                except json.JSONDecodeError:
-                    raw_args = {}
+                raw_args = validated_args
                 question = normalise_question(raw_args if isinstance(raw_args, dict) else {})
 
                 if not question["question"]:
@@ -2564,6 +2752,7 @@ def run_turn(
 
                 # Il risultato di questo tool arriva dall'utente: lo si scrive
                 # in cronologia solo alla ripresa (vedi resume_with_answer).
+                yield from close_remaining(ordered[call_index + 1:])
                 ui_messages.append(
                     {
                         "role": "pending_question",
@@ -2582,15 +2771,7 @@ def run_turn(
                 yield fine("awaiting_user", step)
                 return
 
-            try:
-                args = json.loads(call["arguments"] or "{}")
-                if not isinstance(args, dict):
-                    args = {}
-            except json.JSONDecodeError:
-                args = {}
-                bad_args = True
-            else:
-                bad_args = False
+            args = validated_args
 
             if stopped():
                 # Il tool non parte, ma la sua tool_call e' gia' in cronologia:
@@ -2626,20 +2807,7 @@ def run_turn(
             yield ToolStarted(call_id=call["id"], name=call["name"], args=args)
 
             started = time.monotonic()
-            if bad_args:
-                result = json.dumps(
-                    # ``params_passo`` e non ``params``: il tetto puo' essere
-                    # stato abbassato per questo passo, ed e' quello vero che
-                    # ha tagliato la generazione.
-                    argomenti_illeggibili(
-                        call["arguments"],
-                        step_done_reason,
-                        int(getattr(params_passo, "max_tokens", 0) or 0),
-                    ),
-                    ensure_ascii=False,
-                )
-            else:
-                result = dispatch(tool_ctx, call["name"], args)
+            result = dispatch(tool_ctx, call["name"], args)
             duration = time.monotonic() - started
 
             ok = _esito_del_tool(result)
@@ -2665,6 +2833,8 @@ def run_turn(
                 # esiste: sono problemi diversi, ma entrambi l'utente li vuole
                 # vedere senza aprire la tendina.
                 ok = False
+            if not ok:
+                retry_reasoning = True
             tools_used = True
             ui_messages.append(
                 {
@@ -2704,6 +2874,7 @@ def run_turn(
                     and len(tool_ctx.plan.steps) >= PUNTI_PER_IL_CANCELLO
                 ):
                     gate_mostrato = True
+                    yield from close_remaining(ordered[call_index + 1:])
                     domanda = {
                         "question": (
                             f"Il piano ha {len(tool_ctx.plan.steps)} punti e il "
@@ -2787,8 +2958,9 @@ def run_turn(
                 distillato = pensiero.estrai(
                     blocchi,
                     punto=chiuso["text"],
-                    backend=backend,
+                    backend=backend.scope("memory_extract"),
                     params=params,
+                    should_stop=stopped,
                 )
                 if not distillato:
                     continue
@@ -2905,14 +3077,18 @@ def run_turn(
     # questo. E' lo stesso baratto di ``delega.referto_di_chiusura``: una
     # generazione in piu' contro un turno intero buttato.
     marca_pensiero()
+    if stopped():
+        yield from halt(max_steps)
+        return
     if require_summary and tools_used and not ultima_risposta(ui_messages):
         count_nudge("riepilogo_forzato")
         testo = riepilogo_finale(
             ui_messages,
-            backend=backend,
+            backend=backend.scope("final_summary"),
             params=params,
             budgets=budgets,
             strip_thinking=strip_thinking,
+            should_stop=stopped,
         )
         if testo:
             ui_messages.append(
@@ -2929,7 +3105,7 @@ def run_turn(
             )
             yield AssistantTurn(content=testo, reasoning="", has_tool_calls=False)
 
-    yield fine("max_steps", max_steps)
+    yield fine("stopped" if stopped() else "max_steps", max_steps)
 
 
 # Quante volte l'harness insiste perche' una verifica rossa venga riparata,

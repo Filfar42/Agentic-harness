@@ -181,7 +181,7 @@ def shutdown() -> None:
 # ---------------------------------------------------------------------------
 
 
-async def servi(request: Request) -> Response:
+def servi(request: Request) -> Response:
     radice = _STATO.radice
     if radice is None:
         return PlainTextResponse("Nessuna anteprima attiva.", status_code=404)
@@ -195,7 +195,10 @@ async def servi(request: Request) -> Response:
         return PlainTextResponse("Fuori dalla radice dell'anteprima.", status_code=403)
 
     if target.is_dir():
-        target = target / "index.html"
+        try:
+            target = resolve_path(radice, str((target / "index.html").relative_to(radice)))
+        except WorkspaceError:
+            return PlainTextResponse("Fuori dalla radice dell'anteprima.", status_code=403)
     if not target.is_file():
         return PlainTextResponse("File non trovato.", status_code=404)
 

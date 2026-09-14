@@ -47,6 +47,7 @@ CHUNKS = [
             }
         ]
     },
+    {"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]},
     {
         "choices": [],
         "usage": {"prompt_tokens": 120, "completion_tokens": 45},
@@ -211,12 +212,12 @@ def test_i_sampler_viaggiano_coi_nomi_di_llama_cpp(finto_llama):
     assert "max_model_len" not in corpo
 
 
-def test_il_neutro_non_si_manda(finto_llama):
+def test_il_neutro_sovrascrive_il_default_del_server(finto_llama):
     url, handler = finto_llama
     backend = LlamaCppBackend(url)
     params = GenParams(model="qwen", repetition_penalty=1.0)
     list(backend.stream([{"role": "user", "content": "ciao"}], None, params))
-    assert "repeat_penalty" not in handler.corpi[-1]
+    assert handler.corpi[-1]["repeat_penalty"] == 1.0
 
 
 def test_lo_stream_porta_pensiero_testo_e_tool_call(finto_llama):
@@ -437,43 +438,16 @@ def test_il_motivo_dello_stop_arriva_fino_al_ciclo_agentico(finto_llama):
     )
     usage = [e for e in eventi if e.kind == "usage"]
     assert usage, "nessun evento usage"
-    # Il finto server chiude senza finish_reason sui chunk: il campo c'e'
-    # comunque, vuoto, perche' il ciclo agentico lo legge sempre.
-    assert "done_reason" in usage[-1].usage
+    assert usage[-1].usage["done_reason"] == "tool_calls"
 
 
 def test_lo_stop_per_length_viaggia_nell_usage(finto_llama, monkeypatch):
     """Il caso che conta: il server dice 'length' e il numero arriva a chi
     deve decidere se la tool call e' monca o scritta male."""
-    import core.backend as backend_mod
-
-    class FintoChunk:
-        def __init__(self, finish):
-            self.choices = [type("C", (), {"finish_reason": finish, "delta": type(
-                "D", (), {"content": None, "tool_calls": None})()})()]
-            self.usage = None
-
-    class FintoUsage:
-        prompt_tokens = 10
-        completion_tokens = 5
-
-    class FintoFinale:
-        choices = []
-        usage = FintoUsage()
-
-    class FintoClient:
-        def __init__(self, **_):
-            self.chat = type("Chat", (), {"completions": self})()
-
-        def create(self, **_):
-            return iter([FintoChunk(None), FintoChunk("length"), FintoFinale()])
-
-    monkeypatch.setattr(backend_mod, "OpenAI", FintoClient, raising=False)
-    import sys
-    import types
-    finto_modulo = types.ModuleType("openai")
-    finto_modulo.OpenAI = FintoClient
-    monkeypatch.setitem(sys.modules, "openai", finto_modulo)
+    monkeypatch.setattr(sys.modules[__name__], "CHUNKS", [
+        {"choices": [{"index": 0, "delta": {}, "finish_reason": "length"}]},
+        {"choices": [], "usage": {"prompt_tokens": 10, "completion_tokens": 5}},
+    ])
 
     url, _ = finto_llama
     eventi = list(

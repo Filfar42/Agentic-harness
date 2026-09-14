@@ -279,6 +279,8 @@ function renderSessions(sessions) {
   for (const s of sessions) {
     const li = document.createElement("li");
     li.dataset.id = s.id;
+    li.tabIndex = 0;
+    li.setAttribute('role', 'button');
 
     const title = document.createElement("div");
     title.className = "session-title";
@@ -296,6 +298,12 @@ function renderSessions(sessions) {
 
     li.append(title, meta);
     li.addEventListener("click", () => openChat(s.id));
+    li.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter' || event.key === ' ') {
+        event.preventDefault();
+        openChat(s.id);
+      }
+    });
     list.appendChild(li);
   }
 }

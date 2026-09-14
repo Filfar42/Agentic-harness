@@ -25,11 +25,14 @@ from __future__ import annotations
 
 import json
 import os
+import math
+import tempfile
 from pathlib import Path
 from typing import Any
 
 from .config import DEFAULTS, SETTINGS_FILE
 from .prompts import is_stock_prompt
+from .jsonsafe import JsonBoundaryError, loads_object
 
 # Stato del turno in corso, non preferenze: salvarlo significherebbe riaprire
 # l'app convinta che un agente stia girando.
@@ -73,8 +76,8 @@ def load_settings(path: Path | None = None) -> dict[str, Any]:
         return settings
     try:
         with open(path, encoding="utf-8") as fh:
-            saved = json.load(fh)
-    except (OSError, json.JSONDecodeError):
+            saved = loads_object(fh.read(1_048_577))
+    except (OSError, UnicodeError, JsonBoundaryError):
         # Un file corrotto non deve impedire l'avvio: si riparte dai default.
         return settings
     if not isinstance(saved, dict):
@@ -116,7 +119,7 @@ def tipo_compatibile(valore: Any, atteso: Any) -> bool:
     if isinstance(atteso, int):
         return isinstance(valore, int) and not isinstance(valore, bool)
     if isinstance(atteso, float):
-        return isinstance(valore, (int, float)) and not isinstance(valore, bool)
+        return isinstance(valore, (int, float)) and not isinstance(valore, bool) and math.isfinite(valore)
     return isinstance(valore, type(atteso))
 
 
@@ -127,10 +130,14 @@ def save_settings(settings: dict[str, Any], path: Path | None = None) -> bool:
     """
     path = path or SETTINGS_FILE
     payload = persistable(settings)
-    tmp = path.with_suffix(".json.tmp")
+    tmp: Path | None = None
     try:
-        with open(tmp, "w", encoding="utf-8") as fh:
-            json.dump(payload, fh, ensure_ascii=False, indent=2)
+        fd, filename = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+        tmp = Path(filename)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, ensure_ascii=False, indent=2, allow_nan=False)
+            fh.flush()
+            os.fsync(fh.fileno())
         # I permessi si stringono sul **temporaneo**, prima del replace: cosi'
         # il file definitivo nasce gia' chiuso e non c'e' un istante in cui
         # esiste leggibile da tutti. Qui dentro ci sono ``api_key`` e
@@ -143,8 +150,11 @@ def save_settings(settings: dict[str, Any], path: Path | None = None) -> bool:
             # fa niente e non e' un motivo per non salvare le preferenze.
             pass
         os.replace(tmp, path)
-    except OSError:
+    except (OSError, UnicodeError, ValueError):
         return False
+    finally:
+        if tmp is not None:
+            tmp.unlink(missing_ok=True)
     return True
 
 

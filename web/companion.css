@@ -1,0 +1,178 @@
+/* Two expressive companions share the active conversation's state. */
+.harness-companion-host {
+  position: relative;
+  display: grid;
+  place-items: center;
+  overflow: visible;
+  pointer-events: none;
+  user-select: none;
+}
+
+/* Allow jumps and speech beyond the original 28 px logo slot. */
+#sidebar .logo.harness-companion-host { overflow: visible; z-index: 6; }
+
+.harness-companion {
+  --companion-face: #1c2b30;
+  --companion-eye: #ffffff;
+  --companion-active: #0b7169;
+  display: block;
+  width: 28px;
+  height: 28px;
+  overflow: visible;
+  color: var(--companion-face);
+  pointer-events: none;
+  user-select: none;
+}
+html[data-theme="dark"] .harness-companion {
+  --companion-face: #edf3f3;
+  --companion-eye: #11181b;
+  --companion-active: #68d5c4;
+}
+.harness-companion__pose { transform-origin: 16px 28px; }
+.harness-companion__eyes { fill: var(--companion-eye); transform-origin: 16px 18px; }
+.harness-companion__eyes rect { transform-box: fill-box; transform-origin: center; }
+
+.harness-companion[data-state="welcome"] .harness-companion__eyes { transform: scaleY(.8); }
+.harness-companion[data-state="working"],
+.harness-companion[data-state="success"] { color: var(--companion-active); }
+.harness-companion[data-state="working"] .harness-companion__eyes rect:last-child { transform: scaleY(.65); }
+.harness-companion[data-state="success"] .harness-companion__eyes rect { transform: scaleY(.4) rotate(-12deg); }
+.harness-companion[data-state="success"] .harness-companion__eyes rect:last-child { transform: scaleY(.4) rotate(12deg); }
+.harness-companion[data-state="resting"] .harness-companion__eyes { transform: translateX(2px); }
+.harness-companion[data-state="resting"] .harness-companion__eyes rect:first-child { transform: scaleY(.55); }
+.harness-companion[data-state="error"] .harness-companion__eyes rect { transform: rotate(-18deg) scaleY(.7); }
+.harness-companion[data-state="error"] .harness-companion__eyes rect:last-child { transform: rotate(18deg) scaleY(.7); }
+
+/* Reserve space clear of text and attachments. Align with the 31 px send button. */
+.companion-rail {
+  display: flex;
+  justify-content: flex-end;
+  align-items: flex-end;
+  min-height: 52px;
+  margin-bottom: 4px;
+}
+#composer-companion { width: 42px; height: 42px; margin-right: -5.5px; flex: none; }
+#composer-companion .harness-companion { width: 42px; height: 42px; }
+#composer-companion::before {
+  content: "";
+  position: absolute;
+  bottom: -1px;
+  width: 26px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--accent, #0b7169);
+  opacity: .15;
+  filter: blur(2px);
+}
+
+.harness-companion__speech {
+  position: absolute;
+  z-index: 2;
+  right: calc(100% + 12px);
+  top: 4px;
+  width: max-content;
+  max-width: 180px;
+  padding: 7px 11px;
+  border: 1px solid var(--accent-border, #8fbbb3);
+  border-radius: 12px;
+  background: var(--surface, #ffffff);
+  color: var(--text, #1c2b30);
+  box-shadow: var(--shadow-sm, 0 2px 8px #1c2b3012);
+  font: 600 12px/1.4 var(--font, system-ui, sans-serif);
+  letter-spacing: 0;
+  white-space: nowrap;
+  transform-origin: right center;
+}
+.harness-companion__speech[hidden] { display: none; }
+.harness-companion__speech::after {
+  content: "";
+  position: absolute;
+  right: -5px;
+  top: 12px;
+  width: 8px;
+  height: 8px;
+  background: inherit;
+  border-top: 1px solid var(--accent-border, #8fbbb3);
+  border-right: 1px solid var(--accent-border, #8fbbb3);
+  transform: rotate(45deg);
+}
+#sidebar .harness-companion__speech {
+  right: auto;
+  left: calc(100% + 10px);
+  top: -3px;
+  max-width: calc(var(--sidebar-w, 252px) - 68px);
+  padding: 6px 9px;
+  font-size: 11.5px;
+  line-height: 1.3;
+  white-space: normal;
+  transform-origin: left center;
+}
+/* The brief greeting takes the wordmark's place, without partial text behind it. */
+#sidebar .logo[data-speaking="true"] + div { opacity: 0; }
+#sidebar .harness-companion__speech::after {
+  right: auto;
+  left: -5px;
+  transform: rotate(225deg);
+}
+.harness-companion-host[data-speaking="true"] .harness-companion__speech {
+  animation: companion-speech 350ms cubic-bezier(.2, 1.5, .4, 1) both;
+}
+.harness-companion[data-gesture="greet"] .harness-companion__pose { animation: companion-greet 1400ms ease-in-out both; }
+.harness-companion[data-gesture="nod"] .harness-companion__pose { animation: companion-celebrate 1400ms ease-in-out both; }
+.harness-companion[data-gesture="blink"] .harness-companion__pose { animation: companion-curious 1400ms ease-in-out both; }
+.harness-companion[data-gesture="blink"] .harness-companion__eyes { animation: companion-blink 1400ms ease-in-out both; }
+.harness-companion[data-gesture="shake"] .harness-companion__pose { animation: companion-shake 1400ms ease-in-out both; }
+
+/* Processing stays visibly alive for the duration of the actual turn. */
+.harness-companion[data-state="working"] .harness-companion__pose { animation: companion-working 1700ms ease-in-out infinite; }
+.harness-companion[data-state="working"] .harness-companion__eyes { animation: companion-look 2100ms ease-in-out infinite; }
+
+@keyframes companion-greet {
+  0%, 100% { transform: translateY(0) rotate(0) scale(1); }
+  12%, 50% { transform: translateY(1px) scale(1.08, .88); }
+  27% { transform: translateY(-7px) rotate(-12deg) scale(.96, 1.06); }
+  40% { transform: translateY(0) rotate(8deg) scale(1.05, .94); }
+  65% { transform: translateY(-5px) rotate(11deg); }
+  82% { transform: translateY(0) rotate(-5deg); }
+}
+@keyframes companion-celebrate {
+  0%, 100% { transform: translateY(0) scale(1); }
+  12%, 49%, 78% { transform: translateY(1px) scale(1.12, .85); }
+  29% { transform: translateY(-10px) rotate(-10deg) scale(.94, 1.1); }
+  63% { transform: translateY(-7px) rotate(10deg) scale(.97, 1.06); }
+  89% { transform: translateY(-3px) rotate(-4deg); }
+}
+@keyframes companion-working {
+  0%, 100% { transform: translateY(0) rotate(-5deg); }
+  25% { transform: translateY(-5px) rotate(0); }
+  50% { transform: translateY(-2px) rotate(5deg); }
+  75% { transform: translateY(-6px) rotate(0); }
+}
+@keyframes companion-look {
+  0%, 100% { transform: translateX(-2px); }
+  40%, 65% { transform: translateX(2px); }
+  78% { transform: translateX(0) scaleY(.2); }
+}
+@keyframes companion-curious {
+  0%, 100% { transform: rotate(0); }
+  30%, 65% { transform: translateY(-3px) rotate(13deg); }
+  82% { transform: rotate(-5deg); }
+}
+@keyframes companion-blink {
+  0%, 30%, 55%, 100% { transform: translateX(2px); }
+  42% { transform: translateX(2px) scaleY(.12); }
+}
+@keyframes companion-shake {
+  0%, 65%, 100% { transform: translateX(0) rotate(0); }
+  15%, 40% { transform: translateX(-3px) rotate(-9deg); }
+  27%, 52% { transform: translateX(3px) rotate(9deg); }
+}
+@keyframes companion-speech {
+  from { opacity: 0; transform: translateY(5px) scale(.75); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
+}
+.harness-companion-host[data-paused="true"] *,
+.harness-companion-host[data-reduced-motion="true"] * { animation: none !important; }
+@media (prefers-reduced-motion: reduce) {
+  .harness-companion-host * { animation: none !important; }
+}

@@ -1,0 +1,18 @@
+{
+  "desktop": {
+    "baseline": "docs/brand/qa/before-desktop.css",
+    "current": "web/style.css",
+    "declarations_checked": 860,
+    "removed": [],
+    "added": [],
+    "same": true
+  },
+  "mobile": {
+    "baseline": "D:/Astra-audit-original-20260905/web_mobile/style.css",
+    "current": "web_mobile/style.css",
+    "declarations_checked": 137,
+    "removed": [],
+    "added": [],
+    "same": true
+  }
+}

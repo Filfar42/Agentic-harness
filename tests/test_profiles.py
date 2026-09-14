@@ -55,7 +55,7 @@ def test_repetition_penalty_defaults_to_neutral_and_is_sent_when_changed():
     """Il neutro e' 1.0, non il default Ollama (1.1): a riposo non va nel payload,
     appena l'impostazione si muove va."""
     assert GenParams().repetition_penalty == 1.0
-    assert "repeat_penalty" not in GenParams().ollama_options()
+    assert GenParams().ollama_options()["repeat_penalty"] == 1.0
     opts = GenParams(repetition_penalty=1.2).ollama_options()
     assert opts["repeat_penalty"] == 1.2
 
@@ -80,8 +80,15 @@ def test_think_levels_survive_until_the_request():
     assert GenParams(think="high").think_payload == "high"
     assert GenParams(think="max").think_payload == "max"
     assert GenParams(think=True).think_payload is True
-    # Spento significa omettere il campo, non mandarlo a false.
-    assert GenParams(think=False).think_payload is None
+    # Spento sovrascrive esplicitamente il default del server.
+    assert GenParams(think=False).think_payload is False
+
+
+def test_explicit_off_strings_disable_reasoning_but_unknown_values_remain_omitted():
+    for value in ("false", "off", "no", "0", " FALSE ", " Off ", " NO "):
+        assert GenParams(think=value).think_payload is False
+    for value in ("forse", "auto", "", "invalid"):
+        assert GenParams(think=value).think_payload is None
 
 
 def test_a_level_is_not_squashed_to_a_boolean():

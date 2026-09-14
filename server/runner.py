@@ -19,16 +19,64 @@ prima tutto l'arretrato e poi il flusso dal vivo.
 
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
 import queue
 import threading
-from collections.abc import Callable, Iterator
+from collections.abc import AsyncIterator, Callable, Iterator
 from typing import Any
 
 # Un lettore lento non deve bloccare il turno: oltre questa soglia i frame
 # vengono scartati per quel singolo abbonato, che comunque ha gia' l'arretrato.
 _SUBSCRIBER_QUEUE_MAX = 2000
 _KEEPALIVE_S = 15.0
+_MAX_REPLAY_BYTES = 32 * 1024 * 1024
+_MAX_REPLAY_FRAMES = 64_000
+_LOGGER = logging.getLogger(__name__)
+
+
+class SubscriberQueue(queue.Queue[str | None]):
+    """Bounded thread-safe queue with optional event-loop notification."""
+
+    def __init__(self, capacity: int) -> None:
+        super().__init__(maxsize=capacity)
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._ready: asyncio.Event | None = None
+
+    def attach_loop(self) -> None:
+        self._loop = asyncio.get_running_loop()
+        self._ready = asyncio.Event()
+
+    def put(self, item: str | None, block: bool = True, timeout: float | None = None) -> None:
+        super().put(item, block, timeout)
+        if self._loop is not None and self._ready is not None:
+            try:
+                self._loop.call_soon_threadsafe(self._ready.set)
+            except RuntimeError:
+                pass  # The client's event loop has already shut down.
+
+    async def next_frame(self, timeout: float) -> str | None:
+        assert self._ready is not None
+        while True:
+            self._ready.clear()
+            try:
+                return self.get_nowait()
+            except queue.Empty:
+                await asyncio.wait_for(self._ready.wait(), timeout)
+
+
+def disconnect_subscriber(sub: queue.Queue[str | None]) -> None:
+    """Signal closure without waiting for a slow consumer or losing producer time."""
+    while True:
+        try:
+            sub.put_nowait(None)
+            return
+        except queue.Full:
+            try:
+                sub.get_nowait()
+            except queue.Empty:
+                continue
 
 
 # ---------------------------------------------------------------------------
@@ -96,6 +144,8 @@ class TurnRunner:
         # ridisegna questa e poi riapplica i frame, senza duplicati.
         self.snapshot = snapshot
         self.frames: list[str] = []
+        self._replay_bytes = 0
+        self._overflowed = False
         self.finished = threading.Event()
         # Alzata dal tasto stop. Il worker la controlla nei punti sicuri: qui
         # non si uccide il thread, gli si chiede di fermarsi. Ammazzarlo di
@@ -112,14 +162,32 @@ class TurnRunner:
 
     def emit(self, frame: str) -> None:
         with self._lock:
+            if self.finished.is_set() or self._overflowed:
+                return
+            size = len(frame.encode("utf-8"))
+            if self._replay_bytes + size > _MAX_REPLAY_BYTES or len(self.frames) >= _MAX_REPLAY_FRAMES:
+                self._overflowed = True
+                self.cancelled.set()
+                frame = 'data: {"type":"error","message":"Limite eventi del turno raggiunto; turno interrotto."}\n\n'
+                self.frames.append(frame)
+                self.frames.append('data: {"type":"done","reason":"event_limit"}\n\n')
+                subscribers = list(self._subscribers)
+                self._subscribers.clear()
+                for sub in subscribers:
+                    disconnect_subscriber(sub)
+                return
             self.frames.append(frame)
-            subscribers = list(self._subscribers)
-        for sub in subscribers:
-            if sub.qsize() < _SUBSCRIBER_QUEUE_MAX:
-                sub.put(frame)
+            self._replay_bytes += size
+            for sub in list(self._subscribers):
+                try:
+                    sub.put_nowait(frame)
+                except queue.Full:
+                    self._subscribers.remove(sub)
+                    disconnect_subscriber(sub)
 
     def close(self) -> None:
-        self.finished.set()
+        with self._lock:
+            self.finished.set()
         self.stacca_gli_abbonati()
 
     def stacca_gli_abbonati(self) -> None:
@@ -132,16 +200,42 @@ class TurnRunner:
         with self._lock:
             subscribers = list(self._subscribers)
         for sub in subscribers:
-            sub.put(None)
+            disconnect_subscriber(sub)
 
     # -- consumo -----------------------------------------------------------
 
     def subscribe(self) -> tuple[list[str], queue.Queue[str | None]]:
         with self._lock:
             backlog = list(self.frames)
-            sub: queue.Queue[str | None] = queue.Queue()
+            sub = SubscriberQueue(_SUBSCRIBER_QUEUE_MAX)
             self._subscribers.append(sub)
         return backlog, sub
+
+    async def async_stream(self) -> AsyncIterator[str]:
+        """Replay and live frames without occupying a FastAPI worker thread."""
+        backlog, sub = self.subscribe()
+        assert isinstance(sub, SubscriberQueue)
+        sub.attach_loop()
+        try:
+            for frame in backlog:
+                yield frame
+            if self.finished.is_set() or self._overflowed:
+                for frame in self._residuo(sub):
+                    yield frame
+                return
+            while not SPEGNIMENTO.is_set():
+                try:
+                    frame = await sub.next_frame(_KEEPALIVE_S)
+                except TimeoutError:
+                    if self.finished.is_set():
+                        return
+                    yield ": keepalive\n\n"
+                    continue
+                if frame is None:
+                    return
+                yield frame
+        finally:
+            self.unsubscribe(sub)
 
     def unsubscribe(self, sub: queue.Queue[str | None]) -> None:
         with self._lock:
@@ -174,7 +268,7 @@ class TurnRunner:
         backlog, sub = self.subscribe()
         try:
             yield from backlog
-            if self.finished.is_set():
+            if self.finished.is_set() or self._overflowed:
                 yield from self._residuo(sub)
                 return
             while not SPEGNIMENTO.is_set():
@@ -269,7 +363,8 @@ class RunnerRegistry:
         def target() -> None:
             try:
                 work(runner)
-            except Exception as exc:  # noqa: BLE001 - l'errore va mostrato
+            except Exception as exc:
+                _LOGGER.exception("Turn worker failed for session %s", session_id)
                 runner.error = f"{type(exc).__name__}: {exc}"
                 # ...e va mostrato **davvero**. Prima l'attributo veniva
                 # valorizzato e nessuno lo emetteva: un'eccezione nel worker
@@ -291,8 +386,13 @@ class RunnerRegistry:
                     )
                     + "\n\n"
                 )
+                runner.emit('data: {"type":"done","reason":"error"}\n\n')
             finally:
                 runner.close()
 
-        threading.Thread(target=target, daemon=True, name=f"turn-{session_id}").start()
+        try:
+            threading.Thread(target=target, daemon=True, name=f"turn-{session_id}").start()
+        except RuntimeError:
+            runner.close()
+            raise
         return runner

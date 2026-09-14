@@ -58,6 +58,8 @@ senza server ne' modello: stanno qui.
 
 from __future__ import annotations
 
+from .atomic import write_text as atomic_write_text
+
 import json
 import os
 from dataclasses import dataclass, fields, replace
@@ -197,7 +199,7 @@ def leggi_config(workspace: str | Path) -> VaultConfig:
             letto = json.load(fh)
         if isinstance(letto, dict):
             grezzo = letto
-    except (OSError, json.JSONDecodeError):
+    except (OSError, UnicodeError, ValueError, RecursionError):
         grezzo = {}
     return VaultConfig(
         nome=str(grezzo.get("nome") or base.name or "vault"),
@@ -271,11 +273,8 @@ def scrivi_config(workspace: str | Path, config: VaultConfig) -> VaultConfig:
         wiki=bool(config.wiki),
         note=_ripulisci_note(list(config.note)),
     )
-    tmp = percorso_config(base).with_suffix(".json.tmp")
     try:
-        with open(tmp, "w", encoding="utf-8") as fh:
-            json.dump(pulito.as_dict(), fh, indent=2, ensure_ascii=False)
-        os.replace(tmp, percorso_config(base))
+        atomic_write_text(percorso_config(base), json.dumps(pulito.as_dict(), indent=2, ensure_ascii=False))
     except OSError as errore:
         # Non si puo' ritornare ``pulito`` come se fosse stato salvato. Chi
         # chiama e' ``aggiungi_nota``, che risponde al modello con l'elenco
@@ -283,10 +282,6 @@ def scrivi_config(workspace: str | Path, config: VaultConfig) -> VaultConfig:
         # sopra il resto del turno, e la nota non esiste. Una frase che
         # descrive un comportamento dell'harness deve essere vera, e qui la
         # frase e' un valore di ritorno.
-        try:
-            tmp.unlink()          # senza, il .tmp resta li' per sempre
-        except OSError:
-            pass
         raise VaultScritturaError(
             f"Non ho potuto salvare '{percorso_config(base)}': {errore}"
         ) from errore
@@ -450,7 +445,8 @@ def leggi_indice(workspace: str | Path, max_chars: int = 6_000) -> str:
     """
     indice = Path(workspace) / INDEX_FILE
     try:
-        testo = indice.read_text(encoding="utf-8", errors="replace")
+        with indice.open(encoding="utf-8", errors="replace") as stream:
+            testo = stream.read(max(0, max_chars) + 1)
     except OSError:
         return ""
     if len(testo) > max_chars:
@@ -477,7 +473,10 @@ def leggi_log_coda(workspace: str | Path, voci: int = 10) -> str:
     """
     log = Path(workspace) / LOG_FILE
     try:
-        righe = log.read_text(encoding="utf-8", errors="replace").splitlines()
+        with log.open("rb") as stream:
+            stream.seek(0, os.SEEK_END)
+            stream.seek(max(0, stream.tell() - 65536))
+            righe = stream.read(65536).decode("utf-8", errors="replace").splitlines()
     except OSError:
         return ""
     marcatori = [r for r in righe if r.startswith("## [")]

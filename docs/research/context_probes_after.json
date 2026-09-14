@@ -1,0 +1,37 @@
+{
+  "nota": "Prove sintetiche senza LLM. I token sono stime, non conteggi del tokenizer.",
+  "source_sha256": {
+    "core/agent.py": "f7b54339e3e8e2cb49898a5e8f2d37e9c2aa7debe04e1598a2765f681432c962",
+    "core/compaction.py": "295def0f78dab3f26145b6b8fb2f7b331aa0f3f476e3b208d40afd1896ea6f7b",
+    "core/libreria.py": "5f4b1c9eb878d0f4fd3ab5fd084cedcbaeba72fb45d221ba4ca398b94f912168",
+    "core/config.py": "2ab61cc248b5f68275fedce6b4cf2cd278fd4824549f39843063f649b104901a"
+  },
+  "prefisso_stima_token": {
+    "prompt_esteso": 1475,
+    "prompt_snello": 1199,
+    "schemi_estesi": 4777,
+    "schemi_snelli": 3590
+  },
+  "prompt_piu_schema_snello_senza_vault": 4598,
+  "handle_nel_risultato_vecchio": {
+    "stdout_deposito": true,
+    "stderr_deposito": true,
+    "deposito": true
+  },
+  "read_recente": {
+    "caratteri_input": 11041,
+    "caratteri_api": 11041,
+    "json_valido": true
+  },
+  "scrittura_fallita_potata_come_salvata": false,
+  "compattazione_successiva": {
+    "compattazioni_riuscite": 2,
+    "marcatore_vecchio_primo_input": true,
+    "marcatore_vecchio_secondo_input": false,
+    "caratteri_input": [
+      2056,
+      2379
+    ]
+  },
+  "recupero_su_parola_solo_nel_corpo": true
+}

@@ -93,8 +93,9 @@ class Skill:
 
 def _leggi(path: Path, origine: str) -> Skill | None:
     try:
-        raw = path.read_text(encoding="utf-8")
-    except OSError:
+        with path.open(encoding="utf-8") as stream:
+            raw = stream.read(MAX_SKILL_CHARS + 8192)
+    except (OSError, UnicodeError):
         return None
     match = _FRONTMATTER.match(raw)
     if not match:

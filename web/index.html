@@ -20,15 +20,20 @@
      anche quando la pagina e' scura. -->
 <meta name="color-scheme" content="dark light">
 <title>Local Agent Harness</title>
+<script>
+// Apply the stored appearance before first paint; bootstrap remains authoritative.
+try {
+  const theme = localStorage.getItem('ah-theme');
+  if (theme === 'light' || theme === 'dark') document.documentElement.dataset.theme = theme;
+} catch (_) { /* Storage can be unavailable in private or restricted contexts. */ }
+</script>
 <link rel="stylesheet" href="/static/style.css">
-<!-- Icona della scheda: il robottino ritagliato, senza il riquadro di fondo.
-     Un quadrato nero in mezzo alle altre schede è la cosa che si vede, e il
-     logo diventa il francobollo dentro. Il tratto è terracotta e il fondo
-     trasparente, quindi si legge sia sulle schede chiare sia su quelle scure,
-     senza doverne tenere due versioni. -->
+<link rel="stylesheet" href="/static/companion.css">
+<!-- Raster fallbacks and an adaptive vector mark for modern browsers. -->
 <link rel="icon" type="image/png" sizes="64x64" href="/static/favicon-64.png">
 <link rel="icon" type="image/png" sizes="32x32" href="/static/favicon-32.png">
 <link rel="icon" type="image/png" sizes="16x16" href="/static/favicon-16.png">
+<link rel="icon" type="image/svg+xml" href="/static/brand/favicon.svg">
 </head>
 <body>
 
@@ -37,13 +42,10 @@
   <!-- ------------------------------ sidebar ------------------------------ -->
   <aside id="sidebar">
     <div class="brand">
-      <!-- Due file invece di uno ricolorato via CSS: il logo e' un'immagine,
-           e un filtro CSS su una foto lascia sempre qualcosa di sporco. Lo
-           scambio e' puramente CSS, quindi avviene prima che parta il JS e non
-           c'e' un lampo del logo sbagliato al caricamento. -->
+      <!-- The static vector remains usable before the decorative companion mounts. -->
       <div class="logo">
-        <img class="logo-chiaro" src="/static/logo-light.png" alt="Local Agent Harness">
-        <img class="logo-scuro" src="/static/logo-dark.png" alt="Local Agent Harness">
+        <img class="logo-chiaro" src="/static/brand/mark-light.svg" alt="">
+        <img class="logo-scuro" src="/static/brand/mark-dark.svg" alt="">
       </div>
       <div style="min-width:0">
         <div class="brand-name" id="brand-name">Local Agent Harness</div>
@@ -229,6 +231,9 @@
             </button>
           </div>
           <div id="composer">
+            <div class="companion-rail" aria-hidden="true">
+              <div id="composer-companion"></div>
+            </div>
             <!-- Gli allegati in attesa stanno DENTRO il contenitore, sopra la
                  riga di scrittura: e' il posto in cui li mettono le app di
                  messaggistica, e non per moda -- un file in procinto di
@@ -775,6 +780,7 @@
 </div>
 
 <div id="toast"></div>
+<script src="/static/companion.js"></script>
 <script src="/static/app.js"></script>
 </body>
 </html>

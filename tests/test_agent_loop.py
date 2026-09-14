@@ -468,6 +468,7 @@ def test_leaked_tool_call_is_executed_and_kept_out_of_chat(fake_ollama, tmp_path
                 system_prompt="SYS",
                 env_header=None,
                 max_steps=4,
+                allow_text_tool_calls=True,
             )
         )
     finally:
@@ -719,7 +720,7 @@ def test_leak_nudge_fires_once_and_after_the_tool_results(fake_ollama, tmp_path)
     try:
         ui_messages = [{"role": "user", "content": "elenca i file del progetto"}]
         list(
-            agent_mod.run_turn(
+            agent_mod.run_turn(allow_text_tool_calls=True,
                 backend=OllamaBackend(url, timeout_s=20),
                 params=GenParams(model="fake:latest"),
                 tools_schema=TOOLS_SCHEMA,

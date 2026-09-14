@@ -64,7 +64,7 @@ def mobile(fake_ollama, tmp_path, monkeypatch):
     # Il client del ponte parla direttamente con l'app del principale.
     upstream_client = httpx.AsyncClient(
         transport=httpx.ASGITransport(app=server_main.app),
-        base_url="http://principale/",
+        base_url="http://127.0.0.1/",
     )
     monkeypatch.setattr(mobile_mod, "_client", upstream_client)
 
@@ -376,7 +376,7 @@ def test_upstream_base_default_e_override(monkeypatch):
     assert mobile_mod.upstream_base() == "http://192.168.1.10:9000"
 
 
-def test_get_client_is_a_singleton_with_infinite_read_timeout(monkeypatch):
+def test_get_client_is_a_singleton_with_finite_timeouts(monkeypatch):
     import asyncio
 
     from server import mobile as mobile_mod
@@ -390,9 +390,10 @@ def test_get_client_is_a_singleton_with_infinite_read_timeout(monkeypatch):
         # connessioni e il shutdown chiuderebbe solo l'ultima.
         assert secondo is primo
         assert str(primo.base_url) == "http://127.0.0.1:8123/"
-        # Un turno fra un tool e l'altro resta minuti in silenzio: il read
-        # timeout di httpx di default (5s) taglierebbe lo stream a meta'.
-        assert primo.timeout.read is None
+        # SSE keepalives maintain healthy connections; a dead peer times out.
+        assert primo.timeout.read == 45.0
+        assert primo.timeout.write == 30.0
+        assert primo.timeout.pool == 5.0
         assert primo.timeout.connect == 5.0
     finally:
         asyncio.run(mobile_mod.close_client())

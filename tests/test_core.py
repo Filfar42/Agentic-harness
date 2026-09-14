@@ -291,12 +291,14 @@ def test_missing_file_returns_actionable_hint(ctx):
     assert "error" in result and "list_files" in result["hint"]
 
 
-def test_unknown_args_are_dropped_not_crashing(ctx):
+def test_unknown_args_are_rejected_before_execution(ctx):
     dispatch(ctx, "write_file", {"filepath": "e.py", "content": "1"})
     result = json.loads(
         dispatch(ctx, "read_file", {"filepath": "e.py", "encoding": "utf-16", "foo": 1})
     )
-    assert result.get("ignored_args") == ["encoding", "foo"]
+    assert result["error_code"] == "invalid_arguments"
+    assert {d["path"] for d in result["details"]} == {"$.encoding", "$.foo"}
+    assert "content" not in result
 
 
 def test_dangerous_command_is_blocked(ctx):

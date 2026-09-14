@@ -1,0 +1,206 @@
+{
+  "revision": "2026-09-07",
+  "base_audit": "astra-refactored-20260906.zip",
+  "files": {
+    "docs/brand/BRAND_GUIDE.md": {
+      "bytes": 7946,
+      "sha256": "4c0ec8b45b863d6ba3be893d3b8fb653a4f44e9ba70232692b56afbdb47fb2a2"
+    },
+    "docs/brand/changes.patch": {
+      "bytes": 120794,
+      "sha256": "3efba8d5348a0633e189e8848c48239141757873bf867260f29bbbe0fd2c2523"
+    },
+    "docs/brand/CONTRAST.md": {
+      "bytes": 22505,
+      "sha256": "86a57b65a278e1299f086f6a0702ec8aa402d3096497aa5b8bdfc3a44110d952"
+    },
+    "docs/brand/DESIGN_REVIEW.md": {
+      "bytes": 3963,
+      "sha256": "215b11a85fcaee06b2f01dabaab613609b44eb92c5670634c4c384c559f8613f"
+    },
+    "docs/brand/index.html": {
+      "bytes": 8025,
+      "sha256": "9918c9c31dbdf1f621277a97f05af97482277dcece546308b1c53d7431e681a5"
+    },
+    "docs/brand/qa/before-desktop.css": {
+      "bytes": 64417,
+      "sha256": "835b4fb377935cbded21e4d5440e984a9cfb06d74600acf8c0f718c7f1faf613"
+    },
+    "docs/brand/qa/before-desktop.html": {
+      "bytes": 50084,
+      "sha256": "11bf5754fb5d61005a0f0eb201582b191cdb977f487b65868720501072e36e48"
+    },
+    "docs/brand/qa/brand-dark.png": {
+      "bytes": 113729,
+      "sha256": "5db3afc09ebcbe9e8879013f5f9ab534bea60004ec76bbbd3706b2d02f2e0070"
+    },
+    "docs/brand/qa/css-geometry.json": {
+      "bytes": 426,
+      "sha256": "636d1ec685e25353bf03063e2bc9ff13de6bf287195ef7b015ca91ecaaaff99e"
+    },
+    "docs/brand/qa/desktop-dark.png": {
+      "bytes": 103669,
+      "sha256": "c557b6b6a6b40875edd013ccc85a73f8b6b1e06014582bd8ab0c4a8957da1e27"
+    },
+    "docs/brand/qa/desktop-light.png": {
+      "bytes": 100736,
+      "sha256": "95cb9dcbd9f274684aa8dac52e614878d606ad49b5f504a039c2702c9bcfff9d"
+    },
+    "docs/brand/qa/layout-desktop.json": {
+      "bytes": 1450,
+      "sha256": "adf7fbb2ab02df677e3639f101af977f03bde2beb4ebffdd2866126f1fe79943"
+    },
+    "docs/brand/qa/layout-tests.txt": {
+      "bytes": 101,
+      "sha256": "fbd21cd3807293e942d43b5f77121cb4bfcbf915312e8eca0fd039bf8a56917f"
+    },
+    "docs/brand/qa/mobile-chat.png": {
+      "bytes": 50888,
+      "sha256": "2025e55e37675f509586a491e60474b2c6df1cb5eef10a1bdd584d7feb92c25b"
+    },
+    "docs/brand/qa/mobile-list.png": {
+      "bytes": 18360,
+      "sha256": "27f9af32f119bd9b80cf87dbb212a3eddca750a166905bcf0dfd67b299d29b36"
+    },
+    "docs/brand/qa/settings-dark.png": {
+      "bytes": 85655,
+      "sha256": "ec422e9161beeba5ed8581cf2c9a8509714f180c65d744ebb7468b03e4daa0a4"
+    },
+    "docs/brand/qa/ui-tests.txt": {
+      "bytes": 194,
+      "sha256": "72f47ca11a9b3fdcfdc0ede96516b7a32b078f879085e3f5af9a9b6bdef46d9f"
+    },
+    "docs/brand/qa/ui-tests.xml": {
+      "bytes": 18488,
+      "sha256": "4e1676e09b191f6b9eccfd6a3203953c9a3724303d0a2e2d96c6b8c7f8ecba48"
+    },
+    "docs/brand/VALIDATION.md": {
+      "bytes": 3780,
+      "sha256": "ed52cdf5a1e0e4e5cf096cedbb7d3ea945f3a243c1b0b797758e506b86ed0c78"
+    },
+    "scripts/build_brand_assets.cjs": {
+      "bytes": 5814,
+      "sha256": "d52210e8a8a1ad1efc003cb79e82f45f4c669cd8afe01aaee2bef606bbb0605e"
+    },
+    "scripts/check_visual_contrast.py": {
+      "bytes": 17003,
+      "sha256": "021931eeaa3e80bc3f3f09863be9ca8fd7d59717fe5d7b619f1a188165d692f4"
+    },
+    "scripts/visual_preview.py": {
+      "bytes": 7897,
+      "sha256": "6532c21cfcd04f820f1bb2781fa1c616f2c63ad419cc84b7aed849c2a8747634"
+    },
+    "server/main.py": {
+      "bytes": 143541,
+      "sha256": "d795736fda6b67a1c9d2b26b3b0a3b53556d2d1572506a00e0c174b4aa618b37"
+    },
+    "tests/test_companion.py": {
+      "bytes": 23536,
+      "sha256": "8be8751045059870f0e395dee1059b9db43f6b4af2ecc731984115a11b052f51"
+    },
+    "tests/test_interfaccia_colonne.py": {
+      "bytes": 21614,
+      "sha256": "12b96979f66298d2536fe89624d05f263d9b55cfe5f60fe8b265cd78a30e01a1"
+    },
+    "tests/test_reattivita_e_ripresa.py": {
+      "bytes": 19977,
+      "sha256": "b6d0cd3e0a490469fcf9bf68e4f73e58cd424cc86f8b72afc117ccf4af59a8ec"
+    },
+    "web/app.js": {
+      "bytes": 166616,
+      "sha256": "c9912e23383a0015ab56e9d0c00e5897608a999b3aa7260551402d50e4fdebf8"
+    },
+    "web/brand/app-icon.svg": {
+      "bytes": 633,
+      "sha256": "14bfc1490752bb0cdf805927ffdaf89756920baceb3212878dd3a3e763fded22"
+    },
+    "web/brand/favicon.svg": {
+      "bytes": 665,
+      "sha256": "ca985b54aa1d8de87c4ac07dfba31a06a636cf90c42fba758dab8a59cef275af"
+    },
+    "web/brand/mark-dark.svg": {
+      "bytes": 543,
+      "sha256": "6aa6215593518efa66c07ba8114d7cb01bf614053ee8faac5ba0e3a77a237a1d"
+    },
+    "web/brand/mark-light.svg": {
+      "bytes": 543,
+      "sha256": "ffa5f81e889722ddb68036328468594b287568a124f45cd7392a82ede18e03da"
+    },
+    "web/brand/mark-mono.svg": {
+      "bytes": 657,
+      "sha256": "5d8aa88b6e32634a69cf1dc241d7f8ae183a440248b90ed9f471f58f4a8b2d46"
+    },
+    "web/brand/wordmark-dark.svg": {
+      "bytes": 871,
+      "sha256": "bd470cbd57fb23db15fbfa86d696788fc3cbb924c48e2cc3932e2a289532ed5c"
+    },
+    "web/brand/wordmark-light.svg": {
+      "bytes": 871,
+      "sha256": "9d42590e55bf2be017a25a9308da61a7e7b967f9552d4c8f9ed8abdc91aeae4b"
+    },
+    "web/companion.css": {
+      "bytes": 2116,
+      "sha256": "e62882374897e964a34149c341868f7207ae22f078042d0f1a5d1c7241e07dea"
+    },
+    "web/companion.js": {
+      "bytes": 7872,
+      "sha256": "04e1bf432dbbe9d5e4b77ca0ae7b7011b06322a929b51e79beb2752aaca3b5a7"
+    },
+    "web/favicon-16.png": {
+      "bytes": 312,
+      "sha256": "7dd3b721d29a5f0bd4da14fb85167412a11e8530a6bf668686e4fe258b908335"
+    },
+    "web/favicon-32.png": {
+      "bytes": 435,
+      "sha256": "5b2ac0a569b1e909045c067a50c4a944848fda00e5729496e538ff5656570c34"
+    },
+    "web/favicon-64.png": {
+      "bytes": 879,
+      "sha256": "b1605386f7a8355fed872531c56989ddc908c8eb2ee6d95760dd73a864901ca4"
+    },
+    "web/index.html": {
+      "bytes": 50857,
+      "sha256": "6d7f842d816364945d73c6e5f3a9de5e6e76f03b6474ac52e48f04c978ce2b1e"
+    },
+    "web/logo-dark-64.png": {
+      "bytes": 849,
+      "sha256": "a1ae2df2568aa42b655ff0942780fc946e5713b385fa8b3fb54577fa78ff0335"
+    },
+    "web/logo-light-64.png": {
+      "bytes": 879,
+      "sha256": "b1605386f7a8355fed872531c56989ddc908c8eb2ee6d95760dd73a864901ca4"
+    },
+    "web/style.css": {
+      "bytes": 69991,
+      "sha256": "806c501d29340ef25b870a2318f004223d9bfe7434be89aef9b5a935838685c3"
+    },
+    "web_mobile/app.js": {
+      "bytes": 36022,
+      "sha256": "8a8cf50ca509aabc2a043dd3a0a612776fae30f5a0065fc215ab62666d535883"
+    },
+    "web_mobile/icons/apple-touch-icon.png": {
+      "bytes": 2561,
+      "sha256": "b6e925148e445ba1b82e135440280fff040149e8097685aae5e1c0fe7a742761"
+    },
+    "web_mobile/icons/icon-192.png": {
+      "bytes": 2426,
+      "sha256": "1e94595c77f47c80a9e81ebf1a6e5f37b8f16f34a867f457bcf54e68e3546e5f"
+    },
+    "web_mobile/icons/icon-512.png": {
+      "bytes": 7522,
+      "sha256": "5e1dea7b0e70a98080f52b0ab02e0304f71d10859ec19f1d792fb86bcc2ce656"
+    },
+    "web_mobile/index.html": {
+      "bytes": 3609,
+      "sha256": "40187487d70930a9d14d181ba48dfa353b9e59715ca31bbce509b8f9675cc18f"
+    },
+    "web_mobile/manifest.webmanifest": {
+      "bytes": 646,
+      "sha256": "02550020d4741155b81ac747b400be398e3fe6a363323f3c0c8e19dd87ffd2f1"
+    },
+    "web_mobile/style.css": {
+      "bytes": 13037,
+      "sha256": "d99f230628a149ec6c6274cd32d56308b3a9419ae6da69ab6707e0e33110c36b"
+    }
+  }
+}

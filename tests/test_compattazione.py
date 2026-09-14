@@ -698,4 +698,6 @@ def test_un_errore_non_testuale_non_rompe_la_busta():
     out = _compact_tool_result(
         json.dumps({"error": {"code": 12, "msg": "x" * 900}}), full=False
     )
-    assert isinstance(json.loads(out)["error"], str)
+    errore = json.loads(out)["error"]
+    assert errore["code"] == 12
+    assert len(errore["msg"]) < 400

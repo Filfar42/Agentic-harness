@@ -23,7 +23,7 @@ APP_NAME = "Local Agent Harness"
 # preferenze. 2.31.0 e' stato il merge del fork Qwen; 2.32.0 i passi del
 # turno sul telefono; 2.33.0 Ctrl+C che spegne davvero e la sincronizzazione
 # in diretta; 2.34.0 il workspace legato alla conversazione.
-APP_VERSION = "2.36.1"
+APP_VERSION = "2.37.0"
 
 # --- percorsi di persistenza ------------------------------------------------
 DATA_DIR = Path("chat_sessions")
@@ -221,7 +221,7 @@ def budgets_for(num_ctx: int, tetto_compattazione: int = COMPACT_MAX_TOKENS) -> 
     )
     integrali = min(
         MAX_TOOL_RESULT_FULL_WINDOW,
-        max(MIN_RISULTATI_INTEGRALI, quota // max(read_chars // 4, 1)),
+        max(MIN_RISULTATI_INTEGRALI, quota // max(int(read_chars / 3.6), 1)),
     )
 
     return Budgets(
@@ -240,12 +240,12 @@ def budgets_for(num_ctx: int, tetto_compattazione: int = COMPACT_MAX_TOKENS) -> 
 
 
 def chars_per_token(token: int) -> int:
-    """Quattro caratteri per token: la stessa conversione di ``textutils``.
+    """Stessa conversione (3,6 caratteri/token) usata da ``textutils``.
 
     Duplicata qui e non importata perche' ``config`` non deve dipendere da
     nessun altro modulo del pacchetto: e' quello che tutti importano.
     """
-    return max(0, int(token) * 4)
+    return max(0, int(float(token) * 3.6))
 
 @dataclass(slots=True)
 class GenParams:
@@ -262,8 +262,8 @@ class GenParams:
     presence_penalty: float = 0.0
     # Il default di Ollama e' 1.1: a quel valore penalizza ogni ripetizione,
     # comprese quelle delle parole comuni e degli identificatori. 1.0 e' il
-    # neutro e non viene inviato, come presence_penalty: un'opzione in meno
-    # nel payload e' un prefisso in meno da invalidare.
+    # neutro e viene inviato esplicitamente, per non ereditare il default
+    # del server o del Modelfile quando l'utente ha scelto di disattivarlo.
     #
     # Il campo si chiama repetition_penalty perche' e' cosi' che lo chiamano
     # l'impostazione, l'interfaccia e la letteratura (vLLM, HF). Sul filo
@@ -301,8 +301,7 @@ class GenParams:
             opts["presence_penalty"] = float(self.presence_penalty)
         # Qui il nome cambia: fuori e' repetition_penalty, sul filo di Ollama
         # e' repeat_penalty. Vedi il commento sul campo.
-        if self.repetition_penalty != 1.0:
-            opts["repeat_penalty"] = float(self.repetition_penalty)
+        opts["repeat_penalty"] = float(self.repetition_penalty)
         if self.seed is not None:
             opts["seed"] = int(self.seed)
         if self.stop:
@@ -324,19 +323,20 @@ class GenParams:
         omettere non e' la stessa cosa di ``think: false`` -- il secondo lo
         spegne anche su un modello che lo terrebbe acceso per conto suo.
 
-        Una stringa che non e' ne' un livello ne' un modo di dire "acceso" --
+        Una stringa che non e' un livello ne' un interruttore riconosciuto --
         ``think: "forse"`` in un file scritto a mano -- torna ``None`` e non
-        ``False``: significa "non ho capito, non mi impiccio", che e' la
-        risposta giusta per un valore che non vuol dire niente. Prima tornava
-        ``False``, cioe' *spegneva* il pensiero, e funzionava solo perche' chi
-        legge fa ``if think:`` e non distingue i due.
+        ``False``: lascia al server la scelta predefinita. I booleani e gli
+        interruttori testuali riconosciuti conservano invece l'intenzione
+        esplicita, compreso lo spegnimento.
         """
         if isinstance(self.think, str):
             livello = self.think.strip().lower()
             if livello in self.LIVELLI_PENSIERO:
                 return livello
+            if livello in ("false", "off", "no", "0"):
+                return False
             return True if livello in self.ACCESO else None
-        return bool(self.think) or None
+        return self.think if isinstance(self.think, bool) else None
 
 
 DEFAULTS: dict[str, Any] = {

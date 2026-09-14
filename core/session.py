@@ -54,6 +54,9 @@ import os
 import threading
 import time
 import uuid
+import re
+import logging
+from functools import wraps
 from collections import OrderedDict
 from collections.abc import Iterable
 from datetime import datetime
@@ -61,9 +64,155 @@ from pathlib import Path
 from typing import Any
 
 from .config import DATA_DIR
+from .atomic import write_text as atomic_write_text
+from .jsonsafe import JsonBoundaryError, loads_object
+
+logger = logging.getLogger(__name__)
+# Fixed striped locks avoid unbounded lock allocation from supplied ids.
+_storage_locks = tuple(threading.RLock() for _ in range(64))
+
+
+def _session_locked(function: Any) -> Any:
+    """Serialize per-session storage transactions within this process."""
+    @wraps(function)
+    def wrapped(state: Any, *args: Any, **kwargs: Any) -> Any:
+        sid = state.get("current_session_id", "") if hasattr(state, "get") else state
+        with _storage_locks[hash(str(sid)) % len(_storage_locks)]:
+            return function(state, *args, **kwargs)
+    return wrapped
+
+
+def _valid_id(session_id: str) -> bool:
+    return isinstance(session_id, str) and re.fullmatch(r"[A-Za-z0-9_-]{1,128}", session_id) is not None
+
+
+def _read_metadata(path: Path) -> dict[str, Any] | None:
+    """Reject corrupted stored shapes before indexing or restoring state."""
+    try:
+        with path.open(encoding="utf-8") as stream:
+            data = loads_object(stream.read(64_000_001), max_chars=64_000_000, max_nodes=1_000_000)
+        for key in ("touched_files", "known_files"):
+            if key in data and (not isinstance(data[key], list) or any(not isinstance(x, str) for x in data[key])):
+                raise JsonBoundaryError(f"Invalid storage field: {key}")
+        for key in ("messages", "attachments", "plan", "notes"):
+            if key in data and (not isinstance(data[key], list) or any(not isinstance(x, dict) for x in data[key])):
+                raise JsonBoundaryError(f"Invalid storage field: {key}")
+        if data.get("preview") is not None and not isinstance(data["preview"], dict):
+            raise JsonBoundaryError("Invalid preview")
+        if "n_messages" in data and (type(data["n_messages"]) is not int or data["n_messages"] < 0):
+            raise JsonBoundaryError("Invalid message count")
+        return data
+    except (OSError, UnicodeError, JsonBoundaryError):
+        logger.warning("Cannot load session metadata: %s", path, exc_info=True)
+        return None
 
 _SAVE_DEBOUNCE_S = 1.0
 _last_save: dict[str, float] = {}
+MAX_TURN_TELEMETRY = 50
+MAX_TELEMETRY_BYTES = 2 * 1024 * 1024
+
+
+def bounded_turn_telemetry(value: Any) -> list[dict[str, Any]]:
+    """Keep recent diagnostics within the on-disk budget, independently of chat.
+
+    Invalid optional diagnostics cannot prevent a conversation from loading.
+    An oversized latest turn retains its totals when dropping call details is
+    sufficient. The byte count includes indentation used by session metadata.
+    """
+    if not isinstance(value, list):
+        return []
+    kept: list[dict[str, Any]] = []
+    size = 32  # enclosing object, field name, array and newlines
+    for raw_entry in reversed(value[-MAX_TURN_TELEMETRY:]):
+        entry = raw_entry
+        if not isinstance(entry, dict):
+            continue
+        try:
+            encoded = json.dumps(entry, ensure_ascii=False, indent=2, allow_nan=False)
+            entry_size = len(encoded.encode("utf-8")) + 4 * (encoded.count("\n") + 1) + 2
+            if entry_size + 32 > MAX_TELEMETRY_BYTES:
+                calls = entry.get("calls")
+                previous = entry.get("calls_truncated", 0)
+                entry = {
+                    key: entry[key] for key in (
+                        "version", "totals", "since_offset", "end_offset", "turn_reason",
+                        "steps", "recorded_at",
+                    ) if key in entry
+                }
+                entry.update(calls=[], calls_truncated=(len(calls) if isinstance(calls, list) else 0)
+                             + (previous if type(previous) is int and previous >= 0 else 0))
+                encoded = json.dumps(entry, ensure_ascii=False, indent=2, allow_nan=False)
+                entry_size = len(encoded.encode("utf-8")) + 4 * (encoded.count("\n") + 1) + 2
+        except (TypeError, ValueError, OverflowError, RecursionError):
+            continue
+        if entry_size + 32 > MAX_TELEMETRY_BYTES:
+            continue
+        if entry_size + size > MAX_TELEMETRY_BYTES:
+            break
+        kept.append(json.loads(encoded))
+        size += entry_size
+    return list(reversed(kept))
+
+
+def record_turn_telemetry(state: Any, telemetry: Any, *, reason: str, steps: int) -> None:
+    """Attach a completed turn snapshot before the final session save."""
+    if not isinstance(telemetry, dict) or not telemetry:
+        return
+    entry = {
+        **telemetry,
+        "turn_reason": str(reason)[:64],
+        "steps": max(0, int(steps)),
+        "recorded_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    previous = state.get("turn_telemetry")
+    state["turn_telemetry"] = bounded_turn_telemetry(
+        [*(previous if isinstance(previous, list) else []), entry]
+    )
+
+
+def telemetry_path(session_id: str) -> Path:
+    if not _valid_id(session_id):
+        raise ValueError("Invalid session id")
+    return DATA_DIR / f"{session_id}.telemetry.json"
+
+
+def _telemetry_marker(session_id: str, value: Any) -> tuple:
+    # I record pubblicati sono snapshot: record_turn_telemetry sostituisce la
+    # lista. Identita', lunghezza e ultimo record rilevano anche append e clear
+    # senza scandire megabyte a ogni tool. Il riferimento impedisce riuso di id.
+    return (session_id, value, len(value) if isinstance(value, list) else -1,
+            value[-1] if isinstance(value, list) and value else None)
+
+
+def _save_telemetry(state: Any, session_id: str) -> None:
+    value = state.get("turn_telemetry")
+    previous = state.get("_telemetry_saved")
+    marker = _telemetry_marker(session_id, value)
+    if (isinstance(previous, tuple) and len(previous) == 4
+            and previous[0] == session_id and previous[1] is value
+            and previous[2] == marker[2] and previous[3] is marker[3]):
+        return
+    turns = bounded_turn_telemetry(value)
+    # Anche la lista vuota va scritta: puo' azzerare un sidecar precedente.
+    _atomic_write_json(telemetry_path(session_id), {"turn_telemetry": turns})
+    state["turn_telemetry"] = turns
+    state["_telemetry_saved"] = _telemetry_marker(session_id, turns)
+
+
+def _load_telemetry(session_id: str) -> list[dict[str, Any]] | None:
+    path = telemetry_path(session_id)
+    try:
+        if not path.exists():
+            return None
+        if path.stat().st_size > MAX_TELEMETRY_BYTES:
+            raise ValueError("Telemetry sidecar exceeds its byte budget")
+        with path.open(encoding="utf-8") as stream:
+            payload = loads_object(stream.read(MAX_TELEMETRY_BYTES + 1),
+                                   max_chars=MAX_TELEMETRY_BYTES, max_nodes=1_000_000)
+        return bounded_turn_telemetry(payload.get("turn_telemetry"))
+    except (OSError, UnicodeError, ValueError):
+        logger.warning("Cannot load optional telemetry: %s", path, exc_info=True)
+        return None
 
 
 def ensure_dirs() -> None:
@@ -71,14 +220,11 @@ def ensure_dirs() -> None:
 
 
 def generate_session_id() -> str:
-    return f"{datetime.now():%Y%m%d_%H%M%S}_{uuid.uuid4().hex[:4]}"
+    return f"{datetime.now():%Y%m%d_%H%M%S}_{uuid.uuid4().hex}"
 
 
 def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    with open(tmp, "w", encoding="utf-8") as fh:
-        json.dump(payload, fh, indent=2, ensure_ascii=False)
-    os.replace(tmp, path)
+    atomic_write_text(path, json.dumps(payload, indent=2, ensure_ascii=False, allow_nan=False))
 
 
 # ---------------------------------------------------------------------------
@@ -87,6 +233,8 @@ def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
 
 
 def messages_path(session_id: str) -> Path:
+    if not _valid_id(session_id):
+        raise ValueError("Invalid session id")
     return DATA_DIR / f"{session_id}.jsonl"
 
 
@@ -128,8 +276,8 @@ def _leggi_messaggi(session_id: str) -> list[dict[str, Any]] | None:
                 if not riga:
                     continue
                 try:
-                    messaggi.append(json.loads(riga))
-                except json.JSONDecodeError:
+                    messaggi.append(loads_object(riga, max_chars=16_777_216))
+                except JsonBoundaryError:
                     # Una riga tronca puo' esistere solo in coda, se il
                     # processo e' morto durante l'append: si scarta quella e
                     # si tiene tutto il resto. Con un file unico, la stessa
@@ -137,7 +285,7 @@ def _leggi_messaggi(session_id: str) -> list[dict[str, Any]] | None:
                     sporca = True
                     continue
                 ultima = riga
-    except OSError:
+    except (OSError, UnicodeError):
         return None
     if sporca:
         # Scartata alla lettura, ma **sul disco c'e' ancora**: senza questa
@@ -174,19 +322,18 @@ def _scrivi_messaggi(
         and (gia[0] == 0 or _riga(messages[gia[0] - 1]) == gia[1])
     )
 
-    righe = [_riga(m) for m in (messages[gia[0]:] if accoda else messages)]
     try:
+        righe = [_riga(m) for m in (messages[gia[0]:] if accoda else messages)]
         if accoda:
             if not righe:
                 return True
             with open(path, "a", encoding="utf-8") as fh:
                 fh.write("".join(r + "\n" for r in righe))
+                fh.flush()
+                os.fsync(fh.fileno())
         else:
-            tmp = path.with_suffix(".jsonl.tmp")
-            with open(tmp, "w", encoding="utf-8") as fh:
-                fh.write("".join(r + "\n" for r in righe))
-            os.replace(tmp, path)
-    except OSError:
+            atomic_write_text(path, "".join(r + "\n" for r in righe))
+    except (OSError, UnicodeError, ValueError, TypeError):
         # Il salvataggio non deve mai far crashare la UI. Ma cio' che risulta
         # scritto non si sa piu': la prossima volta si riscrive tutto.
         _scritti.pop(session_id, None)
@@ -211,7 +358,8 @@ def derive_title(messages: list[dict]) -> str:
     return "Nuova conversazione"
 
 
-def save_session(state: Any, *, force: bool = False, riscrivi: bool = False) -> None:
+@_session_locked
+def save_session(state: Any, *, force: bool = False, riscrivi: bool = False) -> bool:
     """Salva la sessione corrente. Debounced salvo ``force=True``.
 
     ``riscrivi=True`` rifa' la coda dei messaggi da capo invece di accodare.
@@ -221,16 +369,31 @@ def save_session(state: Any, *, force: bool = False, riscrivi: bool = False) -> 
     """
     session_id = state.get("current_session_id")
     if not session_id:
-        return
+        return True
+    if not _valid_id(session_id):
+        state["save_error"] = "Invalid session id"
+        return False
 
     now = time.monotonic()
     if not force and (now - _last_save.get(session_id, 0.0)) < _SAVE_DEBOUNCE_S:
-        return
-    _last_save[session_id] = now
+        return True
 
-    ensure_dirs()
+    try:
+        ensure_dirs()
+    except OSError as exc:
+        logger.exception("Cannot create session storage")
+        state["save_error"] = str(exc)
+        return False
     messages = state.get("messages", [])
     coda_ok = _scrivi_messaggi(session_id, messages, riscrivi=riscrivi)
+    telemetry_error = None
+    try:
+        _save_telemetry(state, session_id)
+    except (OSError, UnicodeError, ValueError) as exc:
+        # I messaggi si salvano comunque. Lo snapshot rimane in memoria e il
+        # marker non avanza, quindi il salvataggio successivo ritenta.
+        logger.exception("Cannot persist telemetry for session %s", session_id)
+        telemetry_error = str(exc)
     payload = {
         "id": session_id,
         "title": derive_title(messages),
@@ -276,10 +439,22 @@ def save_session(state: Any, *, force: bool = False, riscrivi: bool = False) -> 
         # al formato nuovo senza rischi: finche' la coda non c'e' davvero, i
         # metadati continuano a portarsi dietro tutto.
         payload["messages"] = messages
+    if telemetry_error is not None:
+        # Fallback compatibile col formato precedente: anche la prima
+        # migrazione conserva una copia durevole se il sidecar non si scrive.
+        payload["turn_telemetry"] = bounded_turn_telemetry(state.get("turn_telemetry"))
     try:
         _atomic_write_json(DATA_DIR / f"{session_id}.json", payload)
-    except OSError:
-        pass  # il salvataggio non deve mai far crashare la UI
+    except (OSError, UnicodeError, ValueError) as exc:
+        logger.exception("Cannot persist session %s", session_id)
+        state["save_error"] = str(exc)
+        return False
+    if telemetry_error is not None:
+        state["save_error"] = f"Telemetria non salvata: {telemetry_error}"
+        return False
+    _last_save[session_id] = now
+    state.pop("save_error", None)
+    return True
 
 
 # Un lucchetto per tutte e due le cache di questo modulo.
@@ -321,10 +496,8 @@ def _session_summary(path: Path) -> dict[str, Any] | None:
         cached = _index_cache.get(path.name)
     if cached and cached[0] == stat.st_mtime and cached[1] == stat.st_size:
         return cached[2]
-    try:
-        with open(path, encoding="utf-8") as fh:
-            data = json.load(fh)
-    except (OSError, json.JSONDecodeError):
+    data = _read_metadata(path)
+    if data is None:
         return None
     # Il conto e la domanda in sospeso stanno nei metadati: l'indice non apre
     # piu' la cronologia di nessuno. Il ramo con ``messages`` e' il formato
@@ -387,6 +560,8 @@ def list_sessions(
     live = set()
     out: list[dict[str, Any]] = []
     for path in DATA_DIR.glob("*.json"):
+        if not _valid_id(path.stem):
+            continue
         live.add(path.name)
         summary = _session_summary(path)
         if summary is None:
@@ -499,10 +674,8 @@ def _cercabile(path: Path) -> dict[str, str] | None:
         if cached and cached[0] == chiave[0] and cached[1] == chiave[1]:
             _search_cache.move_to_end(path.name)   # e' appena servita
             return cached[2]
-    try:
-        with open(path, encoding="utf-8") as fh:
-            data = json.load(fh)
-    except (OSError, json.JSONDecodeError):
+    data = _read_metadata(path)
+    if data is None:
         return None
     messaggi = data.get("messages")
     if messaggi is None:
@@ -518,10 +691,10 @@ def _cercabile(path: Path) -> dict[str, str] | None:
                     if not riga:
                         continue
                     try:
-                        messaggi.append(json.loads(riga))
-                    except json.JSONDecodeError:
+                        messaggi.append(loads_object(riga, max_chars=16_777_216))
+                    except JsonBoundaryError:
                         continue
-        except OSError:
+        except (OSError, UnicodeError):
             messaggi = []
     pezzi = _pezzi_cercabili(data, messaggi)
     with _cache_lock:
@@ -562,6 +735,8 @@ def search_sessions(query: str, limit: int = 40) -> list[dict[str, Any]]:
     ensure_dirs()
     trovate: list[dict[str, Any]] = []
     for path in DATA_DIR.glob("*.json"):
+        if not _valid_id(path.stem):
+            continue
         pezzi = _cercabile(path)
         riga = _session_summary(path)
         if pezzi is None or riga is None:
@@ -585,16 +760,16 @@ def search_sessions(query: str, limit: int = 40) -> list[dict[str, Any]]:
 
 
 def load_session(state: Any, session_id: str) -> bool:
+    if not _valid_id(session_id):
+        return False
     path = DATA_DIR / f"{session_id}.json"
     if not path.exists():
         return False
-    try:
-        with open(path, encoding="utf-8") as fh:
-            data = json.load(fh)
-    except (OSError, json.JSONDecodeError):
+    data = _read_metadata(path)
+    if data is None:
         return False
 
-    state["current_session_id"] = data.get("id", session_id)
+    state["current_session_id"] = session_id
     # La coda, se c'e'. Se non c'e' siamo su una conversazione del formato
     # vecchio, che teneva i messaggi dentro i metadati: si leggono da li' e la
     # coda nasce al primo salvataggio -- nessuna migrazione da lanciare, e
@@ -616,6 +791,15 @@ def load_session(state: Any, session_id: str) -> bool:
     state["known_files"] = set(data.get("known_files", []))
     state["plan"] = list(data.get("plan", []))
     state["notes"] = list(data.get("notes", []))
+    sidecar = _load_telemetry(session_id)
+    inline = data.get("turn_telemetry")
+    # Il campo inline esiste solo nelle sessioni legacy o nel fallback di un
+    # salvataggio fallito: in quel caso e' piu' recente del vecchio sidecar.
+    state["turn_telemetry"] = bounded_turn_telemetry(inline) if isinstance(inline, list) else (
+        sidecar if sidecar is not None else [])
+    state.pop("_telemetry_saved", None)
+    if sidecar is not None and not isinstance(inline, list):
+        state["_telemetry_saved"] = _telemetry_marker(session_id, sidecar)
     state["preview"] = data.get("preview") or None
     state["attachments"] = list(data.get("attachments", []))
     if data.get("workspace_dir"):
@@ -623,17 +807,22 @@ def load_session(state: Any, session_id: str) -> bool:
     return True
 
 
+@_session_locked
 def delete_session(session_id: str) -> None:
+    if not _valid_id(session_id):
+        raise ValueError("Invalid session id")
     try:
         (DATA_DIR / f"{session_id}.json").unlink(missing_ok=True)
         messages_path(session_id).unlink(missing_ok=True)
+        telemetry_path(session_id).unlink(missing_ok=True)
     except OSError:
         pass
     _scritti.pop(session_id, None)
     # Le due cache sono indicizzate per nome file: una conversazione cancellata
     # e poi ricreata con lo stesso id troverebbe altrimenti il testo di prima.
-    _index_cache.pop(f"{session_id}.json", None)
-    _search_cache.pop(f"{session_id}.json", None)
+    with _cache_lock:
+        _index_cache.pop(f"{session_id}.json", None)
+        _search_cache.pop(f"{session_id}.json", None)
 
 
 def new_session(state: Any) -> str:
@@ -647,6 +836,8 @@ def new_session(state: Any) -> str:
     state["preview"] = None
     state["attachments"] = []
     state["last_usage"] = {}
+    state["turn_telemetry"] = []
+    state.pop("_telemetry_saved", None)
     return session_id
 
 

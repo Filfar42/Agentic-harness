@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="it" data-theme="light">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Harness — Identità e movimento</title>
+  <link rel="icon" href="/static/brand/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/static/companion.css">
+  <style>
+    :root { color-scheme: light; --bg:#f7f9f9; --surface:#fff; --text:#1c2b30; --muted:#4f646a; --line:#bccacc; --accent:#0b7169; --soft:#e3f1ee; --on:#fff; }
+    :root[data-theme="dark"] { color-scheme:dark; --bg:#11181b; --surface:#192428; --text:#edf3f3; --muted:#b2c3c6; --line:#455c62; --accent:#68d5c4; --soft:#1d3734; --on:#102a28; }
+    * { box-sizing:border-box; }
+    body { margin:0; background:var(--bg); color:var(--text); font:15px/1.6 system-ui,-apple-system,"Segoe UI",sans-serif; }
+    main { max-width:1120px; margin:auto; padding:36px 32px 64px; }
+    header { display:flex; gap:24px; align-items:center; justify-content:space-between; padding-bottom:24px; border-bottom:1px solid var(--line); }
+    .eyebrow { font:600 11px/1.5 ui-monospace,monospace; letter-spacing:.12em; text-transform:uppercase; color:var(--muted); }
+    h1 { margin:8px 0 14px; font-size:clamp(32px,5vw,56px); line-height:1.08; letter-spacing:-.04em; font-weight:600; }
+    h2 { font-size:21px; line-height:1.25; letter-spacing:-.02em; margin:0 0 12px; }
+    p { margin:0; color:var(--muted); max-width:650px; }
+    .intro { padding:52px 0 36px; }
+    .grid { display:grid; grid-template-columns:1.2fr 1fr; gap:18px; }
+    .card { border:1px solid var(--line); border-radius:16px; background:var(--surface); overflow:hidden; }
+    .canvas { min-height:220px; display:grid; place-items:center; padding:32px; }
+    .canvas img { max-width:100%; }
+    .night { background:#11181b; }
+    .caption { padding:18px 22px; border-top:1px solid var(--line); }
+    .caption strong { display:block; font-size:14px; font-weight:600; }
+    .caption span { font-size:13px; color:var(--muted); }
+    .section { margin-top:40px; }
+    .palette { display:grid; grid-template-columns:repeat(5,1fr); gap:12px; margin-top:18px; }
+    .swatch { height:60px; border-radius:8px; border:1px solid var(--line); margin-bottom:8px; }
+    .color small { display:block; font:12px ui-monospace,monospace; color:var(--muted); }
+    .motion { padding:72px 26px 30px; display:grid; grid-template-columns:160px 1fr; gap:24px; align-items:center; margin-top:18px; overflow:visible; }
+    #companion-slot { width:42px; height:42px; justify-self:center; }
+    #companion-slot .harness-companion { width:42px; height:42px; }
+    #companion-slot .harness-companion__speech { top:auto; right:auto; bottom:calc(100% + 14px); left:50%; translate:-50% 0; transform-origin:center bottom; }
+    #companion-slot .harness-companion__speech::after { top:auto; right:auto; bottom:-5px; left:calc(50% - 4px); border-top:0; border-bottom:1px solid var(--accent-border, #8fbbb3); }
+    .controls { display:flex; gap:8px; flex-wrap:wrap; margin:18px 0 10px; }
+    button,.link { font:500 13px/1.4 system-ui,sans-serif; border:1px solid var(--line); padding:9px 13px; border-radius:8px; color:var(--text); background:var(--surface); cursor:pointer; text-decoration:none; transition:background-color 160ms ease-out,border-color 160ms ease-out,transform 160ms ease-out; }
+    button:hover,.link:hover { border-color:var(--accent); background:var(--soft); }
+    button:active { transform:translateY(1px); }
+    button:focus-visible,a:focus-visible { outline:2px solid var(--accent); outline-offset:3px; }
+    button[aria-pressed="true"] { background:var(--accent); color:var(--on); border-color:var(--accent); }
+    .note { font-size:12px; color:var(--muted); }
+    footer { display:flex; gap:12px; flex-wrap:wrap; margin-top:34px; padding-top:24px; border-top:1px solid var(--line); }
+    @media(max-width:640px) { main{padding:22px 18px 40px}.grid{grid-template-columns:1fr}.palette{grid-template-columns:repeat(3,1fr)}.motion{grid-template-columns:1fr}.intro{padding-top:34px} }
+    @media(prefers-reduced-motion:reduce) { *,*::before,*::after{transition:none!important;animation:none!important} }
+  </style>
+</head>
+<body>
+<main>
+  <header><div class="eyebrow">Local Agent Harness / Brand system 01</div><button id="theme" type="button">Passa al tema scuro</button></header>
+  <div class="intro"><div class="eyebrow">Grafite · Minerale</div><h1>Precisione tecnica.<br>Presenza umana.</h1><p>Un’identità essenziale per uno spazio di lavoro agentico: superfici calme, accenti misurati e un piccolo robot che risponde al lavoro in corso.</p></div>
+  <div class="grid">
+    <div class="card"><div class="canvas"><img id="wordmark" src="/static/brand/wordmark-light.svg" width="330" alt="Harness — Local Agent Harness"></div><div class="caption"><strong>Marchio esteso</strong><span>Geometria pulita e tipografia di sistema. Il nome del prodotto resta Local Agent Harness.</span></div></div>
+    <div class="card"><div class="canvas night"><img src="/static/brand/mark-dark.svg" width="96" height="96" alt="Simbolo del robot su fondo scuro"></div><div class="caption"><strong>Icona pura</strong><span>Due occhi, una testa compatta, un’antenna. Riconoscibile anche in piccolo.</span></div></div>
+  </div>
+  <section class="section"><div class="eyebrow">01 / Superfici e accenti</div><h2>Colore al servizio del lavoro</h2><p>Il verde minerale identifica azioni e selezioni. Grafite e grigi freddi danno struttura; i colori di stato mantengono un significato operativo.</p><div class="palette">
+    <div class="color"><div class="swatch" style="background:#11181b"></div>Graphite<small>#11181B</small></div>
+    <div class="color"><div class="swatch" style="background:#f7f9f9"></div>Paper<small>#F7F9F9</small></div>
+    <div class="color"><div class="swatch" style="background:#0b7169"></div>Mineral<small>#0B7169</small></div>
+    <div class="color"><div class="swatch" style="background:#68d5c4"></div>Signal<small>#68D5C4</small></div>
+    <div class="color"><div class="swatch" style="background:#4f646a"></div>Slate<small>#4F646A</small></div>
+  </div></section>
+  <section class="section"><div class="eyebrow">02 / Una mascotte espressiva</div><h2>Saltini, sguardi e parole</h2><p>La mascotte accompagna la chat in due punti sincronizzati: nel logo e, più grande, sopra il tasto di invio. Gli asset statici del marchio restano invariati.</p><div class="card motion"><div id="companion-slot" aria-hidden="true"></div><div><p>Prova i gesti, le espressioni facciali e le nuvolette della mascotte da 42 px. Durante l’elaborazione continua a muoversi. Sono dimostrazioni visive: non avviano operazioni dell’agente.</p><div class="controls" aria-label="Stati dimostrativi della mascotte"><button data-state="welcome">Saluto</button><button data-state="working">Elaborazione</button><button data-state="success">Completato</button><button data-state="resting">Curiosità</button><button data-state="error">Errore</button><button data-state="idle">Quiete</button></div><div class="note" id="motion-status" role="status">Gesti di 1.400 ms · nuvolette di 4 s · inattività dopo 45 s · con movimento ridotto restano testo ed espressioni.</div></div></div></section>
+  <footer><a class="link" href="/" target="_blank" rel="noopener">Anteprima desktop · dati simulati</a><a class="link" href="/mobile" target="_blank" rel="noopener">Anteprima mobile · dati simulati</a><a class="link" href="/brand/BRAND_GUIDE.md">Linee guida e specifiche</a><a class="link" href="/brand/CONTRAST.md">Rapporto contrasti</a></footer>
+</main>
+<script src="/static/companion.js"></script>
+<script>
+  const theme = document.getElementById('theme');
+  const labels = {welcome:'Saluto',working:'Elaborazione',success:'Completato',resting:'Curiosità',error:'Errore',idle:'Quiete'};
+  HarnessCompanion.init({mount:'#companion-slot'});
+  theme.addEventListener('click', () => {
+    const dark = document.documentElement.dataset.theme !== 'dark';
+    document.documentElement.dataset.theme = dark ? 'dark' : 'light';
+    document.getElementById('wordmark').src = `/static/brand/wordmark-${dark ? 'dark' : 'light'}.svg`;
+    theme.textContent = dark ? 'Passa al tema chiaro' : 'Passa al tema scuro';
+  });
+  document.querySelectorAll('[data-state]').forEach(button => button.addEventListener('click', () => {
+    HarnessCompanion.setState(button.dataset.state);
+    document.querySelectorAll('[data-state]').forEach(item => item.setAttribute('aria-pressed', String(item === button)));
+    document.getElementById('motion-status').textContent = `${labels[button.dataset.state]} · Dimostrazione, nessuna operazione eseguita.`;
+  }));
+</script>
+</body>
+</html>

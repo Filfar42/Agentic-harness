@@ -110,7 +110,8 @@ def test_lo_stato_si_legge_anche_senza_colore():
     assert "linear-gradient(var(--accent), var(--accent))" in doing
     assert "3px 100% no-repeat" in doing
     codice = "\n".join(r for r in css.splitlines() if not r.lstrip().startswith(("/*", "*", "-")))
-    assert "box-shadow: inset" not in codice
+    # Il vincolo riguarda la barretta del passo, non i bordi di altri contenitori.
+    assert "box-shadow: inset" not in doing
     assert ".plan-step.doing::before" not in codice
     # e "saltato" e' giallo, non grigio: e' una decisione, non un "non fatto"
     assert ".plan-step.skipped .plan-mark { color: var(--warn); }" in css

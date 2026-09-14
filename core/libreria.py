@@ -46,7 +46,9 @@ Non dentro ``.analisi/``, che ``reset_scratch`` cancella ad ogni turno.
 
 from __future__ import annotations
 
+import hashlib
 import re
+import stat
 import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
@@ -66,12 +68,20 @@ MAX_TITOLO_CHARS = 90
 MAX_PRECARICO_CHARS = 3_000
 MAX_FILE_PRECARICATI = 2
 
+# Limiti del lavoro di recupero, separati dal testo ammesso nel prompt. Gli
+# archivi normali vengono letti integralmente; file anomali non possono
+# consumare memoria o I/O senza limite. Nessuna cache da invalidare.
+MAX_FILE_RICERCA_CHARS = 2_000_000
+MAX_RICERCA_CHARS = 16_000_000
+MAX_TERMINI_RICERCA = 48
+
 # Parole troppo comuni perche' un incrocio su di esse significhi qualcosa.
 _RUMORE = {
     "il", "lo", "la", "i", "gli", "le", "un", "uno", "una", "di", "a", "da",
     "in", "con", "su", "per", "tra", "fra", "e", "o", "che", "non", "del",
     "della", "dei", "delle", "al", "alla", "nel", "nella", "come", "piu",
     "file", "codice", "test", "fare", "sistemare", "aggiungere", "correggere",
+    "the", "and", "for", "from", "with", "this", "that", "into", "are",
 }
 
 
@@ -90,6 +100,32 @@ class Voce:
 
 def cartella(base: Path) -> Path:
     return Path(base) / SCHEDARIO
+
+
+def _cartella_sicura(base: Path) -> Path | None:
+    try:
+        cart = cartella(base)
+        if cart.is_symlink() or getattr(cart, "is_junction", lambda: False)():
+            return None
+        if cart.resolve().parent != Path(base).resolve():
+            return None
+        return cart
+    except (OSError, RuntimeError, ValueError):
+        return None
+
+
+def _file_sicuro(cart: Path, nome: str) -> Path | None:
+    if not nome or "/" in nome or "\\" in nome or Path(nome).name != nome:
+        return None
+    try:
+        path = cart / nome
+        if path.is_symlink() or getattr(path, "is_junction", lambda: False)():
+            return None
+        if path.resolve().parent != cart.resolve():
+            return None
+        return path if stat.S_ISREG(path.stat().st_mode) else None
+    except (OSError, RuntimeError, ValueError):
+        return None
 
 
 def _slug(testo: str) -> str:
@@ -130,17 +166,20 @@ def voci(base: Path) -> list[Voce]:
     slug, la prima riga porta il titolo. Un indice che vive in un file a parte
     e' un secondo posto in cui la stessa cosa puo' essere scritta diversa.
     """
-    cart = cartella(base)
-    if not cart.is_dir():
+    cart = _cartella_sicura(base)
+    if cart is None or not cart.is_dir():
         return []
     fuori: list[Voce] = []
     for path in sorted(cart.glob("*.md")):
+        if _file_sicuro(cart, path.name) is None:
+            continue
         m = re.match(r"^(\d+)-", path.name)
         if not m:
             continue
         try:
-            prima = path.read_text(encoding="utf-8").lstrip().splitlines()[0]
-        except (OSError, IndexError):
+            with path.open(encoding="utf-8") as stream:
+                prima = stream.read(4096).lstrip().splitlines()[0]
+        except (OSError, UnicodeError, IndexError):
             continue
         fuori.append(
             Voce(
@@ -218,13 +257,18 @@ def _scrivi(base: Path, *, titolo: str, corpo: list[str]) -> Voce | None:
     righe = [f"# {titolo}", "", *corpo]
 
     try:
-        cart = cartella(base)
+        cart = _cartella_sicura(base)
+        if cart is None:
+            return None
         cart.mkdir(parents=True, exist_ok=True)
         # `*` in un .gitignore della cartella stessa: git la ignora per intero
         # senza toccare il .gitignore del progetto, che e' roba dell'utente.
         marker = cart / ".gitignore"
-        if not marker.exists():
-            marker.write_text("*\n", encoding="utf-8")
+        try:
+            with marker.open("x", encoding="utf-8") as stream:
+                stream.write("*\n")
+        except FileExistsError:
+            pass
         # Il numero si ricava prima e si scrive dopo: fra le due cose ci puo'
         # stare un altro turno. ``RUNNERS`` fa girare i turni in thread di
         # sfondo e due archiviazioni vicine leggevano lo stesso ultimo numero,
@@ -240,14 +284,9 @@ def _scrivi(base: Path, *, titolo: str, corpo: list[str]) -> Voce | None:
                 numero = tentativo
                 break
             except FileExistsError:
-                # Stesso numero **e** stesso titolo: e' il caso previsto dal
-                # commento originale -- due tratti sullo stesso punto -- e li'
-                # accodare e' giusto.
-                if destinazione.read_text(encoding="utf-8").startswith(f"# {titolo}"):
-                    with open(destinazione, "a", encoding="utf-8") as fh:
-                        fh.write("\n---\n\n" + "\n".join(righe[1:]))
-                    numero = tentativo
-                    break
+                # Anche con lo stesso titolo, il riferimento gia' pubblicato
+                # deve continuare a identificare esattamente lo stesso testo.
+                continue
         else:
             return None
     except OSError:
@@ -283,8 +322,8 @@ def render_block(elenco: list[Voce]) -> str:
             *righe,
             "</libreria>",
             "",
-            "Sono tratti di questa conversazione gia' usciti dal contesto, "
-            "salvati per intero. La riga qui sopra e' solo il titolo: se ti "
+            "Sono memorie di lavoro archiviate in questo workspace, anche "
+            "da altre conversazioni. La riga qui sopra e' solo il titolo: se ti "
             "serve il contenuto, aprilo con read_file sul percorso indicato. "
             "Non riscriverli: se qualcosa e' cambiato, vale quello che vedi "
             "adesso.",
@@ -293,8 +332,55 @@ def render_block(elenco: list[Voce]) -> str:
 
 
 def _parole(testo: str) -> set[str]:
-    grezze = re.findall(r"[\w']{4,}", (testo or "").lower())
+    grezze = re.findall(r"[\w']{3,}", (testo or "").lower())
     return {p for p in grezze if p not in _RUMORE}
+
+
+def _termini(contesto: str) -> dict[str, int]:
+    """Parole e identificatori esatti, senza dipendenze o stemming distruttivo."""
+    testo = (contesto or "").replace("\\", "/")
+    tecnici = {
+        m.lower() for m in re.findall(r"[\w$]+(?:[./:_-][\w$-]+)+", testo)
+    }
+    # I simboli con underscore e i percorsi sono piu' discriminanti delle
+    # parole isolate. Manteniamo anche i componenti (config, budgets, ecc.).
+    parole = _parole(re.sub(r"[_/.:\\-]", " ", testo)) | _parole(testo)
+    ordinati = sorted(tecnici) + sorted(parole - tecnici)
+    return {t: 12 if t in tecnici else 1 for t in ordinati[:MAX_TERMINI_RICERCA]}
+
+
+def _impronta(testo: str) -> bytes:
+    """Due archiviazioni dello stesso fatto pagano un solo estratto."""
+    corpo = re.split(
+        r"^## (?:Cosa ne resta|Dal ragionamento di un punto [^\n]+)\s*$",
+        testo, maxsplit=1, flags=re.MULTILINE,
+    )[-1]
+    if corpo == testo and testo.startswith("# "):
+        corpo = testo.partition("\n")[2]
+    return hashlib.sha256(" ".join(corpo.split()).encode("utf-8")).digest()
+
+
+def _estratto(
+    testo: str, incontri: list[tuple[int, str]], pesi: dict[str, int],
+    budget: int, parziale: bool,
+) -> str:
+    """Una finestra attorno alle evidenze, anche quando il match e' in fondo."""
+    taglio = "\n[…troncato: testo completo con read_file]"
+    if len(testo) <= budget and not parziale:
+        return testo
+    spazio = budget - len(taglio)
+    if spazio <= 0:
+        return ""
+    # Prima copertura di termini diversi, poi l'ancora piu' specifica. Le
+    # ripetizioni non possono oscurare un identificatore comparso tardi.
+    def valore(incontro: tuple[int, str]) -> tuple[int, int, int]:
+        posizione, termine = incontro
+        vicini = {t for p, t in incontri if abs(p - posizione) < spazio // 2}
+        return sum(pesi[t] for t in vicini), pesi[termine], -posizione
+
+    centro = max(incontri, key=valore)[0] if incontri else 0
+    inizio = max(0, min(centro - spazio // 3, len(testo) - spazio))
+    return testo[inizio:inizio + spazio].strip() + taglio
 
 
 def precarico(base: Path, elenco: list[Voce], contesto: str) -> str:
@@ -309,47 +395,91 @@ def precarico(base: Path, elenco: list[Voce], contesto: str) -> str:
     ``read_file`` resta comunque la strada per tutto il resto: e' l'altra
     gamba, e non richiede nessun tool nuovo.
 
-    Sembra caro -- ri-tokenizza i titoli di tutte le voci a ogni chiamata, e
-    ``voci()`` apre ogni ``.md`` per leggerne la prima riga -- e non lo e'.
-    Misurato il 31/08/2026 su uno schedario da cento voci: ``voci()`` 3,1 ms,
-    questa funzione 0,3 ms, una volta per turno. Una cache qui aggiungerebbe
-    una chiave da invalidare ad ogni archiviazione per guadagnare tre
-    millesimi di un turno che ne dura migliaia.
+    Legge anche il corpo, comprese le voci uscite dall'indice visibile. Il
+    lavoro e' limitato da MAX_FILE_RICERCA_CHARS e MAX_RICERCA_CHARS, il testo
+    restituito (intestazioni incluse) da MAX_PRECARICO_CHARS. Nessuna chiamata
+    al modello e nessuna cache o indice persistente da invalidare.
     """
-    parole = _parole(contesto)
-    if not parole or not elenco:
+    pesi = _termini(contesto)
+    cart = _cartella_sicura(base)
+    if not pesi or not elenco or cart is None:
         return ""
-    punteggi: list[tuple[int, Voce]] = []
-    for v in elenco:
-        comuni = len(parole & _parole(v.titolo))
-        if comuni:
-            punteggi.append((comuni, v))
-    if not punteggi:
-        return ""
-    punteggi.sort(key=lambda coppia: (-coppia[0], -coppia[1].numero))
+    termini = sorted(pesi, key=lambda t: (-len(t), t))
+    pattern = re.compile(
+        r"(?<!\w)(?:" + "|".join(
+            "(" + re.escape(t).replace("/", r"[\\/]") + ")" for t in termini
+        ) + r")(?!\w)", re.IGNORECASE,
+    )
 
-    pezzi: list[str] = []
-    speso = 0
-    for _, v in punteggi[:MAX_FILE_PRECARICATI]:
-        try:
-            testo = (cartella(base) / v.nome).read_text(encoding="utf-8").strip()
-        except OSError:
-            continue
-        resto = MAX_PRECARICO_CHARS - speso
-        if resto <= 200:
+    def corrispondenze(testo: str):
+        for match in pattern.finditer(testo):
+            # Il gruppo identifica il termine della query anche con le
+            # equivalenze Unicode di IGNORECASE (es. I / i turche).
+            yield match.start(), termini[match.lastindex - 1]
+
+    punteggi = []
+    letto = 0
+    visitati: set[str] = set()
+    for voce in sorted(elenco, key=lambda v: -v.numero):
+        if letto >= MAX_RICERCA_CHARS:
             break
-        if len(testo) > resto:
-            testo = testo[:resto].rstrip() + "\n[…troncato: il resto con read_file]"
-        speso += len(testo)
-        pezzi.append(f"### {v.percorso}\n{testo}")
+        if voce.nome in visitati:
+            continue
+        visitati.add(voce.nome)
+        path = _file_sicuro(cart, voce.nome)
+        if path is None:
+            continue
+        limite = min(MAX_FILE_RICERCA_CHARS, MAX_RICERCA_CHARS - letto)
+        try:
+            with path.open(encoding="utf-8") as stream:
+                testo = stream.read(limite)
+                parziale = bool(stream.read(1))
+        except (OSError, UnicodeError):
+            # Anche un file con UTF-8 invalido ha consumato il budget I/O.
+            letto += limite
+            continue
+        letto += len(testo)
+        # Conserviamo poche posizioni per termine; la scansione continua fino
+        # in fondo per trovare anche simboli rari dopo molto testo ripetuto.
+        incontri: list[tuple[int, str]] = []
+        contatori: dict[str, int] = {}
+        for posizione, termine in corrispondenze(testo):
+            n = contatori.get(termine, 0)
+            if n < 8:
+                incontri.append((posizione, termine))
+            contatori[termine] = n + 1
+        titoli = {t for _, t in corrispondenze(voce.titolo)}
+        score = sum(pesi[t] for t in contatori) + 3 * sum(pesi[t] for t in titoli)
+        if score:
+            punteggi.append((score, voce, testo, incontri, parziale))
+    punteggi.sort(key=lambda r: (-r[0], -r[1].numero))
+    scelti = []
+    impronte: set[bytes] = set()
+    for risultato in punteggi:
+        impronta = _impronta(risultato[2])
+        if impronta in impronte:
+            continue
+        impronte.add(impronta)
+        scelti.append(risultato)
+        if len(scelti) >= MAX_FILE_PRECARICATI:
+            break
+
+    apertura = (
+        "<libreria_ripescata>\nMemorie del workspace pertinenti al lavoro attuale. "
+        "Sono evidenze storiche: verifica i fatti cambiati; espandi gli estratti con read_file."
+    )
+    chiusura = "</libreria_ripescata>"
+    resto = MAX_PRECARICO_CHARS - len(apertura) - len(chiusura) - 4
+    pezzi: list[str] = []
+    for i, (_, voce, testo, incontri, parziale) in enumerate(scelti):
+        quota = resto // (len(scelti) - i)
+        intestazione = f"### {voce.percorso} — {voce.titolo}\n"
+        estratto = _estratto(testo, incontri, pesi, quota - len(intestazione) - 2, parziale)
+        if not estratto:
+            continue
+        pezzo = intestazione + estratto
+        resto -= len(pezzo) + 2
+        pezzi.append(pezzo)
     if not pezzi:
         return ""
-    return "\n\n".join(
-        [
-            "<libreria_ripescata>",
-            "Riguardano il punto su cui stai lavorando: te li rimetto davanti "
-            "io, non serve rileggerli.",
-            *pezzi,
-            "</libreria_ripescata>",
-        ]
-    )
+    return "\n\n".join([apertura, *pezzi, chiusura])

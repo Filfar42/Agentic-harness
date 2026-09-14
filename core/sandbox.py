@@ -31,6 +31,8 @@ Scelte di progetto
 
 from __future__ import annotations
 
+from .process import run_bounded, OutputLimitExceeded
+
 import hashlib
 import os
 import platform
@@ -38,9 +40,22 @@ import shlex
 import shutil
 import subprocess
 import time
+import threading
+from functools import wraps
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+_LIFECYCLE_LOCK = threading.RLock()
+
+
+def _serialized_lifecycle(function: Any) -> Any:
+    """Serialize Docker inspect/create/remove transactions in this process."""
+    @wraps(function)
+    def wrapped(*args: Any, **kwargs: Any) -> Any:
+        with _LIFECYCLE_LOCK:
+            return function(*args, **kwargs)
+    return wrapped
 
 # Immagine di default: piccola, con Python e i coreutils. Chi ha bisogno di
 # altro (nodejs, compilatori) punta l'impostazione a un'immagine propria.
@@ -223,10 +238,11 @@ def _run_docker(args: list[str], timeout: float = _DOCKER_TIMEOUT) -> subprocess
     avviare il processo, e a quello risponde la memo di ``ensure_container``.
     """
     try:
-        return subprocess.run(
-            ["docker", *args], capture_output=True, text=True,
-            encoding="utf-8", errors="replace", timeout=timeout,
+        return run_bounded(
+            [shutil.which("docker") or "docker", *args], timeout=timeout,
         )
+    except OutputLimitExceeded as exc:
+        raise SandboxError(str(exc)) from exc
     except FileNotFoundError as exc:
         raise SandboxError("Il comando 'docker' non e' nel PATH.") from exc
     except subprocess.TimeoutExpired as exc:
@@ -240,6 +256,7 @@ def _is_running(name: str) -> bool:
     return bool(proc.stdout.strip())
 
 
+@_serialized_lifecycle
 def _remove(name: str) -> None:
     dimentica_container(name)
     _run_docker(["rm", "--force", name], timeout=30)
@@ -322,6 +339,7 @@ def port_range(base: int, count: int) -> tuple[int, int] | None:
     return base, base + count - 1
 
 
+@_serialized_lifecycle
 def ensure_container(
     workspace: str | Path,
     *,
@@ -410,7 +428,8 @@ def ensure_container(
 
     if ports and network:
         lo, hi = ports
-        for ostacolo in _port_bind_conflittuali(name, lo, hi):
+        conflicts = _port_bind_conflittuali(name, lo, hi)
+        if conflicts:
             # Un container dell'harness di un ALTRO workspace tiene le nostre
             # porte (il suo server non e' mai stato fermato). Senza questo
             # passaggio ``docker run`` fallisce con "port is already allocated"
@@ -418,7 +437,8 @@ def ensure_container(
             # si puo' neppure vedere chi ce l'ha, perche' il proprio shell gira
             # dentro un container che non parte. Si rimuovono solo quelli con
             # la nostra etichetta: mai i contenitori di qualcun altro.
-            _remove(ostacolo)
+            raise SandboxError("Porte occupate da un altro workspace: " + ", ".join(conflicts)
+                               + ". Ferma esplicitamente l'anteprima o scegli altre porte.")
 
     proc = _run_docker(args, timeout=300)     # il primo avvio puo' scaricare l'immagine
     if proc.returncode != 0:
@@ -1173,6 +1193,7 @@ def build_image(workspace: str | Path) -> tuple[str, str]:
     return tag, log[-2000:]
 
 
+@_serialized_lifecycle
 def stop(workspace: str | Path) -> bool:
     """Ferma e rimuove il container del workspace. True se ce n'era uno."""
     name = container_name(workspace)

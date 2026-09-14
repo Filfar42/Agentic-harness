@@ -85,9 +85,9 @@ class TestLivelloArrivaAlBackend:
     def test_auto_non_manda_override(self, client, fake_ollama, script_risposta):
         # "auto" NON viaggia sulla rete: e' l'assenza di scelta, il server fa
         # come da impostazioni. Il frontend omette il campo; qui si verifica
-        # il contratto lato server: senza campo, nessun "think" al backend.
+        # il contratto lato server: senza override vale il False configurato.
         payload = _ultimo_payload(client, current_session(client))
-        assert "think" not in payload
+        assert payload["think"] is False
         # E il sorgente JS non serializza mai 'auto' come valore: il campo
         # parte solo per low/medium/high.
         js = (WEB / "app.js").read_text(encoding="utf-8")
@@ -96,7 +96,7 @@ class TestLivelloArrivaAlBackend:
     def test_assente_come_auto(self, client, fake_ollama, script_risposta):
         # I vecchi client non mandano il campo: stesso comportamento di "auto".
         payload = _ultimo_payload(client, current_session(client))
-        assert "think" not in payload
+        assert payload["think"] is False
 
     def test_valore_sconosciuto_rifiutato(self, client):
         r = client.post(
@@ -123,7 +123,7 @@ class TestLeImpostazioniNonSiToccano:
         assert client.server.STATE.settings["native_think"] == "auto"
 
     @pytest.mark.parametrize("salvata,livello,atteso", [
-        ("auto", None, "assente"),   # nessuna fonte: niente pensiero
+        ("auto", None, "assente"),   # nessuna capability: False esplicito
         ("auto", "high", "high"),    # la goccia vince sull'auto
         ("low", None, "low"),        # solo l'impostazione: vale lei
         ("medium", "high", "high"),  # la goccia vince sull'impostazione
@@ -134,7 +134,7 @@ class TestLeImpostazioniNonSiToccano:
         extra = {"think_level": livello} if livello is not None else {}
         payload = _ultimo_payload(client, current_session(client), **extra)
         if atteso == "assente":
-            assert "think" not in payload
+            assert payload["think"] is False
         else:
             assert payload["think"] == atteso
 

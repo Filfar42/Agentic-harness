@@ -10,6 +10,9 @@ il fake lo muta proprio come farebbe il vero ciclo.
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
+
+import pytest
 
 import tests.test_agent_loop as fake
 from core.config import GenParams
@@ -381,30 +384,85 @@ def test_esegui_passa_al_figlio_budget_stretti_e_finestra_larga(tmp_path):
 
 
 def test_budget_riferimento_valori_attesi_e_coerenza_col_prompt():
-    """Le costanti del prompt derivano dal riferimento base, con valori fissi."""
+    """Il prompt dichiara i limiti della taratura effettiva, compreso il suo tetto."""
     from core.config import BASE_NUM_CTX, budgets_for
     from core.delega import (
         MAX_LETTURA_FIGLIO,
         MAX_MATCHES_FIGLIO,
+        FATTORE_BUDGET_FIGLIO,
+        MIN_READ_FILE_CHARS,
         PROMPT_DELEGA,
         budget_riferimento,
         budget_stretti,
     )
 
     rif = budget_riferimento()
-    # Valori attesi espliciti alla taratura base (padre 16k -> figlio x1.5).
+    base = budgets_for(BASE_NUM_CTX)
+    # Il dimezzamento usa il budget effettivo del padre, senza il +50% del figlio.
     assert BASE_NUM_CTX == 16384
-    assert rif.read_file_max_chars == 6000
-    assert rif.search_max_matches == 40
+    assert rif.read_file_max_chars == max(
+        MIN_READ_FILE_CHARS, int(base.read_file_max_chars * FATTORE_BUDGET_FIGLIO)
+    )
+    assert rif.search_max_matches == max(10, base.search_max_matches // 2)
     # Le due costanti sono la proiezione del riferimento, e il prompt le cita.
-    assert MAX_LETTURA_FIGLIO == rif.read_file_max_chars == 6000
-    assert MAX_MATCHES_FIGLIO == rif.search_max_matches == 40
+    assert rif.read_file_max_chars == MAX_LETTURA_FIGLIO
+    assert rif.search_max_matches == MAX_MATCHES_FIGLIO
     assert f"ai primi {MAX_LETTURA_FIGLIO} caratteri" in PROMPT_DELEGA
     assert f"a {MAX_MATCHES_FIGLIO} corrispondenze" in PROMPT_DELEGA
     # Il riferimento e' esattamente il budget stretto sulla finestra base...
     assert rif == budget_stretti(budgets_for(BASE_NUM_CTX))
     # ...ed e' memoizzato: chiamate successive restituiscono lo stesso oggetto.
     assert budget_riferimento() is rif
+
+
+@pytest.mark.parametrize("window, ceiling", [(8192, 0), (16384, 32768), (65536, 8192)])
+def test_default_parent_budget_uses_parent_window_and_compaction_ceiling(tmp_path, window, ceiling):
+    from core.config import budgets_for
+    from core.delega import budget_stretti
+
+    @dataclass
+    class ParamsConTetto(GenParams):
+        compact_max_tokens: int = 32768
+
+    params = ParamsConTetto(num_ctx=window, compact_max_tokens=ceiling)
+    seen = {}
+
+    def child(**kwargs):
+        seen.update(kwargs)
+        kwargs["ui_messages"].append({"role": "assistant", "content": "referto"})
+        return iter(())
+
+    result = esegui(
+        "Trova la funzione", backend=object(), params=params, tools_schema=[],
+        tool_ctx=ToolContext(workspace=str(tmp_path), sandbox="host"), env_header=None,
+        run_turn=child, registra_esiti=False,
+    )
+    assert result["referto"] == "referto"
+    expected = budget_stretti(budgets_for(window, ceiling))
+    assert seen["budgets"] == expected
+    assert seen["tool_ctx"].budgets is seen["budgets"]
+    assert seen["params"].num_ctx == int(window * 1.5)
+
+
+def test_explicit_parent_budget_is_preserved_when_deriving_child_budget(tmp_path):
+    from core.config import Budgets
+    from core.delega import budget_stretti
+
+    parent_budget = Budgets(read_file_max_chars=8200, tool_result_max_chars=3900,
+                            search_max_matches=22, tool_result_full_window=4)
+    seen = {}
+
+    def child(**kwargs):
+        seen.update(kwargs)
+        kwargs["ui_messages"].append({"role": "assistant", "content": "referto"})
+        return iter(())
+
+    esegui(
+        "Trova la funzione", backend=object(), params=GenParams(num_ctx=65536), tools_schema=[],
+        tool_ctx=ToolContext(workspace=str(tmp_path), sandbox="host", budgets=parent_budget),
+        env_header=None, run_turn=child, registra_esiti=False,
+    )
+    assert seen["budgets"] == budget_stretti(parent_budget)
 
 
 # ---------------------------------------------------------------------------

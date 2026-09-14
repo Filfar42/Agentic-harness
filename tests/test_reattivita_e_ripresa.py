@@ -238,8 +238,16 @@ def test_gli_asset_cambiano_indirizzo_quando_cambiano(client):
     """
     html = client.get("/").text
     assert client.get("/").headers.get("Cache-Control") == "no-cache"
-    impronte = re.findall(r'/static/(app\.js|style\.css)\?v=([0-9a-f]{10})', html)
-    assert {n for n, _ in impronte} == {"app.js", "style.css"}, html[:400]
+    impronte = re.findall(
+        r"/static/(app\.js|style\.css|companion\.js|companion\.css)\?v=([0-9a-f]{10})", html
+    )
+    assert {n for n, _ in impronte} == {"app.js", "style.css", "companion.js", "companion.css"}, (
+        html[:400]
+    )
+    for nome, versione in impronte:
+        response = client.get(f"/static/{nome}?v={versione}")
+        assert response.status_code == 200
+        assert response.headers["Cache-Control"] == "no-cache"
     # E l'impronta segue il file: toccarlo cambia l'indirizzo, senza che
     # nessuno debba ricordarsi di alzare un numero a mano.
     from server import main as sm
@@ -269,9 +277,10 @@ def test_lo_stato_dell_endpoint_si_scrive_in_un_posto_solo():
     scritture = re.findall(r"\$\('#pill-status'\)\.(className|innerHTML|textContent)", js)
     corpo = js[js.index("function renderStatusPill(") :]
     corpo = corpo[: corpo.index("\n}\n")]
-    assert len(scritture) == len(
-        re.findall(r"pill\.(className|innerHTML|textContent)", corpo)
-    ) or not scritture
+    assert (
+        len(scritture) == len(re.findall(r"pill\.(className|innerHTML|textContent)", corpo))
+        or not scritture
+    )
 
     css = (WEB / "style.css").read_text(encoding="utf-8")
     assert ".pill.wait" in css, "«non lo so ancora» e' uno stato, non un avviso"
@@ -366,9 +375,7 @@ def test_il_timing_non_passa_da_basehttpmiddleware():
     # Solo le righe di codice: il commento sopra la classe spiega proprio
     # perche' quel decoratore non si usa, e nominarlo non e' usarlo.
     codice = "\n".join(r for r in sorgente.splitlines() if not r.lstrip().startswith(("#", "*")))
-    assert '@app.middleware("http")' not in codice.replace(
-        '``@app.middleware("http")``', ""
-    )
+    assert '@app.middleware("http")' not in codice.replace('``@app.middleware("http")``', "")
     assert "class ServerTiming:" in sorgente
     assert "app.add_middleware(ServerTiming)" in sorgente
 
@@ -413,13 +420,13 @@ def test_un_turno_che_finisce_mentre_ci_si_attacca_manda_comunque_il_done():
     from server.runner import TurnRunner
 
     runner = TurnRunner("sessione", snapshot=[])
-    runner.emit("data: {\"type\": \"start\"}\n\n")
+    runner.emit('data: {"type": "start"}\n\n')
     flusso = runner.stream()
-    primo = next(flusso)          # qui l'arretrato è appena stato fotografato
+    primo = next(flusso)  # qui l'arretrato è appena stato fotografato
 
     # ...e adesso, dentro la finestra, il turno finisce.
-    runner.emit("data: {\"type\": \"assistant\"}\n\n")
-    runner.emit("data: {\"type\": \"done\"}\n\n")
+    runner.emit('data: {"type": "assistant"}\n\n')
+    runner.emit('data: {"type": "done"}\n\n')
     runner.close()
 
     ricevuti = [primo, *flusso]

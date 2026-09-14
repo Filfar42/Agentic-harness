@@ -1,0 +1,2786 @@
+--- /dev/null
++++ b/scripts/build_brand_assets.cjs
+@@ -0,0 +1,116 @@
++#!/usr/bin/env node
++/**
++ * Rebuild the Harness identity from its native vector geometry.
++ *
++ * Requires Node.js >= 18 and sharp >= 0.33 (no browser or network requests).
++ * Run: node scripts/build_brand_assets.cjs
++ * If sharp is supplied by a shared runtime, set NODE_PATH to its node_modules.
++ *
++ * The 32-unit robot geometry is shared with web/companion.js. Raster exports
++ * are derived from SVG at their target sizes; existing bitmaps are never edited.
++ * PWA artwork fits the central maskable safe circle (radius 40% of the canvas).
++ */
++'use strict';
++
++const fs = require('node:fs/promises');
++const path = require('node:path');
++const sharp = require('sharp');
++
++const ROOT = path.resolve(__dirname, '..');
++const BRAND_DIR = path.join(ROOT, 'web', 'brand');
++const BODY = 'M11 8H21C25.418 8 29 11.582 29 16V21C29 25.418 25.418 29 21 29H11C6.582 29 3 25.418 3 21V16C3 11.582 6.582 8 11 8Z';
++const FACE = `<path d="${BODY}"/><rect x="15" y="3" width="2" height="5" rx="1"/><circle cx="16" cy="3" r="2"/>`;
++const EYES = '<rect x="9" y="15" width="4" height="6" rx="2"/><rect x="19" y="15" width="4" height="6" rx="2"/>';
++const THEMES = {
++  light: {face: '#1c2b30', eyes: '#ffffff', muted: '#4f646a'},
++  dark: {face: '#edf3f3', eyes: '#11181b', muted: '#b2c3c6'},
++};
++
++/** @param {{face: string, eyes: string}} theme @returns {string} */
++function robot(theme) {
++  return `<g fill="${theme.face}">${FACE}</g><g fill="${theme.eyes}">${EYES}</g>`;
++}
++
++/** @param {string} content @param {string} [viewBox] @returns {string} */
++function svg(content, viewBox = '0 0 32 32') {
++  return `<?xml version="1.0" encoding="UTF-8"?>\n<svg xmlns="http://www.w3.org/2000/svg" viewBox="${viewBox}" role="img" aria-labelledby="brand-title"><title id="brand-title">Local Agent Harness</title>${content}</svg>\n`;
++}
++
++/** @param {'light'|'dark'} themeName @returns {string} */
++function wordmark(themeName) {
++  const theme = THEMES[themeName];
++  return svg(`<g transform="translate(0 0) scale(2)">${robot(theme)}</g><g fill="${theme.face}" font-family="Segoe UI, Inter, Helvetica, Arial, sans-serif"><text x="78" y="36" font-size="32" font-weight="600" letter-spacing="-1">Harness</text><text x="79" y="54" fill="${theme.muted}" font-size="10.5" font-weight="500" letter-spacing="1">Local Agent Harness</text></g>`, '0 0 230 64');
++}
++
++/** Write a deterministic PNG and verify its dimensions and corner alpha.
++ * @param {string} filename
++ * @param {string} source
++ * @param {number} size
++ * @param {boolean} transparent
++ * @returns {Promise<void>}
++ */
++async function raster(filename, source, size, transparent) {
++  const destination = path.join(ROOT, filename);
++  await fs.mkdir(path.dirname(destination), {recursive: true});
++  await sharp(Buffer.from(source)).resize(size, size).png({compressionLevel: 9}).toFile(destination);
++  const metadata = await sharp(destination).metadata();
++  if (metadata.width !== size || metadata.height !== size || metadata.format !== 'png') {
++    throw new Error(`Invalid raster dimensions or format: ${filename}`);
++  }
++  const {data, info} = await sharp(destination).ensureAlpha().raw().toBuffer({resolveWithObject: true});
++  const cornerAlpha = data[info.channels - 1];
++  if (cornerAlpha !== (transparent ? 0 : 255)) {
++    throw new Error(`Unexpected corner alpha for ${filename}: ${cornerAlpha}`);
++  }
++  process.stdout.write(`${filename}: ${size} × ${size}, ${transparent ? 'transparent' : 'opaque'}\n`);
++}
++
++/** @returns {Promise<void>} */
++async function main() {
++  // Fail visibly if the animated and static identities drift apart.
++  const companion = await fs.readFile(path.join(ROOT, 'web', 'companion.js'), 'utf8');
++  if (!companion.includes(BODY)) throw new Error('Companion geometry changed; update the brand source before exporting.');
++  await fs.mkdir(BRAND_DIR, {recursive: true});
++  const marks = {
++    light: svg(robot(THEMES.light)),
++    dark: svg(robot(THEMES.dark)),
++  };
++  const monochrome = svg(`<defs><mask id="eye-cutouts"><rect width="32" height="32" fill="white"/><g fill="black">${EYES}</g></mask></defs><g fill="currentColor" mask="url(#eye-cutouts)">${FACE}</g>`);
++  const adaptive = svg(`<style>.face{fill:#1c2b30}.eyes{fill:#ffffff}@media(prefers-color-scheme:dark){.face{fill:#edf3f3}.eyes{fill:#11181b}}</style><g class="face">${FACE}</g><g class="eyes">${EYES}</g>`);
++  const pwa = svg(`<rect width="32" height="32" fill="#11181b"/><g transform="translate(4 4) scale(.75)">${robot({face: '#68d5c4', eyes: '#11181b'})}</g>`);
++  const vectors = {
++    'mark-light.svg': marks.light,
++    'mark-dark.svg': marks.dark,
++    'mark-mono.svg': monochrome,
++    'favicon.svg': adaptive,
++    'wordmark-light.svg': wordmark('light'),
++    'wordmark-dark.svg': wordmark('dark'),
++    'app-icon.svg': pwa,
++  };
++  for (const [name, source] of Object.entries(vectors)) {
++    await fs.writeFile(path.join(BRAND_DIR, name), source, 'utf8');
++  }
++  for (const size of [16, 32, 64]) {
++    await raster(`web/favicon-${size}.png`, marks.light, size, true);
++  }
++  for (const themeName of ['light', 'dark']) {
++    await raster(`web/logo-${themeName}-64.png`, marks[themeName], 64, true);
++    // Keep any historical unversioned raster aliases only when already present.
++    const legacy = `web/logo-${themeName}.png`;
++    try {
++      await fs.access(path.join(ROOT, legacy));
++      await raster(legacy, marks[themeName], 64, true);
++    } catch (error) {
++      if (error.code !== 'ENOENT') throw error;
++    }
++  }
++  for (const [filename, size] of [['icon-192.png', 192], ['icon-512.png', 512], ['apple-touch-icon.png', 180]]) {
++    await raster(`web_mobile/icons/${filename}`, pwa, size, false);
++  }
++  process.stdout.write(`Exported ${Object.keys(vectors).length} native SVG assets.\n`);
++}
++
++main().catch((error) => {
++  process.stderr.write(`Brand build failed: ${error.message}\n`);
++  process.exitCode = 1;
++});
+--- /dev/null
++++ b/scripts/check_visual_contrast.py
+@@ -0,0 +1,425 @@
++"""Measure the committed UI palette, including composite state backgrounds.
++
++Run ``python scripts/check_visual_contrast.py --write-report`` from any folder.
++The checker uses only the standard library, reads the actual CSS tokens, and
++exits nonzero when a measured pair fails. It is a palette regression check,
++not an automated assertion of complete WCAG conformance or rendered CSS audit.
++"""
++
++from __future__ import annotations
++
++import argparse
++import re
++from dataclasses import dataclass
++from pathlib import Path
++
++ROOT = Path(__file__).resolve().parents[1]
++RGB = tuple[float, float, float]
++
++
++@dataclass(frozen=True)
++class Color:
++    """An sRGB color with optional alpha; channel values are in [0, 1]."""
++
++    rgb: RGB
++    alpha: float = 1.0
++
++    def over(self, background: Color) -> Color:
++        """Composite over an opaque background in CSS's sRGB color space."""
++        if background.alpha != 1:
++            raise ValueError("The backing color must be opaque")
++        values = tuple(
++            foreground * self.alpha + backing * (1 - self.alpha)
++            for foreground, backing in zip(self.rgb, background.rgb, strict=True)
++        )
++        return Color((values[0], values[1], values[2]))
++
++    def opacity(self, value: float) -> Color:
++        """Apply element opacity to the foreground for an explicit test case."""
++        if not 0 <= value <= 1:
++            raise ValueError("Opacity outside [0, 1]")
++        return Color(self.rgb, self.alpha * value)
++
++    @property
++    def hex(self) -> str:
++        """Return rounded display values; comparisons retain full precision."""
++        return "#" + "".join(f"{round(channel * 255):02x}" for channel in self.rgb)
++
++
++def luminance(color: Color) -> float:
++    """Return relative luminance using the WCAG sRGB transfer function."""
++    channels = [
++        value / 12.92 if value <= 0.04045 else ((value + 0.055) / 1.055) ** 2.4
++        for value in color.rgb
++    ]
++    return sum(
++        channel * weight for channel, weight in zip(channels, (0.2126, 0.7152, 0.0722), strict=True)
++    )
++
++
++def contrast(foreground: Color, background: Color) -> float:
++    """Return contrast after compositing any foreground transparency."""
++    light, dark = sorted(
++        (luminance(foreground.over(background)), luminance(background)), reverse=True
++    )
++    return (light + 0.05) / (dark + 0.05)
++
++
++def clean_css(path: Path) -> str:
++    """Read CSS and remove comments before matching declarations."""
++    return re.sub(r"/\*.*?\*/", "", path.read_text(encoding="utf-8"), flags=re.S)
++
++
++def block(css: str, selector: str) -> str:
++    """Return the final block for an exact selector in these non-nested files."""
++    matches = re.findall(r"(?:^|})\s*" + re.escape(selector) + r"\s*\{([^{}]*)}", css)
++    if not matches:
++        raise ValueError(f"CSS selector not found: {selector}")
++    return matches[-1]
++
++
++def declaration(css: str, selector: str, property_name: str) -> str:
++    """Read one required declaration, failing rather than inventing a default."""
++    bodies = re.findall(r"(?:^|})\s*" + re.escape(selector) + r"\s*\{([^{}]*)}", css)
++    matches = [
++        value
++        for body in bodies
++        for value in re.findall(r"(?:^|;)\s*" + re.escape(property_name) + r"\s*:\s*([^;]+)", body)
++    ]
++    if not matches:
++        raise ValueError(f"Missing {property_name} in {selector}")
++    return matches[-1].strip()
++
++
++class Palette:
++    """Resolve this project's hexadecimal, rgba and alias color tokens."""
++
++    def __init__(self, css: str, selector: str = ":root") -> None:
++        root = dict(re.findall(r"(--[\w-]+)\s*:\s*([^;]+);", block(css, ":root")))
++        if selector != ":root":
++            root.update(re.findall(r"(--[\w-]+)\s*:\s*([^;]+);", block(css, selector)))
++        self.tokens = root
++
++    def color(self, value: str, seen: frozenset[str] = frozenset()) -> Color:
++        """Resolve a supported color; reject unknown expressions and cycles."""
++        value = value.strip()
++        alias = re.fullmatch(r"var\((--[\w-]+)\)", value)
++        if alias:
++            value = alias.group(1)
++        if value.startswith("--"):
++            if value in seen:
++                raise ValueError(f"Cyclic color token: {value}")
++            return self.color(self.tokens[value], seen | {value})
++        if re.fullmatch(r"#[\da-fA-F]{6}", value):
++            return Color(tuple(int(value[index : index + 2], 16) / 255 for index in (1, 3, 5)))
++        rgba = re.fullmatch(r"rgba?\(([^)]+)\)", value)
++        if rgba:
++            values = [float(part.strip()) for part in rgba.group(1).split(",")]
++            if len(values) in (3, 4) and all(0 <= v <= 255 for v in values[:3]):
++                alpha = values[3] if len(values) == 4 else 1
++                if 0 <= alpha <= 1:
++                    return Color((values[0] / 255, values[1] / 255, values[2] / 255), alpha)
++        raise ValueError(f"Unsupported CSS color: {value}")
++
++
++@dataclass(frozen=True)
++class Measurement:
++    """A deliberately selected semantic foreground/background pair."""
++
++    theme: str
++    group: str
++    label: str
++    foreground: Color
++    background: Color
++    minimum: float = 4.5
++
++    @property
++    def ratio(self) -> float:
++        return contrast(self.foreground, self.background)
++
++    @property
++    def passed(self) -> bool:
++        return self.ratio >= self.minimum
++
++
++def desktop_cases(css: str, theme: str) -> list[Measurement]:
++    """Cover text, status tints, primary actions, control boundaries and focus."""
++    palette = Palette(css, ":root" if theme == "Desktop light" else 'html[data-theme="dark"]')
++    results: list[Measurement] = []
++
++    def add(
++        group: str, label: str, foreground: Color, background: Color, minimum: float = 4.5
++    ) -> None:
++        results.append(Measurement(theme, group, label, foreground, background, minimum))
++
++    surfaces = (
++        "bg",
++        "bg-subtle",
++        "surface",
++        "surface-alt",
++        "hover-bg",
++        "selected-bg",
++        "accent-soft",
++        "code-bg",
++    )
++    for foreground in ("text", "text-muted", "text-faint", "accent", "ok", "warn", "err"):
++        for background in surfaces:
++            add(
++                f"Testo --{foreground}",
++                f"--{foreground} / --{background}",
++                palette.color(f"--{foreground}"),
++                palette.color(f"--{background}"),
++            )
++    for background in ("accent", "accent-hover"):
++        add(
++            "Azioni primarie",
++            f"--on-accent / --{background}",
++            palette.color("--on-accent"),
++            palette.color(f"--{background}"),
++        )
++    for background in ("text-muted", "err"):
++        add(
++            "Interruzione",
++            f"--surface / --{background}",
++            palette.color("--surface"),
++            palette.color(f"--{background}"),
++        )
++    for background in ("bg", "bg-subtle", "surface", "surface-alt"):
++        add(
++            "Contorni controlli",
++            f"--control-border / --{background}",
++            palette.color("--control-border"),
++            palette.color(f"--{background}"),
++            3,
++        )
++    for background in surfaces:
++        add(
++            "Focus e selezione",
++            f"--focus-ring / --{background}",
++            palette.color("--focus-ring"),
++            palette.color(f"--{background}"),
++            3,
++        )
++    for state in ("ok", "warn"):
++        background = palette.color(f"--tint-{state}").over(palette.color("--surface"))
++        for foreground in (state, "text-faint"):
++            add(
++                "Piano: tinte di stato",
++                f"--{foreground} / --tint-{state} su --surface",
++                palette.color(f"--{foreground}"),
++                background,
++            )
++    error_background = palette.color("--err").opacity(0.08).over(palette.color("--surface"))
++    add("Errore: tinta", "--err / --err 8% su --surface", palette.color("--err"), error_background)
++    opacity = float(declaration(css, ".hint-inline", "opacity"))
++    for background in ("surface", "bg-subtle"):
++        add(
++            "Note inline con opacità",
++            f"--text-faint (opacity {opacity:g}) / --{background}",
++            palette.color("--text-faint").opacity(opacity),
++            palette.color(f"--{background}"),
++        )
++    opacity = float(declaration(css, "details.drawer > summary .chev", "opacity"))
++    for foreground in ("text-muted", "accent"):
++        add(
++            "Chevron espansione",
++            f"--{foreground} (opacity {opacity:g}) / --surface-alt",
++            palette.color(f"--{foreground}").opacity(opacity),
++            palette.color("--surface-alt"),
++            3,
++        )
++    return results
++
++
++def mobile_cases(css: str) -> list[Measurement]:
++    """Include pressed actions, messages, code tint and activity opacity."""
++    palette = Palette(css)
++    results: list[Measurement] = []
++
++    def add(
++        group: str, label: str, foreground: Color, background: Color, minimum: float = 4.5
++    ) -> None:
++        results.append(Measurement("Mobile dark", group, label, foreground, background, minimum))
++
++    for foreground in ("testo", "testo-dim"):
++        for background in ("bg", "panel", "panel-hover", "utente"):
++            add(
++                f"Testo --{foreground}",
++                f"--{foreground} / --{background}",
++                palette.color(f"--{foreground}"),
++                palette.color(f"--{background}"),
++            )
++    for background in ("accento", "accento-hover", "accento-active"):
++        add(
++            "Azioni primarie",
++            f"--su-accento / --{background}",
++            palette.color("--su-accento"),
++            palette.color(f"--{background}"),
++        )
++    for name, background in (
++        ("Normale", palette.color("--stop")),
++        ("Premuto", palette.color(declaration(css, ".stop:active", "background"))),
++    ):
++        add("Interruzione", name, palette.color("--su-stop"), background)
++    for background in ("bg", "panel", "panel-hover"):
++        add(
++            "Contorni controlli",
++            f"--bordo-control / --{background}",
++            palette.color("--bordo-control"),
++            palette.color(f"--{background}"),
++            3,
++        )
++        add(
++            "Focus e selezione",
++            f"--accento / --{background}",
++            palette.color("--accento"),
++            palette.color(f"--{background}"),
++            3,
++        )
++    add(
++        "Errore: banner",
++        "--errore / --errore-bg",
++        palette.color("--errore"),
++        palette.color("--errore-bg"),
++    )
++    opacity = float(declaration(css, ".passo", "opacity"))
++    for foreground in ("testo-dim", "errore"):
++        add(
++            "Passi con opacità",
++            f"--{foreground} (opacity {opacity:g}) / --bg",
++            palette.color(f"--{foreground}").opacity(opacity),
++            palette.color("--bg"),
++        )
++    for background in ("panel", "utente"):
++        tint = palette.color(declaration(css, ".msg code", "background")).over(
++            palette.color(f"--{background}")
++        )
++        add(
++            "Codice inline",
++            f"--testo / .msg code su --{background}",
++            palette.color("--testo"),
++            tint,
++        )
++    for selector, foreground in (
++        (".msg.pending", "testo"),
++        (".msg.pending.risposta-data", "testo-dim"),
++    ):
++        tint = palette.color(declaration(css, selector, "background")).over(palette.color("--bg"))
++        add(
++            "Domande e risposte",
++            f"--{foreground} / {selector}",
++            palette.color(f"--{foreground}"),
++            tint,
++        )
++    # The badge's entire box fades: composite both text and fill at its minimum.
++    frames = re.search(r"@keyframes respira\s*\{(.*?)\n}", css, flags=re.S)
++    if frames is None:
++        raise ValueError("Missing badge animation keyframes")
++    opacity = min(float(value) for value in re.findall(r"opacity:\s*([.\d]+)", frames.group(1)))
++    backdrop = palette.color("--panel")
++    badge = palette.color(declaration(css, ".badge-running", "background"))
++    add(
++        "Badge attività",
++        f"--ok / badge, opacità minima {opacity:g}",
++        palette.color("--ok").opacity(opacity).over(backdrop),
++        badge.opacity(opacity).over(backdrop),
++    )
++    return results
++
++
++def report(measurements: list[Measurement]) -> str:
++    """Write a compact worst-case summary plus a reproducible complete matrix."""
++    failures = [case for case in measurements if not case.passed]
++    lines = [
++        "# Verifica del contrasto — Graphite / Mineral",
++        "",
++        f"**{len(measurements) - len(failures)}/{len(measurements)} combinazioni conformi alla soglia misurata.**",
++        "",
++        "Il controllo legge i token correnti di `web/style.css` e `web_mobile/style.css`. "
++        "Misura testo normale, metadati, stati hover/selezionati, azioni premute, tinte "
++        "composite, opacità esplicite e indicatori di focus. Non assume l'esenzione per testo grande: "
++        "usa 4.5:1 per tutto il testo, anche quello più piccolo. La soglia è quella di "
++        "[WCAG 2.1, contrasto minimo](https://www.w3.org/WAI/WCAG21/Understanding/contrast-minimum.html).",
++        "",
++        "Per contorni funzionali, icone significative e focus usa 3:1 rispetto allo sfondo "
++        "adiacente, secondo [WCAG 2.1, contrasto non testuale](https://www.w3.org/WAI/WCAG21/Understanding/non-text-contrast.html). "
++        "I separatori decorativi `--border`, i loghi e i controlli disabilitati non sono trattati "
++        "come contorni funzionali. Gli stati selezionati usano l'accento come indicatore.",
++        "",
++        "È una verifica della palette e delle combinazioni elencate, **non una certificazione "
++        "WCAG completa**. Non dimostra da sola semantica accessibile, navigazione da tastiera, "
++        "assenza di sovrapposizioni, comportamento dei componenti nativi, contrasto di contenuti "
++        "caricati dall'utente o contrasto durante ogni fotogramma delle transizioni. "
++        "Il testo delle aree scorrevoli non viene piu' sfumato da maschere CSS.",
++        "",
++        "## Riproduzione",
++        "",
++        "```powershell",
++        ".venv\\Scripts\\python.exe scripts/check_visual_contrast.py --write-report",
++        "```",
++        "",
++        "Nessuna dipendenza esterna. L'esito restituisce codice 1 se una coppia fallisce. "
++        "Le tinte vengono composte in sRGB prima del calcolo della luminanza; il confronto "
++        "usa valori non arrotondati. I rapporti e gli esadecimali mostrati sono arrotondati.",
++        "",
++        "## Minimo per famiglia",
++        "",
++        "| Tema | Famiglia | Peggiore combinazione | Rapporto | Soglia | Esito |",
++        "| --- | --- | --- | ---: | ---: | --- |",
++    ]
++    groups = dict.fromkeys((case.theme, case.group) for case in measurements)
++    for theme, group in groups:
++        worst = min(
++            (case for case in measurements if case.theme == theme and case.group == group),
++            key=lambda case: case.ratio,
++        )
++        lines.append(
++            f"| {theme} | {group} | {worst.label} | {worst.ratio:.2f}:1 | {worst.minimum:g}:1 | {'PASS' if worst.passed else 'FAIL'} |"
++        )
++    lines.extend(
++        [
++            "",
++            "## Matrice completa",
++            "",
++            "<details>",
++            "<summary>Mostra tutte le combinazioni misurate</summary>",
++            "",
++            "| Tema | Combinazione | Testo/segno effettivo | Sfondo effettivo | Rapporto | Soglia | Esito |",
++            "| --- | --- | --- | --- | ---: | ---: | --- |",
++        ]
++    )
++    for case in measurements:
++        lines.append(
++            f"| {case.theme} | {case.label} | {case.foreground.over(case.background).hex} | {case.background.hex} | {case.ratio:.2f}:1 | {case.minimum:g}:1 | {'PASS' if case.passed else 'FAIL'} |"
++        )
++    lines.extend(["", "</details>", ""])
++    return "\n".join(lines)
++
++
++def main() -> int:
++    """Measure current sources, optionally regenerate the report, and set status."""
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument(
++        "--write-report", action="store_true", help="Regenerate docs/brand/CONTRAST.md"
++    )
++    args = parser.parse_args()
++    desktop = clean_css(ROOT / "web/style.css")
++    mobile = clean_css(ROOT / "web_mobile/style.css")
++    measurements = (
++        desktop_cases(desktop, "Desktop light")
++        + desktop_cases(desktop, "Desktop dark")
++        + mobile_cases(mobile)
++    )
++    if args.write_report:
++        path = ROOT / "docs/brand/CONTRAST.md"
++        path.parent.mkdir(parents=True, exist_ok=True)
++        path.write_text(report(measurements), encoding="utf-8")
++    failures = [case for case in measurements if not case.passed]
++    for case in failures:
++        print(f"FAIL {case.theme}: {case.label}: {case.ratio:.3f}:1 < {case.minimum:g}:1")
++    print(f"Contrast checks: {len(measurements) - len(failures)}/{len(measurements)} passed")
++    return bool(failures)
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+--- /dev/null
++++ b/scripts/visual_preview.py
+@@ -0,0 +1,221 @@
++"""Serve the real UI with explicitly simulated content for visual review.
++
++No agent, command, model request, real session or user preference is touched.
++Run python scripts/visual_preview.py, then open http://127.0.0.1:8137.
++The UI sources are the production sources; only API responses are fixtures.
++"""
++
++from __future__ import annotations
++
++import asyncio
++import json
++import sys
++from pathlib import Path
++
++import uvicorn
++from fastapi import FastAPI, Request
++from fastapi.responses import HTMLResponse, StreamingResponse
++from fastapi.staticfiles import StaticFiles
++
++ROOT = Path(__file__).resolve().parents[1]
++sys.path.insert(0, str(ROOT))
++from core.config import DEFAULTS  # noqa: E402 -- support direct execution from scripts/
++
++app = FastAPI(title="Harness visual preview — simulated data")
++app.mount("/static", StaticFiles(directory=ROOT / "web"), name="desktop")
++app.mount("/mobile-static", StaticFiles(directory=ROOT / "web_mobile"), name="mobile")
++app.mount("/brand", StaticFiles(directory=ROOT / "docs" / "brand"), name="brand")
++SETTINGS = {
++    **DEFAULTS,
++    "workspace_dir": "D:/Workspace/Atlas",
++    "model_name": "qwen3:32b",
++    "theme_mode": "light",
++    "docker_autostart": False,
++    "system_prompt": "Visual preview",
++}
++SESSIONS = [
++    {
++        "id": "design",
++        "title": "Raffinamento del design system",
++        "updated_at": "2026-09-06T16:20:00",
++        "n_messages": 8,
++        "running": False,
++    },
++    {
++        "id": "review",
++        "title": "Revisione del flusso di autenticazione",
++        "updated_at": "2026-09-06T15:10:00",
++        "n_messages": 12,
++    },
++    {
++        "id": "docs",
++        "title": "Documentazione delle API",
++        "updated_at": "2026-09-05T11:30:00",
++        "n_messages": 6,
++    },
++]
++PLAN = [
++    {
++        "id": 1,
++        "text": "Verificare palette e contrasti",
++        "status": "done",
++        "note": "Coppie colore misurate",
++    },
++    {
++        "id": 2,
++        "text": "Rifinire gli stati interattivi",
++        "status": "done",
++        "note": "Focus e feedback uniformi",
++    },
++    {
++        "id": 3,
++        "text": "Controllare light e dark mode",
++        "status": "todo",
++        "note": "Revisione finale",
++    },
++]
++MESSAGES = [
++    {
++        "role": "user",
++        "content": "Rifinisci il design system mantenendo il layout. Controlla i contrasti e gli stati dei componenti.",
++    },
++    {
++        "role": "assistant",
++        "content": "Ho verificato i componenti principali e definito una palette coerente. Mantengo la struttura attuale e concentro le modifiche su **leggibilità, contrasto e feedback**.",
++        "tool_calls": [
++            {
++                "id": "read1",
++                "type": "function",
++                "function": {"name": "read_file", "arguments": '{"filepath":"web/style.css"}'},
++            }
++        ],
++    },
++    {
++        "role": "tool",
++        "name": "read_file",
++        "tool_call_id": "read1",
++        "args": {"filepath": "web/style.css"},
++        "content": json.dumps(
++            {
++                "filepath": "web/style.css",
++                "content": ":root {\n  --accent: #0b7169;\n  --text: #1c2b30;\n}",
++            }
++        ),
++        "duration_s": 0.08,
++        "ok": True,
++    },
++    {
++        "role": "assistant",
++        "content": "La revisione è pronta per il controllo visivo.\n\n- Gerarchie più nitide, anche nei testi secondari.\n- Focus da tastiera sempre riconoscibile.\n- Transizioni brevi e movimento ridotto rispettato.\n\n```css\n--motion-fast: 160ms;\n--motion-ui: 200ms;\n--ease-out: cubic-bezier(.2, .75, .25, 1);\n```\n\nIl comportamento dell'agente e la disposizione dei pannelli restano quelli esistenti.",
++    },
++]
++
++
++def payload(session_id: str = "design") -> dict:
++    """Return a fully local, deterministic visual fixture."""
++    messages = [] if session_id == "new" else MESSAGES
++    return {
++        "session_id": session_id,
++        "messages": messages,
++        "messages_offset": 0,
++        "messages_total": len(messages),
++        "running": False,
++        "pending": None,
++        "plan": PLAN if messages else [],
++        "notes": [],
++        "preview": None,
++        "workspace_dir": SETTINGS["workspace_dir"],
++        "model": SETTINGS["model_name"],
++        "session_workspace": SETTINGS["workspace_dir"],
++        "stats": {
++            "session_id": session_id,
++            "context_used": 6240,
++            "context_window": 32768,
++            "attachments": [],
++            "touched_files": ["web/style.css", "web/index.html"] if messages else [],
++            "sessions": SESSIONS,
++        },
++    }
++
++
++@app.get("/")
++def desktop(baseline: bool = False) -> HTMLResponse:
++    """Optional original CSS permits a geometry comparison against the same fixture."""
++    markup = (ROOT / "web" / "index.html").read_text(encoding="utf-8")
++    if baseline:
++        markup = markup.replace("/static/style.css", "/brand/qa/before-desktop.css")
++    for asset in ("app.js", "style.css", "companion.js", "companion.css"):
++        version = (ROOT / "web" / asset).stat().st_mtime_ns
++        markup = markup.replace(f'/static/{asset}"', f'/static/{asset}?v={version}"')
++    return HTMLResponse(markup, headers={"Cache-Control": "no-store"})
++
++
++@app.get("/mobile")
++def mobile() -> HTMLResponse:
++    markup = (ROOT / "web_mobile" / "index.html").read_text(encoding="utf-8")
++    markup = markup.replace('"/static/', '"/mobile-static/')
++    for asset in ("app.js", "style.css"):
++        version = (ROOT / "web_mobile" / asset).stat().st_mtime_ns
++        markup = markup.replace(f'/mobile-static/{asset}"', f'/mobile-static/{asset}?v={version}"')
++    return HTMLResponse(markup, headers={"Cache-Control": "no-store"})
++
++
++@app.get("/api/events")
++async def events() -> StreamingResponse:
++    async def keepalive():
++        while True:
++            yield ": visual preview\n\n"
++            await asyncio.sleep(12)
++
++    return StreamingResponse(keepalive(), media_type="text/event-stream")
++
++
++@app.api_route("/api/{path:path}", methods=["GET", "POST", "DELETE"])
++async def fixture(path: str, request: Request) -> dict:
++    backend = {
++        "name": "Ollama",
++        "online": True,
++        "models": ["qwen3:32b"],
++        "model_name": "qwen3:32b",
++        "url": "http://127.0.0.1:11434",
++        "detail": "Anteprima con dati simulati",
++    }
++    if path == "bootstrap":
++        return {
++            "app": {"name": "Local Agent Harness", "version": "2.36.1"},
++            "settings": SETTINGS,
++            "session": payload(),
++            "memories": [],
++            "backend": backend,
++        }
++    if path in {"backend", "models", "ping"}:
++        return backend
++    if path == "sessions":
++        return payload("new") if request.method == "POST" else {"sessions": SESSIONS}
++    if path.startswith("sessions/"):
++        return payload(path.split("/")[1])
++    if path == "sandbox":
++        return {
++            "mode": "docker",
++            "available": True,
++            "running": True,
++            "detail": "Sandbox simulata per anteprima visiva",
++            "workdir": "/workspace",
++            "project_image": "harness-workspace:latest",
++            "network": False,
++        }
++    if path == "settings":
++        body = await request.json()
++        SETTINGS.update(body.get("values", {}))
++        return {"settings": SETTINGS, "ok": True}
++    if path == "vaults":
++        return {"vaults": []}
++    if path == "memories":
++        return {"memories": []}
++    if path == "chat":
++        return {"ok": False, "detail": "Anteprima visiva: invio disabilitato."}
++    return {"ok": True, "checks": [], "ready": True}
++
++
++if __name__ == "__main__":
++    uvicorn.run(app, host="127.0.0.1", port=8137, log_level="warning")
+--- a/server/main.py
++++ b/server/main.py
+@@ -1465,7 +1465,7 @@
+     resta apribile a mano durante lo sviluppo.
+     """
+     html = (WEB_DIR / "index.html").read_text(encoding="utf-8")
+-    for nome in ("app.js", "style.css"):
++    for nome in ("app.js", "style.css", "companion.js", "companion.css"):
+         html = html.replace(f"/static/{nome}", f"/static/{nome}?v={_impronta(nome)}")
+     return Response(
+         html,
+--- /dev/null
++++ b/tests/test_companion.py
+@@ -0,0 +1,555 @@
++"""Exercise the real mascot controller with a DOM and a deterministic clock.
++
++These tests check lifecycle and distraction limits, not CSS implementation details.
++The clock runs expired callbacks in deadline order so an accidental recurring
++animation fails without spending real time. Rendering and layout need browser QA.
++"""
++
++from __future__ import annotations
++
++import json
++import re
++from pathlib import Path
++
++import pytest
++
++quickjs = pytest.importorskip("quickjs")
++SOURCE = Path(__file__).resolve().parents[1] / "web" / "companion.js"
++
++DOM_AND_CLOCK = r"""
++class EventTarget {
++  constructor() { this.listeners = []; }
++  addEventListener(type, callback, options = false) {
++    const capture = typeof options === 'boolean' ? options : Boolean(options.capture);
++    this.listeners.push({type, callback, capture});
++  }
++  removeEventListener(type, callback, options = false) {
++    const capture = typeof options === 'boolean' ? options : Boolean(options.capture);
++    this.listeners = this.listeners.filter(item =>
++      !(item.type === type && item.callback === callback && item.capture === capture));
++  }
++  dispatch(type, event = {}) {
++    [...this.listeners].filter(item => item.type === type).forEach(item => item.callback(event));
++  }
++}
++class Node extends EventTarget {
++  constructor(tag, nodeType = 1) {
++    super();
++    this.tag = tag;
++    this.nodeType = nodeType;
++    this.childNodes = [];
++    this.parentNode = null;
++    this.attributes = {};
++    this.dataset = {};
++    this.style = {};
++    this.isContentEditable = false;
++    this.editingAncestor = null;
++    const classes = new Set();
++    this.classList = {
++      add(name) { classes.add(name); },
++      remove(name) { classes.delete(name); },
++      contains(name) { return classes.has(name); },
++      toggle(name, force) {
++        const present = force === undefined ? !classes.has(name) : Boolean(force);
++        if (present) classes.add(name); else classes.delete(name);
++        return present;
++      },
++    };
++  }
++  appendChild(node) {
++    node.remove();
++    this.childNodes.push(node);
++    node.parentNode = this;
++    return node;
++  }
++  append(...nodes) { nodes.forEach(node => this.appendChild(node)); }
++  set innerHTML(value) {
++    if (value !== '') throw new Error('This harness only models empty innerHTML');
++    [...this.childNodes].forEach(node => node.remove());
++  }
++  remove() {
++    if (!this.parentNode) return;
++    const siblings = this.parentNode.childNodes;
++    siblings.splice(siblings.indexOf(this), 1);
++    this.parentNode = null;
++  }
++  setAttribute(name, value) { this.attributes[name] = String(value); }
++  getAttribute(name) { return this.attributes[name] ?? null; }
++  removeAttribute(name) { delete this.attributes[name]; }
++  closest() {
++    if (['input', 'textarea', 'select'].includes(this.tag)) return this;
++    if (this.getAttribute('role') === 'textbox') return this;
++    return this.editingAncestor;
++  }
++}
++var host = new Node('div');
++var otherHost = new Node('div');
++var original = new Node('img');
++var caption = new Node('#text', 3);
++var clicks = 0;
++original.addEventListener('click', () => { clicks += 1; });
++host.appendChild(original);
++host.appendChild(caption);
++var otherOriginal = new Node('img');
++otherHost.appendChild(otherOriginal);
++var document = new EventTarget();
++document.hidden = false;
++document.activeElement = null;
++document.querySelector = selector => {
++  if (selector === '#sidebar .logo') return host;
++  if (selector === '#other') return otherHost;
++  if (selector === '[') throw new SyntaxError('Invalid selector');
++  return null;
++};
++document.createElementNS = (namespace, tag) => new Node(tag);
++var motion = new EventTarget();
++motion.matches = false;
++motion.addListener = callback => motion.addEventListener('change', callback);
++motion.removeListener = callback => motion.removeEventListener('change', callback);
++var now = 0;
++var sequence = 0;
++var timers = new Map();
++var window = {
++  matchMedia: () => motion,
++  setTimeout(callback, delay) {
++    const id = ++sequence;
++    timers.set(id, {callback, deadline: now + delay});
++    return id;
++  },
++  clearTimeout(id) { timers.delete(id); },
++};
++function advance(milliseconds) {
++  const target = now + milliseconds;
++  let callbacks = 0;
++  while (true) {
++    const due = [...timers].filter(([, timer]) => timer.deadline <= target)
++      .sort((a, b) => a[1].deadline - b[1].deadline || a[0] - b[0]);
++    if (!due.length) break;
++    if (++callbacks > 100) throw new Error('Unexpected recurring timers');
++    const [id, timer] = due[0];
++    timers.delete(id);
++    now = timer.deadline;
++    timer.callback();
++  }
++  now = target;
++}
++function graphic() { return host.childNodes[0]; }
++function gesture() { return graphic().getAttribute('data-gesture'); }
++function hide(value) { document.hidden = value; document.dispatch('visibilitychange'); }
++function reduce(value) { motion.matches = value; motion.dispatch('change'); }
++"""
++
++
++@pytest.fixture
++def js() -> quickjs.Context:
++    """Load the whole production module; no controller functions are mocked."""
++    context = quickjs.Context()
++    context.eval(DOM_AND_CLOCK)
++    context.eval(SOURCE.read_text(encoding="utf-8"))
++    context.eval("var companion = window.HarnessCompanion;")
++    return context
++
++
++def test_mount_is_decorative_and_destroy_restores_original_nodes_and_listeners(js) -> None:
++    assert js.eval("companion.init()") is True
++    assert js.eval("host.childNodes.length") == 1
++    assert js.eval("graphic().getAttribute('aria-hidden')") == "true"
++    assert js.eval("graphic().getAttribute('focusable')") == "false"
++    assert js.eval("host.classList.contains('harness-companion-host')") is True
++    js.eval("companion.destroy(); original.dispatch('click');")
++    assert js.eval("host.childNodes[0] === original && host.childNodes[1] === caption") is True
++    assert js.eval("clicks") == 1
++    assert js.eval("host.classList.contains('harness-companion-host')") is False
++    assert js.eval("companion.getState()") == "idle"
++
++
++def test_reinitialization_restores_previous_host_without_duplicating_listeners(js) -> None:
++    js.eval("host.classList.add('harness-companion-host'); companion.init();")
++    listeners = js.eval("document.listeners.length + motion.listeners.length")
++    assert js.eval("companion.init({mount: '#other', state: 'working'})") is True
++    assert js.eval("host.childNodes[0] === original && host.childNodes[1] === caption") is True
++    assert js.eval("host.classList.contains('harness-companion-host')") is True
++    assert js.eval("document.listeners.length + motion.listeners.length") == listeners
++    js.eval("companion.destroy();")
++    assert js.eval("otherHost.childNodes.length === 1 && otherHost.childNodes[0] === otherOriginal") is True
++    assert js.eval("otherHost.classList.contains('harness-companion-host')") is False
++    assert js.eval("document.listeners.length + motion.listeners.length") == 0
++
++
++def test_same_state_does_not_restart_or_extend_a_gesture(js) -> None:
++    js.eval("companion.init({state: 'working'}); advance(120);")
++    assert js.eval("gesture()") is not None
++    assert js.eval("companion.setState('working')") is True
++    js.eval("advance(120);")
++    assert js.eval("gesture()") is None
++    js.eval("companion.setState('working'); advance(600000);")
++    assert js.eval("gesture()") is None
++    assert js.eval("timers.size") == 0
++
++
++def test_new_state_cancels_old_gesture_deadline(js) -> None:
++    js.eval("companion.init({state: 'working'}); advance(100); companion.setState('success');")
++    assert js.eval("gesture()") is not None
++    js.eval("advance(140);")
++    assert js.eval("companion.getState()") == "success"
++    assert js.eval("gesture()") is not None
++    js.eval("advance(100);")
++    assert js.eval("gesture()") is None
++
++
++def test_destroy_is_idempotent_and_cleans_every_resource(js) -> None:
++    js.eval("companion.init(); var detached = graphic(); companion.destroy(); companion.destroy();")
++    assert js.eval("timers.size") == 0
++    assert js.eval("document.listeners.length + motion.listeners.length") == 0
++    js.eval("advance(600000); document.dispatch('pointerdown'); hide(true); reduce(true);")
++    assert js.eval("timers.size") == 0
++    assert js.eval("detached.getAttribute('data-gesture')") is None
++    assert js.eval("host.childNodes.length") == 2
++    assert js.eval("companion.setState('working')") is False
++
++
++@pytest.mark.parametrize(
++    "options",
++    ["{state: 'unknown'}", "{mount: '#missing'}", "{mount: '['}", "{mount: null}",
++     "{mount: {nodeType: 3}}"],
++)
++def test_invalid_reinitialization_preserves_active_mount(js, options: str) -> None:
++    js.eval("companion.init({state: 'working'}); var mounted = graphic();")
++    assert js.eval(f"companion.init({options})") is False
++    assert js.eval("graphic() === mounted") is True
++    assert js.eval("companion.getState()") == "working"
++    assert js.eval("companion.setState('invented')") is False
++    assert js.eval("companion.getState()") == "working"
++
++
++def test_hidden_tab_cancels_movement_and_resume_does_not_replay_completion(js) -> None:
++    js.eval("companion.init({state: 'success'}); hide(true);")
++    assert js.eval("gesture()") is None
++    assert js.eval("timers.size") == 0
++    assert js.eval("graphic().getAttribute('data-paused')") == "true"
++    js.eval("advance(600000); hide(false);")
++    assert js.eval("companion.getState()") == "success"
++    assert js.eval("gesture()") is None
++    assert js.eval("graphic().getAttribute('data-paused')") == "false"
++    # A newly active tab can become idle again, but cannot replay the victory.
++    js.eval("advance(45000);")
++    assert js.eval("companion.getState()") == "resting"
++
++
++def test_hidden_initial_mount_has_no_timers_or_delayed_greeting(js) -> None:
++    js.eval("document.hidden = true; companion.init(); advance(600000); hide(false);")
++    assert js.eval("companion.getState()") == "welcome"
++    assert js.eval("gesture()") is None
++    js.eval("companion.destroy();")
++    assert js.eval("timers.size") == 0
++
++
++def test_reduced_motion_is_respected_initially_and_when_preference_changes(js) -> None:
++    js.eval("motion.matches = true; companion.init();")
++    assert js.eval("gesture()") is None
++    assert js.eval("timers.size") == 0
++    assert js.eval("graphic().getAttribute('data-reduced-motion')") == "true"
++    js.eval("companion.setState('working'); reduce(false);")
++    assert js.eval("gesture()") is None
++    assert js.eval("timers.size") == 0
++    js.eval("companion.setState('success');")
++    assert js.eval("gesture()") is not None
++    js.eval("reduce(true); advance(600000);")
++    assert js.eval("gesture()") is None
++    assert js.eval("timers.size") == 0
++    assert js.eval("companion.getState()") == "success"
++
++
++def test_legacy_media_query_listener_is_removed_on_destroy(js) -> None:
++    js.eval("""
++      motion.addListener = callback => EventTarget.prototype.addEventListener.call(motion, 'change', callback);
++      motion.removeListener = callback => EventTarget.prototype.removeEventListener.call(motion, 'change', callback);
++      motion.addEventListener = undefined;
++      companion.init(); reduce(true);
++    """)
++    assert js.eval("timers.size") == 0
++    assert js.eval("motion.listeners.length") == 1
++    js.eval("companion.destroy();")
++    assert js.eval("motion.listeners.length") == 0
++
++
++@pytest.mark.parametrize(
++    "active",
++    ["new Node('input')", "new Node('textarea')", "new Node('select')",
++     "Object.assign(new Node('div'), {isContentEditable: true})",
++     "Object.assign(new Node('span'), {editingAncestor: new Node('div')})"],
++)
++def test_typing_suppresses_gestures_and_inactivity_until_focus_leaves(js, active: str) -> None:
++    js.eval(f"document.activeElement = {active}; companion.init();")
++    assert js.eval("gesture()") is None
++    assert js.eval("timers.size") == 0
++    js.eval("companion.setState('success'); advance(600000); document.dispatch('keydown');")
++    assert js.eval("companion.getState()") == "success"
++    assert js.eval("timers.size") == 0
++    js.eval("document.activeElement = null; document.dispatch('focusout'); advance(45000);")
++    assert js.eval("companion.getState()") == "resting"
++
++
++def test_focusing_text_during_gesture_cancels_it_immediately(js) -> None:
++    js.eval("companion.init(); document.activeElement = new Node('textarea'); document.dispatch('focusin');")
++    assert js.eval("gesture()") is None
++    assert js.eval("timers.size") == 0
++
++
++def test_idle_cue_is_finite_and_user_activity_rearms_one_deadline(js) -> None:
++    js.eval("companion.init({state: 'idle'}); advance(45000);")
++    assert js.eval("companion.getState()") == "resting"
++    js.eval("advance(600000);")
++    assert js.eval("timers.size") == 0
++    assert js.eval("gesture()") is None
++    js.eval("document.dispatch('pointerdown'); advance(30000); document.dispatch('keydown'); advance(30000);")
++    assert js.eval("companion.getState()") == "idle"
++    js.eval("advance(15000);")
++    assert js.eval("companion.getState()") == "resting"
++
++
++def test_failure_state_stays_static_until_explicit_recovery(js) -> None:
++    js.eval("companion.init({state: 'working'}); companion.setState('error'); advance(600000);")
++    assert js.eval("companion.getState()") == "error"
++    assert js.eval("gesture()") is None
++    assert js.eval("timers.size") == 0
++    js.eval("document.dispatch('pointerdown');")
++    assert js.eval("companion.getState()") == "error"
++    assert js.eval("companion.setState('idle')") is True
++
++
++def _load_functions(context: quickjs.Context, relative_path: str, *names: str) -> None:
++    """Load complete top-level functions from the real UI source, including async ones."""
++    source = (SOURCE.parents[1] / relative_path).read_text(encoding="utf-8")
++    for name in names:
++        found = re.search(
++            rf"^(?:async )?function {re.escape(name)}\([^\n]*\) \{{.*?^\}}",
++            source,
++            re.MULTILINE | re.DOTALL,
++        )
++        assert found, f"Cannot find {name} in {relative_path}"
++        context.eval(found.group())
++
++
++@pytest.fixture
++def desktop(js: quickjs.Context) -> quickjs.Context:
++    """Use the real controller and stream handlers, stubbing unrelated renderers."""
++    js.eval(r"""
++      var nodes = new Map();
++      function $(selector) {
++        if (!nodes.has(selector)) nodes.set(selector, new Node('div'));
++        return nodes.get(selector);
++      }
++      document.body = new Node('body');
++      var state = {sessionId: 'visible', running: new Set(), busy: false,
++        settings: {}, attachToken: 0, attachAbort: null};
++      var companionCalls = [];
++      window.HarnessCompanion = {
++        getState: companion.getState,
++        setState(next) { companionCalls.push(next); return companion.setState(next); },
++      };
++      var uiStatus = '';
++      var usage = null;
++      var attached = [];
++      function renderSessions() {}
++      function renderUsage(next) { usage = next; }
++      function renderPlan() {}
++      function renderNotes() {}
++      function renderPreview() {}
++      function renderHistory() {}
++      function resetUsage() {}
++      function applyStats() {}
++      function attachStream(id) { attached.push(id); }
++      function esc(text) { return String(text); }
++      function el(tag, className, text) {
++        const node = new Node(tag);
++        node.className = className;
++        node.textContent = text;
++        return node;
++      }
++      function makeTestTurn() {
++        return {appended: [], files: 0, statusNode: null,
++          append(node) { this.appended.push(node); },
++          showFiles() { this.files += 1; }};
++      }
++      var turn = makeTestTurn();
++      function deliver(event) {
++        handleEvent(event, turn, null, message => { uiStatus = message; });
++      }
++      companion.init({state: 'idle'});
++    """)
++    _load_functions(js, "web/app.js", "setRunning", "handleEvent", "showSession", "leggiLoStream")
++    return js
++
++
++@pytest.mark.parametrize(
++    ("reason", "steps", "expected"),
++    [("completed", 4, "success"), ("completed", 1, "idle"),
++     ("stopped", 7, "idle"), ("max_steps", 7, "idle"),
++     ("awaiting_user", 7, "idle"), ("error", 7, "error")],
++)
++def test_stream_termination_maps_to_truthful_feedback(desktop, reason, steps, expected) -> None:
++    desktop.eval("setRunning('visible', true);")
++    desktop.eval(f"deliver({json.dumps({'type': 'done', 'reason': reason, 'steps': steps})});")
++    assert desktop.eval("companion.getState()") == expected
++    desktop.eval("setRunning('visible', false);")
++    assert desktop.eval("companion.getState()") == expected
++    assert desktop.eval("turn.files") == (0 if reason == "awaiting_user" else 1)
++
++
++def test_error_event_blocks_later_completion_celebration(desktop) -> None:
++    desktop.eval("""
++      setRunning('visible', true);
++      deliver({type: 'error', message: 'Il modello non risponde'});
++      deliver({type: 'done', reason: 'completed', steps: 4});
++      setRunning('visible', false);
++    """)
++    assert desktop.eval("companion.getState()") == "error"
++    assert desktop.eval("companionCalls.includes('success')") is False
++    assert desktop.eval("turn.appended[0].className") == "error-box"
++
++
++def test_reconnection_notice_does_not_mark_a_recovered_turn_as_failed(desktop) -> None:
++    desktop.eval("""
++      setRunning('visible', true);
++      deliver({type: 'error', message: 'Connessione interrotta: riprendo da dove eravamo.'});
++    """)
++    assert desktop.eval("companion.getState()") == "working"
++    assert desktop.eval("Boolean(turn.companionFailed)") is False
++    assert desktop.eval("turn.appended[0].className") == "notice"
++    desktop.eval("deliver({type: 'done', reason: 'completed', steps: 4});")
++    assert desktop.eval("companion.getState()") == "success"
++
++
++def test_repeated_done_frame_does_not_replay_completion(desktop) -> None:
++    desktop.eval("""
++      setRunning('visible', true);
++      deliver({type: 'done', reason: 'completed', steps: 4});
++      advance(120);
++      deliver({type: 'done', reason: 'completed', steps: 4});
++      advance(120);
++    """)
++    assert desktop.eval("companionCalls.filter(state => state === 'success').length") == 1
++    assert desktop.eval("gesture()") is None
++
++
++def test_repeated_busy_updates_keep_working_without_replaying_or_clearing_it(desktop) -> None:
++    desktop.eval("setRunning('visible', true); advance(120); setRunning('visible', true);")
++    assert desktop.eval("companion.getState()") == "working"
++    desktop.eval("advance(120);")
++    assert desktop.eval("gesture()") is None
++    assert desktop.eval("companionCalls.filter(state => state === 'working').length") == 1
++
++
++def test_busy_refresh_after_failure_does_not_erase_failure(desktop) -> None:
++    desktop.eval("""
++      setRunning('visible', true);
++      deliver({type: 'error', message: 'Errore definitivo'});
++      setRunning('visible', true);
++    """)
++    assert desktop.eval("companion.getState()") == "error"
++    desktop.eval("setRunning('visible', false); setRunning('visible', true);")
++    assert desktop.eval("companion.getState()") == "working"
++
++
++@pytest.mark.parametrize("settled", ["success", "error"])
++def test_other_conversation_activity_does_not_overwrite_visible_outcome(desktop, settled) -> None:
++    desktop.eval(f"companion.setState({json.dumps(settled)}); setRunning('background', true);")
++    assert desktop.eval("state.busy") is False
++    assert desktop.eval("companion.getState()") == settled
++    desktop.eval("setRunning('background', false);")
++    assert desktop.eval("companion.getState()") == settled
++
++
++@pytest.mark.parametrize("settled", ["success", "error"])
++def test_opening_another_conversation_clears_stale_outcome(desktop, settled) -> None:
++    desktop.eval(f"companion.setState({json.dumps(settled)});")
++    desktop.eval("showSession({session_id: 'different', running: false, messages: []});")
++    assert desktop.eval("state.sessionId") == "different"
++    assert desktop.eval("companion.getState()") == "idle"
++
++
++@pytest.mark.parametrize("settled", ["success", "error"])
++def test_refresh_of_same_conversation_preserves_outcome(desktop, settled) -> None:
++    desktop.eval(f"companion.setState({json.dumps(settled)});")
++    desktop.eval("showSession({session_id: 'visible', running: false, messages: []});")
++    assert desktop.eval("companion.getState()") == settled
++
++
++@pytest.mark.parametrize("event_type", ["error", "done"])
++def test_abandoned_stream_cannot_change_current_conversation_feedback(desktop, event_type) -> None:
++    frame = "data: " + json.dumps(
++        {"type": event_type, "message": "Old failure", "reason": "completed", "steps": 5}
++    ) + "\n\n"
++    desktop.eval(f"var oldFrame = {json.dumps(frame)};")
++    desktop.eval("""
++      var TextDecoder = class { decode(value) { return value; } };
++      var cancelled = 0, released = 0, read = 0, result = null, streamError = null;
++      var response = {body: {getReader() { return {
++        async read() { return ++read === 1 ? {value: oldFrame, done: false} : {done: true}; },
++        async cancel() { cancelled += 1; },
++        releaseLock() { released += 1; },
++      }; }}};
++      leggiLoStream(response, turn, () => false)
++        .then(value => { result = value; }, error => { streamError = String(error); });
++    """)
++    for _ in range(20):
++        if not desktop.execute_pending_job():
++            break
++    assert desktop.eval("streamError") is None
++    assert desktop.eval("result.tipo") == "estraneo"
++    assert desktop.eval("companionCalls.length") == 0
++    assert desktop.eval("cancelled === 1 && released === 1") is True
++
++
++@pytest.fixture
++def mobile(js: quickjs.Context) -> quickjs.Context:
++    js.eval("""
++      var sessionList = new Node('ul');
++      function $(id) { if (id === 'session-list') return sessionList; return null; }
++      document.createElement = tag => new Node(tag);
++      function fmtDate(value) { return value; }
++      var opened = [];
++      function openChat(id) { opened.push(id); }
++    """)
++    _load_functions(js, "web_mobile/app.js", "renderSessions")
++    js.eval("renderSessions([{id: 'first', title: 'Primo'}, {id: 'second', title: 'Secondo'}]);")
++    return js
++
++
++@pytest.mark.parametrize("key", ["Enter", " "])
++def test_mobile_session_keyboard_activation_prevents_default_and_opens_correct_chat(mobile, key) -> None:
++    mobile.eval(f"var activationKey = {json.dumps(key)};")
++    mobile.eval("""
++      var prevented = 0;
++      sessionList.childNodes[1].dispatch('keydown', {
++        key: activationKey, preventDefault() { prevented += 1; },
++      });
++    """)
++    assert mobile.eval("sessionList.childNodes.every(node => node.tabIndex === 0)") is True
++    assert mobile.eval("sessionList.childNodes[1].getAttribute('role')") == "button"
++    assert mobile.eval("JSON.stringify(opened)") == '["second"]'
++    assert mobile.eval("prevented") == 1
++
++
++@pytest.mark.parametrize("key", ["Tab", "ArrowDown", "Escape", "a"])
++def test_other_mobile_keys_preserve_browser_behavior_and_do_not_open_chat(mobile, key) -> None:
++    mobile.eval(f"var navigationKey = {json.dumps(key)};")
++    mobile.eval("""
++      var prevented = 0;
++      sessionList.childNodes[0].dispatch('keydown', {
++        key: navigationKey, preventDefault() { prevented += 1; },
++      });
++    """)
++    assert mobile.eval("opened.length") == 0
++    assert mobile.eval("prevented") == 0
++
++
++def test_mobile_pointer_activation_and_rerender_keep_correct_session_binding(mobile) -> None:
++    mobile.eval("""
++      sessionList.childNodes[0].dispatch('click');
++      renderSessions([{id: 'replacement', title: 'Nuova lista'}]);
++      sessionList.childNodes[0].dispatch('click');
++    """)
++    assert mobile.eval("sessionList.childNodes.length") == 1
++    assert mobile.eval("JSON.stringify(opened)") == '["first","replacement"]'
+--- a/tests/test_interfaccia_colonne.py
++++ b/tests/test_interfaccia_colonne.py
+@@ -110,7 +110,8 @@
+     assert "linear-gradient(var(--accent), var(--accent))" in doing
+     assert "3px 100% no-repeat" in doing
+     codice = "\n".join(r for r in css.splitlines() if not r.lstrip().startswith(("/*", "*", "-")))
+-    assert "box-shadow: inset" not in codice
++    # Il vincolo riguarda la barretta del passo, non i bordi di altri contenitori.
++    assert "box-shadow: inset" not in doing
+     assert ".plan-step.doing::before" not in codice
+     # e "saltato" e' giallo, non grigio: e' una decisione, non un "non fatto"
+     assert ".plan-step.skipped .plan-mark { color: var(--warn); }" in css
+--- a/tests/test_reattivita_e_ripresa.py
++++ b/tests/test_reattivita_e_ripresa.py
+@@ -238,8 +238,16 @@
+     """
+     html = client.get("/").text
+     assert client.get("/").headers.get("Cache-Control") == "no-cache"
+-    impronte = re.findall(r'/static/(app\.js|style\.css)\?v=([0-9a-f]{10})', html)
+-    assert {n for n, _ in impronte} == {"app.js", "style.css"}, html[:400]
++    impronte = re.findall(
++        r"/static/(app\.js|style\.css|companion\.js|companion\.css)\?v=([0-9a-f]{10})", html
++    )
++    assert {n for n, _ in impronte} == {"app.js", "style.css", "companion.js", "companion.css"}, (
++        html[:400]
++    )
++    for nome, versione in impronte:
++        response = client.get(f"/static/{nome}?v={versione}")
++        assert response.status_code == 200
++        assert response.headers["Cache-Control"] == "no-cache"
+     # E l'impronta segue il file: toccarlo cambia l'indirizzo, senza che
+     # nessuno debba ricordarsi di alzare un numero a mano.
+     from server import main as sm
+@@ -269,9 +277,10 @@
+     scritture = re.findall(r"\$\('#pill-status'\)\.(className|innerHTML|textContent)", js)
+     corpo = js[js.index("function renderStatusPill(") :]
+     corpo = corpo[: corpo.index("\n}\n")]
+-    assert len(scritture) == len(
+-        re.findall(r"pill\.(className|innerHTML|textContent)", corpo)
+-    ) or not scritture
++    assert (
++        len(scritture) == len(re.findall(r"pill\.(className|innerHTML|textContent)", corpo))
++        or not scritture
++    )
+ 
+     css = (WEB / "style.css").read_text(encoding="utf-8")
+     assert ".pill.wait" in css, "«non lo so ancora» e' uno stato, non un avviso"
+@@ -366,9 +375,7 @@
+     # Solo le righe di codice: il commento sopra la classe spiega proprio
+     # perche' quel decoratore non si usa, e nominarlo non e' usarlo.
+     codice = "\n".join(r for r in sorgente.splitlines() if not r.lstrip().startswith(("#", "*")))
+-    assert '@app.middleware("http")' not in codice.replace(
+-        '``@app.middleware("http")``', ""
+-    )
++    assert '@app.middleware("http")' not in codice.replace('``@app.middleware("http")``', "")
+     assert "class ServerTiming:" in sorgente
+     assert "app.add_middleware(ServerTiming)" in sorgente
+ 
+@@ -413,13 +420,13 @@
+     from server.runner import TurnRunner
+ 
+     runner = TurnRunner("sessione", snapshot=[])
+-    runner.emit("data: {\"type\": \"start\"}\n\n")
++    runner.emit('data: {"type": "start"}\n\n')
+     flusso = runner.stream()
+-    primo = next(flusso)          # qui l'arretrato è appena stato fotografato
++    primo = next(flusso)  # qui l'arretrato è appena stato fotografato
+ 
+     # ...e adesso, dentro la finestra, il turno finisce.
+-    runner.emit("data: {\"type\": \"assistant\"}\n\n")
+-    runner.emit("data: {\"type\": \"done\"}\n\n")
++    runner.emit('data: {"type": "assistant"}\n\n')
++    runner.emit('data: {"type": "done"}\n\n')
+     runner.close()
+ 
+     ricevuti = [primo, *flusso]
+--- a/web/app.js
++++ b/web/app.js
+@@ -914,7 +914,14 @@
+   if (running) state.running.add(sessionId);
+   else state.running.delete(sessionId);
+   const busyHere = state.running.has(state.sessionId);
++  const activityChanged = busyHere !== state.busy;
+   state.busy = busyHere;
++  // Decorative feedback follows actual activity in the visible conversation.
++  const companion = typeof window !== 'undefined' && window.HarnessCompanion;
++  if (companion) {
++    if (busyHere && activityChanged) companion.setState('working');
++    else if (!busyHere && companion.getState() === 'working') companion.setState('idle');
++  }
+ 
+   // Mentre l'agente lavora il tasto non si spegne: diventa stop. Un tasto
+   // disabilitato lascia l'utente senza via d'uscita se il modello parte per
+@@ -1307,9 +1314,17 @@
+         setStatus('Riconnessione al modello in corso…');
+       } else {
+         turn.append(el('div', 'error-box', esc(event.message)));
++        turn.companionFailed = true;
++        if (typeof window !== 'undefined') window.HarnessCompanion?.setState('error');
+       }
+       break;
+     case 'done':
++      // A stop, question or step limit must never look like a successful delivery.
++      if (typeof window !== 'undefined' && !turn.companionSettled) {
++        turn.companionSettled = true;
++        window.HarnessCompanion?.setState(turn.companionFailed || event.reason === 'error' ? 'error'
++          : event.reason === 'completed' && event.steps > 1 ? 'success' : 'idle');
++      }
+       // Le gocce chiudono il ciclo: su una pausa per domanda il ciclo non e'
+       // finito, e mostrarle li' direbbe "ho consegnato" quando invece sta
+       // ancora aspettando una risposta.
+@@ -2580,6 +2595,7 @@
+  * sparire da sola la pagina che l'agente ha appena finito di costruire.
+  */
+ async function showSession(payload, { entrando = false } = {}) {
++  const conversationChanged = state.sessionId !== payload.session_id;
+   state.sessionId = payload.session_id;
+   // Il workspace segue la conversazione: aprendo una chat di ieri il server
+   // ci rimette sulla cartella su cui era stata fatta, e qui se ne prende
+@@ -2616,6 +2632,9 @@
+   if (payload.running) state.running.add(payload.session_id);
+   else state.running.delete(payload.session_id);
+   setRunning(payload.session_id, payload.running);
++  if (conversationChanged && typeof window !== 'undefined') {
++    window.HarnessCompanion?.setState(payload.running ? 'working' : 'idle');
++  }
+   if (payload.running) attachStream(payload.session_id);
+ }
+ 
+@@ -3470,6 +3489,7 @@
+   renderHeader();
+ 
+   await showSession(data.session, { entrando: true });
++  window.HarnessCompanion?.init({state: data.session.running ? 'working' : 'welcome'});
+   bindGlobalEvents();
+   bindSveglie();
+   refreshSandbox();
+--- /dev/null
++++ b/web/brand/app-icon.svg
+@@ -0,0 +1,2 @@
++<?xml version="1.0" encoding="UTF-8"?>
++<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" role="img" aria-labelledby="brand-title"><title id="brand-title">Local Agent Harness</title><rect width="32" height="32" fill="#11181b"/><g transform="translate(4 4) scale(.75)"><g fill="#68d5c4"><path d="M11 8H21C25.418 8 29 11.582 29 16V21C29 25.418 25.418 29 21 29H11C6.582 29 3 25.418 3 21V16C3 11.582 6.582 8 11 8Z"/><rect x="15" y="3" width="2" height="5" rx="1"/><circle cx="16" cy="3" r="2"/></g><g fill="#11181b"><rect x="9" y="15" width="4" height="6" rx="2"/><rect x="19" y="15" width="4" height="6" rx="2"/></g></g></svg>
+--- /dev/null
++++ b/web/brand/favicon.svg
+@@ -0,0 +1,2 @@
++<?xml version="1.0" encoding="UTF-8"?>
++<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" role="img" aria-labelledby="brand-title"><title id="brand-title">Local Agent Harness</title><style>.face{fill:#1c2b30}.eyes{fill:#ffffff}@media(prefers-color-scheme:dark){.face{fill:#edf3f3}.eyes{fill:#11181b}}</style><g class="face"><path d="M11 8H21C25.418 8 29 11.582 29 16V21C29 25.418 25.418 29 21 29H11C6.582 29 3 25.418 3 21V16C3 11.582 6.582 8 11 8Z"/><rect x="15" y="3" width="2" height="5" rx="1"/><circle cx="16" cy="3" r="2"/></g><g class="eyes"><rect x="9" y="15" width="4" height="6" rx="2"/><rect x="19" y="15" width="4" height="6" rx="2"/></g></svg>
+--- /dev/null
++++ b/web/brand/mark-dark.svg
+@@ -0,0 +1,2 @@
++<?xml version="1.0" encoding="UTF-8"?>
++<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" role="img" aria-labelledby="brand-title"><title id="brand-title">Local Agent Harness</title><g fill="#edf3f3"><path d="M11 8H21C25.418 8 29 11.582 29 16V21C29 25.418 25.418 29 21 29H11C6.582 29 3 25.418 3 21V16C3 11.582 6.582 8 11 8Z"/><rect x="15" y="3" width="2" height="5" rx="1"/><circle cx="16" cy="3" r="2"/></g><g fill="#11181b"><rect x="9" y="15" width="4" height="6" rx="2"/><rect x="19" y="15" width="4" height="6" rx="2"/></g></svg>
+--- /dev/null
++++ b/web/brand/mark-light.svg
+@@ -0,0 +1,2 @@
++<?xml version="1.0" encoding="UTF-8"?>
++<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" role="img" aria-labelledby="brand-title"><title id="brand-title">Local Agent Harness</title><g fill="#1c2b30"><path d="M11 8H21C25.418 8 29 11.582 29 16V21C29 25.418 25.418 29 21 29H11C6.582 29 3 25.418 3 21V16C3 11.582 6.582 8 11 8Z"/><rect x="15" y="3" width="2" height="5" rx="1"/><circle cx="16" cy="3" r="2"/></g><g fill="#ffffff"><rect x="9" y="15" width="4" height="6" rx="2"/><rect x="19" y="15" width="4" height="6" rx="2"/></g></svg>
+--- /dev/null
++++ b/web/brand/mark-mono.svg
+@@ -0,0 +1,2 @@
++<?xml version="1.0" encoding="UTF-8"?>
++<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" role="img" aria-labelledby="brand-title"><title id="brand-title">Local Agent Harness</title><defs><mask id="eye-cutouts"><rect width="32" height="32" fill="white"/><g fill="black"><rect x="9" y="15" width="4" height="6" rx="2"/><rect x="19" y="15" width="4" height="6" rx="2"/></g></mask></defs><g fill="currentColor" mask="url(#eye-cutouts)"><path d="M11 8H21C25.418 8 29 11.582 29 16V21C29 25.418 25.418 29 21 29H11C6.582 29 3 25.418 3 21V16C3 11.582 6.582 8 11 8Z"/><rect x="15" y="3" width="2" height="5" rx="1"/><circle cx="16" cy="3" r="2"/></g></svg>
+--- /dev/null
++++ b/web/brand/wordmark-dark.svg
+@@ -0,0 +1,2 @@
++<?xml version="1.0" encoding="UTF-8"?>
++<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 230 64" role="img" aria-labelledby="brand-title"><title id="brand-title">Local Agent Harness</title><g transform="translate(0 0) scale(2)"><g fill="#edf3f3"><path d="M11 8H21C25.418 8 29 11.582 29 16V21C29 25.418 25.418 29 21 29H11C6.582 29 3 25.418 3 21V16C3 11.582 6.582 8 11 8Z"/><rect x="15" y="3" width="2" height="5" rx="1"/><circle cx="16" cy="3" r="2"/></g><g fill="#11181b"><rect x="9" y="15" width="4" height="6" rx="2"/><rect x="19" y="15" width="4" height="6" rx="2"/></g></g><g fill="#edf3f3" font-family="Segoe UI, Inter, Helvetica, Arial, sans-serif"><text x="78" y="36" font-size="32" font-weight="600" letter-spacing="-1">Harness</text><text x="79" y="54" fill="#b2c3c6" font-size="10.5" font-weight="500" letter-spacing="1">Local Agent Harness</text></g></svg>
+--- /dev/null
++++ b/web/brand/wordmark-light.svg
+@@ -0,0 +1,2 @@
++<?xml version="1.0" encoding="UTF-8"?>
++<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 230 64" role="img" aria-labelledby="brand-title"><title id="brand-title">Local Agent Harness</title><g transform="translate(0 0) scale(2)"><g fill="#1c2b30"><path d="M11 8H21C25.418 8 29 11.582 29 16V21C29 25.418 25.418 29 21 29H11C6.582 29 3 25.418 3 21V16C3 11.582 6.582 8 11 8Z"/><rect x="15" y="3" width="2" height="5" rx="1"/><circle cx="16" cy="3" r="2"/></g><g fill="#ffffff"><rect x="9" y="15" width="4" height="6" rx="2"/><rect x="19" y="15" width="4" height="6" rx="2"/></g></g><g fill="#1c2b30" font-family="Segoe UI, Inter, Helvetica, Arial, sans-serif"><text x="78" y="36" font-size="32" font-weight="600" letter-spacing="-1">Harness</text><text x="79" y="54" fill="#4f646a" font-size="10.5" font-weight="500" letter-spacing="1">Local Agent Harness</text></g></svg>
+--- /dev/null
++++ b/web/companion.css
+@@ -0,0 +1,86 @@
++/* A decorative 28 px presence. The existing logo slot owns its dimensions. */
++.harness-companion-host {
++  display: grid;
++  place-items: center;
++}
++
++.harness-companion {
++  --companion-face: #1c2b30;
++  --companion-eye: #ffffff;
++  --companion-active: #0b7169;
++  display: block;
++  width: 28px;
++  height: 28px;
++  overflow: visible;
++  color: var(--companion-face);
++  pointer-events: none;
++  user-select: none;
++}
++
++html[data-theme="dark"] .harness-companion {
++  --companion-face: #edf3f3;
++  --companion-eye: #11181b;
++  --companion-active: #68d5c4;
++}
++
++.harness-companion__pose {
++  transform-origin: 16px 19px;
++}
++
++.harness-companion__eyes {
++  fill: var(--companion-eye);
++  transform-origin: 16px 18px;
++}
++
++.harness-companion[data-state="working"] {
++  color: var(--companion-active);
++}
++
++.harness-companion[data-state="resting"] .harness-companion__eyes {
++  transform: translateX(1px);
++}
++
++.harness-companion[data-gesture="greet"] .harness-companion__pose {
++  animation: companion-greet 240ms ease-out 1;
++}
++
++.harness-companion[data-gesture="nod"] .harness-companion__pose {
++  animation: companion-nod 240ms ease-in-out 1;
++}
++
++.harness-companion[data-gesture="look"] .harness-companion__eyes {
++  animation: companion-look 240ms ease-in-out 1;
++}
++
++.harness-companion[data-gesture="blink"] .harness-companion__eyes {
++  animation: companion-blink 240ms ease-in-out 1;
++}
++
++@keyframes companion-greet {
++  0%, 100% { transform: rotate(0deg); }
++  48% { transform: rotate(-4deg); }
++}
++
++@keyframes companion-nod {
++  0%, 100% { transform: translateY(0); }
++  50% { transform: translateY(1.2px); }
++}
++
++@keyframes companion-look {
++  0%, 100% { transform: translateX(0); }
++  45% { transform: translateX(1px); }
++}
++
++@keyframes companion-blink {
++  0%, 100% { transform: translateX(1px); }
++  45% { transform: translateX(1px) scaleY(.12); }
++}
++
++.harness-companion[data-paused="true"] *,
++.harness-companion[data-reduced-motion="true"] * {
++  animation: none !important;
++}
++
++@media (prefers-reduced-motion: reduce) {
++  .harness-companion * { animation: none !important; }
++}
+--- /dev/null
++++ b/web/companion.js
+@@ -0,0 +1,212 @@
++/**
++ * A quiet, finite-state companion inside the existing 28 px brand slot.
++ *
++ * HarnessCompanion.init({mount: '#sidebar .logo', state: 'welcome'});
++ * HarnessCompanion.setState('working');
++ * HarnessCompanion.setState('success'); // Only after a completed operation.
++ * HarnessCompanion.destroy();
++ *
++ * There is no pointer tracking, recurring animation, navigation or persistence.
++ * The host's original nodes are restored by destroy(), including their listeners.
++ */
++(function installCompanion(global) {
++  'use strict';
++
++  const SVG_NS = 'http://www.w3.org/2000/svg';
++  const STATES = new Set(['welcome', 'working', 'success', 'idle', 'resting', 'error']);
++  const GESTURE_MS = 240;
++  const REST_AFTER_MS = 45_000;
++  const DEFAULT_MOUNT = '#sidebar .logo';
++
++  let host = null;
++  let graphic = null;
++  let previousNodes = [];
++  let hadHostClass = false;
++  let currentState = 'idle';
++  let gestureTimer = null;
++  let idleTimer = null;
++  let motionPreference = null;
++  let reducedMotion = false;
++  let listeners = [];
++
++  /** Create SVG nodes from constant geometry; no HTML strings are interpreted. */
++  function svgNode(tag, attributes = {}) {
++    const node = document.createElementNS(SVG_NS, tag);
++    Object.entries(attributes).forEach(([name, value]) => node.setAttribute(name, String(value)));
++    return node;
++  }
++
++  function makeGraphic() {
++    const svg = svgNode('svg', {
++      class: 'harness-companion', viewBox: '0 0 32 32',
++      width: 28, height: 28, 'aria-hidden': 'true', focusable: 'false',
++    });
++    const pose = svgNode('g', {class: 'harness-companion__pose'});
++    const face = svgNode('g', {class: 'harness-companion__face', fill: 'currentColor'});
++    face.appendChild(svgNode('path', {
++      d: 'M11 8H21C25.418 8 29 11.582 29 16V21C29 25.418 25.418 29 21 29H11C6.582 29 3 25.418 3 21V16C3 11.582 6.582 8 11 8Z',
++    }));
++    face.appendChild(svgNode('rect', {x: 15, y: 3, width: 2, height: 5, rx: 1}));
++    face.appendChild(svgNode('circle', {cx: 16, cy: 3, r: 2}));
++    const eyes = svgNode('g', {class: 'harness-companion__eyes'});
++    eyes.appendChild(svgNode('rect', {x: 9, y: 15, width: 4, height: 6, rx: 2}));
++    eyes.appendChild(svgNode('rect', {x: 19, y: 15, width: 4, height: 6, rx: 2}));
++    pose.appendChild(face);
++    pose.appendChild(eyes);
++    svg.appendChild(pose);
++    return svg;
++  }
++
++  function clearGesture() {
++    if (gestureTimer !== null) global.clearTimeout(gestureTimer);
++    gestureTimer = null;
++    graphic?.removeAttribute('data-gesture');
++  }
++
++  function clearIdleTimer() {
++    if (idleTimer !== null) global.clearTimeout(idleTimer);
++    idleTimer = null;
++  }
++
++  function mayMove() {
++    return graphic !== null && !document.hidden && !reducedMotion;
++  }
++
++  function editingText() {
++    const active = document.activeElement;
++    if (!active) return false;
++    if (active.isContentEditable) return true;
++    return Boolean(active.closest?.('input, textarea, select, [role="textbox"], [contenteditable]:not([contenteditable="false"])'));
++  }
++
++  /** At most one 240 ms gesture, with no callback that starts another gesture. */
++  function gesture(name) {
++    clearGesture();
++    if (!mayMove() || editingText()) return;
++    graphic.setAttribute('data-gesture', name);
++    gestureTimer = global.setTimeout(clearGesture, GESTURE_MS);
++  }
++
++  /** One inactivity deadline, never an interval. Text editing cancels it. */
++  function armIdleTimer() {
++    clearIdleTimer();
++    if (!mayMove() || editingText() || !['welcome', 'success', 'idle'].includes(currentState)) return;
++    idleTimer = global.setTimeout(() => {
++      idleTimer = null;
++      if (mayMove() && !editingText() && ['welcome', 'success', 'idle'].includes(currentState)) {
++        setState('resting');
++      }
++    }, REST_AFTER_MS);
++  }
++
++  /**
++   * Set the visual state. Repeated events of the same kind do not replay cues.
++   * Invalid states are rejected. Stop/cancel should map to idle, failures to error.
++   * @param {'welcome'|'working'|'success'|'idle'|'resting'|'error'} next
++   * @returns {boolean}
++   */
++  function setState(next) {
++    if (!graphic || !STATES.has(next)) return false;
++    if (next === currentState) return true;
++    clearGesture();
++    clearIdleTimer();
++    currentState = next;
++    graphic.setAttribute('data-state', next);
++    const cue = {welcome: 'greet', working: 'look', success: 'nod', resting: 'blink'}[next];
++    if (cue) gesture(cue);
++    armIdleTimer();
++    return true;
++  }
++
++  function onActivity() {
++    if (!graphic) return;
++    if (editingText()) clearGesture();
++    if (currentState === 'resting') setState('idle');
++    armIdleTimer();
++  }
++
++  function onVisibilityChange() {
++    clearGesture();
++    clearIdleTimer();
++    graphic?.setAttribute('data-paused', document.hidden ? 'true' : 'false');
++    // Becoming visible never replays a completion or working gesture.
++    if (!document.hidden) armIdleTimer();
++  }
++
++  function onMotionChange() {
++    reducedMotion = Boolean(motionPreference?.matches);
++    graphic?.setAttribute('data-reduced-motion', reducedMotion ? 'true' : 'false');
++    clearGesture();
++    armIdleTimer();
++  }
++
++  function listen(target, type, callback, options = false) {
++    target.addEventListener(type, callback, options);
++    listeners.push(() => target.removeEventListener(type, callback, options));
++  }
++
++  /** Restore the host and release every timer and event listener. Idempotent. */
++  function destroy() {
++    clearGesture();
++    clearIdleTimer();
++    listeners.forEach((remove) => remove());
++    listeners = [];
++    if (host) {
++      graphic?.remove();
++      previousNodes.forEach((node) => host.appendChild(node));
++      if (!hadHostClass) host.classList.remove('harness-companion-host');
++    }
++    host = graphic = motionPreference = null;
++    previousNodes = [];
++    reducedMotion = false;
++    currentState = 'idle';
++  }
++
++  /**
++   * Mount in a caller-supplied existing slot; never creates an overlay or dock.
++   * Reinitialization first restores the previous host.
++   * @param {{mount?: string|Element, state?: string}} [options]
++   * @returns {boolean} False when a slot/state is invalid; the current mount stays intact.
++   */
++  function init({mount = DEFAULT_MOUNT, state = 'welcome'} = {}) {
++    if (!STATES.has(state)) return false;
++    let target;
++    try {
++      target = typeof mount === 'string' ? document.querySelector(mount) : mount;
++    } catch (_) {
++      return false;
++    }
++    if (!target || target.nodeType !== 1 || typeof target.appendChild !== 'function') return false;
++    destroy();
++    host = target;
++    previousNodes = [...host.childNodes];
++    previousNodes.forEach((node) => node.remove());
++    hadHostClass = host.classList.contains('harness-companion-host');
++    host.classList.add('harness-companion-host');
++    graphic = makeGraphic();
++    host.appendChild(graphic);
++    motionPreference = typeof global.matchMedia === 'function'
++      ? global.matchMedia('(prefers-reduced-motion: reduce)') : null;
++    if (motionPreference?.addEventListener) {
++      listen(motionPreference, 'change', onMotionChange);
++    } else if (motionPreference?.addListener) {
++      motionPreference.addListener(onMotionChange);
++      listeners.push(() => motionPreference?.removeListener(onMotionChange));
++    }
++    listen(document, 'visibilitychange', onVisibilityChange);
++    listen(document, 'pointerdown', onActivity, {passive: true, capture: true});
++    listen(document, 'keydown', onActivity, true);
++    listen(document, 'focusin', onActivity, true);
++    listen(document, 'focusout', onActivity, true);
++    onMotionChange();
++    graphic.setAttribute('data-paused', document.hidden ? 'true' : 'false');
++    // The sentinel lets the requested initial state render even when it is idle.
++    currentState = null;
++    setState(state);
++    return true;
++  }
++
++  global.HarnessCompanion = Object.freeze({
++    init, setState, destroy, getState: () => currentState,
++  });
++})(window);
+--- a/web/index.html
++++ b/web/index.html
+@@ -20,15 +20,20 @@
+      anche quando la pagina e' scura. -->
+ <meta name="color-scheme" content="dark light">
+ <title>Local Agent Harness</title>
++<script>
++// Apply the stored appearance before first paint; bootstrap remains authoritative.
++try {
++  const theme = localStorage.getItem('ah-theme');
++  if (theme === 'light' || theme === 'dark') document.documentElement.dataset.theme = theme;
++} catch (_) { /* Storage can be unavailable in private or restricted contexts. */ }
++</script>
+ <link rel="stylesheet" href="/static/style.css">
+-<!-- Icona della scheda: il robottino ritagliato, senza il riquadro di fondo.
+-     Un quadrato nero in mezzo alle altre schede è la cosa che si vede, e il
+-     logo diventa il francobollo dentro. Il tratto è terracotta e il fondo
+-     trasparente, quindi si legge sia sulle schede chiare sia su quelle scure,
+-     senza doverne tenere due versioni. -->
++<link rel="stylesheet" href="/static/companion.css">
++<!-- Raster fallbacks and an adaptive vector mark for modern browsers. -->
+ <link rel="icon" type="image/png" sizes="64x64" href="/static/favicon-64.png">
+ <link rel="icon" type="image/png" sizes="32x32" href="/static/favicon-32.png">
+ <link rel="icon" type="image/png" sizes="16x16" href="/static/favicon-16.png">
++<link rel="icon" type="image/svg+xml" href="/static/brand/favicon.svg">
+ </head>
+ <body>
+ 
+@@ -37,13 +42,10 @@
+   <!-- ------------------------------ sidebar ------------------------------ -->
+   <aside id="sidebar">
+     <div class="brand">
+-      <!-- Due file invece di uno ricolorato via CSS: il logo e' un'immagine,
+-           e un filtro CSS su una foto lascia sempre qualcosa di sporco. Lo
+-           scambio e' puramente CSS, quindi avviene prima che parta il JS e non
+-           c'e' un lampo del logo sbagliato al caricamento. -->
++      <!-- The static vector remains usable before the decorative companion mounts. -->
+       <div class="logo">
+-        <img class="logo-chiaro" src="/static/logo-light.png" alt="Local Agent Harness">
+-        <img class="logo-scuro" src="/static/logo-dark.png" alt="Local Agent Harness">
++        <img class="logo-chiaro" src="/static/brand/mark-light.svg" alt="">
++        <img class="logo-scuro" src="/static/brand/mark-dark.svg" alt="">
+       </div>
+       <div style="min-width:0">
+         <div class="brand-name" id="brand-name">Local Agent Harness</div>
+@@ -775,6 +777,7 @@
+ </div>
+ 
+ <div id="toast"></div>
++<script src="/static/companion.js"></script>
+ <script src="/static/app.js"></script>
+ </body>
+ </html>
+--- a/web/style.css
++++ b/web/style.css
+@@ -1,40 +1,46 @@
+-/* Local Agent Harness — foglio di stile unico.
+-   Palette "carta calda" ispirata a Claude CoWork. Tutto passa dalle custom
+-   properties: il tema scuro riempie le stesse variabili, quindi le due
+-   versioni non possono divergere nella geometria. */
++/* Harness — graphite / mineral. Visual tokens share one geometry in both
++   themes. Layout, type sizes, spacing and responsive breakpoints are retained. */
+ 
+ :root {
+-  --bg: #faf9f5;
+-  --bg-subtle: #f2f0e9;
++  --bg: #f7f9f9;
++  --bg-subtle: #edf2f2;
+   --surface: #ffffff;
+-  --surface-alt: #f6f4ee;
+-  --border: #e4e0d6;
+-  --border-strong: #d2cdc0;
+-  --text: #1f1e1d;
+-  --text-muted: #6e6a62;
+-  --text-faint: #98938a;
++  --surface-alt: #f1f5f5;
++  --border: #d7e1e2;
++  --border-strong: #bccacc;
++  --text: #1c2b30;
++  --text-muted: #4f646a;
++  --text-faint: #55686d;
+   /* Alias storico. C'e' stato un momento in cui la palette aveva un quarto
+      grigio, e tre regole continuavano a chiedere `var(--text-dim)`: senza
+      ripiego la dichiarazione diventa `unset` e il colore viene EREDITATO.
+      Le righe dei vault nascevano gia' a colore pieno, quindi :hover e .active
+      -- che portano a var(--text) -- non cambiavano niente di visibile. */
+   --text-dim: var(--text-muted);
+-  --accent: #c96442;
+-  --accent-hover: #b4573a;
+-  --accent-soft: #f7ece7;
+-  --accent-border: #e8cfc4;
+-  --ok: #4a7c59;
+-  --warn: #b07d2b;
+-  --err: #b3453a;
+-  --code-bg: #f4f2ec;
++  --accent: #0b7169;
++  --accent-hover: #085d57;
++  --accent-soft: #e3f1ee;
++  --accent-border: #8fbbb3;
++  --on-accent: #ffffff;
++  --control-border: #72868a;
++  --focus-ring: #0b7169;
++  --hover-bg: #e3ebec;
++  --selected-bg: #dcece8;
++  --ok: #186b49;
++  --warn: #865b0a;
++  --err: #b03b44;
++  --code-bg: #edf2f3;
+   /* Tinte di stato: un velo, non un colore. Servono a far leggere una riga
+      senza leggerla, quindi devono restare sotto la soglia in cui il testo
+      sopra perde contrasto. Sono variabili perche' sul tema scuro la stessa
+      percentuale sparisce: la geometria resta una, i valori no. */
+-  --tint-ok: rgba(74, 124, 89, 0.085);
+-  --tint-warn: rgba(176, 125, 43, 0.10);
+-  --shadow-sm: 0 1px 2px rgba(31, 30, 29, 0.06);
+-  --shadow: 0 1px 2px rgba(31, 30, 29, 0.05), 0 4px 12px rgba(31, 30, 29, 0.04);
++  --tint-ok: rgba(24, 107, 73, 0.07);
++  --tint-warn: rgba(134, 91, 10, 0.08);
++  --shadow-sm: 0 1px 2px rgba(19, 43, 48, 0.045);
++  --shadow: 0 1px 2px rgba(19, 43, 48, 0.04), 0 6px 18px rgba(19, 43, 48, 0.045);
++  --motion-fast: 160ms;
++  --motion-ui: 200ms;
++  --ease-out: cubic-bezier(.2, .75, .25, 1);
+   --font: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, "Helvetica Neue", Arial, sans-serif;
+   --mono: "JetBrains Mono", "SF Mono", "Cascadia Mono", "Roboto Mono", Menlo, Consolas, monospace;
+   --sidebar-w: 252px;
+@@ -47,25 +53,30 @@
+ }
+ 
+ html[data-theme="dark"] {
+-  --bg: #1b1a18;
+-  --bg-subtle: #211f1d;
+-  --surface: #262523;
+-  --surface-alt: #2d2b28;
+-  --border: #393733;
+-  --border-strong: #4a4741;
+-  --text: #f0eee7;
+-  --text-muted: #a8a29a;
+-  --text-faint: #7c766d;
+-  --accent: #d97757;
+-  --accent-hover: #e48a6c;
+-  --accent-soft: #33241d;
+-  --accent-border: #4e362a;
+-  --ok: #7fb08c;
+-  --warn: #d9a441;
+-  --err: #e0796b;
+-  --code-bg: #1f1e1c;
+-  --tint-ok: rgba(127, 176, 140, 0.10);
+-  --tint-warn: rgba(217, 164, 65, 0.11);
++  --bg: #11181b;
++  --bg-subtle: #151e22;
++  --surface: #192428;
++  --surface-alt: #202e32;
++  --border: #304247;
++  --border-strong: #455c62;
++  --text: #edf3f3;
++  --text-muted: #b2c3c6;
++  --text-faint: #a5b8bd;
++  --accent: #68d5c4;
++  --accent-hover: #8ce3d5;
++  --accent-soft: #1d3734;
++  --accent-border: #4c8b80;
++  --on-accent: #102a28;
++  --control-border: #70878b;
++  --focus-ring: #68d5c4;
++  --hover-bg: #26383d;
++  --selected-bg: #25413d;
++  --ok: #7ad6ad;
++  --warn: #e8be6a;
++  --err: #ff9eaa;
++  --code-bg: #111b1e;
++  --tint-ok: rgba(122, 214, 173, 0.08);
++  --tint-warn: rgba(232, 190, 106, 0.09);
+   --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.28);
+   --shadow: 0 1px 2px rgba(0, 0, 0, 0.3), 0 4px 14px rgba(0, 0, 0, 0.22);
+ }
+@@ -113,7 +124,7 @@
+ }
+ .col-grip::after {
+   content: ""; height: 34px; width: 2px; border-radius: 2px;
+-  background: transparent; transition: background .12s;
++  background: transparent; transition: background var(--motion-ui) var(--ease-out);
+ }
+ .col-grip:hover::after { background: var(--accent); }
+ #sidebar-grip { left: calc(var(--sidebar-w) - 3px); }
+@@ -139,13 +150,11 @@
+ .logo {
+   width: 28px; height: 28px; border-radius: 8px; flex: none;
+   overflow: hidden; position: relative;
+-  /* Il logo scuro e' quasi nero e la sidebar chiara e' quasi bianca: senza un
+-     bordo, in entrambi i temi uno dei due sparisce nello sfondo. */
+-  box-shadow: 0 0 0 1px var(--accent-border);
++  box-shadow: none;
+ }
+ .logo img { width: 100%; height: 100%; display: block; object-fit: cover; }
+ .logo .logo-scuro { display: none; }
+-html[data-theme="dark"] .logo { box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.85); }
++html[data-theme="dark"] .logo { box-shadow: none; }
+ html[data-theme="dark"] .logo .logo-chiaro { display: none; }
+ html[data-theme="dark"] .logo .logo-scuro { display: block; }
+ .brand-name { font-size: 14px; font-weight: 600; line-height: 1.2; }
+@@ -184,7 +193,7 @@
+ }
+ .row-grip::after {
+   content: ""; width: 34px; height: 2px; border-radius: 2px;
+-  background: transparent; transition: background .12s;
++  background: transparent; transition: background var(--motion-ui) var(--ease-out);
+ }
+ .row-grip:hover::after { background: var(--accent); }
+ /* Durante il trascinamento il cursore non deve tornare freccia uscendo dagli
+@@ -202,7 +211,7 @@
+ }
+ .vault-new {
+   flex: 1; font: inherit; font-size: 11.5px; color: var(--text);
+-  background: transparent; border: 1px solid rgba(127, 122, 112, 0.28);
++  background: transparent; border: 1px solid var(--control-border);
+   border-radius: 8px; padding: 5px 9px; cursor: pointer; text-align: center;
+ }
+ .vault-new:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+@@ -217,8 +226,8 @@
+   background: none; border: 0; border-radius: 8px;
+   padding: 6px 12px; cursor: pointer;
+ }
+-.vault:hover { background: rgba(127, 122, 112, 0.11); color: var(--text); }
+-.vault.active { background: rgba(127, 122, 112, 0.16); color: var(--text); font-weight: 500; }
++.vault:hover { background: var(--hover-bg); color: var(--text); }
++.vault.active { background: var(--selected-bg); color: var(--text); font-weight: 500; }
+ /* Centrata verticalmente come la gemella .session.active::before, che lo
+    faceva gia': due elementi con la stessa funzione avevano due comportamenti. */
+ .vault.active::before {
+@@ -243,8 +252,8 @@
+   background: none; border: 0; padding: 0; cursor: pointer;
+   color: var(--text-faint); border-radius: 5px;
+ }
+-.vault-twisty:hover { color: var(--text); background: rgba(127, 122, 112, 0.14); }
+-.vault-twisty .chev { transition: transform .12s; }
++.vault-twisty:hover { color: var(--text); background: var(--hover-bg); }
++.vault-twisty .chev { transition: transform var(--motion-ui) var(--ease-out); }
+ .vault-node.open .vault-twisty .chev { transform: rotate(90deg); }
+ .vault-branch {
+   margin: 0 0 4px 17px; padding-left: 8px;
+@@ -272,7 +281,7 @@
+   border: 1px solid var(--border-strong); border-radius: 9px;
+   background: var(--surface); box-shadow: var(--shadow-sm);
+   font-size: 13.5px; font-weight: 500;
+-  transition: border-color .13s, color .13s, background .13s;
++  transition: border-color var(--motion-ui) var(--ease-out), color var(--motion-ui) var(--ease-out), background var(--motion-ui) var(--ease-out);
+ }
+ .new-chat:hover { border-color: var(--accent); color: var(--accent); background: var(--accent-soft); }
+ 
+@@ -291,8 +300,8 @@
+   position: relative; display: flex; align-items: center;
+   margin: 0 6px 6px; padding: 0 8px;
+   border: 1px solid transparent; border-radius: 8px;
+-  background: rgba(127, 122, 112, 0.09);
+-  transition: border-color .12s, background .12s;
++  background: var(--hover-bg);
++  transition: border-color var(--motion-ui) var(--ease-out), background var(--motion-ui) var(--ease-out);
+ }
+ .search-box:focus-within {
+   border-color: var(--accent); background: var(--surface);
+@@ -312,7 +321,7 @@
+   display: grid; place-items: center; color: var(--text-faint);
+   font-size: 15px; line-height: 1;
+ }
+-.search-clear:hover { color: var(--err); background: rgba(179, 69, 58, 0.12); }
++.search-clear:hover { color: var(--err); background: color-mix(in srgb, var(--err) 10%, var(--surface)); }
+ .search-empty { padding: 10px 12px; font-size: 12.5px; color: var(--text-faint); font-style: italic; }
+ 
+ .session {
+@@ -322,10 +331,10 @@
+   padding: 6px 8px 6px 10px; margin-bottom: 1px;
+   border-radius: 7px; color: var(--text-muted);
+   font-size: 13.5px; line-height: 1.35;
+-  transition: background .1s ease, color .1s ease;
+-}
+-.session:hover { background: rgba(127, 122, 112, 0.11); color: var(--text); }
+-.session.active { background: rgba(127, 122, 112, 0.16); color: var(--text); font-weight: 500; }
++  transition: background var(--motion-ui) var(--ease-out), color var(--motion-ui) var(--ease-out);
++}
++.session:hover { background: var(--hover-bg); color: var(--text); }
++.session.active { background: var(--selected-bg); color: var(--text); font-weight: 500; }
+ .session.active::before {
+   content: ""; position: absolute; left: 2px; top: 50%; transform: translateY(-50%);
+   width: 2.5px; height: 15px; border-radius: 2px; background: var(--accent);
+@@ -371,10 +380,10 @@
+   flex: none; width: 18px; height: 18px; border-radius: 5px;
+   display: grid; place-items: center; color: var(--text-faint);
+   font-size: 15px; line-height: 1; opacity: 0;
+-  transition: opacity .1s, color .1s, background .1s;
++  transition: opacity var(--motion-ui) var(--ease-out), color var(--motion-ui) var(--ease-out), background var(--motion-ui) var(--ease-out);
+ }
+ .session:hover .session-del { opacity: 1; }
+-.session-del:hover { color: var(--err); background: rgba(179, 69, 58, 0.12); }
++.session-del:hover { color: var(--err); background: color-mix(in srgb, var(--err) 10%, var(--surface)); }
+ 
+ .sidebar-foot {
+   border-top: 1px solid var(--border);
+@@ -384,7 +393,7 @@
+ .icon-btn {
+   width: 28px; height: 28px; border-radius: 7px;
+   display: grid; place-items: center; color: var(--text-muted);
+-  transition: background .12s, color .12s;
++  transition: background var(--motion-ui) var(--ease-out), color var(--motion-ui) var(--ease-out);
+ }
+ .icon-btn:hover { background: var(--surface-alt); color: var(--text); }
+ .icon-btn.on { color: var(--accent); background: var(--accent-soft); }
+@@ -394,7 +403,7 @@
+   display: flex; align-items: center; gap: 6px;
+   height: 28px; padding: 0 9px; border-radius: 7px;
+   color: var(--text-muted); font-size: 12.5px; font-weight: 500;
+-  transition: background .12s, color .12s;
++  transition: background var(--motion-ui) var(--ease-out), color var(--motion-ui) var(--ease-out);
+ }
+ .foot-btn svg { flex: none; }
+ .foot-btn:hover { background: var(--surface-alt); color: var(--text); }
+@@ -421,14 +430,14 @@
+   margin: -3px 0 0; padding: 3px 7px;
+   border: 1px solid transparent; border-radius: 8px;
+   background: none; color: inherit; font: inherit; cursor: pointer;
+-  transition: background .12s, border-color .12s;
++  transition: background var(--motion-ui) var(--ease-out), border-color var(--motion-ui) var(--ease-out);
+ }
+ .model-chip:hover { background: var(--surface); border-color: var(--border); }
+ .model-chip[aria-expanded="true"] {
+   background: var(--surface); border-color: var(--border-strong);
+ }
+ .model-chip .title { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+-.model-caret { flex: none; color: var(--text-faint); transition: transform .14s; }
++.model-caret { flex: none; color: var(--text-faint); transition: transform var(--motion-ui) var(--ease-out); }
+ .model-chip[aria-expanded="true"] .model-caret { transform: rotate(180deg); }
+ 
+ /* Le due gocce della barra: una per riga, ognuna nella sua ancora.
+@@ -481,7 +490,7 @@
+   margin: 1px 0 0; padding: 1px 7px;
+   border: 1px solid transparent; border-radius: 7px;
+   background: none; color: inherit; font: inherit; cursor: pointer;
+-  transition: background .12s, border-color .12s;
++  transition: background var(--motion-ui) var(--ease-out), border-color var(--motion-ui) var(--ease-out);
+ }
+ .ws-chip:hover { background: var(--surface); border-color: var(--border); }
+ .ws-chip[aria-expanded="true"] { background: var(--surface); border-color: var(--border-strong); }
+@@ -573,11 +582,11 @@
+   list-style: none; cursor: pointer;
+   padding: 6px 11px; font-size: 12.5px; color: var(--text-muted);
+   display: flex; align-items: center; gap: 7px;
+-  user-select: none; transition: color .12s;
++  user-select: none; transition: color var(--motion-ui) var(--ease-out);
+ }
+ details.drawer > summary::-webkit-details-marker { display: none; }
+ details.drawer > summary:hover { color: var(--accent); }
+-details.drawer > summary .chev { transition: transform .15s ease; flex: none; opacity: .55; }
++details.drawer > summary .chev { transition: transform var(--motion-ui) var(--ease-out); flex: none; opacity: .55; }
+ details.drawer[open] > summary .chev { transform: rotate(90deg); }
+ details.drawer > summary .grow {
+   flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+@@ -626,7 +635,7 @@
+ .q-option {
+   text-align: left; padding: 8px 12px; border-radius: 9px;
+   border: 1px solid var(--border-strong); background: var(--surface);
+-  font-size: 13.5px; transition: border-color .12s, background .12s, transform .06s;
++  font-size: 13.5px; transition: border-color var(--motion-ui) var(--ease-out), background var(--motion-ui) var(--ease-out), transform var(--motion-ui) var(--ease-out);
+ }
+ .q-option:hover { border-color: var(--accent); background: var(--bg); }
+ .q-option:active { transform: translateY(1px); }
+@@ -677,7 +686,7 @@
+   padding: 4px 11px; border-radius: 9999px;
+   border: 1px solid var(--border-strong); background: var(--surface);
+   color: var(--text); font-size: 12px; font-weight: 500;
+-  cursor: pointer; transition: all .15s ease; user-select: none;
++  cursor: pointer; transition: color var(--motion-fast) var(--ease-out), background-color var(--motion-fast) var(--ease-out), border-color var(--motion-fast) var(--ease-out), transform var(--motion-fast) var(--ease-out); user-select: none;
+ }
+ .quick-chip:hover:not(:disabled) {
+   background: var(--accent-soft); border-color: var(--accent);
+@@ -692,7 +701,7 @@
+   display: flex; flex-direction: column;
+   border: 1px solid var(--border-strong); border-radius: 15px;
+   background: var(--surface); box-shadow: var(--shadow); padding: 8px 8px 8px 14px;
+-  transition: border-color .13s, box-shadow .13s;
++  transition: border-color var(--motion-ui) var(--ease-out), box-shadow var(--motion-ui) var(--ease-out);
+ }
+ .composer-row { display: flex; align-items: flex-end; gap: 8px; }
+ 
+@@ -715,19 +724,19 @@
+ #composer textarea::placeholder { color: var(--text-faint); }
+ #send {
+   width: 31px; height: 31px; flex: none; border-radius: 9px;
+-  background: var(--accent); color: #fff; display: grid; place-items: center;
+-  transition: background .12s, opacity .12s;
++  background: var(--accent); color: var(--on-accent); display: grid; place-items: center;
++  transition: background var(--motion-ui) var(--ease-out), opacity var(--motion-ui) var(--ease-out);
+ }
+ #send:hover { background: var(--accent-hover); }
+ #send:disabled { opacity: .35; cursor: not-allowed; }
+ /* Con un turno in corso il tasto invia diventa stop: stessa posizione, stesso
+    ingombro, nessun bottone che compare e scompare facendo saltare il layout. */
+-#send.stopping { background: var(--text-muted); }
++#send.stopping { background: var(--text-muted); color: var(--surface); }
+ #send.stopping:hover { background: var(--err); }
+ #attach {
+   width: 31px; height: 31px; flex: none; border-radius: 9px;
+   color: var(--text-faint); display: grid; place-items: center;
+-  transition: color .12s, background .12s;
++  transition: color var(--motion-ui) var(--ease-out), background var(--motion-ui) var(--ease-out);
+ }
+ #attach:hover { color: var(--accent); background: var(--accent-soft); }
+ /* Goccia "Ricerca online": ancorata a destra della riga, fra la casella
+@@ -739,7 +748,7 @@
+   border: 1px solid var(--border-strong); background: var(--surface);
+   color: var(--text-faint); font-size: 12px; font-weight: 500;
+   cursor: pointer; user-select: none; margin-bottom: 2px;
+-  transition: all .15s ease; white-space: nowrap;
++  transition: color var(--motion-fast) var(--ease-out), background-color var(--motion-fast) var(--ease-out), border-color var(--motion-fast) var(--ease-out), transform var(--motion-fast) var(--ease-out); white-space: nowrap;
+ }
+ .goccia-web .globo { display: block; flex: none; }
+ .goccia-web:hover { color: var(--accent); background: var(--accent-soft); }
+@@ -805,14 +814,10 @@
+      scorrimento orizzontale per 6px che nessuno voleva. */
+   padding-left: 6px; margin-left: -6px;
+ }
+-/* Sfumatura in coda quando c'è altro sotto. Senza, un piano da dieci punti si
+-   interrompe a metà di una riga e sembra finito lì: la barra di scorrimento
+-   da sola non basta, su Windows compare solo al passaggio del mouse. La classe
+-   la toglie il JS appena si arriva in fondo, così non resta una velatura su
+-   contenuto che è già tutto visibile. */
++/* A bottom edge signals more content without fading the text itself.
++   The existing scroll observer removes it when the end becomes visible. */
+ .scorre {
+-  -webkit-mask-image: linear-gradient(to bottom, #000 calc(100% - 26px), transparent);
+-  mask-image: linear-gradient(to bottom, #000 calc(100% - 26px), transparent);
++  box-shadow: inset 0 -1px var(--border-strong);
+ }
+ /* Avanzamento. Stessa geometria della barra del contesto -- e' la stessa
+    idea, "quanto e' pieno" -- ma a due segmenti: i saltati riempiono il piano
+@@ -821,7 +826,7 @@
+   display: flex; height: 5px; margin: 3px 0 9px;
+   border-radius: 3px; overflow: hidden; background: var(--border);
+ }
+-.plan-bar > span { transition: width .3s ease; }
++.plan-bar > span { transition: width var(--motion-ui) var(--ease-out); }
+ .plan-bar-done { background: var(--ok); }
+ .plan-bar-skipped { background: var(--warn); }
+ 
+@@ -951,7 +956,7 @@
+ }
+ .preview-grip::after {
+   content: ""; height: 34px; width: 2px; border-radius: 2px;
+-  background: var(--border-strong); transition: background .12s;
++  background: var(--border-strong); transition: background var(--motion-ui) var(--ease-out);
+ }
+ .preview-grip:hover::after { background: var(--accent); }
+ /* Durante il trascinamento il puntatore esce dalla maniglia: senza questa
+@@ -983,7 +988,7 @@
+ .preview-pad { padding: 20px 26px; max-width: 900px; margin: 0 auto; }
+ .preview-img { max-width: 100%; height: auto; display: block; margin: 0 auto; }
+ .meter { height: 5px; border-radius: 3px; background: var(--border); overflow: hidden; margin: 4px 0 6px; }
+-.meter > div { height: 100%; background: var(--accent); border-radius: 3px; transition: width .3s ease; }
++.meter > div { height: 100%; background: var(--accent); border-radius: 3px; transition: width var(--motion-ui) var(--ease-out); }
+ .meter.warn > div { background: var(--warn); }
+ .meter.err > div { background: var(--err); }
+ .path {
+@@ -1025,7 +1030,7 @@
+ .att-del {
+   flex: none; color: var(--text-faint); font-size: 14px; line-height: 1;
+   width: 16px; height: 16px; border-radius: 5px;
+-  opacity: 0; transition: opacity .12s, color .12s, background .12s;
++  opacity: 0; transition: opacity var(--motion-ui) var(--ease-out), color var(--motion-ui) var(--ease-out), background var(--motion-ui) var(--ease-out);
+ }
+ .att-chip:hover .att-del { opacity: 1; }
+ .att-del:hover { color: var(--err); background: var(--surface-alt); }
+@@ -1045,7 +1050,7 @@
+ .empty { color: var(--text-faint); font-size: 12.5px; font-style: italic; }
+ .mini-btn {
+   padding: 5px 10px; border-radius: 8px; border: 1px solid var(--border-strong);
+-  background: var(--surface); font-size: 12.5px; transition: border-color .12s, color .12s, background .12s;
++  background: var(--surface); font-size: 12.5px; transition: border-color var(--motion-ui) var(--ease-out), color var(--motion-ui) var(--ease-out), background var(--motion-ui) var(--ease-out);
+ }
+ .mini-btn:hover { border-color: var(--accent); color: var(--accent); background: var(--accent-soft); }
+ .btn-row { display: flex; gap: 6px; margin-bottom: 9px; }
+@@ -1054,7 +1059,7 @@
+ /* ---------- overlay impostazioni ---------- */
+ 
+ #overlay {
+-  position: fixed; inset: 0; background: rgba(20, 19, 18, 0.42);
++  position: fixed; inset: 0; background: rgba(10, 22, 27, 0.48);
+   display: none; align-items: flex-start; justify-content: center;
+   padding: 46px 20px; z-index: 50; backdrop-filter: blur(2px);
+ }
+@@ -1122,11 +1127,11 @@
+ .btn {
+   padding: 7px 14px; border-radius: 9px; font-size: 13.5px; font-weight: 500;
+   border: 1px solid var(--border-strong); background: var(--surface);
+-  transition: border-color .12s, background .12s, color .12s;
++  transition: border-color var(--motion-ui) var(--ease-out), background var(--motion-ui) var(--ease-out), color var(--motion-ui) var(--ease-out);
+ }
+ .btn:hover { border-color: var(--accent); color: var(--accent); background: var(--accent-soft); }
+-.btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+-.btn.primary:hover { background: var(--accent-hover); color: #fff; }
++.btn.primary { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
++.btn.primary:hover { background: var(--accent-hover); color: var(--on-accent); }
+ 
+ .banner { border-radius: 9px; padding: 9px 12px; font-size: 13px; margin-bottom: 11px; border: 1px solid var(--border); background: var(--surface-alt); }
+ .banner.ok { border-color: color-mix(in srgb, var(--ok) 40%, var(--border)); color: var(--ok); }
+@@ -1146,9 +1151,9 @@
+ .mem-row .id { font-family: var(--mono); font-size: 10.5px; color: var(--text-faint); }
+ 
+ #toast {
+-  position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%) translateY(14px);
++  position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%) translateY(3px);
+   background: var(--text); color: var(--bg); padding: 8px 15px; border-radius: 9px;
+-  font-size: 13px; opacity: 0; pointer-events: none; transition: opacity .18s, transform .18s; z-index: 90;
++  font-size: 13px; opacity: 0; pointer-events: none; transition: opacity var(--motion-ui) var(--ease-out), transform var(--motion-ui) var(--ease-out); z-index: 90;
+ }
+ #toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+ 
+@@ -1267,7 +1272,7 @@
+   border: 1px solid var(--border-strong); border-radius: 12px;
+   background: var(--surface); box-shadow: var(--shadow-sm);
+   padding: 9px 9px 9px 12px;
+-  transition: border-color .13s;
++  transition: border-color var(--motion-ui) var(--ease-out);
+ }
+ .vault-composer:focus-within { border-color: var(--accent); }
+ .vault-composer textarea {
+@@ -1288,9 +1293,9 @@
+   display: flex; flex-direction: column; gap: 2px; width: 100%;
+   text-align: left; font: inherit; background: none; border: 0;
+   border-radius: 9px; padding: 9px 11px; cursor: pointer;
+-  transition: background .12s;
+-}
+-.vault-chat:hover { background: rgba(127, 122, 112, 0.11); }
++  transition: background var(--motion-ui) var(--ease-out);
++}
++.vault-chat:hover { background: var(--hover-bg); }
+ .vault-chat-title {
+   font-size: 13.5px; color: var(--text);
+   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+@@ -1357,7 +1362,7 @@
+ .vmem-del {
+   flex: none; border: 0; background: none; cursor: pointer; padding: 0 2px;
+   color: var(--text-faint); font-size: 14px; line-height: 1; opacity: 0;
+-  transition: opacity .12s, color .12s;
++  transition: opacity var(--motion-ui) var(--ease-out), color var(--motion-ui) var(--ease-out);
+ }
+ .vmem:hover .vmem-del { opacity: 1; }
+ .vmem-del:hover { color: var(--accent); }
+@@ -1369,3 +1374,65 @@
+   margin-top: 8px; padding-top: 7px; border-top: 1px dashed var(--border-strong);
+   font-size: 11.5px; color: var(--text-faint);
+ }
++
++
++/* Visual refinement: paint and motion only. Grid, spacing and type sizes stay fixed. */
++button, a, input, textarea, select, summary, [role="button"], [role="checkbox"] {
++  -webkit-tap-highlight-color: color-mix(in srgb, var(--accent) 12%, transparent);
++}
++button, a, summary, [role="button"], [role="checkbox"] {
++  transition: color var(--motion-fast) var(--ease-out),
++    background-color var(--motion-fast) var(--ease-out),
++    border-color var(--motion-fast) var(--ease-out),
++    box-shadow var(--motion-fast) var(--ease-out),
++    transform var(--motion-fast) var(--ease-out);
++}
++:is(button, a, input, textarea, select, summary, [tabindex]):focus-visible {
++  outline: 2px solid var(--focus-ring);
++  outline-offset: 2px;
++}
++input, textarea { caret-color: var(--accent); }
++input::placeholder, textarea::placeholder { color: var(--text-faint); opacity: 1; }
++.hint-inline { opacity: 1; }
++details.drawer > summary .chev { opacity: 1; }
++.search-box, #composer,
++.field input[type="text"], .field input[type="password"], .field input[type="number"],
++.field select, .field textarea, .q-free input, #vault-card input[type="text"],
++#vault-card textarea, .vault-composer, .new-chat, .btn, .quick-chip, .goccia-web {
++  border-color: var(--control-border);
++}
++.search-box:focus-within, #composer:focus-within, .vault-composer:focus-within {
++  border-color: var(--focus-ring);
++  box-shadow: 0 0 0 2px var(--focus-ring), var(--shadow-sm);
++}
++.field :is(input, select, textarea):focus-visible,
++.q-free input:focus-visible, #vault-card :is(input, textarea):focus-visible {
++  border-color: var(--focus-ring);
++  box-shadow: none;
++}
++.btn.primary { border-color: var(--accent); }
++.goccia-web.on { border-color: var(--accent); }
++:is(.new-chat, .btn, .quick-chip, .goccia-web):hover:not(:disabled) {
++  border-color: var(--accent);
++  box-shadow: var(--shadow-sm);
++}
++:is(.new-chat, .btn, #send):active:not(:disabled) { transform: translateY(1px); }
++:is(.session, .att-chip, .vmem):focus-within :is(.session-del, .att-del, .vmem-del),
++:is(.session-del, .att-del, .vmem-del):focus-visible { opacity: 1; }
++@media (hover: none) {
++  .session-del, .att-del, .vmem-del { opacity: 1; }
++}
++#overlay.open .modal, .tab-panel.active, .model-menu:not([hidden]), .ws-menu:not([hidden]) {
++  animation: surface-enter var(--motion-ui) var(--ease-out) both;
++}
++@keyframes surface-enter {
++  from { opacity: .96; transform: translateY(2px); }
++  to { opacity: 1; transform: translateY(0); }
++}
++@media (prefers-reduced-motion: reduce) {
++  *, *::before, *::after {
++    animation: none !important;
++    transition: none !important;
++    scroll-behavior: auto !important;
++  }
++}
+--- a/web_mobile/app.js
++++ b/web_mobile/app.js
+@@ -279,6 +279,8 @@
+   for (const s of sessions) {
+     const li = document.createElement("li");
+     li.dataset.id = s.id;
++    li.tabIndex = 0;
++    li.setAttribute('role', 'button');
+ 
+     const title = document.createElement("div");
+     title.className = "session-title";
+@@ -296,6 +298,12 @@
+ 
+     li.append(title, meta);
+     li.addEventListener("click", () => openChat(s.id));
++    li.addEventListener('keydown', (event) => {
++      if (event.key === 'Enter' || event.key === ' ') {
++        event.preventDefault();
++        openChat(s.id);
++      }
++    });
+     list.appendChild(li);
+   }
+ }
+--- a/web_mobile/index.html
++++ b/web_mobile/index.html
+@@ -3,7 +3,7 @@
+ <head>
+ <meta charset="utf-8">
+ <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+-<meta name="theme-color" content="#101418">
++<meta name="theme-color" content="#11181b">
+ <!-- Senza, su iOS i controlli nativi (cursore del textarea, barre di
+      scorrimento) restano in schema chiaro sopra un fondo scuro. -->
+ <meta name="color-scheme" content="dark">
+--- a/web_mobile/manifest.webmanifest
++++ b/web_mobile/manifest.webmanifest
+@@ -7,8 +7,8 @@
+   "scope": "/",
+   "display": "standalone",
+   "orientation": "portrait",
+-  "background_color": "#101418",
+-  "theme_color": "#101418",
++  "background_color": "#11181b",
++  "theme_color": "#11181b",
+   "icons": [
+     {
+       "src": "/static/icons/icon-192.png",
+--- a/web_mobile/style.css
++++ b/web_mobile/style.css
+@@ -4,14 +4,24 @@
+  */
+ 
+ :root {
+-  --bg: #101418;
+-  --panel: #171c22;
+-  --bordo: #262d36;
+-  --testo: #e6eaef;
+-  --testo-dim: #93a0ad;
+-  --accento: #4da3ff;
+-  --utente: #2b527f;
+-  --ok: #3ecf8e;
++  color-scheme: dark;
++  --bg: #11181b;
++  --panel: #192226;
++  --panel-hover: #223036;
++  --bordo: #304247;
++  --bordo-control: #70878b;
++  --testo: #edf3f3;
++  --testo-dim: #acbdbf;
++  --accento: #63d5c5;
++  --accento-hover: #83e1d3;
++  --accento-active: #50b9aa;
++  --su-accento: #102a28;
++  --utente: #244941;
++  --ok: #7fe0b6;
++  --errore: #ffb8ad;
++  --errore-bg: #39262a;
++  --stop: #e9a3a3;
++  --su-stop: #3b181c;
+ }
+ 
+ * { box-sizing: border-box; }
+@@ -80,7 +90,7 @@
+ }
+ 
+ .icon-btn {
+-  border: 1px solid var(--bordo);
++  border: 1px solid var(--bordo-control);
+   background: transparent;
+   color: var(--testo);
+   width: 38px;
+@@ -91,7 +101,7 @@
+   display: grid;
+   place-items: center;
+ }
+-.icon-btn:active { background: var(--bordo); }
++.icon-btn:active { background: var(--panel-hover); border-color: var(--accento); }
+ 
+ /* ---------------------------------------------------------------- elenco */
+ 
+@@ -99,8 +109,8 @@
+   margin: 10px 12px 0;
+   padding: 10px 12px;
+   border-radius: 10px;
+-  background: #3a1f22;
+-  color: #ffb4ae;
++  background: var(--errore-bg);
++  color: var(--errore);
+   font-size: 14px;
+ }
+ 
+@@ -116,7 +126,7 @@
+   padding: 12px;
+   margin-bottom: 8px;
+   background: var(--panel);
+-  border: 1px solid var(--bordo);
++  border: 1px solid var(--bordo-control);
+   border-radius: 12px;
+ }
+ .session-list li:active { border-color: var(--accento); }
+@@ -134,7 +144,7 @@
+   margin-left: 8px;
+   padding: 2px 8px;
+   border-radius: 999px;
+-  background: rgba(62, 207, 142, 0.15);
++  background: #203f36;
+   color: var(--ok);
+   font-size: 11px;
+   font-weight: 600;
+@@ -144,7 +154,7 @@
+ 
+ @keyframes respira {
+   0%, 100% { opacity: 1; }
+-  50%      { opacity: 0.45; }
++  50%      { opacity: 0.88; }
+ }
+ 
+ /* -------------------------------------------------------- conversazione */
+@@ -182,7 +192,7 @@
+   font-size: 0.88em;
+   padding: 1px 4px;
+   border-radius: 5px;
+-  background: rgba(127, 127, 127, 0.18);
++  background: rgba(172, 189, 191, 0.12);
+   word-break: break-all;
+ }
+ 
+@@ -195,21 +205,21 @@
+ 
+ .msg.pending {
+   align-self: stretch;
+-  background: rgba(77, 163, 255, 0.12);
++  background: rgba(99, 213, 197, 0.12);
+   border: 1px solid var(--accento);
+ }
+ 
+ /* Una domanda a cui si e' gia' risposto e' cronologia, non una richiesta
+    aperta: perde il bordo acceso e resta li' a dire cosa era stato chiesto. */
+ .msg.pending.risposta-data {
+-  background: rgba(77, 163, 255, 0.06);
++  background: rgba(99, 213, 197, 0.06);
+   border-color: var(--bordo);
+   color: var(--testo-dim);
+ }
+ 
+ .msg.user.risposta-scelta::before {
+   content: "↳ ";
+-  opacity: 0.6;
++  opacity: 1;
+ }
+ 
+ .msg.live::after {
+@@ -255,7 +265,7 @@
+   display: inline-block;
+   width: 12px;
+   margin-right: 2px;
+-  transition: transform 0.15s ease;
++  transition: transform 180ms ease-out;
+ }
+ .passi[open] > .passi-sommario::before { transform: rotate(90deg); }
+ 
+@@ -280,13 +290,13 @@
+   width: 5px;
+   height: 5px;
+   border-radius: 50%;
+-  background: var(--bordo);
++  background: var(--testo-dim);
+   transform: translateY(-1px);
+ }
+ .passo.pensiero::before { background: transparent; box-shadow: inset 0 0 0 1px var(--testo-dim); }
+-.passo.tool::before { background: var(--accento); opacity: 0.55; }
+-.passo.male { color: #ffb4ae; }
+-.passo.male::before { background: #ffb4ae; opacity: 1; }
++.passo.tool::before { background: var(--accento); opacity: 0.85; }
++.passo.male { color: var(--errore); }
++.passo.male::before { background: var(--errore); opacity: 1; }
+ 
+ /* Il passo in corso pulsa: e' l'unica riga viva dell'elenco. */
+ .passo.corso {
+@@ -301,7 +311,7 @@
+ 
+ @keyframes pulsa {
+   0%, 100% { transform: translateY(-1px) scale(1); opacity: 1; }
+-  50%      { transform: translateY(-1px) scale(1.9); opacity: 0.45; }
++  50%      { transform: translateY(-1px) scale(1.9); opacity: 0.75; }
+ }
+ 
+ /* ------------------------------------------------------ striscia attivita' */
+@@ -316,7 +326,7 @@
+   border: 1px solid var(--bordo);
+   border-radius: 12px;
+   background:
+-    linear-gradient(90deg, transparent, rgba(77, 163, 255, 0.13), transparent)
++    linear-gradient(90deg, transparent, rgba(99, 213, 197, 0.13), transparent)
+       0 0 / 45% 100% no-repeat,
+     var(--panel);
+   animation: scorre 1.9s linear infinite;
+@@ -337,14 +347,14 @@
+   height: 8px;
+   border-radius: 50%;
+   background: var(--accento);
+-  box-shadow: 0 0 0 0 rgba(77, 163, 255, 0.55);
++  box-shadow: 0 0 0 0 rgba(99, 213, 197, 0.45);
+   animation: battito 1.4s ease-out infinite;
+ }
+ 
+ @keyframes battito {
+-  0%   { box-shadow: 0 0 0 0 rgba(77, 163, 255, 0.55); }
+-  70%  { box-shadow: 0 0 0 9px rgba(77, 163, 255, 0); }
+-  100% { box-shadow: 0 0 0 0 rgba(77, 163, 255, 0); }
++  0%   { box-shadow: 0 0 0 0 rgba(99, 213, 197, 0.45); }
++  70%  { box-shadow: 0 0 0 9px rgba(99, 213, 197, 0); }
++  100% { box-shadow: 0 0 0 0 rgba(99, 213, 197, 0); }
+ }
+ 
+ .attivita-testo {
+@@ -364,6 +374,11 @@
+ /* Chi ha chiesto meno animazioni al sistema operativo le ottiene: resta il
+    colore, che basta a dire che qualcosa e' in corso. */
+ @media (prefers-reduced-motion: reduce) {
++  *, *::before, *::after {
++    animation: none !important;
++    transition: none !important;
++    scroll-behavior: auto !important;
++  }
+   .attivita { animation: none; }
+   .battito { animation: none; }
+   .passo.corso::before { animation: none; }
+@@ -392,11 +407,11 @@
+   border: 0;
+   border-radius: 10px;
+   background: var(--accento);
+-  color: #06121f;
++  color: var(--su-accento);
+   font-weight: 700;
+   font-size: 15px;
+ }
+-button.primary:active { filter: brightness(0.85); }
++button.primary:active { background: var(--accento-active); }
+ 
+ /* -------------------------------------------------------------- composer */
+ 
+@@ -415,18 +430,18 @@
+   resize: none;
+   max-height: 120px;
+   padding: 10px 12px;
+-  border: 1px solid var(--bordo);
++  border: 1px solid var(--bordo-control);
+   border-radius: 12px;
+   background: var(--bg);
+   color: var(--testo);
+   font: inherit;
+ }
+-.composer textarea:focus { outline: 1px solid var(--accento); }
++.composer textarea:focus { outline: 2px solid var(--accento); outline-offset: 2px; }
+ 
+ .question-card textarea {
+   resize: none;
+   padding: 10px 12px;
+-  border: 1px solid var(--bordo);
++  border: 1px solid var(--bordo-control);
+   border-radius: 10px;
+   background: var(--bg);
+   color: var(--testo);
+@@ -443,9 +458,10 @@
+   display: grid;
+   place-items: center;
+ }
+-.send { background: var(--accento); color: #06121f; }
+-.stop { background: #a33b3b; color: #fff; }
+-.send:active, .stop:active { filter: brightness(0.85); }
++.send { background: var(--accento); color: var(--su-accento); }
++.stop { background: var(--stop); color: var(--su-stop); }
++.send:active { background: var(--accento-active); }
++.stop:active { background: #d68d8d; }
+ 
+ /* ------------------------------------------------------------ opzioni domanda */
+ 
+@@ -460,7 +476,7 @@
+ 
+ .option-btn {
+   padding: 10px 14px;
+-  border: 1px solid var(--bordo);
++  border: 1px solid var(--bordo-control);
+   border-radius: 18px;
+   background: var(--panel);
+   color: var(--testo);
+@@ -470,7 +486,36 @@
+ .option-btn.on {
+   border-color: var(--accento);
+   background: var(--accento);
+-  color: #06121f;
++  color: var(--su-accento);
++}
++
++/* Feedback cromatico: nessuna variazione delle misure o della posizione. */
++button, textarea, .session-list li, .passi-sommario {
++  transition: background-color 180ms ease-out, border-color 180ms ease-out,
++    color 180ms ease-out, box-shadow 180ms ease-out;
++}
++
++button { cursor: pointer; -webkit-tap-highlight-color: rgba(99, 213, 197, 0.16); }
++textarea { caret-color: var(--accento); }
++textarea::placeholder { color: var(--testo-dim); opacity: 1; }
++
++button:focus-visible, textarea:focus-visible,
++.session-list li:focus-visible, .passi-sommario:focus-visible {
++  outline: 2px solid var(--accento);
++  outline-offset: 3px;
++}
++
++button:disabled { cursor: default; }
++
++@media (hover: hover) and (pointer: fine) {
++  .icon-btn:hover:not(:disabled), .option-btn:hover:not(:disabled):not(.on),
++  .session-list li:hover {
++    background: var(--panel-hover);
++    border-color: var(--accento);
++  }
++  button.primary:hover:not(:disabled), .send:hover:not(:disabled),
++  .option-btn.on:hover:not(:disabled) { background: var(--accento-hover); }
++  .stop:hover:not(:disabled) { background: #f3b7b7; }
+ }
+ 
+ /* ----------------------------------------------------------------- toast */
+@@ -482,8 +527,9 @@
+   transform: translateX(-50%);
+   max-width: 90vw;
+   padding: 10px 16px;
+-  background: #000c;
+-  color: #fff;
++  background: #192226;
++  color: var(--testo);
++  box-shadow: 0 0 0 1px var(--bordo-control), 0 8px 24px rgba(0, 0, 0, 0.28);
+   border-radius: 10px;
+   font-size: 14px;
+   z-index: 10;

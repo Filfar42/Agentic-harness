@@ -178,10 +178,13 @@ def ctx_vuoto(tmp_path) -> ToolContext:
     return ToolContext(workspace=str(tmp_path), sandbox="host")
 
 
-def test_il_tool_accetta_un_elenco_scritto_a_righe(tmp_path):
-    """Rifiutarlo sarebbe formalmente corretto e praticamente inutile."""
+def test_il_tool_rifiuta_stringhe_al_posto_di_array(tmp_path):
+    """Strict arguments must not silently coerce an invalid model call."""
     ctx = ctx_vuoto(tmp_path)
-    dispatch(ctx, PLAN_TOOL, {"action": "set", "steps": "- leggere\n- correggere"})
+    result = json.loads(dispatch(ctx, PLAN_TOOL, {"action": "set", "steps": "- leggere\n- correggere"}))
+    assert result["error_code"] == "invalid_arguments"
+    assert ctx.plan.steps == []
+    dispatch(ctx, PLAN_TOOL, {"action": "set", "steps": ["leggere", "correggere"]})
     assert [s.text for s in ctx.plan.steps] == ["leggere", "correggere"]
 
 

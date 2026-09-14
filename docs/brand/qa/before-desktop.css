@@ -1,0 +1,1371 @@
+/* Local Agent Harness — foglio di stile unico.
+   Palette "carta calda" ispirata a Claude CoWork. Tutto passa dalle custom
+   properties: il tema scuro riempie le stesse variabili, quindi le due
+   versioni non possono divergere nella geometria. */
+
+:root {
+  --bg: #faf9f5;
+  --bg-subtle: #f2f0e9;
+  --surface: #ffffff;
+  --surface-alt: #f6f4ee;
+  --border: #e4e0d6;
+  --border-strong: #d2cdc0;
+  --text: #1f1e1d;
+  --text-muted: #6e6a62;
+  --text-faint: #98938a;
+  /* Alias storico. C'e' stato un momento in cui la palette aveva un quarto
+     grigio, e tre regole continuavano a chiedere `var(--text-dim)`: senza
+     ripiego la dichiarazione diventa `unset` e il colore viene EREDITATO.
+     Le righe dei vault nascevano gia' a colore pieno, quindi :hover e .active
+     -- che portano a var(--text) -- non cambiavano niente di visibile. */
+  --text-dim: var(--text-muted);
+  --accent: #c96442;
+  --accent-hover: #b4573a;
+  --accent-soft: #f7ece7;
+  --accent-border: #e8cfc4;
+  --ok: #4a7c59;
+  --warn: #b07d2b;
+  --err: #b3453a;
+  --code-bg: #f4f2ec;
+  /* Tinte di stato: un velo, non un colore. Servono a far leggere una riga
+     senza leggerla, quindi devono restare sotto la soglia in cui il testo
+     sopra perde contrasto. Sono variabili perche' sul tema scuro la stessa
+     percentuale sparisce: la geometria resta una, i valori no. */
+  --tint-ok: rgba(74, 124, 89, 0.085);
+  --tint-warn: rgba(176, 125, 43, 0.10);
+  --shadow-sm: 0 1px 2px rgba(31, 30, 29, 0.06);
+  --shadow: 0 1px 2px rgba(31, 30, 29, 0.05), 0 4px 12px rgba(31, 30, 29, 0.04);
+  --font: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, "Helvetica Neue", Arial, sans-serif;
+  --mono: "JetBrains Mono", "SF Mono", "Cascadia Mono", "Roboto Mono", Menlo, Consolas, monospace;
+  --sidebar-w: 252px;
+  --panel-w: 288px;
+  /* Quanto larga puo' farsi una bolla dell'utente. Le tre regole che la usano
+     (la bolla, gli allegati sotto, la striscia di chip) devono restare
+     allineate per costruzione: erano tre numeri uguali scritti a mano in tre
+     punti lontani, e allinearli era un lavoro di ricerca. */
+  --bolla-max: 78%;
+}
+
+html[data-theme="dark"] {
+  --bg: #1b1a18;
+  --bg-subtle: #211f1d;
+  --surface: #262523;
+  --surface-alt: #2d2b28;
+  --border: #393733;
+  --border-strong: #4a4741;
+  --text: #f0eee7;
+  --text-muted: #a8a29a;
+  --text-faint: #7c766d;
+  --accent: #d97757;
+  --accent-hover: #e48a6c;
+  --accent-soft: #33241d;
+  --accent-border: #4e362a;
+  --ok: #7fb08c;
+  --warn: #d9a441;
+  --err: #e0796b;
+  --code-bg: #1f1e1c;
+  --tint-ok: rgba(127, 176, 140, 0.10);
+  --tint-warn: rgba(217, 164, 65, 0.11);
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.28);
+  --shadow: 0 1px 2px rgba(0, 0, 0, 0.3), 0 4px 14px rgba(0, 0, 0, 0.22);
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0; padding: 0; height: 100%;
+  background: var(--bg); color: var(--text);
+  font-family: var(--font); font-size: 15px; line-height: 1.6;
+  letter-spacing: -0.008em;
+  -webkit-font-smoothing: antialiased;
+}
+
+button, input, textarea, select { font-family: inherit; font-size: inherit; color: inherit; }
+button { cursor: pointer; background: none; border: none; padding: 0; }
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+
+::-webkit-scrollbar { width: 9px; height: 9px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--border-strong); border-radius: 5px; }
+::-webkit-scrollbar-thumb:hover { background: var(--text-faint); }
+
+/* ---------- impianto ---------- */
+
+#app {
+  display: grid;
+  grid-template-columns: var(--sidebar-w) minmax(0, 1fr) var(--panel-w);
+  height: 100vh; overflow: hidden;
+  /* Riferimento per le maniglie delle colonne. Sono figlie assolute di #app:
+     in un grid gli elementi in posizione assoluta non partecipano al calcolo
+     delle tracce, quindi non spostano niente. */
+  position: relative;
+}
+
+/* Divisori trascinabili delle colonne laterali. Stessa larghezza e stesso
+   comportamento del divisorio dell'anteprima — un solo gesto da imparare —
+   ma invisibili finché non ci si passa sopra: una riga colorata fissa fra due
+   colonne che hanno già il loro bordo sarebbe rumore. */
+.col-grip {
+  position: absolute; top: 0; bottom: 0; width: 7px; z-index: 5;
+  cursor: ew-resize; touch-action: none;
+  display: grid; place-items: center;
+}
+.col-grip::after {
+  content: ""; height: 34px; width: 2px; border-radius: 2px;
+  background: transparent; transition: background .12s;
+}
+.col-grip:hover::after { background: var(--accent); }
+#sidebar-grip { left: calc(var(--sidebar-w) - 3px); }
+#panel-grip { right: calc(var(--panel-w) - 3px); }
+#app.no-sidebar #sidebar-grip, #app.no-panel #panel-grip { display: none; }
+#app.no-panel { grid-template-columns: var(--sidebar-w) minmax(0, 1fr); }
+#app.no-sidebar { grid-template-columns: minmax(0, 1fr) var(--panel-w); }
+#app.no-panel.no-sidebar { grid-template-columns: minmax(0, 1fr); }
+#app.no-sidebar #sidebar, #app.no-panel #panel { display: none; }
+
+/* ---------- sidebar ---------- */
+
+#sidebar {
+  background: var(--bg-subtle);
+  border-right: 1px solid var(--border);
+  display: flex; flex-direction: column; min-height: 0;
+}
+
+.brand {
+  display: flex; align-items: center; gap: 9px;
+  padding: 14px 14px 10px;
+}
+.logo {
+  width: 28px; height: 28px; border-radius: 8px; flex: none;
+  overflow: hidden; position: relative;
+  /* Il logo scuro e' quasi nero e la sidebar chiara e' quasi bianca: senza un
+     bordo, in entrambi i temi uno dei due sparisce nello sfondo. */
+  box-shadow: 0 0 0 1px var(--accent-border);
+}
+.logo img { width: 100%; height: 100%; display: block; object-fit: cover; }
+.logo .logo-scuro { display: none; }
+html[data-theme="dark"] .logo { box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.85); }
+html[data-theme="dark"] .logo .logo-chiaro { display: none; }
+html[data-theme="dark"] .logo .logo-scuro { display: block; }
+.brand-name { font-size: 14px; font-weight: 600; line-height: 1.2; }
+.brand-sub { font-size: 11px; color: var(--text-faint); font-family: var(--mono); }
+
+.section-hint { font-weight: 400; color: var(--text-faint); margin-left: 4px; }
+
+/* La sezione Vault e' la meta' bassa della colonna, non una striscia in fondo:
+   con le chat annidate sotto ogni vault e' un elenco come quello sopra, non un
+   menu. `margin-top: auto` la spingeva in fondo e le lasciava l'altezza del suo
+   contenuto -- due vault aperti e il ramo usciva sotto il footer.
+   Quanto valga "meta'" lo decide la maniglia: `--vaults-h` e' l'altezza della
+   sezione, e le due parti scorrono per conto loro -- risalire fra i vault non
+   deve trascinare via le conversazioni, e viceversa. */
+/* Le proprieta' di #sessions stanno tutte insieme piu' sotto, nella sezione
+   dell'elenco conversazioni: qui c'era un secondo blocco con `flex: 1 1 auto`
+   che l'altro sovrascriveva 113 righe dopo -- e il commento sopra spiegava il
+   disegno riferendosi a una regola morta. */
+.vaults-sec {
+  flex: 0 0 var(--vaults-h, 50%); min-height: 0;
+  display: flex; flex-direction: column;
+}
+.vaults-label { border-top: 1px solid var(--border); padding-top: 10px; }
+#vaults {
+  flex: 1 1 auto; min-height: 0; overflow-y: auto;
+  padding: 0 6px 8px;
+}
+
+/* Maniglia orizzontale fra i due elenchi. E' la `.col-grip` girata di 90
+   gradi: stesso gesto, stessa invisibilita' a riposo, stesso doppio clic come
+   uscita di sicurezza. Sta in mezzo al flusso e non in `position: absolute`
+   perche' qui il confine e' davvero fra due elementi, non sopra di essi. */
+.row-grip {
+  flex: none; height: 8px; cursor: ns-resize; touch-action: none;
+  display: grid; place-items: center;
+}
+.row-grip::after {
+  content: ""; width: 34px; height: 2px; border-radius: 2px;
+  background: transparent; transition: background .12s;
+}
+.row-grip:hover::after { background: var(--accent); }
+/* Durante il trascinamento il cursore non deve tornare freccia uscendo dagli
+   8px della maniglia: la stessa regola che gia' vale per le colonne. */
+/* La regola e' una sola; cambia solo il cursore, e quello arriva da una
+   proprieta'. Erano due copie identiche a 700 righe di distanza, e chi ne
+   correggeva una non aveva modo di sapere dell'altra. */
+body.resizing-rows { --cursore-trascina: ns-resize; }
+
+/* La sezione Vault vive in fondo alla colonna, sopra il footer: elenco
+   compatto nello stile delle conversazioni, piu' la casella per registrare
+   un percorso nuovo senza aprire le impostazioni. */
+.vault-add {
+  display: flex; gap: 6px; padding: 2px 10px 6px;
+}
+.vault-new {
+  flex: 1; font: inherit; font-size: 11.5px; color: var(--text);
+  background: transparent; border: 1px solid rgba(127, 122, 112, 0.28);
+  border-radius: 8px; padding: 5px 9px; cursor: pointer; text-align: center;
+}
+.vault-new:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+.vault-new:disabled { opacity: 0.55; cursor: wait; }
+.vault-add input::placeholder { color: var(--text-faint); }
+
+.vault {
+  position: relative;   /* per ::before: senza, si posiziona su .vault-node,
+                           che include anche il ramo delle chat */
+  display: flex; align-items: center; gap: 8px; width: 100%;
+  text-align: left; font: inherit; font-size: 12px; color: var(--text-dim);
+  background: none; border: 0; border-radius: 8px;
+  padding: 6px 12px; cursor: pointer;
+}
+.vault:hover { background: rgba(127, 122, 112, 0.11); color: var(--text); }
+.vault.active { background: rgba(127, 122, 112, 0.16); color: var(--text); font-weight: 500; }
+/* Centrata verticalmente come la gemella .session.active::before, che lo
+   faceva gia': due elementi con la stessa funzione avevano due comportamenti. */
+.vault.active::before {
+  content: ''; position: absolute; left: 4px; top: 50%; transform: translateY(-50%);
+  width: 3px; height: 16px; border-radius: 2px; background: var(--accent);
+}
+.vault-name {
+  flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.vault-meta { font-size: 10.5px; color: var(--text-faint); font-variant-numeric: tabular-nums; flex: none; }
+.vault-empty { padding: 2px 14px 8px; font-size: 11px; color: var(--text-faint); }
+
+/* Albero dei vault: la riga del vault, e sotto le sue chat rientrate.
+   Il rientro e' la riga verticale a sinistra, non solo il padding: dice dove
+   comincia e dove finisce il ramo anche quando le chat sono dieci. */
+.vault-node { position: relative; }
+.vault-row { display: flex; align-items: center; }
+.vault-row .vault { flex: 1; min-width: 0; padding-left: 2px; }
+.vault-twisty {
+  flex: none; width: 18px; height: 22px; margin-left: 8px;
+  display: flex; align-items: center; justify-content: center;
+  background: none; border: 0; padding: 0; cursor: pointer;
+  color: var(--text-faint); border-radius: 5px;
+}
+.vault-twisty:hover { color: var(--text); background: rgba(127, 122, 112, 0.14); }
+.vault-twisty .chev { transition: transform .12s; }
+.vault-node.open .vault-twisty .chev { transform: rotate(90deg); }
+.vault-branch {
+  margin: 0 0 4px 17px; padding-left: 8px;
+  border-left: 1px solid var(--border);
+}
+.vault-branch .vault-empty { padding: 3px 6px 4px; }
+.session.vault-session { font-size: 12px; padding-top: 4px; padding-bottom: 4px; }
+
+/* Sentinella della risalita, in cima al thread. Un pulsante e non un semplice
+   avviso: chi legge deve poter chiedere il blocco precedente senza dover
+   indovinare che scorrere fino in cima lo fa da solo. */
+.load-older {
+  display: block; width: 100%; margin: 0 0 14px;
+  padding: 9px 12px; font: inherit; font-size: 12px;
+  color: var(--text-dim); background: transparent;
+  border: 1px dashed var(--border-strong); border-radius: 9px;
+  cursor: pointer; text-align: center;
+}
+.load-older:hover:not(:disabled) { color: var(--accent); border-color: var(--accent); background: var(--accent-soft); }
+.load-older:disabled { cursor: wait; opacity: 0.65; }
+
+.new-chat {
+  margin: 2px 10px 10px; padding: 7px 11px;
+  display: flex; align-items: center; gap: 8px;
+  border: 1px solid var(--border-strong); border-radius: 9px;
+  background: var(--surface); box-shadow: var(--shadow-sm);
+  font-size: 13.5px; font-weight: 500;
+  transition: border-color .13s, color .13s, background .13s;
+}
+.new-chat:hover { border-color: var(--accent); color: var(--accent); background: var(--accent-soft); }
+
+.section-label {
+  padding: 6px 14px 4px; font-size: 11px; font-weight: 600;
+  text-transform: uppercase; letter-spacing: 0.07em; color: var(--text-faint);
+}
+
+/* Lista conversazioni: righe piatte, nessun bordo, nessuna card.
+   L'elemento attivo si riconosce dal fondo e dalla barretta a sinistra. */
+#sessions { flex: 1; overflow-y: auto; padding: 0 6px 8px; min-height: 0; }
+
+/* Ricerca nelle conversazioni. Stessa grammatica delle righe che sta sopra:
+   nessun bordo a riposo, il contorno compare quando ci si scrive dentro. */
+.search-box {
+  position: relative; display: flex; align-items: center;
+  margin: 0 6px 6px; padding: 0 8px;
+  border: 1px solid transparent; border-radius: 8px;
+  background: rgba(127, 122, 112, 0.09);
+  transition: border-color .12s, background .12s;
+}
+.search-box:focus-within {
+  border-color: var(--accent); background: var(--surface);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+.search-icon { flex: none; color: var(--text-faint); }
+#session-search {
+  flex: 1; min-width: 0; border: 0; outline: none; background: none;
+  padding: 6px 6px; font-size: 13px; color: var(--text);
+}
+#session-search::placeholder { color: var(--text-faint); }
+/* La crocetta di serie di <input type="search"> compare solo in alcuni
+   browser e con una grafica sua: meglio la nostra, che c'e' sempre. */
+#session-search::-webkit-search-cancel-button { display: none; }
+.search-clear {
+  flex: none; width: 17px; height: 17px; border-radius: 5px;
+  display: grid; place-items: center; color: var(--text-faint);
+  font-size: 15px; line-height: 1;
+}
+.search-clear:hover { color: var(--err); background: rgba(179, 69, 58, 0.12); }
+.search-empty { padding: 10px 12px; font-size: 12.5px; color: var(--text-faint); font-style: italic; }
+
+.session {
+  position: relative;
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  width: 100%; text-align: left;
+  padding: 6px 8px 6px 10px; margin-bottom: 1px;
+  border-radius: 7px; color: var(--text-muted);
+  font-size: 13.5px; line-height: 1.35;
+  transition: background .1s ease, color .1s ease;
+}
+.session:hover { background: rgba(127, 122, 112, 0.11); color: var(--text); }
+.session.active { background: rgba(127, 122, 112, 0.16); color: var(--text); font-weight: 500; }
+.session.active::before {
+  content: ""; position: absolute; left: 2px; top: 50%; transform: translateY(-50%);
+  width: 2.5px; height: 15px; border-radius: 2px; background: var(--accent);
+}
+.session-title {
+  flex: 1; min-width: 0;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.session-meta { font-size: 10.5px; color: var(--text-faint); font-variant-numeric: tabular-nums; flex: none; }
+/* Il pezzo di conversazione in cui la parola cercata compare: senza, una riga
+   trovata "nel contenuto" e' un titolo qualunque che non dice perche' e' li'. */
+.session-snippet {
+  flex-basis: 100%; margin-top: 1px;
+  font-size: 11.5px; line-height: 1.35; color: var(--text-faint);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.session-snippet mark {
+  background: var(--accent-soft); color: var(--accent);
+  border-radius: 3px; padding: 0 1px;
+}
+.session-where {
+  flex: none; font-size: 9.5px; text-transform: uppercase; letter-spacing: .04em;
+  color: var(--text-faint); border: 1px solid var(--border); border-radius: 4px;
+  padding: 0 4px; line-height: 1.5;
+}
+/* Pallino della conversazione con un turno in corso: pulsa, cosi' si
+   distingue a colpo d'occhio dalla riga semplicemente selezionata. */
+.session-running {
+  flex: none; width: 7px; height: 7px; border-radius: 50%;
+  background: var(--accent); animation: pulse 1.3s ease-in-out infinite;
+}
+@keyframes pulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: .35; transform: scale(.72); }
+}
+.session.running .session-meta { color: var(--accent); font-weight: 500; }
+
+.session-pending {
+  flex: none; width: 6px; height: 6px; border-radius: 50%;
+  background: var(--warn); box-shadow: 0 0 0 2px var(--bg-subtle);
+}
+.session-del {
+  flex: none; width: 18px; height: 18px; border-radius: 5px;
+  display: grid; place-items: center; color: var(--text-faint);
+  font-size: 15px; line-height: 1; opacity: 0;
+  transition: opacity .1s, color .1s, background .1s;
+}
+.session:hover .session-del { opacity: 1; }
+.session-del:hover { color: var(--err); background: rgba(179, 69, 58, 0.12); }
+
+.sidebar-foot {
+  border-top: 1px solid var(--border);
+  padding: 8px 10px; display: flex; align-items: center; gap: 6px;
+}
+
+.icon-btn {
+  width: 28px; height: 28px; border-radius: 7px;
+  display: grid; place-items: center; color: var(--text-muted);
+  transition: background .12s, color .12s;
+}
+.icon-btn:hover { background: var(--surface-alt); color: var(--text); }
+.icon-btn.on { color: var(--accent); background: var(--accent-soft); }
+
+/* Pulsante con icona + etichetta: l'ingranaggio da solo era ambiguo. */
+.foot-btn {
+  display: flex; align-items: center; gap: 6px;
+  height: 28px; padding: 0 9px; border-radius: 7px;
+  color: var(--text-muted); font-size: 12.5px; font-weight: 500;
+  transition: background .12s, color .12s;
+}
+.foot-btn svg { flex: none; }
+.foot-btn:hover { background: var(--surface-alt); color: var(--text); }
+
+/* ---------- area principale ---------- */
+
+#main { display: flex; flex-direction: column; min-width: 0; min-height: 0; }
+
+#topbar {
+  display: flex; align-items: center; gap: 10px;
+  padding: 11px 22px; border-bottom: 1px solid var(--border);
+  background: var(--bg);
+}
+#topbar .title { font-size: 14.5px; font-weight: 600; }
+#topbar .sub { font-size: 11.5px; color: var(--text-faint); font-family: var(--mono); }
+
+/* Goccia del modello. Ha la stessa forma delle gocce dei file a fine turno —
+   pillola, bordo tenue, superficie cliccabile intera — perché è la stessa
+   idea: un oggetto nominato su cui si può agire. A riposo non sembra un
+   pulsante, il segno è il chevron; è un titolo, e un titolo che grida "premimi"
+   in cima alla pagina sarebbe rumore permanente per un gesto occasionale. */
+.model-chip {
+  display: inline-flex; align-items: center; gap: 6px; max-width: 100%;
+  margin: -3px 0 0; padding: 3px 7px;
+  border: 1px solid transparent; border-radius: 8px;
+  background: none; color: inherit; font: inherit; cursor: pointer;
+  transition: background .12s, border-color .12s;
+}
+.model-chip:hover { background: var(--surface); border-color: var(--border); }
+.model-chip[aria-expanded="true"] {
+  background: var(--surface); border-color: var(--border-strong);
+}
+.model-chip .title { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.model-caret { flex: none; color: var(--text-faint); transition: transform .14s; }
+.model-chip[aria-expanded="true"] .model-caret { transform: rotate(180deg); }
+
+/* Le due gocce della barra: una per riga, ognuna nella sua ancora.
+   L'ancora è larga quanto la goccia (`width: fit-content`) e non quanto la
+   colonna: è questo che rende `right: 0` il bordo destro del percorso invece
+   che quello dello schermo. Ed è `display: block` che le rimette una sopra
+   l'altra — da inline-flex finivano affiancate, e il bordo che compare al
+   passaggio del mouse sulla seconda andava a toccare la freccia della prima. */
+.topbar-id { flex: 1; min-width: 0; }
+/* Il rientro negativo sta sull'ancora e non sulla goccia. Sulla goccia si
+   scontrava con il suo `max-width: 100%`: la percentuale si risolve contro
+   l'ancora, che a sua volta e' larga quanto la goccia, e il giro si chiude
+   togliendo esattamente i pixel dei margini negativi -- due gocce troncate
+   con i puntini anche quando lo spazio c'era tutto. Qui il conto e' pulito:
+   l'ancora e' larga quanto la goccia, quindi `right: 0` e' il bordo destro
+   di quello che si sta guardando, al pixel. */
+.chip-anchor {
+  position: relative; display: block; width: fit-content; max-width: 100%;
+  margin-left: -7px;
+}
+
+.model-menu {
+  position: absolute; top: 100%; left: 0; z-index: 40; margin-top: 4px;
+  min-width: 240px; max-width: 420px; max-height: 46vh; overflow-y: auto;
+  padding: 5px; border: 1px solid var(--border-strong); border-radius: 11px;
+  background: var(--surface); box-shadow: var(--shadow);
+}
+.model-opt {
+  display: flex; align-items: center; gap: 8px; width: 100%;
+  padding: 6px 8px; border: 0; border-radius: 7px;
+  background: none; color: var(--text); font: inherit; font-size: 13px;
+  text-align: left; cursor: pointer;
+}
+.model-opt:hover { background: var(--surface-alt); }
+.model-opt .model-tick { flex: none; width: 12px; color: var(--accent); }
+.model-opt .model-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.model-opt.on { font-weight: 600; }
+.model-menu .empty { padding: 10px; font-size: 12px; color: var(--text-faint); }
+.menu-label {
+  padding: 5px 8px 3px; font-size: 10px; font-weight: 600;
+  text-transform: uppercase; letter-spacing: .07em; color: var(--text-faint);
+}
+.menu-sep { height: 1px; margin: 4px 6px; background: var(--border); }
+
+/* Il percorso della cartella: è già scritto in alto, quindi è lui il bersaglio
+   del clic. Stessa grammatica della goccia del modello che gli sta sopra —
+   pillola discreta a riposo, chevron come unico segno che si può premere. */
+.ws-chip {
+  display: inline-flex; align-items: center; gap: 5px; max-width: 100%;
+  margin: 1px 0 0; padding: 1px 7px;
+  border: 1px solid transparent; border-radius: 7px;
+  background: none; color: inherit; font: inherit; cursor: pointer;
+  transition: background .12s, border-color .12s;
+}
+.ws-chip:hover { background: var(--surface); border-color: var(--border); }
+.ws-chip[aria-expanded="true"] { background: var(--surface); border-color: var(--border-strong); }
+.ws-chip .ws-folder { flex: none; color: var(--text-faint); }
+.ws-chip .sub { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ws-chip[aria-expanded="true"] .model-caret { transform: rotate(180deg); }
+/* Ancorata a destra: la tendina cade sotto la fine del percorso, che è il
+   punto che si stava guardando quando si è premuto. Sotto l'inizio sarebbe a
+   mezzo schermo di distanza dal cursore su una cartella dal nome lungo. */
+.ws-menu { min-width: 240px; left: auto; right: 0; }
+.ws-opt { flex-direction: column; align-items: flex-start; gap: 1px; }
+.ws-opt-name { font-size: 12.5px; font-weight: 500; }
+.ws-opt-path {
+  max-width: 100%; font-family: var(--mono); font-size: 10.5px; color: var(--text-faint);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+
+.pill {
+  display: inline-flex; align-items: center; gap: 5px;
+  padding: 2px 9px; border-radius: 999px;
+  font-size: 11.5px; font-weight: 500; white-space: nowrap;
+  border: 1px solid var(--border); background: var(--surface); color: var(--text-muted);
+}
+.pill .dot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+.pill.ok { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 35%, transparent); }
+.pill.err { color: var(--err); border-color: color-mix(in srgb, var(--err) 35%, transparent); }
+.pill.warn { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 35%, transparent); }
+.pill.acc { color: var(--accent); background: var(--accent-soft); border-color: var(--accent-border); }
+/* "Non lo so ancora" e' uno stato, non un avviso: grigio dichiarato, cosi' non
+   si confonde con l'ambra di .warn mentre l'endpoint viene interrogato. */
+.pill.wait { color: var(--text-faint); border-style: dashed; }
+
+#scroller { flex: 1; overflow-y: auto; min-height: 0; scroll-behavior: smooth; }
+#thread { max-width: 780px; margin: 0 auto; padding: 22px 22px 28px; }
+
+/* ---------- messaggi ---------- */
+
+.msg { margin-bottom: 14px; }
+
+.bubble-user {
+  margin-left: auto; width: fit-content; max-width: var(--bolla-max);
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: 14px 14px 4px 14px; padding: 9px 13px;
+  box-shadow: var(--shadow-sm); white-space: pre-wrap; word-break: break-word;
+}
+
+.assistant { max-width: 100%; }
+.assistant p:first-child { margin-top: 0; }
+.assistant p:last-child { margin-bottom: 0; }
+.assistant p { margin: 0 0 10px; }
+.assistant ul, .assistant ol { margin: 0 0 10px; padding-left: 22px; }
+.assistant li { margin-bottom: 3px; }
+/* Sei livelli, non tre: il renderer conserva il livello del markdown, e i
+   report che l'agente scrive hanno una gerarchia vera. Le taglie restano
+   vicine di proposito -- in una bolla di chat un h1 da 28px sarebbe un titolo
+   di giornale -- ma non identiche, o la gerarchia si vedrebbe solo nel
+   sorgente. */
+.assistant h1, .assistant h2, .assistant h3,
+.assistant h4, .assistant h5, .assistant h6 {
+  font-weight: 600; margin: 16px 0 7px; letter-spacing: -0.015em;
+}
+.assistant h1 { font-size: 17px; }
+.assistant h2 { font-size: 16px; }
+.assistant h3 { font-size: 15px; }
+.assistant h4, .assistant h5, .assistant h6 {
+  font-size: 14px; color: var(--text-muted);
+}
+.assistant code {
+  font-family: var(--mono); font-size: 0.85em;
+  background: var(--code-bg); border: 1px solid var(--border);
+  border-radius: 5px; padding: 1px 5px; color: var(--accent);
+}
+.assistant pre {
+  background: var(--code-bg); border: 1px solid var(--border);
+  border-radius: 10px; padding: 11px 13px; overflow-x: auto; margin: 0 0 11px;
+}
+.assistant pre code {
+  background: none; border: none; padding: 0; color: var(--text);
+  font-size: 12.5px; line-height: 1.6;
+}
+
+/* ---------- tendine (pensiero e tool) ---------- */
+
+details.drawer {
+  border: 1px solid var(--border); border-radius: 10px;
+  background: var(--surface-alt); margin: 6px 0 9px; overflow: hidden;
+}
+details.drawer > summary {
+  list-style: none; cursor: pointer;
+  padding: 6px 11px; font-size: 12.5px; color: var(--text-muted);
+  display: flex; align-items: center; gap: 7px;
+  user-select: none; transition: color .12s;
+}
+details.drawer > summary::-webkit-details-marker { display: none; }
+details.drawer > summary:hover { color: var(--accent); }
+details.drawer > summary .chev { transition: transform .15s ease; flex: none; opacity: .55; }
+details.drawer[open] > summary .chev { transform: rotate(90deg); }
+details.drawer > summary .grow {
+  flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.drawer-body { padding: 0 11px 9px; }
+
+.tool-name { font-family: var(--mono); font-weight: 600; color: var(--accent); font-size: 12.5px; flex: none; }
+.tool-arg { font-family: var(--mono); color: var(--text-faint); font-size: 12px; }
+.tool-time { font-family: var(--mono); font-size: 11px; color: var(--text-faint); flex: none; font-variant-numeric: tabular-nums; }
+details.drawer.failed { border-color: color-mix(in srgb, var(--err) 40%, var(--border)); }
+
+.think {
+  font-size: 13.5px; line-height: 1.62; color: var(--text-muted);
+  border-left: 2px solid var(--accent-border); padding-left: 11px;
+  white-space: pre-wrap; word-break: break-word;
+}
+.think.live { border-left-color: var(--accent); }
+
+.caret {
+  display: inline-block; width: 6px; height: 1em; margin-left: 2px;
+  background: var(--accent); vertical-align: text-bottom; border-radius: 1px;
+  animation: blink 1.05s steps(2, start) infinite;
+}
+@keyframes blink { to { visibility: hidden; } }
+
+.tool-json {
+  font-family: var(--mono); font-size: 11.5px; line-height: 1.55;
+  background: var(--code-bg); border: 1px solid var(--border); border-radius: 8px;
+  padding: 8px 10px; max-height: 340px; overflow: auto;
+  white-space: pre-wrap; word-break: break-word; margin: 4px 0 0;
+}
+.tool-label { font-size: 11px; color: var(--text-faint); margin: 7px 0 0; }
+
+/* ---------- domanda dell'agente ---------- */
+
+.question {
+  border: 1px solid var(--accent-border); background: var(--accent-soft);
+  border-radius: 13px; padding: 13px 15px; margin: 10px 0 14px;
+}
+.question .q-label {
+  font-size: 10.5px; font-weight: 600; text-transform: uppercase;
+  letter-spacing: 0.07em; color: var(--accent); margin-bottom: 5px;
+}
+.question .q-text { font-size: 14.5px; font-weight: 500; margin-bottom: 11px; }
+.q-options { display: flex; flex-direction: column; gap: 6px; }
+.q-option {
+  text-align: left; padding: 8px 12px; border-radius: 9px;
+  border: 1px solid var(--border-strong); background: var(--surface);
+  font-size: 13.5px; transition: border-color .12s, background .12s, transform .06s;
+}
+.q-option:hover { border-color: var(--accent); background: var(--bg); }
+.q-option:active { transform: translateY(1px); }
+.q-option.selected { border-color: var(--accent); background: var(--accent-soft); font-weight: 500; }
+.q-option .lbl { font-weight: 500; }
+.q-option .desc { display: block; font-size: 12px; color: var(--text-muted); margin-top: 2px; }
+.q-free { display: flex; gap: 6px; margin-top: 9px; }
+.q-free input {
+  flex: 1; padding: 7px 11px; border-radius: 9px;
+  border: 1px solid var(--border-strong); background: var(--surface);
+}
+.q-free input:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+.q-answered { font-size: 12.5px; color: var(--text-muted); }
+.q-answered b { color: var(--text); font-weight: 500; }
+
+/* ---------- stato del turno ---------- */
+
+.turn-status {
+  display: flex; align-items: center; gap: 8px;
+  font-size: 12.5px; color: var(--text-muted); margin: 6px 0 10px;
+}
+.spinner {
+  width: 11px; height: 11px; flex: none;
+  border: 2px solid var(--border-strong); border-top-color: var(--accent);
+  border-radius: 50%; animation: spin .7s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+.notice {
+  font-size: 12.5px; color: var(--text-muted);
+  border-left: 2px solid var(--warn); padding-left: 10px; margin: 6px 0 10px;
+}
+.error-box {
+  border: 1px solid color-mix(in srgb, var(--err) 45%, var(--border));
+  background: color-mix(in srgb, var(--err) 8%, var(--surface));
+  color: var(--err); border-radius: 10px; padding: 9px 12px;
+  font-size: 13px; margin: 6px 0 10px;
+}
+
+/* ---------- composer ---------- */
+
+#composer-wrap { padding: 0 22px 18px; background: var(--bg); }
+.composer-toolbar {
+  max-width: 780px; margin: 0 auto 6px;
+  display: flex; align-items: center; gap: 6px;
+}
+.quick-chip {
+  display: inline-flex; align-items: center; gap: 5px;
+  padding: 4px 11px; border-radius: 9999px;
+  border: 1px solid var(--border-strong); background: var(--surface);
+  color: var(--text); font-size: 12px; font-weight: 500;
+  cursor: pointer; transition: all .15s ease; user-select: none;
+}
+.quick-chip:hover:not(:disabled) {
+  background: var(--accent-soft); border-color: var(--accent);
+  color: var(--accent); transform: translateY(-1px);
+}
+.quick-chip:active:not(:disabled) { transform: translateY(0); }
+.quick-chip:disabled { opacity: 0.45; cursor: not-allowed; }
+.quick-chip .chip-icon { font-size: 10px; line-height: 1; color: var(--accent); }
+
+#composer {
+  max-width: 780px; margin: 0 auto;
+  display: flex; flex-direction: column;
+  border: 1px solid var(--border-strong); border-radius: 15px;
+  background: var(--surface); box-shadow: var(--shadow); padding: 8px 8px 8px 14px;
+  transition: border-color .13s, box-shadow .13s;
+}
+.composer-row { display: flex; align-items: flex-end; gap: 8px; }
+
+/* Gli allegati in attesa: dentro il contenitore, sopra la riga di scrittura,
+   separati da una riga e non da un riquadro a parte — sono lo stesso messaggio,
+   non un pannello che gli sta accanto. */
+#attach-strip {
+  display: flex; flex-wrap: wrap; gap: 6px;
+  padding: 2px 0 8px; margin-bottom: 7px;
+  border-bottom: 1px solid var(--border);
+}
+/* Un `display` esplicito batte il `[hidden] { display: none }` del browser:
+   senza questa riga la striscia resterebbe visibile, vuota, con il suo bordo. */
+#attach-strip[hidden] { display: none; }
+#composer:focus-within { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft), var(--shadow); }
+#composer textarea {
+  flex: 1; border: none; outline: none; background: none; resize: none;
+  max-height: 200px; line-height: 1.55; padding: 5px 0;
+}
+#composer textarea::placeholder { color: var(--text-faint); }
+#send {
+  width: 31px; height: 31px; flex: none; border-radius: 9px;
+  background: var(--accent); color: #fff; display: grid; place-items: center;
+  transition: background .12s, opacity .12s;
+}
+#send:hover { background: var(--accent-hover); }
+#send:disabled { opacity: .35; cursor: not-allowed; }
+/* Con un turno in corso il tasto invia diventa stop: stessa posizione, stesso
+   ingombro, nessun bottone che compare e scompare facendo saltare il layout. */
+#send.stopping { background: var(--text-muted); }
+#send.stopping:hover { background: var(--err); }
+#attach {
+  width: 31px; height: 31px; flex: none; border-radius: 9px;
+  color: var(--text-faint); display: grid; place-items: center;
+  transition: color .12s, background .12s;
+}
+#attach:hover { color: var(--accent); background: var(--accent-soft); }
+/* Goccia "Ricerca online": ancorata a destra della riga, fra la casella
+   e l'invio. Toggle di modalita': spenta e' una goccia fioca, accesa prende
+   l'accento cosi' lo stato si vede senza leggere il testo. */
+.goccia-web {
+  flex: none; display: inline-flex; align-items: center; gap: 5px;
+  padding: 4px 11px; border-radius: 9999px;
+  border: 1px solid var(--border-strong); background: var(--surface);
+  color: var(--text-faint); font-size: 12px; font-weight: 500;
+  cursor: pointer; user-select: none; margin-bottom: 2px;
+  transition: all .15s ease; white-space: nowrap;
+}
+.goccia-web .globo { display: block; flex: none; }
+.goccia-web:hover { color: var(--accent); background: var(--accent-soft); }
+.goccia-web.on { color: var(--accent); background: var(--accent-soft); border-color: var(--accent); }
+
+/* Tendina del livello di pensiero: stessa grammatica del menu modelli
+   (.chip-anchor + .model-menu), ma stretta — quattro voci, non un catalogo. */
+.think-anchor { position: relative; }
+.think-menu { min-width: 200px; max-width: 260px; left: 0; bottom: calc(100% + 4px); top: auto; }
+.think-menu .menu-desc {
+  margin-left: auto; font-size: 11px; color: var(--text-faint);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.think-menu .model-opt.on .model-tick::after { content: '✓'; }
+#composer.dragging { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft), var(--shadow); }
+.composer-hint {
+  max-width: 780px; margin: 6px auto 0;
+  font-size: 11px; color: var(--text-faint); text-align: right;
+}
+
+/* ---------- pannello destro ---------- */
+
+#panel {
+  border-left: 1px solid var(--border); background: var(--bg-subtle);
+  overflow-y: auto; padding: 14px 12px;
+}
+.card {
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: 11px; padding: 10px 12px; margin-bottom: 9px;
+  box-shadow: var(--shadow-sm);
+}
+.card h4 {
+  margin: 0 0 7px; font-size: 10.5px; font-weight: 600;
+  text-transform: uppercase; letter-spacing: 0.07em; color: var(--text-faint);
+}
+/* Sottotitolo dentro una scheda: separa due gruppi di righe senza aprire un
+   secondo riquadro con la sua ombra e i suoi margini. */
+.card-split {
+  margin: 9px 0 5px; padding-top: 8px; border-top: 1px solid var(--border);
+  font-size: 10.5px; font-weight: 600;
+  text-transform: uppercase; letter-spacing: 0.07em; color: var(--text-faint);
+}
+.kv { display: flex; justify-content: space-between; gap: 8px; font-size: 12.5px; padding: 2px 0; }
+.kv span:first-child { color: var(--text-muted); }
+.kv span:last-child { font-variant-numeric: tabular-nums; font-weight: 500; }
+
+/* Piano di lavoro. Nessuna scatola annidata: la gerarchia la fa il colore, e
+   il punto in corso è l'unica riga a piena intensità — è quella che si cerca.
+   Con dieci punti la scheda diventava un muro, quindi scorre da sola invece di
+   allungare il pannello e spingere il contesto sotto la piega. */
+.plan-count { float: right; color: var(--text-faint); font-variant-numeric: tabular-nums; letter-spacing: 0; }
+#plan, #notes {
+  max-height: 40vh; overflow-y: auto;
+  /* Spazio per la barra di scorrimento, così non copre il testo quando c'è, e
+     margine negativo perché quando non c'è la scheda resti allineata. */
+  padding-right: 6px; margin-right: -6px;
+  /* Lo stesso trattamento anche a sinistra, e non è simmetria per estetica:
+     ``overflow-y: auto`` fa diventare ``auto`` anche l'asse orizzontale, e le
+     righe del piano sporgono di 6px a sinistra (``margin: 0 -6px``). Senza
+     questo padding il ritaglio cadeva esattamente sul bordo sinistro della
+     riga in corso -- mezzo pixel di accento tagliato di traverso, che è lo
+     "spigolo scuro" che si vedeva -- e su Windows compariva pure una barra di
+     scorrimento orizzontale per 6px che nessuno voleva. */
+  padding-left: 6px; margin-left: -6px;
+}
+/* Sfumatura in coda quando c'è altro sotto. Senza, un piano da dieci punti si
+   interrompe a metà di una riga e sembra finito lì: la barra di scorrimento
+   da sola non basta, su Windows compare solo al passaggio del mouse. La classe
+   la toglie il JS appena si arriva in fondo, così non resta una velatura su
+   contenuto che è già tutto visibile. */
+.scorre {
+  -webkit-mask-image: linear-gradient(to bottom, #000 calc(100% - 26px), transparent);
+  mask-image: linear-gradient(to bottom, #000 calc(100% - 26px), transparent);
+}
+/* Avanzamento. Stessa geometria della barra del contesto -- e' la stessa
+   idea, "quanto e' pieno" -- ma a due segmenti: i saltati riempiono il piano
+   senza essere lavoro fatto. */
+.plan-bar {
+  display: flex; height: 5px; margin: 3px 0 9px;
+  border-radius: 3px; overflow: hidden; background: var(--border);
+}
+.plan-bar > span { transition: width .3s ease; }
+.plan-bar-done { background: var(--ok); }
+.plan-bar-skipped { background: var(--warn); }
+
+.plan-step {
+  display: grid; grid-template-columns: 15px 13px 1fr; gap: 1px 6px;
+  font-size: 12px; line-height: 1.45;
+  padding: 5px 6px; margin: 0 -6px 2px; border-radius: 7px;
+  color: var(--text-muted);
+}
+/* Il numero è quello del piano, non quello che il modello si è portato dietro
+   dalla richiesta: è lo stesso id che passa a manage_plan, quindi leggere il
+   pannello e leggere la chiamata danno la stessa risposta. */
+.plan-num {
+  grid-row: 1; font-size: 10.5px; line-height: 1.75;
+  color: var(--text-faint); font-variant-numeric: tabular-nums; text-align: right;
+}
+/* Lo stato si legge due volte: forma e colore. Il colore da solo non basta —
+   fra "da fare" e "fatto" c'erano due grigi diversi, e a colpo d'occhio due
+   grigi sono lo stesso grigio; e un colore solo escluderebbe chi non li
+   distingue. Il glifo ha forme deliberatamente diverse fra loro (cerchio
+   vuoto, cerchio pieno, spunta, barrato), non varianti dello stesso segno. */
+.plan-mark {
+  grid-row: 1; font-size: 11px; line-height: 1.65; text-align: center;
+  color: var(--text-faint);
+}
+.plan-text { grid-row: 1; min-width: 0; word-break: break-word; }
+.plan-note {
+  grid-column: 3; font-size: 11px; line-height: 1.4;
+  color: var(--text-faint); word-break: break-word;
+}
+
+/* Da fare: il grado zero. Nessuna tinta -- e' l'assenza di sfondo a dire
+   "questo non e' ancora successo", e tutto il resto si stacca da qui. */
+.plan-step.todo .plan-text { color: var(--text-muted); }
+
+/* In corso: la riga più forte delle quattro. Adesso uno sfondo ce l'hanno
+   anche "fatto" e "saltato", quindi qui non basta più averlo: la tinta è la
+   più satura e la barretta a sinistra ce l'ha solo questa. È la domanda che
+   ci si fa guardando il pannello — "a che punto è?" — e deve avere una
+   risposta che non richiede di leggere. */
+/* La barretta è un livello di sfondo, non un elemento sovrapposto. È l'unica
+   forma che non produce spigoli, e il motivo è come il browser dipinge:
+   - `box-shadow: inset` segue il `border-radius`, quindi sui 7px d'angolo i
+     3px di accento si incurvavano addensandosi in due cunei scuri;
+   - un `::before` posizionato è un rettangolo che sta SOPRA lo sfondo e non
+     viene ritagliato da niente: agli angoli sporgeva fuori dalla curva, e i
+     due spigoli quadrati restavano lì a sbordare;
+   - un livello di `background`, invece, viene dipinto dentro la box e
+     ritagliato dal `border-radius` per costruzione. Gli angoli della barretta
+     diventano gli angoli della riga, perché sono gli stessi.
+   Ordine: prima la barretta (livello sopra), poi la tinta (livello sotto). */
+.plan-step.doing {
+  background:
+    linear-gradient(var(--accent), var(--accent)) left / 3px 100% no-repeat,
+    var(--accent-soft);
+}
+.plan-step.doing .plan-text { color: var(--text); font-weight: 600; }
+.plan-step.doing .plan-num { color: var(--accent); font-weight: 700; }
+.plan-step.doing .plan-mark { color: var(--accent); }
+
+/* Fatto: velo verde e testo barrato. Prima "fatto" e "da fare" erano due
+   grigi diversi, e a colpo d'occhio due grigi sono lo stesso grigio: la
+   spunta da 11px era l'unica differenza, e si trovava solo cercandola. La
+   barra e' grigio chiaro e non del colore del testo -- deve dire "chiuso",
+   non cancellare la riga: cosa e' stato fatto si deve ancora poter leggere. */
+.plan-step.done { background: var(--tint-ok); }
+.plan-step.done .plan-mark { color: var(--ok); font-weight: 700; }
+.plan-step.done .plan-num { color: var(--ok); }
+.plan-step.done .plan-text {
+  color: var(--text-faint);
+  text-decoration: line-through;
+  text-decoration-color: var(--border-strong);
+  text-decoration-thickness: 1px;
+}
+
+/* Saltato: giallo e non grigio. "Deciso di non farlo" è una decisione, e una
+   decisione va vista; sbiadirla la confonde con "non ancora fatto", che è
+   esattamente l'errore che si vuole evitare leggendo un piano. */
+.plan-step.skipped { background: var(--tint-warn); }
+.plan-step.skipped .plan-mark { color: var(--warn); }
+.plan-step.skipped .plan-num { color: var(--warn); text-decoration: line-through; }
+.plan-step.skipped .plan-text { color: var(--text-faint); font-style: italic; }
+
+.preview-icon { flex: none; font-size: 15px; color: var(--accent); }
+.preview-sub { font-size: 11px; color: var(--text-faint); }
+
+/* L'overlay copre la colonna della chat, non la finestra: la sidebar e il
+   pannello destro restano visibili, così si continua a vedere il piano
+   aggiornarsi mentre si guarda il risultato. */
+/* Chat e anteprima affiancate. La chat resta una colonna intera (thread +
+   composer) e l'anteprima le sta accanto a tutta altezza: nessuno dei due si
+   accorcia, e il divisorio è una riga verticale. La larghezza sta in una
+   variabile perché il trascinamento la scrive lì. */
+#main-split { flex: 1; display: flex; min-height: 0; min-width: 0; }
+#chat-col {
+  flex: 1; min-width: 0; min-height: 0;
+  display: flex; flex-direction: column;
+}
+#preview-pane {
+  flex: none;
+  width: var(--preview-w, 50%);
+  min-width: 260px;
+  max-width: var(--bolla-max);
+  display: flex;
+  background: var(--bg);
+}
+#preview-pane[hidden] { display: none; }
+/* Stessa ragione della riga qui sopra, e la stessa trappola pagata due volte:
+   `display: flex` batte il `display: none` che il browser da' da solo a
+   [hidden], quindi nascondere la colonna della chat con l'attributo non
+   faceva niente. Il risultato era la schermata iniziale del vault che si
+   affiancava alla chat -- schermo diviso a meta' -- invece di prenderne il
+   posto, ed era visibile solo aprendo un vault mentre una chat era gia'
+   selezionata. */
+#chat-col[hidden] { display: none; }
+.preview-inner { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+
+/* Il divisorio è largo 7px: sotto i 10 di zona sensibile un bordo trascinabile
+   diventa un esercizio di mira, quindi la barretta interna è sottile ma il
+   bersaglio no. */
+.preview-grip {
+  flex: none; width: 7px; cursor: ew-resize;
+  display: grid; place-items: center;
+  background: var(--bg-subtle);
+  border-left: 1px solid var(--border);
+  border-right: 1px solid var(--border);
+}
+.preview-grip::after {
+  content: ""; height: 34px; width: 2px; border-radius: 2px;
+  background: var(--border-strong); transition: background .12s;
+}
+.preview-grip:hover::after { background: var(--accent); }
+/* Durante il trascinamento il puntatore esce dalla maniglia: senza questa
+   classe sul body il cursore tornerebbe a freccia e la selezione del testo
+   evidenzierebbe mezza pagina. */
+body.resizing { --cursore-trascina: ew-resize; }
+body.resizing, body.resizing *,
+body.resizing-rows, body.resizing-rows * {
+  cursor: var(--cursore-trascina, ew-resize) !important;
+  user-select: none !important;
+}
+.preview-bar {
+  display: flex; align-items: center; gap: 9px;
+  padding: 8px 12px; border-bottom: 1px solid var(--border);
+  background: var(--surface); flex: none;
+}
+.preview-name { font-size: 13px; font-weight: 600; }
+.preview-bar .preview-sub {
+  font-family: var(--mono); overflow: hidden;
+  text-overflow: ellipsis; white-space: nowrap;
+  /* min-width:0 e' cio' che permette a un figlio flex di rimpicciolirsi sotto
+     la larghezza del suo contenuto: senza, l'URL spingerebbe fuori i pulsanti
+     invece di accorciarsi con i puntini. */
+  flex: 0 1 auto; min-width: 0;
+}
+.preview-bar .mini-btn { padding: 4px 9px; line-height: 1.2; text-decoration: none; }
+.preview-body { flex: 1; min-height: 0; overflow: auto; background: var(--bg); }
+.preview-frame { width: 100%; height: 100%; border: 0; background: #fff; }
+.preview-pad { padding: 20px 26px; max-width: 900px; margin: 0 auto; }
+.preview-img { max-width: 100%; height: auto; display: block; margin: 0 auto; }
+.meter { height: 5px; border-radius: 3px; background: var(--border); overflow: hidden; margin: 4px 0 6px; }
+.meter > div { height: 100%; background: var(--accent); border-radius: 3px; transition: width .3s ease; }
+.meter.warn > div { background: var(--warn); }
+.meter.err > div { background: var(--err); }
+.path {
+  font-family: var(--mono); font-size: 11px; color: var(--text-muted);
+  background: var(--code-bg); border: 1px solid var(--border); border-radius: 7px;
+  padding: 6px 8px; word-break: break-all; line-height: 1.45;
+}
+/* Le stesse gocce della chat, impilate: nel pannello la larghezza è quella e
+   affiancarle vorrebbe dire troncare ogni nome a metà. Larghe quanto il nome
+   e non quanto la colonna: da quando il percorso non c'è più, tirarle fino al
+   bordo lascerebbe due terzi di riga vuota sotto ogni file. */
+.file-chips.stacked { flex-direction: column; align-items: flex-start; gap: 5px; margin: 0; }
+.file-chips.stacked .chip { max-width: 100%; }
+/* Il nome si prende lo spazio, la cartella resta della sua misura: al
+   contrario, l'iconcina della cartella diventerebbe un bersaglio largo mezza
+   colonna per un gesto secondario. */
+.file-chips.stacked .chip-name { flex: 1; min-width: 0; }
+.file-chips.stacked .chip-dir { flex: none; }
+.file-chips.stacked .chip-label { max-width: 100%; }
+/* Gocce degli allegati. Stessa forma nella striscia del composer e sotto al
+   messaggio a cui sono agganciati: e' lo stesso oggetto prima e dopo l'invio. */
+.att-chip {
+  display: inline-flex; align-items: center; gap: 6px; max-width: 100%;
+  padding: 4px 5px 4px 8px; border-radius: 9px;
+  border: 1px solid var(--border); background: var(--code-bg);
+}
+.att-icon { flex: none; font-size: 12px; line-height: 1; }
+.att-name {
+  min-width: 0; font-size: 12px; color: var(--text);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.att-size { font-size: 11px; color: var(--text-faint); white-space: nowrap; }
+.att-badge {
+  font-size: 9.5px; text-transform: uppercase; letter-spacing: .04em;
+  color: var(--accent); background: var(--accent-soft);
+  border: 1px solid var(--accent-border); border-radius: 4px; padding: 0 4px;
+  white-space: nowrap;
+}
+.att-del {
+  flex: none; color: var(--text-faint); font-size: 14px; line-height: 1;
+  width: 16px; height: 16px; border-radius: 5px;
+  opacity: 0; transition: opacity .12s, color .12s, background .12s;
+}
+.att-chip:hover .att-del { opacity: 1; }
+.att-del:hover { color: var(--err); background: var(--surface-alt); }
+
+/* Le gocce agganciate a un messaggio stanno dal lato di chi le ha mandate,
+   sopra la bolla e allineate al suo bordo destro. */
+.att-chips {
+  display: flex; flex-wrap: wrap; justify-content: flex-end;
+  gap: 6px; margin: 0 0 6px auto; max-width: var(--bolla-max);
+}
+.att-chips .att-chip { background: var(--surface); }
+
+/* Con un turno in corso la × sparisce: il file e' montato nel workspace e
+   l'agente potrebbe averlo aperto un istante fa. Il divieto si vede prima di
+   provarci, invece di arrivare come errore dopo il clic. */
+body.turn-live .att-del { display: none; }
+.empty { color: var(--text-faint); font-size: 12.5px; font-style: italic; }
+.mini-btn {
+  padding: 5px 10px; border-radius: 8px; border: 1px solid var(--border-strong);
+  background: var(--surface); font-size: 12.5px; transition: border-color .12s, color .12s, background .12s;
+}
+.mini-btn:hover { border-color: var(--accent); color: var(--accent); background: var(--accent-soft); }
+.btn-row { display: flex; gap: 6px; margin-bottom: 9px; }
+.btn-row .mini-btn { flex: 1; }
+
+/* ---------- overlay impostazioni ---------- */
+
+#overlay {
+  position: fixed; inset: 0; background: rgba(20, 19, 18, 0.42);
+  display: none; align-items: flex-start; justify-content: center;
+  padding: 46px 20px; z-index: 50; backdrop-filter: blur(2px);
+}
+#overlay.open { display: flex; }
+.modal {
+  background: var(--bg); border: 1px solid var(--border); border-radius: 15px;
+  box-shadow: 0 18px 48px rgba(0, 0, 0, 0.24);
+  width: min(880px, 100%); max-height: 100%; overflow-y: auto;
+}
+.modal-head {
+  display: flex; align-items: center; gap: 10px;
+  padding: 14px 20px; border-bottom: 1px solid var(--border);
+  position: sticky; top: 0; background: var(--bg); z-index: 1;
+}
+.modal-head h2 { margin: 0; font-size: 16px; font-weight: 600; flex: 1; }
+.modal-body { padding: 16px 20px 22px; }
+
+.tabs { display: flex; gap: 3px; border-bottom: 1px solid var(--border); margin-bottom: 15px; }
+.tab {
+  padding: 6px 13px; font-size: 13.5px; font-weight: 500; color: var(--text-muted);
+  border-radius: 8px 8px 0 0; border-bottom: 2px solid transparent; margin-bottom: -1px;
+}
+.tab.active { color: var(--accent); border-bottom-color: var(--accent); }
+.tab-panel { display: none; }
+.tab-panel.active { display: block; }
+
+.grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 15px 22px; }
+@media (max-width: 720px) { .grid2 { grid-template-columns: 1fr; } }
+
+/* Finestra stretta: le colonne laterali si **stringono**, non spariscono.
+   Erano fisse a 252px e 288px a qualunque larghezza, e su una finestra da 900
+   alla conversazione ne restavano meno di 400 -- cioe' la parte che conta era
+   la piu' piccola delle tre. Stringere e non nascondere e' voluto: il footer
+   della barra laterale e' l'unica strada per le impostazioni, e una finestra
+   stretta non deve toglierla. Chi vuole tutto lo spazio ha gia' i due
+   interruttori in alto, e quelli continuano a funzionare come prima. */
+@media (max-width: 1100px) {
+  #app { --sidebar-w: 200px; --panel-w: 232px; }
+}
+@media (max-width: 900px) {
+  #app { --sidebar-w: 168px; --panel-w: 0px; }
+  #app #panel, #app #panel-grip { display: none; }
+}
+
+.field { margin-bottom: 12px; }
+.field label { display: block; font-size: 12.5px; font-weight: 500; color: var(--text-muted); margin-bottom: 4px; }
+.field .help { font-size: 11.5px; color: var(--text-faint); margin-top: 3px; line-height: 1.45; }
+.field input[type="text"], .field input[type="password"], .field input[type="number"],
+.field select, .field textarea {
+  width: 100%; padding: 7px 10px; border-radius: 9px;
+  border: 1px solid var(--border-strong); background: var(--surface);
+}
+.field input:focus, .field select:focus, .field textarea:focus {
+  outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft);
+}
+.field textarea { font-family: var(--mono); font-size: 12.5px; line-height: 1.55; resize: vertical; }
+.field input[type="range"] { width: 100%; accent-color: var(--accent); }
+/* Mascheratura visiva senza type="password" (vedi commento in index.html). */
+.field input.masked { -webkit-text-security: disc; text-security: disc; font-family: var(--mono); }
+.field input.masked:placeholder-shown { -webkit-text-security: none; text-security: none; }
+.switch { display: flex; align-items: flex-start; gap: 8px; margin-bottom: 11px; font-size: 13.5px; }
+.switch input { margin-top: 3px; accent-color: var(--accent); flex: none; }
+.switch .help { font-size: 11.5px; color: var(--text-faint); margin-top: 2px; }
+
+.btn {
+  padding: 7px 14px; border-radius: 9px; font-size: 13.5px; font-weight: 500;
+  border: 1px solid var(--border-strong); background: var(--surface);
+  transition: border-color .12s, background .12s, color .12s;
+}
+.btn:hover { border-color: var(--accent); color: var(--accent); background: var(--accent-soft); }
+.btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+.btn.primary:hover { background: var(--accent-hover); color: #fff; }
+
+.banner { border-radius: 9px; padding: 9px 12px; font-size: 13px; margin-bottom: 11px; border: 1px solid var(--border); background: var(--surface-alt); }
+.banner.ok { border-color: color-mix(in srgb, var(--ok) 40%, var(--border)); color: var(--ok); }
+.banner.err { border-color: color-mix(in srgb, var(--err) 40%, var(--border)); color: var(--err); }
+
+table.grid { width: 100%; border-collapse: collapse; font-size: 13px; margin-top: 9px; }
+table.grid th, table.grid td { text-align: left; padding: 6px 9px; border-bottom: 1px solid var(--border); }
+table.grid th { font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--text-faint); font-weight: 600; }
+table.grid td.yes { color: var(--ok); font-weight: 500; }
+table.grid td.no { color: var(--text-faint); }
+
+.mem-row {
+  display: flex; align-items: flex-start; gap: 9px;
+  padding: 8px 11px; border: 1px solid var(--border); border-radius: 9px;
+  background: var(--surface); margin-bottom: 6px; font-size: 13.5px;
+}
+.mem-row .id { font-family: var(--mono); font-size: 10.5px; color: var(--text-faint); }
+
+#toast {
+  position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%) translateY(14px);
+  background: var(--text); color: var(--bg); padding: 8px 15px; border-radius: 9px;
+  font-size: 13px; opacity: 0; pointer-events: none; transition: opacity .18s, transform .18s; z-index: 90;
+}
+#toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+
+.welcome { text-align: center; padding: 58px 20px; color: var(--text-muted); }
+.welcome h3 { font-size: 17px; font-weight: 600; color: var(--text); margin: 0 0 7px; }
+.welcome p { font-size: 13.5px; margin: 0; line-height: 1.65; }
+
+/* Elenco dei controlli d'ambiente. Allineato a sinistra dentro un blocco
+   centrato: i titoli si leggono in colonna, e il pulsante che risolve sta
+   sulla riga del problema invece che in fondo alla pagina. */
+.checks { max-width: 520px; margin: 14px auto 0; text-align: left; }
+.check {
+  display: flex; align-items: center; gap: 9px;
+  padding: 8px 11px; margin-bottom: 6px;
+  border: 1px solid var(--border); border-radius: 9px;
+  background: var(--surface); font-size: 13px;
+}
+.check-dot { flex: none; font-size: 9px; }
+.check.error .check-dot { color: var(--err); }
+.check.warn .check-dot { color: var(--warn); }
+.check.ok .check-dot { color: var(--ok); }
+.check-text { flex: 1; min-width: 0; line-height: 1.5; }
+.check-text b { color: var(--text); font-weight: 600; }
+.check-btn { flex: none; white-space: nowrap; }
+.check-foot { margin-top: 12px !important; font-size: 12.5px; color: var(--text-faint); }
+
+/* Gocce dei file toccati -----------------------------------------------------
+   Chiudono un ciclo agentico: "ecco cosa ho scritto". Il nome apre l'anteprima,
+   l'iconcina della cartella apre il file manager sul file. Sono due bersagli
+   distinti dentro una stessa pillola, separati da una riga verticale, perche'
+   sono due azioni diverse e confonderle costa un clic sbagliato. */
+.file-chips {
+  display: flex; flex-wrap: wrap; gap: 6px;
+  margin: 10px 0 2px;
+}
+.file-chips .chip {
+  display: inline-flex; align-items: stretch;
+  border: 1px solid var(--border); border-radius: 8px;
+  background: var(--surface); box-shadow: var(--shadow-sm);
+  overflow: hidden; max-width: 100%;
+}
+.file-chips .chip:hover { border-color: var(--border-strong); }
+.file-chips button {
+  border: 0; background: none; cursor: pointer;
+  color: var(--text); font: inherit; font-size: 12.5px;
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 5px 9px; min-width: 0;
+}
+.file-chips button:hover { background: var(--surface-alt); }
+.file-chips .chip-icon { font-size: 12px; line-height: 1; flex: none; }
+.file-chips .chip-label {
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 220px;
+}
+/* Solo l'iconcina: la scorciatoia per aprire la cartella, non un'etichetta.
+   Il percorso lo dice il titolo della goccia. */
+.file-chips .chip-dir {
+  border-left: 1px solid var(--border);
+  color: var(--text-faint); padding: 5px 6px;
+}
+.file-chips .chip-dir:hover { color: var(--accent); background: var(--accent-soft); }
+
+/* Note di lavoro ------------------------------------------------------------ */
+.note-row {
+  display: flex; gap: 7px; align-items: flex-start;
+  font-size: 12px; line-height: 1.45; color: var(--text-muted);
+  padding: 4px 0;
+}
+.note-row + .note-row { border-top: 1px solid var(--border); }
+.note-dot {
+  flex: none; width: 4px; height: 4px; border-radius: 50%;
+  background: var(--accent); margin-top: 7px;
+}
+
+/* Confine della compattazione ------------------------------------------------
+   Una riga orizzontale nel thread, non una scheda: segna un punto nel tempo, e
+   una scatola suggerirebbe che sopra c'è qualcosa da recuperare. Sopra la riga
+   i messaggi restano leggibili — è solo il modello che non li ha più. */
+.compacted { margin: 18px 0 10px; }
+.compacted-head { display: flex; align-items: center; gap: 10px; }
+.compacted-line { flex: 1; height: 1px; background: var(--border-strong); }
+.compacted-label {
+  flex: none; font-size: 11px; letter-spacing: .02em;
+  color: var(--text-faint); white-space: nowrap;
+}
+.compacted-drawer { margin-top: 8px; }
+.compacted-note {
+  margin-top: 6px; text-align: center;
+  font-size: 11px; color: var(--text-faint);
+}
+
+/* ---------------------------------------------------------------------------
+   Vault: schermata iniziale e scheda d'identità
+   ---------------------------------------------------------------------------
+   Un vault è un posto, non una modalità: aprirlo mostra dove si è arrivati —
+   nome, a cosa serve, una casella per cominciare, e cosa c'era già. Prende il
+   posto della chat nella stessa colonna invece di affiancarlesi: sono due
+   viste dello stesso spazio, non due cose da guardare insieme. */
+
+#vault-col { flex: 1; min-width: 0; overflow-y: auto; }
+.vault-home { max-width: 720px; margin: 0 auto; padding: 48px 28px 40px; }
+
+.vault-head h1 {
+  margin: 0; font-size: 27px; font-weight: 600; letter-spacing: -0.01em;
+}
+/* La descrizione è la riga che risponde a "cos'era questo": tono basso, ma
+   sotto al nome, dove la si legge senza cercarla. */
+.vault-descr {
+  margin: 7px 0 0; font-size: 13.5px; line-height: 1.55; color: var(--text-muted);
+  white-space: pre-wrap;
+}
+
+/* La casella della chat nuova sta in alto e non in fondo all'elenco: nove
+   volte su dieci un vault si apre per scriverci, non per rileggere. */
+.vault-composer {
+  display: flex; gap: 8px; align-items: flex-end; margin: 26px 0 30px;
+  border: 1px solid var(--border-strong); border-radius: 12px;
+  background: var(--surface); box-shadow: var(--shadow-sm);
+  padding: 9px 9px 9px 12px;
+  transition: border-color .13s;
+}
+.vault-composer:focus-within { border-color: var(--accent); }
+.vault-composer textarea {
+  flex: 1; min-width: 0; border: 0; background: none; resize: none;
+  font: inherit; font-size: 14px; line-height: 1.55; color: var(--text);
+  padding: 3px 0; outline: none;
+}
+.vault-composer textarea::placeholder { color: var(--text-faint); }
+.vault-composer .btn { flex: none; }
+
+.vault-chats .section-label { padding-left: 0; }
+#vh-sessions { display: flex; flex-direction: column; gap: 1px; }
+
+/* Le righe delle conversazioni: stessa grammatica della colonna di sinistra —
+   niente bordi, niente card — ma con due righe, perché qui lo spazio c'è e
+   "quando" e "quanto" aiutano a riconoscere quella giusta. */
+.vault-chat {
+  display: flex; flex-direction: column; gap: 2px; width: 100%;
+  text-align: left; font: inherit; background: none; border: 0;
+  border-radius: 9px; padding: 9px 11px; cursor: pointer;
+  transition: background .12s;
+}
+.vault-chat:hover { background: rgba(127, 122, 112, 0.11); }
+.vault-chat-title {
+  font-size: 13.5px; color: var(--text);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.vault-chat-meta { font-size: 11.5px; color: var(--text-faint); }
+.vault-chat.running .vault-chat-title::after {
+  content: ''; display: inline-block; width: 6px; height: 6px; margin-left: 7px;
+  border-radius: 50%; background: var(--accent); vertical-align: middle;
+}
+
+/* Il badge "w" sulle righe della colonna: dice quali vault sono wiki senza
+   aggiungere una parola. Le altre proprietà stanno nel titolo al passaggio. */
+.vault-badge {
+  flex: none; font-size: 9.5px; font-weight: 600; line-height: 1;
+  padding: 2px 4px; border-radius: 4px;
+  color: var(--text-faint); border: 1px solid var(--border-strong);
+}
+
+/* "esci" accanto all'etichetta dell'elenco: uscire da un vault deve costare
+   quanto entrarci, e nessuno cerca un modo per uscire dentro le impostazioni. */
+.section-label { display: flex; align-items: baseline; gap: 8px; }
+.section-back {
+  margin-left: auto; font: inherit; font-size: 10px; font-weight: 600;
+  text-transform: uppercase; letter-spacing: 0.06em;
+  color: var(--text-faint); background: none; border: 0; cursor: pointer;
+  padding: 0;
+}
+.section-back:hover { color: var(--accent); }
+
+/* La scheda a destra: i campi sono nudi finché non li si tocca, come il resto
+   del pannello — è una scheda di lettura in cui si può anche scrivere, non un
+   modulo da compilare. */
+.field-lite {
+  display: block; font-size: 10.5px; font-weight: 600; letter-spacing: 0.05em;
+  text-transform: uppercase; color: var(--text-faint); margin: 9px 0 3px;
+}
+.hint-inline { font-weight: 400; text-transform: none; letter-spacing: 0; opacity: 0.8; }
+#vault-card input[type="text"], #vault-card textarea {
+  width: 100%; box-sizing: border-box; font: inherit; font-size: 12.5px;
+  color: var(--text); background: var(--bg-subtle);
+  border: 1px solid transparent; border-radius: 7px; padding: 5px 7px;
+  line-height: 1.5; resize: vertical;
+}
+#vault-card input[type="text"]:hover, #vault-card textarea:hover { border-color: var(--border); }
+#vault-card input[type="text"]:focus, #vault-card textarea:focus {
+  outline: none; border-color: var(--accent); background: var(--surface);
+}
+#vault-card .switch.compact { margin: 11px 0 4px; font-size: 12.5px; }
+.vault-path {
+  font-family: var(--mono); font-size: 11.5px; font-weight: 400 !important;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 60%;
+}
+
+/* Memoria del vault: righe di testo, niente riquadri annidati. Il × compare
+   al passaggio — togliere una nota è un gesto raro e deliberato, e un bottone
+   sempre acceso su ogni riga sarebbe un invito a cancellare. */
+.vmem {
+  display: flex; align-items: flex-start; gap: 6px;
+  font-size: 12.5px; line-height: 1.5; color: var(--text-dim);
+  padding: 4px 0; border-bottom: 1px solid var(--border);
+}
+.vmem:last-child { border-bottom: 0; }
+.vmem-text { flex: 1; min-width: 0; }
+.vmem-del {
+  flex: none; border: 0; background: none; cursor: pointer; padding: 0 2px;
+  color: var(--text-faint); font-size: 14px; line-height: 1; opacity: 0;
+  transition: opacity .12s, color .12s;
+}
+.vmem:hover .vmem-del { opacity: 1; }
+.vmem-del:hover { color: var(--accent); }
+
+/* Il resoconto chiesto dall'harness a passi esauriti. Tono basso e riga
+   sottile: non è un errore, è un'informazione sul perché il turno finisce lì.
+   Senza, una chiusura forzata si legge come una chiusura riuscita. */
+.turn-forzato {
+  margin-top: 8px; padding-top: 7px; border-top: 1px dashed var(--border-strong);
+  font-size: 11.5px; color: var(--text-faint);
+}

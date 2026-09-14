@@ -1,0 +1,780 @@
+<!DOCTYPE html>
+<html lang="it" data-theme="light">
+<head>
+<meta charset="utf-8">
+<!-- Nessuna Content-Security-Policy, ed e' una scelta.
+     Questa pagina gira su localhost, la serve lo stesso processo che serve la
+     sua API, e non ci sono terze parti: niente CDN, nessuno script esterno,
+     nessun font remoto. La superficie che una CSP chiuderebbe qui e' il
+     markup che il modello scrive -- e quello passa gia' da `esc()` e da
+     `markdown()`, che costruiscono testo escapato e non HTML del modello (il
+     test `test_il_markup_del_modello_resta_escapato` e' li' per quello).
+     L'unico contenuto davvero non nostro, le anteprime scritte dall'agente,
+     vive su un'ALTRA origine (server/previewhost.py, porta sua, niente
+     cookie, niente CORS): e' li' che sta il confine, e un'intestazione qui
+     non lo sposterebbe di un millimetro. -->
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<!-- I due schemi sono entrambi veri: il tema lo sceglie l'utente con
+     `data-theme` sull'<html>. Senza questa riga i controlli nativi -- cursore
+     dei campi di testo, barre di scorrimento -- restano nello schema chiaro
+     anche quando la pagina e' scura. -->
+<meta name="color-scheme" content="dark light">
+<title>Local Agent Harness</title>
+<link rel="stylesheet" href="/static/style.css">
+<!-- Icona della scheda: il robottino ritagliato, senza il riquadro di fondo.
+     Un quadrato nero in mezzo alle altre schede è la cosa che si vede, e il
+     logo diventa il francobollo dentro. Il tratto è terracotta e il fondo
+     trasparente, quindi si legge sia sulle schede chiare sia su quelle scure,
+     senza doverne tenere due versioni. -->
+<link rel="icon" type="image/png" sizes="64x64" href="/static/favicon-64.png">
+<link rel="icon" type="image/png" sizes="32x32" href="/static/favicon-32.png">
+<link rel="icon" type="image/png" sizes="16x16" href="/static/favicon-16.png">
+</head>
+<body>
+
+<div id="app">
+
+  <!-- ------------------------------ sidebar ------------------------------ -->
+  <aside id="sidebar">
+    <div class="brand">
+      <!-- Due file invece di uno ricolorato via CSS: il logo e' un'immagine,
+           e un filtro CSS su una foto lascia sempre qualcosa di sporco. Lo
+           scambio e' puramente CSS, quindi avviene prima che parta il JS e non
+           c'e' un lampo del logo sbagliato al caricamento. -->
+      <div class="logo">
+        <img class="logo-chiaro" src="/static/logo-light.png" alt="Local Agent Harness">
+        <img class="logo-scuro" src="/static/logo-dark.png" alt="Local Agent Harness">
+      </div>
+      <div style="min-width:0">
+        <div class="brand-name" id="brand-name">Local Agent Harness</div>
+        <div class="brand-sub" id="brand-sub">v2</div>
+      </div>
+    </div>
+
+    <button class="new-chat" id="new-chat">
+      <svg width="13" height="13" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round">
+        <path d="M7 2.5v9M2.5 7h9"/>
+      </svg>
+      Nuova chat
+    </button>
+
+    <!-- L'etichetta dice DOVE si sta guardando: dentro un vault l'elenco è
+         quello del vault, fuori è quello delle chat libere. Un elenco solo, ma
+         non sempre lo stesso: senza l'etichetta l'unico modo di sapere quale
+         dei due si ha davanti sarebbe non ritrovarci una chat. -->
+    <div class="section-label" id="sessions-label">
+      <span id="sessions-label-text">Conversazioni</span>
+      <button class="section-back" id="vault-exit" hidden title="Torna alle conversazioni libere">esci</button>
+    </div>
+    <!-- La ricerca sta in cima all'elenco e non dietro un pulsante: con
+         quaranta conversazioni dal titolo che comincia tutto uguale ("Nel
+         workspace deve esistere...") scorrere non è un modo di ritrovarle.
+         Cerca nel titolo, in quello che è stato detto e nei nomi degli
+         allegati, perché sono i tre modi in cui uno se le ricorda. -->
+    <div class="search-box">
+      <svg class="search-icon" width="13" height="13" viewBox="0 0 16 16" fill="none"
+           stroke="currentColor" stroke-width="1.6" stroke-linecap="round">
+        <circle cx="7" cy="7" r="4.3"/><path d="m10.2 10.2 3 3"/>
+      </svg>
+      <input type="search" id="session-search" placeholder="Cerca nelle conversazioni…"
+             autocomplete="off" spellcheck="false">
+      <button class="search-clear" id="search-clear" title="Pulisci (Esc)" hidden>×</button>
+    </div>
+    <div id="sessions"></div>
+
+    <!-- Il confine fra i due elenchi si trascina: quanto spazio meritino i
+         vault dipende da quanti ne hai e da quante chat tieni aperte sotto,
+         e non è una cosa che si possa decidere una volta per tutte da qui.
+         Stessa grammatica delle maniglie verticali, ruotata: invisibile a
+         riposo, doppio clic per tornare a metà e metà. -->
+    <div class="row-grip" id="vaults-grip"
+         title="Trascina per dare più o meno spazio ai vault (doppio clic: metà e metà)"></div>
+
+    <!-- Un vault è un posto di lavoro: nome, descrizione, cartella e le chat
+         che ci sono state fatte dentro. Cliccarne uno apre la sua schermata
+         iniziale, non solo il workspace. La modalità manutentore-wiki è
+         diventata una proprietà del vault, non la sua definizione. -->
+    <div class="vaults-sec" id="vaults-sec">
+      <div class="section-label vaults-label">Vault</div>
+      <div class="vault-add">
+        <button class="vault-new" id="vault-new" title="Scegli la cartella con Esplora risorse">+ Nuovo vault</button>
+      </div>
+      <div id="vaults"></div>
+    </div>
+
+    <div class="sidebar-foot">
+      <button class="icon-btn" id="theme-toggle" title="Tema chiaro/scuro">☀</button>
+      <button class="foot-btn" id="open-settings" title="Impostazioni">
+        <!-- Ingranaggio vero: il glifo precedente era un cerchio con raggi,
+             cioe' visivamente identico al sole del selettore di tema. -->
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+             stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="12" cy="12" r="3.1"/>
+          <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
+        </svg>
+        Impostazioni
+      </button>
+    </div>
+  </aside>
+
+  <!-- Divisori trascinabili delle colonne laterali. Sono figli di #app e non
+       delle colonne: dentro un contenitore che scorre scorrerebbero con il
+       contenuto, e posizionati sulle variabili di larghezza seguono da soli
+       la colonna senza che nessuno li aggiorni. -->
+  <div class="col-grip" id="sidebar-grip" title="Trascina per ridimensionare · doppio clic per la larghezza di serie"></div>
+  <div class="col-grip" id="panel-grip" title="Trascina per ridimensionare · doppio clic per la larghezza di serie"></div>
+
+  <!-- -------------------------------- main ------------------------------- -->
+  <main id="main">
+    <header id="topbar">
+      <button class="icon-btn" id="toggle-sidebar" title="Nascondi la barra laterale">☰</button>
+      <!-- Chi lavora e su cosa: due righe, due gocce. Ognuna sta dentro la sua
+           ancora, che è larga esattamente quanto la goccia — è ciò che permette
+           alla tendina di allinearsi al bordo di quello che si sta guardando
+           invece che a quello della colonna, e ciò che le rimette su due righe
+           (da inline-flex finivano affiancate, e il bordo di una toccava la
+           freccia dell'altra). -->
+      <div class="topbar-id">
+        <!-- Il modello non è un'etichetta, è una scelta: cambiarlo era un giro
+             nelle impostazioni per una cosa che si fa più volte in un'ora. La
+             goccia mostra quale gira e apre l'elenco di quelli che l'endpoint
+             offre davvero. -->
+        <div class="chip-anchor">
+          <button class="model-chip" id="model-chip" type="button" aria-haspopup="listbox" aria-expanded="false">
+            <span class="title" id="top-title">—</span>
+            <svg class="model-caret" width="9" height="9" viewBox="0 0 10 10" fill="none"
+                 stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M2 3.7 5 6.7l3-3"/>
+            </svg>
+          </button>
+          <div class="model-menu" id="model-menu" role="listbox" hidden></div>
+        </div>
+        <!-- Il percorso non è una didascalia: è la seconda cosa che si cambia
+             più spesso dopo il modello, e stava in fondo alla colonna di
+             destra. Qui è già scritto — premerlo apre le ultime cartelle usate
+             e il selettore di sistema, cioè il gesto sull'oggetto che si sta
+             guardando invece che su un pulsante altrove. -->
+        <div class="chip-anchor">
+          <button class="ws-chip" id="ws-chip" type="button" aria-haspopup="menu" aria-expanded="false"
+                  title="Cambia cartella di lavoro">
+            <svg class="ws-folder" width="11" height="11" viewBox="0 0 16 16" fill="none"
+                 stroke="currentColor" stroke-width="1.5" stroke-linejoin="round">
+              <path d="M1.8 4.2h4l1.2 1.6h7.2v7A1.2 1.2 0 0 1 13 14H3a1.2 1.2 0 0 1-1.2-1.2z"/>
+            </svg>
+            <span class="sub" id="top-sub"></span>
+            <svg class="model-caret" width="9" height="9" viewBox="0 0 10 10" fill="none"
+                 stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M2 3.7 5 6.7l3-3"/>
+            </svg>
+          </button>
+          <div class="model-menu ws-menu" id="ws-menu" role="menu" hidden></div>
+        </div>
+      </div>
+      <span class="pill wait" id="pill-status" role="status" aria-live="polite"><span class="dot"></span>controllo…</span>
+      <span class="pill acc" id="pill-ctx">ctx</span>
+      <span class="pill" id="pill-backend">—</span>
+      <!-- Sapere se l'agente e' nel recinto o no deve costare un'occhiata,
+           non un giro nelle impostazioni. -->
+      <span class="pill" id="pill-sandbox">—</span>
+      <span class="pill" id="pill-stream" style="display:none"></span>
+      <!-- Stesso glifo del pulsante a sinistra, non una sua variante: è lo
+           stesso gesto su una colonna diversa, e la colonna la dice già la
+           posizione. Due simboli diversi per la stessa azione obbligherebbero
+           a impararli entrambi. Sta qui e non più in fondo alla sidebar, dove
+           spariva proprio quando si chiudeva la sidebar. -->
+      <button class="icon-btn" id="toggle-panel" title="Nascondi il pannello destro">☰</button>
+    </header>
+
+    <!-- Chat e anteprima affiancate, divise da una riga verticale. La chat
+         resta una colonna intera — thread sopra, composer sotto — e l'anteprima
+         le sta accanto a tutta altezza: si legge la conversazione e si guarda
+         il risultato senza che nessuno dei due si accorci. Il divisorio si
+         trascina. -->
+    <div id="main-split">
+      <!-- Schermata iniziale di un vault: prende il posto della chat, non le si
+           affianca. È la stessa colonna, con un contenuto diverso — un posto in
+           cui si arriva, si scrive la prima riga di una chat nuova o si ritrova
+           una vecchia. Nascosta finché non si apre un vault. -->
+      <div id="vault-col" hidden>
+        <div class="vault-home">
+          <header class="vault-head">
+            <h1 id="vh-nome">—</h1>
+            <p class="vault-descr" id="vh-descr"></p>
+          </header>
+
+          <!-- Il campo della chat nuova sta in alto e non in fondo all'elenco:
+               nove volte su dieci si apre un vault per scriverci, non per
+               rileggere. -->
+          <div class="vault-composer">
+            <textarea id="vh-input" rows="3" placeholder="Nuova conversazione in questo vault…"
+                      spellcheck="false"></textarea>
+            <button class="btn primary" id="vh-send">Avvia</button>
+          </div>
+
+          <div class="vault-chats">
+            <div class="section-label">Conversazioni <span class="section-hint" id="vh-count"></span></div>
+            <div id="vh-sessions"></div>
+          </div>
+        </div>
+      </div>
+
+      <div id="chat-col">
+        <div id="scroller"><div id="thread"></div></div>
+
+        <div id="composer-wrap">
+          <div class="composer-toolbar" id="composer-toolbar" hidden>
+            <button type="button" class="quick-chip" id="btn-quick-continue" title="Invia subito 'continua' all'agente">
+              <span class="chip-icon">▶</span>
+              <span class="chip-label">continua</span>
+            </button>
+          </div>
+          <div id="composer">
+            <!-- Gli allegati in attesa stanno DENTRO il contenitore, sopra la
+                 riga di scrittura: e' il posto in cui li mettono le app di
+                 messaggistica, e non per moda -- un file in procinto di
+                 partire e' parte del messaggio che si sta scrivendo, non un
+                 elenco che vive da un'altra parte dello schermo. Nascosta
+                 quando non c'e' niente: una striscia vuota sopra la casella
+                 sarebbe un bordo in piu' e basta. -->
+            <div id="attach-strip" hidden></div>
+            <div class="composer-row">
+              <button id="attach" title="Allega file alla conversazione">
+                <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M9.5 4.5 5.2 8.8a1.9 1.9 0 0 0 2.7 2.7l4.6-4.6a3.2 3.2 0 0 0-4.5-4.5L3.3 7.1a4.5 4.5 0 0 0 6.4 6.4l4-4"/>
+                </svg>
+              </button>
+              <input type="file" id="attach-input" multiple hidden>
+              <!-- Goccia "Ricerca online": toggle di modalita', non un allegato.
+                   Ancorata a destra della riga, fra la casella e l'invio:
+                   cambia COME parte il messaggio. Spenta, il modello non sa
+                   nemmeno che il tool esiste: lo schema e la riga di prompt
+                   vengono appesi solo quando questa e' attiva. -->
+              <textarea rows="1" placeholder="Chiedi all'agente di lavorare sul workspace…"></textarea>
+              <button type="button" id="toggle-web-search" class="goccia-web" aria-pressed="false"
+                      title="Ricerca online: permette al modello di cercare sul web">
+                <svg class="globo" width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round">
+                  <circle cx="8" cy="8" r="6.2"/>
+                  <ellipse cx="8" cy="8" rx="2.8" ry="6.2"/>
+                  <path d="M1.8 8h12.4M2.9 4.8h10.2M2.9 11.2h10.2"/>
+                </svg>
+                <span>Ricerca online</span>
+              </button>
+              <div class="chip-anchor think-anchor">
+                <button class="goccia-web" id="toggle-think" type="button" aria-haspopup="listbox" aria-expanded="false" title="Livello di pensiero per questo messaggio">
+                  <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M8 1.8a4.6 4.6 0 0 0-2.55 8.42c.48.33.75.87.75 1.44v.54h3.6v-.54c0-.57.27-1.11.75-1.44A4.6 4.6 0 0 0 8 1.8z"/>
+                    <path d="M6.5 14.2h3"/>
+                  </svg>
+                  <span id="think-label">Auto</span>
+                  <svg class="chev" width="10" height="10" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M4 6l4 4 4-4"/></svg>
+                </button>
+                <div class="model-menu think-menu" id="think-menu" role="listbox" aria-label="Livello di pensiero" hidden></div>
+              </div>
+              <button id="send" title="Invia (Invio)">
+                <svg id="icon-send" width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M8 13V3M3.5 7.5L8 3l4.5 4.5"/>
+                </svg>
+                <svg id="icon-stop" width="15" height="15" viewBox="0 0 16 16" fill="currentColor" style="display:none">
+                  <rect x="4.5" y="4.5" width="7" height="7" rx="1.4"/>
+                </svg>
+              </button>
+            </div>
+          </div>
+          <div class="composer-hint" id="composer-hint">Invio per inviare · Maiusc+Invio per andare a capo</div>
+        </div>
+      </div>
+
+      <div id="preview-pane" hidden>
+        <div class="preview-grip" id="preview-grip" title="Trascina per ridimensionare · doppio clic per metà schermo"></div>
+        <div class="preview-inner">
+          <div class="preview-bar">
+            <span class="preview-icon" id="ov-icon">◱</span>
+            <span class="preview-name" id="ov-title">—</span>
+            <span class="preview-sub" id="ov-sub"></span>
+            <span style="flex:1"></span>
+            <button class="mini-btn" id="ov-reload" title="Ricarica">↻</button>
+            <a class="mini-btn" id="ov-external" target="_blank" rel="noopener" title="Apri in una scheda">↗</a>
+            <button class="mini-btn" id="ov-close" title="Chiudi (Esc)">✕</button>
+          </div>
+          <div class="preview-body" id="ov-body"></div>
+        </div>
+      </div>
+    </div>
+  </main>
+
+  <!-- ---------------------------- pannello destro ------------------------ -->
+  <aside id="panel">
+    <!-- L'identità del vault. Sta in cima e compare solo dentro un vault,
+         perché è la scheda del posto in cui si sta: nome, a cosa serve, come
+         ci si lavora, dov'è. I due testi sono separati di proposito — la
+         descrizione è per te e non arriva mai al modello, le istruzioni sì:
+         una riga scritta di fretta per ritrovare la cartella non deve
+         diventare un ordine che l'agente segue per i mesi successivi. Si
+         salvano uscendo dal campo, dentro .vault.json — cioè nella cartella,
+         così il vault resta sé stesso anche se lo sposti. -->
+    <div class="card" id="vault-card" style="display:none">
+      <h4>Vault</h4>
+      <label class="field-lite" for="v-nome">Nome</label>
+      <input id="v-nome" type="text" maxlength="120" spellcheck="false">
+      <label class="field-lite" for="v-descr">Descrizione <span class="hint-inline">solo per te</span></label>
+      <textarea id="v-descr" rows="2" maxlength="400" placeholder="Cos'è questo posto"></textarea>
+      <label class="field-lite" for="v-istr">Istruzioni <span class="hint-inline">vanno al modello</span></label>
+      <textarea id="v-istr" rows="4" maxlength="2000" placeholder="Come si lavora qui dentro"></textarea>
+      <div class="switch compact">
+        <input type="checkbox" id="v-wiki">
+        <div><label for="v-wiki" style="margin:0">Modalità wiki</label>
+          <div class="help">L'agente diventa il manutentore di una wiki LLM: <code>raw/</code> immutabile, <code>wiki/</code> sua, schema in <code>CLAUDE.md</code>. Accendendola la struttura viene creata.</div></div>
+      </div>
+      <div class="kv"><span>Cartella</span><span class="vault-path" id="v-path" title="">—</span></div>
+      <div class="kv" id="v-wiki-counts" style="display:none"><span>Wiki</span><span id="v-counts">—</span></div>
+    </div>
+
+    <!-- La memoria del vault: quello che l'agente ha capito di QUESTO posto.
+         Tre fogli, e la differenza è quanto vivono: le note della chat muoiono
+         con lei, questa vale per tutte le conversazioni della cartella, le
+         memorie a lungo termine valgono ovunque. La scrive il modello con
+         manage_notes ambito='vault'; qui si legge e si toglie quello che non
+         è più vero — una nota sbagliata è peggio di nessuna nota. -->
+    <div class="card" id="vault-mem-card" style="display:none">
+      <h4>Memoria del vault <span class="plan-count" id="v-mem-count">—</span></h4>
+      <div id="v-mem"></div>
+    </div>
+
+    <!-- Il piano sta in cima perché è la risposta alla domanda che l'utente si
+         fa davvero mentre l'agente lavora: "a che punto è?". Prima l'unico
+         segnale era una tendina del pensiero che si apriva e si chiudeva.
+         Nascosto finché non c'è un piano: su una richiesta semplice sarebbe
+         una scatola vuota. -->
+    <div class="card" id="plan-card" style="display:none">
+      <h4>Piano <span class="plan-count" id="plan-count">—</span></h4>
+      <!-- A che punto è, prima di leggere una riga. Il conteggio accanto al
+           titolo c'era già, ma è la cosa meno visibile della scheda: la barra
+           risponde da lontano, e con un piano da dieci punti risponde anche
+           quando i punti chiusi sono scorsi fuori dalla vista. Due segmenti,
+           perché "saltato" non è "fatto" e non deve contarci dentro. -->
+      <div class="plan-bar" id="plan-bar" role="img" aria-label="avanzamento del piano">
+        <span class="plan-bar-done" id="plan-bar-done"></span>
+        <span class="plan-bar-skipped" id="plan-bar-skipped"></span>
+      </div>
+      <div id="plan"></div>
+    </div>
+
+    <!-- Le note stanno sotto il piano perché rispondono all'altra domanda:
+         non "a che punto è" ma "cosa ha capito". Le scrive il modello mentre
+         lavora, e sono ciò che sopravvive quando la cronologia viene
+         compattata — quindi vederle serve anche a sapere cosa NON verrà
+         perso. Nascoste finché il foglio è vuoto. -->
+    <div class="card" id="notes-card" style="display:none">
+      <h4>Note <span class="plan-count" id="notes-count">—</span></h4>
+      <div id="notes"></div>
+    </div>
+
+    <!-- Contesto e ultima esecuzione erano due riquadri con due intestazioni
+         per rispondere alla stessa domanda: quanto sta costando. Uniti, la
+         barra fa da titolo e i numeri del turno appena finito le stanno sotto,
+         separati da una riga invece che da un bordo, un'ombra e 19px di aria. -->
+    <div class="card">
+      <h4>Consumo</h4>
+      <div class="meter" id="ctx-meter"><div id="ctx-bar" style="width:0%"></div></div>
+      <div class="kv"><span>Inviati al modello</span><span id="ctx-used">—</span></div>
+      <div class="kv"><span>Finestra</span><span id="ctx-window">—</span></div>
+      <div class="kv"><span>Occupazione</span><span id="ctx-pct">—</span></div>
+
+      <div id="usage-block" style="display:none">
+        <div class="card-split">Ultima esecuzione</div>
+        <div class="kv"><span>Prompt</span><span id="u-prompt">—</span></div>
+        <div class="kv"><span>Generati</span><span id="u-gen">—</span></div>
+        <div class="kv"><span>Velocità</span><span id="u-speed">—</span></div>
+        <div class="kv"><span>Totale</span><span id="u-total">—</span></div>
+        <!-- Quante volte l'harness ha dovuto correggere il modello. Compare solo
+             quando è successo: su un modello che non ne ha bisogno la riga non
+             c'è, ed è esattamente l'informazione che serve per decidere se le
+             reti di sicurezza si possono togliere. -->
+        <div class="kv" id="u-nudge-row" style="display:none">
+          <span title="Solleciti automatici che l'harness ha dovuto iniettare">Correzioni</span>
+          <span id="u-nudges">—</span>
+        </div>
+        <!-- Quanto rende il draft model. Compare solo se il server ne ha uno e
+             ne dichiara i contatori: senza speculative decoding la riga non
+             c'è, e non c'è nemmeno un numero inventato al suo posto. -->
+        <div class="kv" id="u-draft-row" style="display:none">
+          <span title="Token proposti dal draft model e accettati dal modello grande">Draft</span>
+          <span id="u-draft">—</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- I file toccati erano righe di testo monospaziato: si leggevano e basta.
+         Sono le stesse gocce di fine turno, quindi hanno lo stesso aspetto e lo
+         stesso gesto — il nome apre l'anteprima, l'iconcina apre la cartella. -->
+    <div class="card">
+      <h4 id="files-title">File toccati</h4>
+      <div id="files"><div class="empty">Nessun file toccato.</div></div>
+    </div>
+  </aside>
+
+</div>
+
+<!-- ------------------------------ impostazioni ---------------------------- -->
+<div id="overlay">
+  <div class="modal">
+    <div class="modal-head">
+      <h2>Impostazioni</h2>
+      <button class="btn" id="close-settings">Chiudi</button>
+    </div>
+    <div class="modal-body">
+      <!-- role/aria-selected: cinque <button> con una classe CSS diversa non
+           dicono niente a uno screen reader su quale scheda è aperta. Il
+           gestore in app.js sposta `aria-selected` insieme alla classe. -->
+      <div class="tabs" role="tablist" aria-label="Sezioni delle impostazioni">
+        <button class="tab active" data-tab="conn" role="tab" id="tabbtn-conn"
+                aria-controls="tab-conn" aria-selected="true">Connessione</button>
+        <button class="tab" data-tab="gen" role="tab" id="tabbtn-gen"
+                aria-controls="tab-gen" aria-selected="false">Generazione</button>
+        <button class="tab" data-tab="eff" role="tab" id="tabbtn-eff"
+                aria-controls="tab-eff" aria-selected="false">Efficienza</button>
+        <button class="tab" data-tab="prompt" role="tab" id="tabbtn-prompt"
+                aria-controls="tab-prompt" aria-selected="false">System prompt</button>
+        <button class="tab" data-tab="mem" role="tab" id="tabbtn-mem"
+                aria-controls="tab-mem" aria-selected="false">Memoria</button>
+      </div>
+
+      <!-- connessione -->
+      <section class="tab-panel active" id="tab-conn" role="tabpanel" aria-labelledby="tabbtn-conn">
+        <div class="grid2">
+          <div>
+            <div class="field">
+              <label for="s-api-base">Endpoint API (api_base)</label>
+              <input type="text" id="s-api-base" placeholder="http://localhost:11434 o https://openrouter.ai/api/v1">
+              <div class="help">URL dell'endpoint LLM (chiave <code>api_base</code>). Es. <code>http://localhost:11434</code> per Ollama oppure <code>https://openrouter.ai/api/v1</code> per OpenRouter.</div>
+            </div>
+            <div class="field">
+              <label for="s-gpu-vram">VRAM della scheda remota (MB)</label>
+              <input type="number" id="s-gpu-vram" min="0" step="1024">
+              <div class="help">Serve solo con Ollama su un'altra macchina: da lì <code>nvidia-smi</code> non è raggiungibile e l'API dice quanto è <em>occupato</em>, non quanto è <em>grande</em> la scheda. 0 = endpoint locale. Es. 32768 per una scheda da 32 GB.</div>
+            </div>
+            <div class="field">
+              <label for="s-transport">Transport</label>
+              <select id="s-transport">
+                <option value="auto">auto</option>
+                <option value="ollama">ollama</option>
+                <option value="openai">openai</option>
+                <option value="llamacpp">llamacpp</option>
+              </select>
+              <div class="help">Solo <code>/api/chat</code> di Ollama applica davvero num_ctx, num_gpu e keep_alive. Con <code>llamacpp</code> il contesto lo comanda <code>-c</code> al lancio del server: l'harness lo <em>legge</em> da <code>/props</code> e ci si adegua. <code>auto</code> riconosce da solo quale dei due sta rispondendo.</div>
+            </div>
+            <div class="field">
+              <label for="s-stream-tools">Tool in streaming</label>
+              <select id="s-stream-tools">
+                <option value="auto">auto</option>
+                <option value="sempre">sempre</option>
+                <option value="mai">mai</option>
+              </select>
+              <div class="help">Ollama &lt; 0.8.0 non emette tool call con stream=true. "auto" legge la versione del server.</div>
+            </div>
+            <div class="field">
+              <label for="s-model">Modello</label>
+              <input type="text" id="s-model" list="s-model-list" placeholder="Es. Qwen3.8:27B-Q6_K o qwen/qwen-2.5-72b-instruct" autocomplete="off" spellcheck="false">
+              <datalist id="s-model-list"></datalist>
+              <div class="help">Digita il nome di qualsiasi modello (es. per OpenRouter/OpenAI) oppure sceglilo dai suggerimenti trovati sull'endpoint.</div>
+            </div>
+            <!-- La cartella di lavoro NON sta qui. Stava qui e in alto a
+                 sinistra, e le due copie facevano lo stesso identico gesto:
+                 scegliere una cartella e aprirla in Esplora risorse. È rimasta
+                 quella in alto, che è dove si legge dove si sta lavorando —
+                 cercare una cosa dentro le impostazioni per cambiarla è un
+                 passaggio in più per una scelta che si fa mentre si lavora. -->
+            <div class="field">
+              <label for="s-api-key">API key</label>
+              <!-- NON usare type="password": il gestore password di Chrome
+                   tratterebbe il campo come una credenziale, offrirebbe di
+                   salvarlo, lo autocompilerebbe con password salvate e
+                   mostrerebbe l'avviso "password compromessa". Mascheriamo
+                   il testo via CSS: stesso aspetto, zero password manager. -->
+              <input type="text" id="s-api-key" class="masked" autocomplete="off"
+                     spellcheck="false" autocapitalize="off" data-lpignore="true"
+                     data-1p-ignore data-bwignore data-form-type="other">
+              <div class="help">Serve solo con transport <code>openai</code>. Con Ollama lascia vuoto.</div>
+            </div>
+            <div class="field">
+              <label for="s-timeout">Timeout richieste (s)</label>
+              <input type="number" id="s-timeout" min="10" max="1800" step="10">
+            </div>
+          </div>
+
+          <!-- Seconda colonna: tutto quello che riguarda il recinto in cui
+               girano i comandi. Prima stava di seguito ai campi di
+               connessione, con la diagnostica del tool calling a destra; tolta
+               quella, la sandbox si prende la colonna che si era liberata. -->
+          <div>
+            <div class="field">
+              <label for="s-sandbox">Sandbox dei comandi</label>
+              <select id="s-sandbox">
+                <option value="docker">docker (isolato)</option>
+                <option value="host">host (nessun recinto)</option>
+              </select>
+              <div class="help" id="sandbox-help">—</div>
+            </div>
+            <div class="field">
+              <label for="s-docker-image">Immagine del container</label>
+              <input type="text" id="s-docker-image">
+              <div class="help">Deve contenere gli strumenti che l'agente usa (python, git, pytest).</div>
+            </div>
+            <div class="switch">
+              <input type="checkbox" id="s-sandbox-network">
+              <div><label for="s-sandbox-network" style="margin:0">Rete nel container</label>
+                <div class="help">Spenta, l'agente non puo' scaricare nulla ne' mandare dati fuori.</div></div>
+            </div>
+            <!-- I due tasti "Costruisci l'immagine" e "Ricrea il container"
+                 non stanno più qui. Immagine e container si preparano da soli
+                 quando si cambia cartella; farli a mano è un rimedio, e i
+                 rimedi stanno accanto alla cosa da rimediare — nella tendina
+                 della cartella in alto a sinistra, sotto "Impostazioni". -->
+
+            <div class="switch">
+              <input type="checkbox" id="s-danger">
+              <div><label for="s-danger" style="margin:0">Consenti comandi distruttivi</label>
+                <div class="help">Disattivato, un guard-rail blocca rm -rf, format e simili.</div></div>
+            </div>
+          </div>
+
+        </div>
+      </section>
+
+      <!-- generazione -->
+      <section class="tab-panel" id="tab-gen" role="tabpanel" aria-labelledby="tabbtn-gen">
+        <div class="grid2">
+          <div>
+            <div class="field">
+              <label for="s-numctx">Finestra di contesto — <span id="s-numctx-val"></span></label>
+              <select id="s-numctx">
+                <option>2048</option><option>4096</option><option>8192</option>
+                <option>16384</option><option>24576</option><option>32768</option>
+                <option>49152</option><option>65536</option><option>98304</option>
+                <option>131072</option>
+              </select>
+              <div class="help">Sotto 8192 il tool calling degrada: system prompt e schemi occupano già ~2.400 token. I limiti di troncamento dei tool scalano con questo valore, quindi alzarlo allarga anche quanto file entra in un <code>read_file</code>.</div>
+            </div>
+            <div class="field">
+              <label for="s-numgpu">Layer su GPU (num_gpu)</label>
+              <input type="number" id="s-numgpu" min="0" max="999">
+              <div class="help">999 = tutti. Abbassalo solo in caso di OOM di VRAM.</div>
+            </div>
+            <div class="field">
+              <label for="s-keepalive">keep_alive</label>
+              <select id="s-keepalive">
+                <option value="0">0 (scarica subito)</option>
+                <option value="5m">5m</option><option value="30m">30m</option>
+                <option value="2h">2h</option><option value="-1">-1 (per sempre)</option>
+              </select>
+              <div class="help">Tenere il modello in VRAM elimina 4–15 s di ricarica ad ogni passo agentico.</div>
+            </div>
+            <div class="field">
+              <label for="s-think">Canale thinking nativo</label>
+              <select id="s-think">
+                <option value="auto">auto (rileva dal modello)</option>
+                <option value="si">sempre</option>
+                <option value="no">mai</option>
+                <option value="low">livello: low</option>
+                <option value="medium">livello: medium</option>
+                <option value="high">livello: high</option>
+                <option value="max">livello: max</option>
+              </select>
+              <div class="help">Su "auto" si accende solo se il modello dichiara la capability <code>thinking</code>. I livelli valgono sui modelli che li supportano: <code>max</code> per progettare, <code>low</code> per le modifiche meccaniche, dove il pensiero lungo è solo tempo di GPU.</div>
+            </div>
+          </div>
+          <div>
+            <div class="field">
+              <label for="s-temp">Temperature — <span id="s-temp-val"></span></label>
+              <input type="range" id="s-temp" min="0" max="1.5" step="0.05">
+              <div class="help">Sopra 0.4 il modello inizia a inventare nomi di parametri nei tool.</div>
+            </div>
+            <div class="field">
+              <label for="s-topp">top_p — <span id="s-topp-val"></span></label>
+              <input type="range" id="s-topp" min="0.1" max="1" step="0.05">
+            </div>
+            <div class="field">
+              <label for="s-topk">top_k — <span id="s-topk-val"></span></label>
+              <input type="range" id="s-topk" min="1" max="100" step="1">
+              <div class="help">Qwen 3.x raccomanda 20. Non inviarlo lascia il 40 di Ollama.</div>
+            </div>
+            <div class="field">
+              <label for="s-presence">presence_penalty — <span id="s-presence-val"></span></label>
+              <input type="range" id="s-presence" min="0" max="2" step="0.1">
+              <div class="help">Aiuta i modelli di pensiero a non girare in tondo. Sul codice tienila a 0: penalizza gli identificatori ripetuti, che devono restare uguali.</div>
+            </div>
+            <div class="field">
+              <label for="s-repetition">repetition_penalty — <span id="s-repetition-val"></span></label>
+              <input type="range" id="s-repetition" min="1" max="2" step="0.05">
+              <div class="help">Penalizza ogni ripetizione di un token già visto: 1 non fa niente (senza di lei Ollama lascerebbe il suo default 1.1), sopra 1.05 rischia di tagliare le parole comuni nel mezzo delle frasi.</div>
+            </div>
+            <div class="field">
+              <label for="s-maxtok">Max token generati — <span id="s-maxtok-val"></span></label>
+              <input type="range" id="s-maxtok" min="256" max="16384" step="256">
+            </div>
+            <div class="field">
+              <label for="s-loops">Max passi agentici</label>
+              <input type="number" id="s-loops" min="1" max="40">
+            </div>
+            <div class="card" style="margin-top:14px">
+              <h4>Profilo consigliato</h4>
+              <div class="help" id="profile-note">—</div>
+              <div class="btn-row" style="margin-top:8px">
+                <button class="mini-btn" id="profile-apply">Applica i consigliati</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- efficienza -->
+      <section class="tab-panel" id="tab-eff" role="tabpanel" aria-labelledby="tabbtn-eff">
+        <p class="help" style="margin-bottom:14px">Ogni interruttore qui sotto scambia qualcosa: contesto contro round-trip, oppure token contro riuso del KV cache.</p>
+        <div class="switch">
+          <input type="checkbox" id="s-strip">
+          <div><label for="s-strip" style="margin:0">Rimuovi i blocchi &lt;think&gt; dal contesto</label>
+            <div class="help">Il ragionamento resta visibile in chat ma non torna al modello.</div></div>
+        </div>
+        <div class="switch">
+          <input type="checkbox" id="s-compact">
+          <div><label for="s-compact" style="margin:0">Compatta i risultati dei tool più vecchi di 3 passi</label>
+            <div class="help">Un read_file già consumato costa token in ogni richiesta successiva.</div></div>
+        </div>
+        <div class="switch">
+          <input type="checkbox" id="s-plan-gate">
+          <div><label for="s-plan-gate" style="margin:0">Fammi leggere i piani lunghi prima di partire</label>
+            <div class="help">Oltre sei punti il turno si ferma e ti mostra il piano, con "procedi" o "correggi". Correggere un piano costa dieci secondi; valutare trenta passi fatti male, no. Sui compiti corti non si fa vedere.</div></div>
+        </div>
+        <div class="switch">
+          <input type="checkbox" id="s-compact-history">
+          <div><label for="s-compact-history" style="margin:0">Riassumi la cronologia oltre soglia</label>
+            <div class="help">Quando il contesto si riempie, la parte vecchia viene riassunta da una chiamata dedicata e tolta alla vista del modello. In chat resta leggibile. Costa una generazione e un ricalcolo del KV cache: per questo la soglia è alta.</div></div>
+        </div>
+        <div class="field" style="margin-left:30px">
+          <label for="s-compact-threshold">Soglia di compattazione</label>
+          <input type="number" id="s-compact-threshold" min="0.4" max="0.95" step="0.05">
+          <div class="help">Frazione della finestra oltre la quale scatta. A 0.75 resta un quarto di contesto libero per il passo successivo.</div>
+        </div>
+        <div class="field" style="margin-left:30px">
+          <label for="s-compact-max-tokens">…e comunque non oltre (token)</label>
+          <input type="number" id="s-compact-max-tokens" min="0" max="200000" step="4096">
+          <div class="help">Il costo del contesto è un numero assoluto, non una frazione: su endpoint remoto sono token pagati ad ogni passo, e l'attenzione del modello cala molto prima che la finestra si riempia. Con finestre grandi la sola percentuale non scatta mai. 0 = nessun tetto.</div>
+        </div>
+        <div class="switch" style="margin-left:30px">
+          <input type="checkbox" id="s-libreria">
+          <div><label for="s-libreria" style="margin:0">Salva i tratti compattati in <code>.memoria/</code></label>
+            <div class="help">Ogni riassunto finisce anche su disco, così com'è e per sempre. Serve a due cose: non viene riassunto una seconda volta alla compattazione dopo — che è il modo in cui un riassunto diventa la fotocopia di una fotocopia — e in contesto ne resta una riga di indice invece del testo. Il modello li rilegge con read_file, e quelli che riguardano il punto aperto glieli rimette davanti l'harness.</div></div>
+        </div>
+        <div class="switch" style="margin-left:30px">
+          <input type="checkbox" id="s-estratto-pensiero">
+          <div><label for="s-estratto-pensiero" style="margin:0">Distilla il ragionamento quando un punto di piano si chiude</label>
+            <div class="help">Il ragionamento vale 22 volte le risposte e viene buttato a ogni turno, ma non è scarto: dentro ci sono errori veri, versioni, percorsi e comandi che funzionano, scritti da nessun'altra parte. Alla chiusura (o al salto) di un punto, una chiamata sola ne tiene solo <code>SCOPERTO</code> e <code>SCARTATO</code> e li archivia in <code>.memoria/</code>. Costa una chiamata per punto chiuso, e richiede l'impostazione qui sopra: senza indice, l'estratto verrebbe scritto e mai riletto.</div></div>
+        </div>
+        <div class="switch">
+          <input type="checkbox" id="s-spec-delega">
+          <div><label for="s-spec-delega" style="margin:0">Impara dagli esiti delle esplorazioni</label>
+            <div class="help">Su 17 esplorazioni misurate, 8 finivano i sei passi senza rispondere: il figlio non sa quanto tempo gli resta. Con questa attiva se lo vede a ogni passo, e l'esito di ogni delega resta scritto in <code>.memoria/.deleghe.json</code>. Da quei fatti si ricavano al volo due frasi — un avviso al figlio quando qui le esplorazioni sfondano spesso, e un esempio vero di domanda ben posta in coda al sollecito. I fatti non si riscrivono mai; le frasi si rifanno da capo ogni volta, così se l'evidenza cambia cambiano anche loro.</div></div>
+        </div>
+        <div class="switch">
+          <input type="checkbox" id="s-deposito">
+          <div><label for="s-deposito" style="margin:0">Deposita i risultati troppo lunghi in <code>.deposito/</code></label>
+            <div class="help">Oggi un risultato che sfora il budget viene <em>troncato</em>: per un file la coda si rilegge a righe, ma per lo stdout di un comando quel testo non esiste più da nessuna parte e l'unica strada è rilanciarlo. Col deposito il testo intero finisce su disco <em>prima</em> del taglio e il risultato ne porta il percorso: in contesto entrano gli stessi token di prima, ma la coda smette di essere perduta. Vale per <code>run_command</code> e <code>search_files</code>.</div></div>
+        </div>
+        <div class="field" style="margin-left:30px">
+          <label for="s-deposito-max-mb">Tetto del deposito (MB)</label>
+          <input type="number" id="s-deposito-max-mb" min="0" max="4096" step="16">
+          <div class="help">Sopra il tetto escono i file più vecchi. Le conversazioni non si chiudono mai da sole, quindi legare la vita del deposito alla sessione vorrebbe dire non potarlo mai. 0 = nessun tetto.</div>
+        </div>
+        <div class="switch">
+          <input type="checkbox" id="s-envhdr">
+          <div><label for="s-envhdr" style="margin:0">Inietta l'environment header</label>
+            <div class="help">cwd, OS e albero del workspace: è la leva principale sull'uso spontaneo dei tool.</div></div>
+        </div>
+        <div class="switch">
+          <input type="checkbox" id="s-docker-autostart">
+          <div><label for="s-docker-autostart" style="margin:0">Avvia Docker all'apertura dell'harness</label>
+            <div class="help">Docker Desktop ci mette 20-60 secondi: avviandolo subito è pronto prima che tu abbia finito di scrivere il primo messaggio. Se è già acceso non fa nulla.</div></div>
+        </div>
+        <div class="switch">
+          <input type="checkbox" id="s-image-autobuild">
+          <div><label for="s-image-autobuild" style="margin:0">Costruisci l'immagine quando scegli una cartella</label>
+            <div class="help">Solo se non esiste già e se non hai scelto tu un'immagine tua. La build parte in background e l'immagine viene selezionata da sola quando è pronta.</div></div>
+        </div>
+        <div class="switch">
+          <input type="checkbox" id="s-preview">
+          <div><label for="s-preview" style="margin:0">Apri l'anteprima da sola sui file visuali</label>
+            <div class="help">Quando l'agente scrive un .md, .html, .svg, un'immagine o un PDF il pannello si apre senza che debba chiederlo. Sui file di codice no, sarebbero dieci anteprime per un refactoring.</div></div>
+        </div>
+        <div class="switch">
+          <input type="checkbox" id="s-preview-ports">
+          <div><label for="s-preview-ports" style="margin:0">Pubblica le porte per le anteprime di applicazioni</label>
+            <div class="help">Il container espone <code id="preview-ports-echo">8200-8203</code> su 127.0.0.1, così un server avviato dall'agente si vede nel browser. È una concessione sulla tenuta della sandbox: solo questa macchina, solo queste porte. Cambiarla ricrea il container.</div></div>
+        </div>
+        <div class="field">
+          <label for="s-preview-port-base">Prima porta per le anteprime</label>
+          <input type="number" id="s-preview-port-base" min="1024" max="65500">
+        </div>
+        <div class="field">
+          <label for="s-preview-port-count">Quante porte</label>
+          <input type="number" id="s-preview-port-count" min="1" max="20">
+        </div>
+        <div class="switch">
+          <input type="checkbox" id="s-preview-autobackend">
+          <div><label for="s-preview-autobackend" style="margin:0">Avvia da solo il backend del progetto</label>
+            <div class="help">Prima di mostrare una pagina, se la sua cartella dichiara un backend (Flask, FastAPI, Django, Vite, <code>package.json</code>) l'harness lo avvia. Se non risponde, la pagina si vede lo stesso come file statico e il modello legge il log.</div></div>
+        </div>
+        <div class="field">
+          <label for="s-preview-host-port">Porta del server delle anteprime</label>
+          <input type="number" id="s-preview-host-port" min="0" max="65500">
+          <div class="help">Le pagine si servono da qui, non dalla porta dell'harness: è un'origine diversa, ed è quello che permette loro di avere <code>localStorage</code>, moduli ES e <code>fetch</code> senza poter leggere le risposte delle rotte dell'harness. Si accende alla prima anteprima. 0 = spento.</div>
+        </div>
+        <div class="switch">
+          <input type="checkbox" id="s-require-plan">
+          <div><label for="s-require-plan" style="margin:0">Pretendi un piano sulle richieste con più obiettivi</label>
+            <div class="help">Se la richiesta ha step numerati o più verbi all'imperativo e il modello lavora senza piano, l'harness glielo chiede una volta.</div></div>
+        </div>
+        <div class="switch">
+          <input type="checkbox" id="s-think-watchdog">
+          <div><label for="s-think-watchdog" style="margin:0">Interrompi i ragionamenti che non portano ad azioni</label>
+            <div class="help">Oltre il 55% del budget di generazione senza nessuna tool call, la generazione viene chiusa e il modello riportato al piano. È la difesa contro gli 8.000 token di pensiero che finiscono in un turno vuoto.</div></div>
+        </div>
+      </section>
+
+      <!-- system prompt -->
+      <section class="tab-panel" id="tab-prompt" role="tabpanel" aria-labelledby="tabbtn-prompt">
+        <div class="field">
+          <label for="s-prompt">System prompt</label>
+          <textarea id="s-prompt" rows="22" placeholder="Vuoto: lo sceglie l'harness in base al modello."></textarea>
+          <!-- Il testo qui dentro vince SEMPRE su quello del codice, e una
+               copia vecchia rimasta nel campo e' il modo silenzioso di non
+               ricevere piu' nessuna modifica al prompt: succede da solo,
+               perche' basta che il testo di riferimento cambi perche' la copia
+               smetta di combaciare e passi per "personalizzato". -->
+          <div class="help">
+            Quello che scrivi qui vince sempre e blocca la scelta automatica fra
+            prompt esteso (modelli senza canale di pensiero) e snello. Svuota il
+            campo per tornare automatico:
+            <button type="button" class="btn" id="s-prompt-reset">Ripristina</button>
+          </div>
+        </div>
+      </section>
+
+      <!-- memoria -->
+      <section class="tab-panel" id="tab-mem" role="tabpanel" aria-labelledby="tabbtn-mem">
+        <div class="field" style="display:flex;gap:8px;align-items:flex-end">
+          <div style="flex:1">
+            <label for="mem-input">Nuova memoria</label>
+            <input type="text" id="mem-input" placeholder="I test si lanciano con: uv run pytest -q">
+          </div>
+          <button class="btn primary" id="mem-add">Salva</button>
+        </div>
+        <div id="mem-list"></div>
+      </section>
+    </div>
+  </div>
+</div>
+
+<div id="toast"></div>
+<script src="/static/app.js"></script>
+</body>
+</html>

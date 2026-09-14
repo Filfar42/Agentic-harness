@@ -97,6 +97,7 @@ def cerca_nel_vault(
     env_header: str | None,
     run_turn: Any,
     registri: list[dict[str, Any]] | None = None,
+    should_stop: Any = None,
 ) -> dict[str, Any]:
     """Esegue la ricerca nel vault e ritorna il referto.
 
@@ -168,6 +169,14 @@ def cerca_nel_vault(
         on_memories_changed=None,
         read_cache={},
         new_symbols={},
+        known_files=set(),
+        touched_files=set(),
+        memories=[],
+        authored_tests=set(),
+        punti_chiusi=[],
+        vault_dir="",
+        vault_notes=[],
+        on_vault_notes_changed=None,
         step=0,
         # Il perimetro di sola lettura come dato, non come schema: qui pesa
         # il doppio, perche' il workspace del cercatore e' la cartella di un
@@ -202,6 +211,15 @@ def cerca_nel_vault(
         system_prompt=system_prompt,
         env_header=env_header,
         max_steps=MAX_PASSI_CERCA,
+        initialize_workspace=False,
+        should_stop=should_stop,
+        enable_nudge=False,
+        require_plan=False,
+        require_summary=False,
+        auto_preview=False,
+        libreria_attiva=False,
+        abilita_delega=False,
+        plan_gate=False,
     ):
         # ``StepStarted`` come in ``delega.esegui``: prima qui si contavano i
         # ``ToolFinished``, cioe' le **chiamate**, e lo stesso campo ``passi``
@@ -210,7 +228,7 @@ def cerca_nel_vault(
         if isinstance(evento, StepStarted):
             passi += 1
             continue
-        if isinstance(evento, AssistantTurn):
+        if isinstance(evento, AssistantTurn) and not evento.has_tool_calls:
             testo = getattr(evento, "content", "") or ""
             if not str(testo).strip():
                 continue

@@ -35,6 +35,7 @@ import hashlib
 import json
 import os
 import secrets
+import asyncio
 from pathlib import Path
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -44,6 +45,7 @@ import httpx
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
+from server.security import browser_request_allowed, API_TOKEN_ENV, API_TOKEN_HEADER, MAX_REQUEST_BYTES
 
 WEB_MOBILE_DIR = Path(__file__).resolve().parent.parent / "web_mobile"
 
@@ -86,7 +88,10 @@ def get_client() -> httpx.AsyncClient:
     if _client is None:
         _client = httpx.AsyncClient(
             base_url=f"{upstream_base()}/",
-            timeout=httpx.Timeout(connect=5.0, read=None, write=None, pool=None),
+            timeout=httpx.Timeout(connect=5.0, read=45.0, write=30.0, pool=5.0),
+            limits=httpx.Limits(max_connections=40, max_keepalive_connections=10),
+            headers={API_TOKEN_HEADER: os.environ.get(API_TOKEN_ENV, "")},
+            trust_env=False,
         )
     return _client
 
@@ -167,6 +172,8 @@ async def guardia_del_token(request: Request, call_next):
     che si apre la prima volta), il cookie che quella query lascia, e
     l'intestazione ``X-Harness-Token`` per chi chiama da uno script.
     """
+    if not browser_request_allowed(request.scope, request.headers):
+        return JSONResponse({"detail": "Origine non autorizzata."}, status_code=403)
     atteso = token()
     dalla_query = request.query_params.get("k") or ""
     presentate = (
@@ -188,11 +195,14 @@ async def guardia_del_token(request: Request, call_next):
             status_code=401,
         )
     risposta = await call_next(request)
+    risposta.headers["Referrer-Policy"] = "no-referrer"
+    risposta.headers["Cache-Control"] = "no-store"
     if dalla_query:
         # Arrivata dalla query: la si deposita, cosi' le richieste della
         # pagina (fetch, EventSource, immagini) non devono portarsela dietro.
         risposta.set_cookie(
-            COOKIE, atteso, max_age=COOKIE_MAX_AGE, httponly=True, samesite="lax"
+            COOKIE, atteso, max_age=COOKIE_MAX_AGE, httponly=True, samesite="lax",
+            secure=request.url.scheme == "https",
         )
     return risposta
 
@@ -227,8 +237,9 @@ async def health() -> JSONResponse:
 
 
 def _filtered_headers(headers: Any) -> dict[str, str]:
+    connection_headers = {name.strip().lower() for name in headers.get("connection", "").split(",")}
     return {
-        k: v for k, v in headers.items() if k.lower() not in _HOP_BY_HOP
+        k: v for k, v in headers.items() if k.lower() not in _HOP_BY_HOP | connection_headers
     }
 
 
@@ -237,8 +248,25 @@ def _filtered_headers(headers: Any) -> dict[str, str]:
     methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
 )
 async def proxy_api(path: str, request: Request) -> StreamingResponse:
-    body = await request.body()
+    async def read_body() -> bytes:
+        body = bytearray()
+        async for block in request.stream():
+            if len(body) + len(block) > MAX_REQUEST_BYTES:
+                raise HTTPException(413, "Richiesta troppo grande.")
+            body.extend(block)
+        return bytes(body)
+    try:
+        body = await asyncio.wait_for(read_body(), timeout=30.0)
+    except TimeoutError as exc:
+        raise HTTPException(408, "Timeout della richiesta.") from exc
     client = get_client()
+    headers = {
+        k: v for k, v in _filtered_headers(request.headers).items()
+        if k.lower() not in {"cookie", "authorization", "x-harness-token", API_TOKEN_HEADER,
+                             "origin", "referer", "sec-fetch-site", "forwarded", "x-forwarded-for"}
+    }
+    headers["origin"] = str(client.base_url).rstrip("/")
+    headers[API_TOKEN_HEADER] = os.environ.get(API_TOKEN_ENV, "")
     # La chiave del ponte non deve proseguire verso il server principale: li'
     # non significa niente e finirebbe nei log di un altro processo.
     parametri = {k: v for k, v in request.query_params.items() if k != "k"}
@@ -251,7 +279,7 @@ async def proxy_api(path: str, request: Request) -> StreamingResponse:
                 f"api/{path}",
                 params=parametri,
                 content=body if body else None,
-                headers=_filtered_headers(request.headers),
+                headers=headers,
             ),
             stream=True,
         )
@@ -276,7 +304,8 @@ async def proxy_api(path: str, request: Request) -> StreamingResponse:
     return StreamingResponse(
         flow(),
         status_code=upstream_response.status_code,
-        headers=_filtered_headers(upstream_response.headers),
+        headers={k: v for k, v in _filtered_headers(upstream_response.headers).items()
+                 if k.lower() not in {"content-encoding", "set-cookie"}},
     )
 
 

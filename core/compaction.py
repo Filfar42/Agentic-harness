@@ -51,15 +51,18 @@ salvare *mentre* capiva, non quella che ricostruisce alla fine.
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, replace
 from collections.abc import Callable, Iterable, Sequence
 from typing import Any
 
 from .config import (
+    Budgets,
     CODA_COMPATTAZIONE,
     COMPACT_MAX_TOKENS,
     HISTORY_COMPACT_THRESHOLD,
 )
+from .context import REFERENCE_KEYS, compact_result
 from .textutils import chars_for_tokens, smart_truncate, strip_think
 
 # Quanta parte della finestra puo' occupare la cronologia prima di intervenire.
@@ -117,6 +120,81 @@ MIN_BLOCCHI = 4
 # Tetto al riassunto. Deve stare comodamente sotto quello che sostituisce,
 # altrimenti l'operazione non ha senso.
 MAX_TOKEN_RIASSUNTO = 700
+
+# Lo stato aperto e' un piccolo checkpoint deterministico: non deve tornare a
+# essere l'intera conversazione. Il testo integrale eccedente resta nella
+# voce archiviata insieme al riassunto, con un riferimento esplicito.
+MAX_STATO_ATTIVO_CHARS = 1_800
+
+_SEZIONE = re.compile(r"^(FATTO|SCOPERTO|SCARTATO|APERTO|VINCOLI|VINCOLO)\s*(?::\s*(.*))?$", re.I)
+_STATO_VUOTO = {"nessuno", "nessuna", "nessun punto aperto", "nessun vincolo", "nulla"}
+
+
+def _sezioni(testo: str) -> dict[str, list[str]]:
+    """Legge il formato esistente anche con titoli Markdown e liste."""
+    sezioni: dict[str, list[str]] = {}
+    corrente: str | None = None
+    for riga in (testo or "").splitlines():
+        pulita = riga.strip().lstrip("#-* ").strip().replace("**", "")
+        if pulita.startswith(("<", "[Stato abbreviato", "[Stato precedente")):
+            corrente = None
+            continue
+        match = _SEZIONE.fullmatch(pulita)
+        if match:
+            corrente = "VINCOLI" if match[1].upper() == "VINCOLO" else match[1].upper()
+            sezioni.setdefault(corrente, [])
+            pulita = (match[2] or "").strip()
+        if corrente and pulita:
+            sezioni[corrente].append(pulita)
+    return sezioni
+
+
+def riassunto_strutturato(testo: str) -> bool:
+    """I legacy senza sezioni devono ancora passare dal fallback testuale."""
+    return bool(_sezioni(testo))
+
+
+def stato_attivo(precedente: str, nuovo: str = "") -> str:
+    """Riporta aperti/vincoli omessi; deduplica senza parafrasarli ogni volta.
+
+    Un APERTO esplicitamente dichiarato 'nessuno' chiude la sezione; lo stesso
+    vale per VINCOLI. Un elemento ripetuto testualmente sotto FATTO chiude solo
+    quel punto aperto. L'assenza di una sezione non significa che sia risolta.
+    """
+    prima, dopo = _sezioni(precedente), _sezioni(nuovo)
+
+    def chiave(testo: str) -> str:
+        return " ".join(testo.lower().split()).rstrip(". ;")
+
+    fatti = {chiave(t) for t in dopo.get("FATTO", [])}
+    righe: list[str] = []
+    for sezione in ("VINCOLI", "APERTO"):
+        aggiunte = dopo.get(sezione, [])
+        if aggiunte and all(chiave(t) in _STATO_VUOTO for t in aggiunte):
+            continue
+        voci = []
+        viste: set[str] = set()
+        for testo in [*prima.get(sezione, []), *aggiunte]:
+            k = chiave(testo)
+            if not k or k in viste or k in _STATO_VUOTO or (sezione == "APERTO" and k in fatti):
+                continue
+            viste.add(k)
+            voci.append(testo)
+        if voci:
+            righe += [f"{sezione}:", *[f"- {v}" for v in voci]]
+    return "\n".join(righe)
+
+
+def limita_stato_attivo(testo: str, fonte: str = "") -> str:
+    """Budget stretto, con riferimento recuperabile quando serve abbreviare."""
+    if len(testo) <= MAX_STATO_ATTIVO_CHARS:
+        return testo
+    avviso = (
+        f"\n[Stato abbreviato: espandi con read_file {fonte}]" if fonte else
+        "\n[Stato abbreviato: testo integrale nel checkpoint precedente.]"
+    )
+    spazio = max(0, MAX_STATO_ATTIVO_CHARS - len(avviso))
+    return testo[:spazio].rstrip() + avviso
 
 # Quanta finestra puo' occupare la trascrizione da riassumere. Il caso normale
 # ci sta comodo (2.837 token per 72 messaggi di lavoro vero), ma il caso da
@@ -182,6 +260,17 @@ def richieste_utente(messaggi: Iterable[dict[str, Any]]) -> list[str]:
             testo = str(msg.get("content") or "").strip()
             if testo:
                 fuori.append(testo)
+        elif (msg.get("role") == "tool" and msg.get("name") == "ask_user_question"
+              and msg.get("answered") is True):
+            # La ripresa registra la risposta umana come risultato del tool:
+            # anche questa e' specifica originale, non un'osservazione del LLM.
+            try:
+                payload = json.loads(msg.get("content") or "{}")
+            except (TypeError, ValueError, RecursionError):
+                continue
+            risposta = payload.get("user_answer") if isinstance(payload, dict) else None
+            if isinstance(risposta, str) and risposta.strip():
+                fuori.append(risposta.strip())
     return fuori
 
 
@@ -250,7 +339,7 @@ def _argomenti_brevi(fn: dict[str, Any]) -> str:
 def _esito_breve(raw: str) -> str:
     try:
         payload = json.loads(raw)
-    except (json.JSONDecodeError, TypeError, ValueError):
+    except (json.JSONDecodeError, TypeError, ValueError, RecursionError):
         # ``TypeError`` se un giorno qui arriva un ``bytes`` invece di una
         # stringa: oggi non succede, ma questa funzione gira **dentro la
         # compattazione**, e un'eccezione qui fa saltare il riassunto di tutta
@@ -258,12 +347,13 @@ def _esito_breve(raw: str) -> str:
         return str(raw)[:200]
     if not isinstance(payload, dict):
         return raw[:200]
-    if "error" in payload:
-        return f"errore: {str(payload['error'])[:200]}"
     tenuti = {
         k: v
         for k, v in payload.items()
-        if k in ("status", "action", "filepath", "returncode", "match_count")
+        if k in REFERENCE_KEYS or k in (
+            "status", "esito", "ok", "action", "filepath", "returncode", "match_count",
+            "sha256", "error", "error_code", "hint",
+        )
     }
     # stderr conta piu' di stdout in un riassunto: e' dove sta il motivo.
     for chiave in ("stderr", "stdout"):
@@ -271,7 +361,7 @@ def _esito_breve(raw: str) -> str:
         if corpo:
             tenuti[chiave] = corpo[-200:]
             break
-    return json.dumps(tenuti, ensure_ascii=False)[:300]
+    return compact_result(json.dumps(tenuti, ensure_ascii=False), full=False, budgets=Budgets())
 
 
 PROMPT_RIASSUNTO = (
@@ -287,6 +377,12 @@ PROMPT_RIASSUNTO = (
     "SCARTATO: strade provate che non hanno funzionato, e perche'. Servono a "
     "non rifarle.\n"
     "APERTO: cosa resta da fare o da verificare.\n\n"
+    "VINCOLI: condizioni ancora valide da rispettare.\n\n"
+    "Se ricevi uno STATO ATTIVO PRECEDENTE, confrontalo con i nuovi eventi. "
+    "Non ripetere i fatti completati: riporta solo gli aperti e i vincoli "
+    "ancora validi. Puoi scrivere APERTO: nessuno o VINCOLI: nessuno solo se "
+    "i nuovi eventi dimostrano che tutta quella sezione e' risolta o revocata. "
+    "Un singolo aperto risolto puo' essere riportato testualmente sotto FATTO.\n\n"
     "Regole: solo cose presenti nella trascrizione, mai dedotte. Se un "
     "comando e' fallito dillo con l'errore esatto. Niente frasi di cortesia, "
     "niente 'l'agente ha proceduto a': scrivi il fatto."
@@ -298,17 +394,22 @@ def costruisci_riassunto(
     *,
     backend: Any,
     params: Any,
+    should_stop: Callable[[], bool] | None = None,
 ) -> str:
     """Una chiamata sola, senza tool e senza pensiero, per riassumere il tratto."""
+    from .inference import service_text
+
     if not trascritto.strip():
         return ""
     finestra = int(getattr(params, "num_ctx", 0) or 0)
-    if finestra > 0:
-        trascritto = smart_truncate(
-            trascritto,
-            chars_for_tokens(finestra * QUOTA_TRASCRIZIONE),
-            label="cronologia da riassumere",
-        )
+    limite_token = min(8192, finestra * QUOTA_TRASCRIZIONE) if finestra > 0 else 8192
+    limite_chars = max(1, chars_for_tokens(limite_token) - 1)
+    trascritto = smart_truncate(
+        trascritto,
+        limite_chars,
+        label="cronologia da riassumere",
+        consiglio="Riassumi solo il testo visibile.",
+    )[:limite_chars]
     # think spento e max_tokens stretto: qui si vuole un referto, non un
     # ragionamento. Un modello che pensa ottomila token per riassumere
     # vanificherebbe la compattazione nel momento stesso in cui la fa.
@@ -322,32 +423,11 @@ def costruisci_riassunto(
         {"role": "system", "content": PROMPT_RIASSUNTO},
         {"role": "user", "content": trascritto},
     ]
-    pezzi: list[str] = []
-    try:
-        for evento in backend.stream(messaggi, None, p):
-            if evento.kind == "content":
-                pezzi.append(evento.text)
-            elif evento.kind == "error":
-                # Un riassunto mancato non deve far fallire il turno: si torna
-                # vuoto e il chiamante rinuncia alla compattazione, che e'
-                # sempre meglio che buttare la cronologia senza averla
-                # riassunta.
-                return ""
-    except Exception:  # noqa: BLE001 - vale la stessa regola del ramo "error"
-        # Il ramo qui sopra copre l'errore che il backend *dichiara*; questo
-        # copre quello che **solleva** -- connessione caduta, timeout, JSON
-        # malformato. Senza, un'eccezione qui uccideva il turno intero nel
-        # momento peggiore: la compattazione scatta quando il contesto e'
-        # pieno, cioe' dopo che il lavoro e' gia' stato fatto.
-        #
-        # ``pensiero.estrai`` e ``agent.riepilogo_finale`` -- le altre due
-        # chiamate di servizio al modello -- lo facevano gia'.
-        return ""
-    return strip_think("".join(pezzi)).strip()
+    return service_text(backend, messaggi, p, should_stop=should_stop)
 
 
 def render_messaggio(
-    riassunto: str, richieste: Sequence[str], *, voce: Any = None
+    riassunto: str, richieste: Sequence[str], *, voce: Any = None, stato: str = ""
 ) -> str:
     """Il messaggio che sostituisce il tratto compattato."""
     if voce is not None:
@@ -376,6 +456,8 @@ def render_messaggio(
         ]
     if riassunto:
         pezzi += ["", riassunto]
+    if stato:
+        pezzi += ["", "<stato_attivo>", stato, "</stato_attivo>"]
     pezzi.append("</cronologia_compattata>")
     return "\n".join(pezzi)
 

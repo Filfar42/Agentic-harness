@@ -128,9 +128,9 @@ class Notes:
                         ident = int(item.get("id") or 0)
                     except (TypeError, ValueError):
                         ident = 0
-                    notes.append(Note(id=ident or len(notes) + 1, text=str(item["text"])))
+                    notes.append(Note(id=ident or len(notes) + 1, text=str(item["text"])[:MAX_NOTE_CHARS]))
                 elif isinstance(item, str) and item.strip():
-                    notes.append(Note(id=len(notes) + 1, text=item.strip()))
+                    notes.append(Note(id=len(notes) + 1, text=item.strip()[:MAX_NOTE_CHARS]))
         prossimo = max((n.id for n in notes), default=0) + 1
         return cls(notes=notes[:MAX_NOTES], _next_id=prossimo)
 

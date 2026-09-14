@@ -234,6 +234,7 @@ def referto_di_chiusura(
     params: Any,
     build_messages: Any,
     budgets: Any,
+    should_stop: Any = None,
 ) -> str:
     """Chiede al figlio il referto quando i passi sono finiti senza risposta.
 
@@ -265,25 +266,9 @@ def referto_di_chiusura(
             int(getattr(params, "max_tokens", 2048) or 2048), MAX_TOKEN_CHIUSURA
         ),
     )
-    pezzi: list[str] = []
-    try:
-        for evento in backend.stream(api, None, p):
-            if evento.kind == "content":
-                pezzi.append(evento.text)
-            elif evento.kind == "error":
-                # Un referto di chiusura mancato lascia le cose come stavano:
-                # si torna all'errore di prima, che almeno dice cosa e'
-                # successo.
-                return ""
-    except Exception:  # noqa: BLE001 - vale la stessa regola del ramo "error"
-        # Il ramo qui sopra copre l'errore che il backend *dichiara*; questo
-        # copre quello che **solleva**. Senza, un'eccezione qui faceva fallire
-        # il tool di delega proprio nel percorso che esiste per recuperare un
-        # sotto-turno gia' andato male: si perdeva il lavoro due volte.
-        return ""
-    from .textutils import strip_think
+    from .inference import service_text
 
-    return strip_think("".join(pezzi)).strip()
+    return service_text(backend, api, p, should_stop=should_stop)
 
 
 def schema_ridotto(tools_schema: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -306,6 +291,7 @@ def esegui(
     run_turn: Any,
     build_messages: Any = None,
     registra_esiti: bool = True,
+    should_stop: Any = None,
 ) -> dict[str, Any]:
     """Esegue il sotto-turno e restituisce il referto.
 
@@ -324,10 +310,16 @@ def esegui(
     # referto, che e' l'unica cosa che il padre riceve.
     params_figlio = parametri_figlio(params, backend)
     budgets_padre = getattr(tool_ctx, "budgets", None)
-    if budgets_padre is None:
-        from .config import budgets_for
+    from .config import COMPACT_MAX_TOKENS, Budgets, budgets_for
 
-        budgets_padre = budgets_for(int(getattr(params_figlio, "num_ctx", 0) or 0))
+    if budgets_padre is None or budgets_padre == Budgets():
+        # ToolContext starts with static Budgets(), before run_turn has sized
+        # it. Derive this fallback from the parent's effective window: using
+        # the child's +50% window would undo part of the intended reduction.
+        budgets_padre = budgets_for(
+            int(getattr(params, "num_ctx", 0) or 0),
+            getattr(params, "compact_max_tokens", COMPACT_MAX_TOKENS),
+        )
     # Calcolati **una volta**: erano tre chiamate identiche che producevano tre
     # oggetti distinti, e il ciclo li confronta per decidere se qualcuno ha
     # allargato la finestra sotto i piedi del figlio. Tre oggetti uguali ma non
@@ -419,6 +411,8 @@ def esegui(
         # e un esploratore che ci scrive dentro ci mette pezzi di un contesto
         # che nessuno ha visto.
         libreria_attiva=False,
+        initialize_workspace=False,
+        should_stop=should_stop,
     ):
         if isinstance(evento, StepStarted):
             passi += 1
@@ -427,7 +421,7 @@ def esegui(
 
     referto = ""
     for msg in reversed(messaggi):
-        if msg.get("role") == "assistant":
+        if msg.get("role") == "assistant" and not msg.get("tool_calls"):
             testo = strip_think(str(msg.get("content") or "")).strip()
             if testo:
                 referto = testo
@@ -449,13 +443,14 @@ def esegui(
     # file, gliene si chiede il referto: quel contenuto e' ancora nel contesto
     # del figlio, e senza questa chiamata lo si butta insieme ai passi.
     chiuso_a_forza = False
-    if not referto and letti and build_messages is not None:
+    if not referto and letti and build_messages is not None and not (should_stop and should_stop()):
         referto = referto_di_chiusura(
             messaggi,
             backend=backend,
             params=params_figlio,
             build_messages=build_messages,
             budgets=budgets_figlio,
+            should_stop=should_stop,
         )
         chiuso_a_forza = bool(referto)
 

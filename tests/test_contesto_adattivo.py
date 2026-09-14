@@ -48,8 +48,10 @@ def test_alla_finestra_di_riferimento_i_budget_non_cambiano():
     di un fattore, si vedrebbe qui prima che altrove.
     """
     b = budgets_for(config_mod.BASE_NUM_CTX)
-    assert b.read_file_max_chars == config_mod.READ_FILE_MAX_CHARS
-    assert b.tool_result_max_chars == config_mod.TOOL_RESULT_MAX_CHARS
+    # Il limite tiene conto dei 3,6 caratteri/token dello stimatore, non 4.
+    assert b.read_file_max_chars <= config_mod.READ_FILE_MAX_CHARS
+    assert b.read_file_max_chars >= 11_000
+    assert b.tool_result_max_chars <= config_mod.TOOL_RESULT_MAX_CHARS
     assert b.tool_result_full_window == config_mod.TOOL_RESULT_FULL_WINDOW
     assert b.scale == 1.0
 
@@ -58,7 +60,7 @@ def test_una_finestra_doppia_raddoppia_i_testi():
     """La scala resta lineare finche' la finestra su cui si compatta cresce."""
     b = budgets_for(32_768)
     assert b.scale == 2.0
-    assert b.read_file_max_chars == 2 * config_mod.READ_FILE_MAX_CHARS
+    assert b.read_file_max_chars == 2 * budgets_for(16_384).read_file_max_chars
     assert b.command_stderr_max_chars == 2 * config_mod.COMMAND_STDERR_MAX_CHARS
 
 
@@ -110,7 +112,7 @@ def test_i_risultati_integrali_non_superano_la_soglia_che_li_fa_compattare(num_c
     soglia = int(
         config_mod.finestra_efficace(num_ctx) * config_mod.HISTORY_COMPACT_THRESHOLD
     )
-    picco = b.tool_result_full_window * (b.read_file_max_chars // 4)
+    picco = b.tool_result_full_window * int(b.read_file_max_chars / 3.6)
     assert picco <= soglia * config_mod.QUOTA_RISULTATI_INTEGRALI, (
         f"a num_ctx={num_ctx} i {b.tool_result_full_window} risultati tenuti "
         f"integrali pesano {picco} token contro una soglia di {soglia}"

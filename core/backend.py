@@ -17,17 +17,229 @@ per vLLM, llama.cpp server, LM Studio o qualunque endpoint compatibile.
 from __future__ import annotations
 
 import json
+import math
+import random
+import re
 import threading
 import time
+from datetime import UTC, datetime
 from dataclasses import dataclass
+from email.utils import parsedate_to_datetime
 from typing import Any, Literal
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 
 import httpx
 
 from .config import GenParams
+from .jsonsafe import JsonBoundaryError, loads_object
 
 EventKind = Literal["content", "reasoning", "tool_call", "usage", "error"]
+
+MAX_FRAME_BYTES = 1_048_576
+MAX_STREAM_BYTES = 16_777_216
+MAX_TOOL_CALLS = 64
+MAX_ATTEMPTS = 3
+RETRY_BASE_S = 0.25
+RETRY_CAP_S = 4.0
+RETRY_AFTER_CAP_S = 30.0
+StopCheck = Callable[[], bool] | None
+
+
+class TransportProtocolError(ValueError):
+    """A peer sent an incomplete, ambiguous or oversized response."""
+
+
+class TransportCancelled(Exception):
+    """Cooperative cancellation; never retry a cancelled generation."""
+
+
+class _HTTPFailure(Exception):
+    """An HTTP rejection with bounded retry metadata and diagnostic text."""
+
+    def __init__(self, status: int, body: str, retry_after: str = "") -> None:
+        super().__init__(f"HTTP {status}: {body[:600]}")
+        self.status = status
+        self.body = body
+        self.retry_after = retry_after
+
+
+def _checkpoint(should_stop: StopCheck, deadline: float) -> None:
+    if should_stop is not None and should_stop():
+        raise TransportCancelled("Generazione annullata.")
+    if time.monotonic() >= deadline:
+        raise httpx.ReadTimeout("Budget temporale della generazione esaurito.")
+
+
+def _request_timeout(deadline: float) -> httpx.Timeout:
+    remaining = max(0.001, deadline - time.monotonic())
+    return httpx.Timeout(remaining, connect=min(10.0, remaining), pool=min(5.0, remaining))
+
+
+def _retry_delay(attempt: int, retry_after: str = "") -> float:
+    """Full jitter; a server Retry-After is a minimum, never an unbounded sleep."""
+    delay = random.uniform(0.0, min(RETRY_CAP_S, RETRY_BASE_S * 2**attempt))
+    if retry_after:
+        try:
+            seconds = float(retry_after)
+        except ValueError:
+            try:
+                target = parsedate_to_datetime(retry_after)
+                if target.tzinfo is None:
+                    target = target.replace(tzinfo=UTC)
+                seconds = (target - datetime.now(UTC)).total_seconds()
+            except (ValueError, TypeError, OverflowError):
+                seconds = 0.0
+        if math.isfinite(seconds):
+            delay = max(delay, min(RETRY_AFTER_CAP_S, max(0.0, seconds)))
+    return delay
+
+
+def _wait_retry(delay: float, should_stop: StopCheck, deadline: float) -> None:
+    until = min(deadline, time.monotonic() + delay)
+    while time.monotonic() < until:
+        _checkpoint(should_stop, deadline)
+        time.sleep(min(0.05, max(0.0, until - time.monotonic())))
+    _checkpoint(should_stop, deadline)
+
+
+def _stream_with_retries(
+    attempt_stream: Callable[[float], Iterator[StreamEvent]],
+    timeout_s: float,
+    should_stop: StopCheck,
+) -> Iterator[StreamEvent]:
+    """Retry transient transport failures only before any observable output.
+
+    Tools remain buffered by the protocol parser until completion. Once text
+    or reasoning is visible a replay would duplicate content, so it fails the
+    current generation explicitly. The caller's worker owns this sync iterator.
+    """
+    deadline = time.monotonic() + timeout_s
+    emitted = False
+    try:
+        for attempt in range(MAX_ATTEMPTS):
+            _checkpoint(should_stop, deadline)
+            try:
+                yield_from = attempt_stream(deadline)
+                try:
+                    for event in yield_from:
+                        _checkpoint(should_stop, deadline)
+                        emitted = True
+                        yield event
+                finally:
+                    yield_from.close()
+                return
+            except (_HTTPFailure, httpx.TransportError) as exc:
+                retryable = (
+                    exc.status in {408, 429, 500, 502, 503, 504}
+                    if isinstance(exc, _HTTPFailure)
+                    else isinstance(exc, (httpx.TimeoutException, httpx.NetworkError,
+                                          httpx.RemoteProtocolError))
+                )
+                if emitted or not retryable or attempt == MAX_ATTEMPTS - 1:
+                    raise
+                after = exc.retry_after if isinstance(exc, _HTTPFailure) else ""
+                _wait_retry(_retry_delay(attempt, after), should_stop, deadline)
+    except TransportCancelled as exc:
+        yield StreamEvent("error", text=str(exc))
+    except (httpx.HTTPError, _HTTPFailure, TransportProtocolError,
+            JsonBoundaryError, UnicodeError, TypeError, ValueError, OverflowError) as exc:
+        yield StreamEvent("error", text=f"{type(exc).__name__}: {str(exc)[:600]}")
+
+
+def _response_bytes(
+    response: httpx.Response, should_stop: StopCheck, deadline: float
+) -> Iterator[bytes]:
+    """Bound decoded response bytes, including responses with compression."""
+    total = 0
+    for block in response.iter_bytes():
+        _checkpoint(should_stop, deadline)
+        total += len(block)
+        if total > MAX_STREAM_BYTES:
+            raise TransportProtocolError("Risposta oltre il limite di 16 MiB.")
+        yield block
+
+
+def _bounded_lines(
+    response: httpx.Response, should_stop: StopCheck, deadline: float
+) -> Iterator[str]:
+    """Incremental UTF-8 framing, including CRLF split across socket reads."""
+    pending = b""
+    for block in _response_bytes(response, should_stop, deadline):
+        pending += block
+        start = 0
+        offset = 0
+        while offset < len(pending):
+            byte = pending[offset]
+            if byte not in (10, 13):
+                offset += 1
+                continue
+            if byte == 13 and offset == len(pending) - 1:
+                break
+            if offset - start > MAX_FRAME_BYTES:
+                raise TransportProtocolError("Frame oltre il limite di 1 MiB.")
+            yield pending[start:offset].decode("utf-8", errors="strict")
+            offset += 2 if byte == 13 and pending[offset + 1] == 10 else 1
+            start = offset
+        pending = pending[start:]
+        if len(pending) > MAX_FRAME_BYTES:
+            raise TransportProtocolError("Frame oltre il limite di 1 MiB.")
+    if pending:
+        yield pending.removesuffix(b"\r").decode("utf-8", errors="strict")
+
+
+def _sse_data(lines: Iterator[str]) -> Iterator[str]:
+    """Emit complete SSE data events. EOF never completes a partial event."""
+    data: list[str] = []
+    size = 0
+    for line in lines:
+        if line == "":
+            if data:
+                yield "\n".join(data)
+                data = []
+                size = 0
+            continue
+        if line.startswith(":"):
+            continue
+        field, separator, value = line.partition(":")
+        if field != "data":
+            continue
+        value = value.removeprefix(" ") if separator else ""
+        size += len(value) + 1
+        if size > MAX_FRAME_BYTES:
+            raise TransportProtocolError("Evento SSE oltre il limite di 1 MiB.")
+        data.append(value)
+    if data:
+        raise TransportProtocolError("Evento SSE troncato prima della riga vuota.")
+
+
+def _http_status(response: httpx.Response, should_stop: StopCheck, deadline: float) -> None:
+    if response.status_code < 400:
+        return
+    body = bytearray()
+    for block in _response_bytes(response, should_stop, deadline):
+        body.extend(block[: max(0, 2400 - len(body))])
+        if len(body) >= 2400:
+            break
+    raise _HTTPFailure(response.status_code, body.decode("utf-8", "replace")[:600],
+                       response.headers.get("retry-after", ""))
+
+
+def _text_field(value: Any, field: str, *, limit: int = MAX_FRAME_BYTES) -> str:
+    if value is None:
+        return ""
+    if not isinstance(value, str) or len(value) > limit:
+        raise TransportProtocolError(f"Campo {field} non valido o troppo lungo.")
+    return value
+
+
+def _counter(value: Any, field: str) -> int | float:
+    if value is None:
+        return 0
+    if (isinstance(value, bool) or not isinstance(value, (int, float))
+            or (isinstance(value, float) and not math.isfinite(value))
+            or value < 0 or value > 9_223_372_036_854_775_807):
+        raise TransportProtocolError(f"Contatore {field} non valido.")
+    return value
 
 
 # ---------------------------------------------------------------------------
@@ -68,11 +280,12 @@ def get_client() -> httpx.Client:
     if _client is None:
         with _client_lock:
             if _client is None:
-                # Nessun ``timeout`` di default: ogni chiamata passa il suo,
-                # e sono molto diversi fra loro (4 s per una sonda, minuti per
-                # una generazione). Un default qui sarebbe solo il valore che
-                # si applica quando qualcuno dimentica di passarlo.
-                _client = httpx.Client(timeout=None)
+                # Ogni richiesta esplicita il suo budget; il default finito
+                # protegge anche i futuri call site che lo dimenticassero.
+                _client = httpx.Client(
+                    timeout=httpx.Timeout(30.0, connect=10.0, pool=5.0),
+                    limits=httpx.Limits(max_connections=64, max_keepalive_connections=16),
+                )
     return _client
 
 
@@ -111,6 +324,41 @@ def _new_tool_call(index: int, call_id: str, name: str, arguments: str) -> dict[
         "name": name,
         "arguments": arguments,
     }
+
+
+def _reasoning_report(params: GenParams, payload: dict[str, Any], support: str) -> dict[str, Any]:
+    """Describe the request, never claim that a server applied its controls."""
+    return {"requested": params.think, "payload": payload, "support": support, "verified": False}
+
+
+def _known_thinking_key(model: str) -> str | None:
+    """Documented template switches; an endpoint/model alias remains unknown.
+
+    https://docs.vllm.ai/en/latest/features/reasoning_outputs/
+    These are template conventions, not proof that an OpenAI-compatible peer
+    implements vLLM extensions. Never send both keys hoping that one works.
+    """
+    name = model.lower().replace("\\", "/").rsplit("/", 1)[-1]
+    if re.match(r"(?:qwen3|gemma-?4)(?=[.:-]|$)", name):
+        # The 2507 Qwen3 instruct/thinking-only releases are not hybrids.
+        if "2507" in name or "thinking" in name:
+            return None
+        return "enable_thinking"
+    if re.match(r"(?:deepseek-?v3\.1|granite-?3\.2)(?=[.:-]|$)", name):
+        return "thinking"
+    return None
+
+
+def _template_reasoning_keys(template: str) -> set[str]:
+    """Inspect Jinja variables without evaluating untrusted server templates.
+
+    Tags/prose containing 'thinking' are not evidence of a template switch.
+    Strip quoted literals and comments before checking expression identifiers.
+    """
+    template = re.sub(r"{#.*?#}", "", template, flags=re.DOTALL)
+    expressions = "\n".join(re.findall(r"{[{%](.*?)[}%]}", template, re.DOTALL))
+    expressions = re.sub(r"'(?:\\.|[^'\\])*'|\"(?:\\.|[^\"\\])*\"", "", expressions)
+    return set(re.findall(r"\b(?:enable_thinking|thinking|reasoning_effort)\b", expressions))
 
 
 # ---------------------------------------------------------------------------
@@ -171,13 +419,7 @@ def to_ollama_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
             for index, call in enumerate(calls):
                 fn = call.get("function", {})
                 raw_args = fn.get("arguments", "{}")
-                if isinstance(raw_args, str):
-                    try:
-                        parsed = json.loads(raw_args or "{}")
-                    except json.JSONDecodeError:
-                        parsed = {"_raw": raw_args}
-                else:
-                    parsed = raw_args
+                parsed = loads_object(raw_args)
                 converted["tool_calls"].append(
                     {
                         "type": "function",
@@ -250,6 +492,8 @@ class OllamaBackend:
     """Transport nativo ``/api/chat``: options e keep_alive funzionano davvero."""
 
     name = "ollama"
+    supports_cancellation = True
+    manages_retries = True
 
     def __init__(
         self,
@@ -260,6 +504,8 @@ class OllamaBackend:
     ) -> None:
         self.base_url = normalise_base_url(base_url)
         self.timeout_s = float(timeout_s)
+        if not math.isfinite(self.timeout_s) or self.timeout_s <= 0:
+            raise ValueError("timeout_s deve essere finito e positivo")
         # None = decidi dalla versione del server.
         self._stream_with_tools = stream_with_tools
         self._version_cache: str | None = None
@@ -285,7 +531,8 @@ class OllamaBackend:
         try:
             resp = get_client().get(f"{self.base_url}/api/version", timeout=4.0)
             resp.raise_for_status()
-            self._version_cache = str(resp.json().get("version", ""))
+            data = loads_object(resp.json())
+            self._version_cache = _text_field(data.get("version"), "version", limit=128)
         except Exception:  # noqa: BLE001
             self._version_cache = ""
         return self._version_cache
@@ -309,7 +556,11 @@ class OllamaBackend:
         try:
             resp = get_client().get(f"{self.base_url}/api/tags", timeout=4.0)
             resp.raise_for_status()
-            models = sorted(m.get("name", "") for m in resp.json().get("models", []))
+            data = loads_object(resp.json())
+            raw_models = data.get("models", [])
+            if not isinstance(raw_models, list) or any(not isinstance(m, dict) for m in raw_models):
+                raise TransportProtocolError("models deve essere una lista di oggetti.")
+            models = sorted(_text_field(m.get("name"), "model.name") for m in raw_models)
             return True, f"{len(models)} modelli disponibili", models
         except Exception as exc:  # noqa: BLE001 - diagnostica per la UI
             return False, f"{type(exc).__name__}: {exc}", []
@@ -336,7 +587,10 @@ class OllamaBackend:
         try:
             resp = get_client().get(f"{self.base_url}/api/ps", timeout=4.0)
             resp.raise_for_status()
-            models = resp.json().get("models", [])
+            data = loads_object(resp.json())
+            models = data.get("models", [])
+            if not isinstance(models, list):
+                raise TransportProtocolError("models deve essere una lista.")
         except Exception:  # noqa: BLE001
             return []
         return [m for m in models if isinstance(m, dict)]
@@ -365,7 +619,7 @@ class OllamaBackend:
                 f"{self.base_url}/api/show", json={"model": model}, timeout=6.0
             )
             resp.raise_for_status()
-            info = resp.json()
+            info = loads_object(resp.json())
         except Exception:  # noqa: BLE001
             _MODEL_INFO_FALLITI[key] = time.monotonic()
             return {}
@@ -440,6 +694,18 @@ class OllamaBackend:
 
     # -- generazione ------------------------------------------------------
 
+    def reasoning_control(self, params: GenParams) -> dict[str, Any]:
+        """Pure diagnostic of the native payload, including learned fallback."""
+        think = params.think_payload
+        support = "native_unverified"
+        if isinstance(think, str) and self._think_levels_ok is False:
+            think = True
+            support = "boolean_only"
+        return _reasoning_report(
+            params, {"think": think} if think is not None else {},
+            support if think is not None else "omitted",
+        )
+
     def build_payload(
         self,
         messages: list[dict[str, Any]],
@@ -457,13 +723,7 @@ class OllamaBackend:
         }
         if tools:
             payload["tools"] = tools
-        think = params.think_payload
-        if think:
-            # Su un server che ha gia' rifiutato i livelli si manda il
-            # booleano: il pensiero resta acceso, si perde solo la manopola.
-            if isinstance(think, str) and self._think_levels_ok is False:
-                think = True
-            payload["think"] = think
+        payload.update(self.reasoning_control(params)["payload"])
         return payload
 
     def _livello_rifiutato(self, payload: dict[str, Any], corpo: str) -> bool:
@@ -484,161 +744,165 @@ class OllamaBackend:
     def _emit_message(
         self, message: dict[str, Any], tool_index: int
     ) -> tuple[list[StreamEvent], int]:
-        """Traduce un ``message`` di Ollama in eventi normalizzati."""
+        """Validate the Ollama envelope; argument semantics belong to the dispatcher."""
+        if not isinstance(message, dict):
+            raise TransportProtocolError("message deve essere un oggetto.")
         events: list[StreamEvent] = []
-        if message.get("thinking"):
-            events.append(StreamEvent("reasoning", text=message["thinking"]))
-        if message.get("content"):
-            events.append(StreamEvent("content", text=message["content"]))
-        for call in message.get("tool_calls") or []:
-            fn = call.get("function", {})
+        for field, kind in (("thinking", "reasoning"), ("content", "content")):
+            value = _text_field(message.get(field), field)
+            if value:
+                events.append(StreamEvent(kind, text=value))
+        calls = message.get("tool_calls")
+        if calls is None:
+            calls = []
+        if not isinstance(calls, list) or len(calls) + tool_index > MAX_TOOL_CALLS:
+            raise TransportProtocolError("Lista tool_call non valida o troppo lunga.")
+        for call in calls:
+            if not isinstance(call, dict) or not isinstance(call.get("function"), dict):
+                raise TransportProtocolError("Envelope tool_call non valido.")
+            fn = call["function"]
+            name = _text_field(fn.get("name"), "function.name", limit=256)
+            if not name:
+                raise TransportProtocolError("Nome tool mancante.")
+            call_id = _text_field(call.get("id"), "tool_call.id", limit=256)
             args = fn.get("arguments", {})
-            events.append(
-                StreamEvent(
-                    "tool_call",
-                    tool_call=_new_tool_call(
-                        tool_index,
-                        call.get("id", "") or f"ollama_{tool_index}",
-                        fn.get("name", ""),
-                        args
-                        if isinstance(args, str)
-                        else json.dumps(args, ensure_ascii=False),
-                    ),
-                )
-            )
+            # Preserve malformed argument strings for the dispatcher's structured
+            # self-correction feedback, but never accept arbitrary decoded values.
+            if isinstance(args, str):
+                args_text = _text_field(args, "function.arguments")
+            else:
+                args_text = json.dumps(loads_object(args), ensure_ascii=False, allow_nan=False)
+            events.append(StreamEvent("tool_call", tool_call=_new_tool_call(
+                tool_index, call_id or f"ollama_{tool_index}", name, args_text,
+            )))
             tool_index += 1
         return events, tool_index
 
     @staticmethod
     def _usage_event(chunk: dict[str, Any]) -> StreamEvent:
-        return StreamEvent(
-            "usage",
-            usage={
-                "prompt_tokens": chunk.get("prompt_eval_count", 0),
-                "completion_tokens": chunk.get("eval_count", 0),
-                "prompt_eval_ms": round(chunk.get("prompt_eval_duration", 0) / 1e6),
-                "eval_ms": round(chunk.get("eval_duration", 0) / 1e6),
-                "total_ms": round(chunk.get("total_duration", 0) / 1e6),
-                "done_reason": chunk.get("done_reason", ""),
-            },
-        )
+        """Normalize counters after validating all untrusted scalar types."""
+        usage: dict[str, Any] = {
+            "done_reason": _text_field(chunk.get("done_reason"), "done_reason", limit=128),
+        }
+        for target, source, scale in (
+            ("prompt_tokens", "prompt_eval_count", 1),
+            ("completion_tokens", "eval_count", 1),
+            ("prompt_eval_ms", "prompt_eval_duration", 1e6),
+            ("eval_ms", "eval_duration", 1e6),
+            ("total_ms", "total_duration", 1e6),
+        ):
+            value = chunk.get(source)
+            if value is not None:
+                usage[target] = round(_counter(value, source) / scale)
+        return StreamEvent("usage", usage=usage)
+
+    def _ollama_attempt(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None,
+        params: GenParams,
+        *,
+        streaming: bool,
+        should_stop: StopCheck,
+        deadline: float,
+    ) -> Iterator[StreamEvent]:
+        """One request, plus at most one explicit unsupported-think fallback.
+
+        Tool calls are translated as they arrive but released only after
+        ``done: true``. EOF, invalid JSON or cancellation discards the buffer.
+        """
+        for compatibility_attempt in range(2):
+            _checkpoint(should_stop, deadline)
+            payload = self.build_payload(messages, tools, params, stream=streaming)
+            pending_tools: list[StreamEvent] = []
+            tool_index = 0
+            try:
+                with get_client().stream(
+                    "POST", f"{self.base_url}/api/chat", json=payload,
+                    timeout=_request_timeout(deadline),
+                ) as response:
+                    _http_status(response, should_stop, deadline)
+                    if streaming:
+                        chunks = (
+                            loads_object(line)
+                            for line in _bounded_lines(response, should_stop, deadline)
+                            if line.strip()
+                        )
+                    else:
+                        raw = b"".join(_response_bytes(response, should_stop, deadline))
+                        chunks = iter([loads_object(raw.decode("utf-8"), max_chars=MAX_STREAM_BYTES)])
+                    for chunk in chunks:
+                        _checkpoint(should_stop, deadline)
+                        if chunk.get("error"):
+                            raise TransportProtocolError(
+                                f"Ollama: {_text_field(chunk['error'], 'error')[:600]}"
+                            )
+                        done = chunk.get("done", False)
+                        if not isinstance(done, bool):
+                            raise TransportProtocolError("done deve essere booleano.")
+                        message = chunk.get("message")
+                        events, tool_index = self._emit_message(
+                            {} if message is None else message, tool_index
+                        )
+                        for event in events:
+                            if event.kind == "tool_call":
+                                pending_tools.append(event)
+                            else:
+                                yield event
+                        if done:
+                            usage = self._usage_event(chunk)
+                            yield usage
+                            # A token-limit finish is complete on the wire but
+                            # its tool arguments may be incomplete: never dispatch.
+                            if usage.usage and usage.usage["done_reason"] != "length":
+                                yield from pending_tools
+                            return
+                    raise TransportProtocolError("Stream Ollama incompleto: manca done=true.")
+            except _HTTPFailure as exc:
+                if (compatibility_attempt == 0 and exc.status == 400
+                        and self._livello_rifiutato(payload, exc.body)):
+                    continue
+                raise
 
     def _blocking_chat(
         self,
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None,
         params: GenParams,
+        *,
+        should_stop: StopCheck = None,
     ) -> Iterator[StreamEvent]:
-        """Richiesta non-streaming, usata quando il server non streamma i tool.
-
-        Si perde l'effetto macchina-da-scrivere ma le tool call arrivano. Su
-        Ollama < 0.8.0 e' l'unico modo per ottenerle.
-        """
-        payload = self.build_payload(messages, tools, params, stream=False)
-        try:
-            resp = get_client().post(
-                f"{self.base_url}/api/chat",
-                json=payload,
-                timeout=httpx.Timeout(self.timeout_s, connect=10.0),
-            )
-            if resp.status_code >= 400:
-                if self._livello_rifiutato(payload, resp.text[:600]):
-                    yield from self._blocking_chat(messages, tools, params)
-                    return
-                yield StreamEvent(
-                    "error", text=f"HTTP {resp.status_code}: {resp.text[:600]}"
-                )
-                return
-            chunk = resp.json()
-        except httpx.TimeoutException:
-            yield StreamEvent("error", text=f"Timeout dopo {self.timeout_s:.0f}s.")
-            return
-        except (httpx.HTTPError, json.JSONDecodeError) as exc:
-            yield StreamEvent("error", text=f"Errore verso Ollama: {exc}")
-            return
-
-        if chunk.get("error"):
-            yield StreamEvent("error", text=str(chunk["error"]))
-            return
-
-        events, _ = self._emit_message(chunk.get("message") or {}, 0)
-        yield from events
-        yield self._usage_event(chunk)
+        """Bounded non-streaming fallback for Ollama versions without streaming tools."""
+        yield from _stream_with_retries(
+            lambda deadline: self._ollama_attempt(
+                messages, tools, params, streaming=False,
+                should_stop=should_stop, deadline=deadline,
+            ), self.timeout_s, should_stop,
+        )
 
     def stream(
         self,
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None,
         params: GenParams,
+        *,
+        should_stop: StopCheck = None,
     ) -> Iterator[StreamEvent]:
-        if tools and not self.streams_tool_calls():
-            yield from self._blocking_chat(messages, tools, params)
+        """Stream on the caller's worker, with bounded retries and cancellation.
+
+        Cancellation is cooperative between network reads. A silent socket
+        remains interruptible by its configured read timeout, not by this callback.
+        """
+        if should_stop is not None and should_stop():
+            yield StreamEvent("error", text="Generazione annullata.")
             return
-
-        payload = self.build_payload(messages, tools, params, stream=True)
-
-        tool_index = 0
-        # Il secondo tentativo si fa **fuori** dal ``with``, e per questo esiste
-        # questo flag. Prima la ricorsione stava dentro: la risposta fallita
-        # restava aperta per tutta la durata del secondo tentativo -- cioe' per
-        # tutta una generazione -- e con il client condiviso quello e' un
-        # posto del pool tenuto occupato da una risposta gia' letta e buttata.
-        riprova = False
-        try:
-            with get_client().stream(
-                "POST",
-                f"{self.base_url}/api/chat",
-                json=payload,
-                timeout=httpx.Timeout(self.timeout_s, connect=10.0),
-            ) as resp:
-                if resp.status_code >= 400:
-                    body = resp.read().decode("utf-8", "replace")[:600]
-                    # Un server troppo vecchio per i livelli di pensiero: si
-                    # riprova subito col booleano invece di far fallire il
-                    # passo. Una volta sola e non di piu': ``_livello_rifiutato``
-                    # ha appena messo il flag a False, quindi il payload del
-                    # secondo giro non ha piu' una stringa e la condizione non
-                    # puo' ripresentarsi.
-                    if not self._livello_rifiutato(payload, body):
-                        yield StreamEvent(
-                            "error", text=f"HTTP {resp.status_code}: {body}"
-                        )
-                        return
-                    riprova = True
-                else:
-                    for line in resp.iter_lines():
-                        if not line:
-                            continue
-                        try:
-                            chunk = json.loads(line)
-                        except json.JSONDecodeError:
-                            continue
-
-                        if chunk.get("error"):
-                            yield StreamEvent("error", text=str(chunk["error"]))
-                            return
-
-                        events, tool_index = self._emit_message(
-                            chunk.get("message") or {}, tool_index
-                        )
-                        yield from events
-
-                        if chunk.get("done"):
-                            yield self._usage_event(chunk)
-        except httpx.TimeoutException:
-            yield StreamEvent(
-                "error",
-                text=(
-                    f"Timeout dopo {self.timeout_s:.0f}s. Il modello e' probabilmente "
-                    "in fase di caricamento in VRAM: aumenta il timeout o alza keep_alive."
-                ),
-            )
-        except httpx.HTTPError as exc:
-            yield StreamEvent("error", text=f"Errore di rete verso Ollama: {exc}")
-        if riprova:
-            # La connessione del primo tentativo e' chiusa: qui il ``with`` e'
-            # gia' uscito.
-            yield from self.stream(messages, tools, params)
+        streaming = not tools or self.streams_tool_calls()
+        yield from _stream_with_retries(
+            lambda deadline: self._ollama_attempt(
+                messages, tools, params, streaming=streaming,
+                should_stop=should_stop, deadline=deadline,
+            ), self.timeout_s, should_stop,
+        )
 
     # -- diagnostica -------------------------------------------------------
 
@@ -647,12 +911,16 @@ class OpenAICompatBackend:
     """Fallback ``/v1/chat/completions`` per vLLM, LM Studio, llama.cpp server."""
 
     name = "openai"
+    supports_cancellation = True
+    manages_retries = True
 
     def __init__(self, base_url: str, api_key: str, timeout_s: float = 180.0) -> None:
         base = normalise_base_url(base_url)
         self.base_url = f"{base}/v1"
         self.api_key = api_key or "not-needed"
         self.timeout_s = float(timeout_s)
+        if not math.isfinite(self.timeout_s) or self.timeout_s <= 0:
+            raise ValueError("timeout_s deve essere finito e positivo")
 
     def _auth_headers(self) -> dict[str, str]:
         """Header di autenticazione, uno solo per tutte le sonde.
@@ -678,7 +946,11 @@ class OpenAICompatBackend:
                 f"{self.base_url}/models", headers=self._auth_headers(), timeout=4.0
             )
             resp.raise_for_status()
-            models = sorted(m.get("id", "") for m in resp.json().get("data", []))
+            data = loads_object(resp.json())
+            raw_models = data.get("data", [])
+            if not isinstance(raw_models, list) or any(not isinstance(m, dict) for m in raw_models):
+                raise TransportProtocolError("data deve essere una lista di oggetti.")
+            models = sorted(_text_field(m.get("id"), "model.id") for m in raw_models)
             return True, f"{len(models)} modelli disponibili", models
         except Exception as exc:  # noqa: BLE001 - diagnostica per la UI
             return False, f"{type(exc).__name__}: {exc}", []
@@ -703,6 +975,27 @@ class OpenAICompatBackend:
     def supports_tools(self, model: str) -> bool | None:  # noqa: ARG002
         return None
 
+    def reasoning_control(self, params: GenParams) -> dict[str, Any]:
+        """Translate explicit effort and known hybrid-model template switches.
+
+        The generic endpoint cannot advertise universal boolean support. The
+        diagnostic is intentionally unverified, and does no HTTP introspection.
+        Chat Completions uses reasoning_effort; model-specific accepted levels
+        remain the server's responsibility (including explicit 'max').
+        https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create
+        """
+        think = params.think_payload
+        payload: dict[str, Any] = {}
+        support = "omitted" if think is None else "unknown"
+        if isinstance(think, str):
+            payload["reasoning_effort"] = think
+            support = "effort_unverified"
+        key = _known_thinking_key(params.model)
+        if key is not None and think is not None:
+            payload["chat_template_kwargs"] = {key: bool(think)}
+            support = "template_unverified" if isinstance(think, bool) else "effort_template_unverified"
+        return _reasoning_report(params, payload, support)
+
     # -- ganci per i dialetti (llama.cpp, vLLM, ...) -----------------------
     #
     # Esistono perche' l'alternativa era una seconda copia di ``stream``: la
@@ -721,24 +1014,125 @@ class OpenAICompatBackend:
         # cui esiste ``clamp_num_ctx`` su llama.cpp. Se un giorno un endpoint
         # lo rifiuta con un 400, il posto dove toglierlo e' una sottoclasse
         # come ``LlamaCppBackend``, non questo metodo.
-        return {"max_model_len": params.num_ctx}
+        return {"max_model_len": params.num_ctx, **self.reasoning_control(params)["payload"]}
 
     def _extra_usage(self, chunk: Any) -> dict[str, Any]:  # noqa: ARG002
         """Numeri fuori standard letti dal chunk. Qui non ce ne sono."""
         return {}
+
+    def _openai_attempt(
+        self,
+        payload: dict[str, Any],
+        should_stop: StopCheck,
+        deadline: float,
+    ) -> Iterator[StreamEvent]:
+        """Parse SSE without an SDK hiding the mandatory end-of-stream sentinel."""
+        buffers: dict[int, dict[str, str]] = {}
+        extra_usage: dict[str, Any] = {}
+        usage: dict[str, Any] = {}
+        done_reason = ""
+        with get_client().stream(
+            "POST", f"{self.base_url}/chat/completions", json=payload,
+            headers=self._auth_headers(), timeout=_request_timeout(deadline),
+        ) as response:
+            _http_status(response, should_stop, deadline)
+            for data in _sse_data(_bounded_lines(response, should_stop, deadline)):
+                _checkpoint(should_stop, deadline)
+                if data == "[DONE]":
+                    if not done_reason:
+                        raise TransportProtocolError("Stream OpenAI senza finish_reason.")
+                    completed_tools: list[StreamEvent] = []
+                    identifiers: set[str] = set()
+                    if done_reason in {"stop", "tool_calls", "function_call"}:
+                        for index in sorted(buffers):
+                            slot = buffers[index]
+                            if not slot["name"]:
+                                raise TransportProtocolError("Nome tool mancante.")
+                            tool = _new_tool_call(
+                                index, slot["id"], slot["name"], slot["arguments"],
+                            )
+                            if tool["id"] in identifiers:
+                                raise TransportProtocolError("ID tool_call duplicato.")
+                            identifiers.add(tool["id"])
+                            completed_tools.append(StreamEvent("tool_call", tool_call=tool))
+                    yield StreamEvent("usage", usage={
+                        **usage, "done_reason": done_reason, **extra_usage,
+                    })
+                    yield from completed_tools
+                    return
+                chunk = loads_object(data)
+                if chunk.get("error"):
+                    raise TransportProtocolError("Il backend ha restituito un errore nello stream.")
+                extra_usage.update(self._extra_usage(chunk))
+                raw_usage = chunk.get("usage")
+                if raw_usage is not None:
+                    if not isinstance(raw_usage, dict):
+                        raise TransportProtocolError("usage deve essere un oggetto.")
+                    for field in ("prompt_tokens", "completion_tokens"):
+                        value = raw_usage.get(field)
+                        if value is not None:
+                            usage[field] = _counter(value, field)
+                choices = chunk.get("choices", [])
+                if not isinstance(choices, list) or len(choices) > 1:
+                    raise TransportProtocolError("Attesa una sola choice nello stream.")
+                if not choices:
+                    continue
+                choice = choices[0]
+                if not isinstance(choice, dict) or choice.get("index", 0) != 0:
+                    raise TransportProtocolError("Indice choice non valido.")
+                if done_reason:
+                    raise TransportProtocolError("Delta ricevuto dopo finish_reason.")
+                finish = _text_field(choice.get("finish_reason"), "finish_reason", limit=128)
+                delta = choice.get("delta")
+                if delta is None:
+                    delta = {}
+                if not isinstance(delta, dict):
+                    raise TransportProtocolError("delta deve essere un oggetto.")
+                for field, kind in (("reasoning_content", "reasoning"),
+                                    ("reasoning", "reasoning"), ("content", "content")):
+                    value = _text_field(delta.get(field), field)
+                    if value and not (field == "reasoning" and delta.get("reasoning_content")):
+                        yield StreamEvent(kind, text=value)
+                calls = delta.get("tool_calls")
+                if calls is None:
+                    calls = []
+                if not isinstance(calls, list) or len(calls) > MAX_TOOL_CALLS:
+                    raise TransportProtocolError("tool_calls deve essere una lista limitata.")
+                for call in calls:
+                    if not isinstance(call, dict):
+                        raise TransportProtocolError("Envelope tool_call non valido.")
+                    index = call.get("index")
+                    if isinstance(index, bool) or not isinstance(index, int) or not 0 <= index < MAX_TOOL_CALLS:
+                        raise TransportProtocolError("Indice tool_call non valido.")
+                    slot = buffers.setdefault(index, {"id": "", "name": "", "arguments": ""})
+                    identifier = _text_field(call.get("id"), "tool_call.id", limit=256)
+                    if identifier:
+                        if slot["id"] and slot["id"] != identifier:
+                            raise TransportProtocolError("ID tool_call cambiato durante lo stream.")
+                        slot["id"] = identifier
+                    function = call.get("function")
+                    if function is None:
+                        function = {}
+                    if not isinstance(function, dict):
+                        raise TransportProtocolError("function deve essere un oggetto.")
+                    for field, limit in (("name", 256), ("arguments", MAX_FRAME_BYTES)):
+                        slot[field] += _text_field(function.get(field), field, limit=limit)
+                        if len(slot[field]) > limit:
+                            raise TransportProtocolError(f"Buffer tool {field} oltre il limite.")
+                if finish:
+                    done_reason = finish
+            raise TransportProtocolError("Stream OpenAI incompleto: manca [DONE].")
 
     def stream(
         self,
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None,
         params: GenParams,
+        *,
+        should_stop: StopCheck = None,
     ) -> Iterator[StreamEvent]:
-        from openai import OpenAI  # import locale: avvio dell'app piu' rapido
-
-        client = OpenAI(
-            base_url=self.base_url, api_key=self.api_key, timeout=self.timeout_s
-        )
-        kwargs: dict[str, Any] = {
+        """Stream validated SSE with pooled HTTP connections and bounded retries."""
+        payload: dict[str, Any] = {
             "model": params.model,
             "messages": messages,
             "temperature": params.temperature,
@@ -746,94 +1140,15 @@ class OpenAICompatBackend:
             "max_tokens": params.max_tokens,
             "stream": True,
             "stream_options": {"include_usage": True},
-            "extra_body": self._extra_body(params),
+            **self._extra_body(params),
         }
         if tools:
-            kwargs["tools"] = tools
-            kwargs["tool_choice"] = "auto"
-
-        buffers: dict[int, dict[str, str]] = {}
-        fuori_standard: dict[str, Any] = {}
-        usage_emesso = False
-        # Perche' la generazione si e' fermata. Nello standard OpenAI e'
-        # ``finish_reason``, su Ollama ``done_reason``: qui si traduce nel
-        # secondo, che e' il nome con cui il ciclo agentico lo conosce gia'.
-        #
-        # Nessuno lo leggeva. Una generazione tagliata a meta' -- tetto di
-        # ``max_tokens`` raggiunto, o finestra del server esaurita -- arrivava
-        # quindi indistinguibile da una finita bene, e se il taglio cadeva
-        # dentro gli argomenti di una tool call il modello si prendeva la colpa
-        # con un "Argomenti JSON malformati" che non descriveva niente di
-        # quello che era successo.
-        done_reason = ""
-        try:
-            stream = client.chat.completions.create(**kwargs)
-            for chunk in stream:
-                # I numeri fuori standard si leggono **prima** dell'usage: su
-                # llama.cpp i timings viaggiano nello stesso chunk finale e
-                # devono poter entrare nello stesso evento.
-                fuori_standard.update(self._extra_usage(chunk))
-                # ...e cosi' il motivo dello stop: arriva sull'ultimo chunk con
-                # un ``choices`` pieno, mentre ``usage`` arriva su quello dopo,
-                # che di ``choices`` non ne ha. Leggerlo solo dentro il ramo
-                # dell'usage vorrebbe dire non leggerlo mai.
-                scelte = getattr(chunk, "choices", None) or []
-                if scelte and getattr(scelte[0], "finish_reason", None):
-                    done_reason = str(scelte[0].finish_reason)
-                if getattr(chunk, "usage", None):
-                    usage = chunk.usage
-                    usage_emesso = True
-                    yield StreamEvent(
-                        "usage",
-                        usage={
-                            "prompt_tokens": getattr(usage, "prompt_tokens", 0),
-                            "completion_tokens": getattr(usage, "completion_tokens", 0),
-                            "done_reason": done_reason,
-                            **fuori_standard,
-                        },
-                    )
-                if not scelte:
-                    continue
-                delta = scelte[0].delta
-
-                reasoning = getattr(delta, "reasoning_content", None) or getattr(
-                    delta, "reasoning", None
-                )
-                if reasoning:
-                    yield StreamEvent("reasoning", text=str(reasoning))
-
-                if delta.content:
-                    yield StreamEvent("content", text=delta.content)
-
-                for tcd in delta.tool_calls or []:
-                    idx = tcd.index or 0
-                    slot = buffers.setdefault(idx, {"id": "", "name": "", "arguments": ""})
-                    if tcd.id:
-                        slot["id"] = tcd.id
-                    if tcd.function and tcd.function.name:
-                        slot["name"] += tcd.function.name
-                    if tcd.function and tcd.function.arguments:
-                        slot["arguments"] += tcd.function.arguments
-
-            for idx in sorted(buffers):
-                slot = buffers[idx]
-                if slot["name"]:
-                    yield StreamEvent(
-                        "tool_call",
-                        tool_call=_new_tool_call(
-                            idx, slot["id"], slot["name"], slot["arguments"] or "{}"
-                        ),
-                    )
-            # Un server che non manda ``usage`` non deve far sparire anche i
-            # numeri che ha mandato: i tempi e i contatori del draft valgono
-            # da soli, ed e' su quelli che si decide se lo speculative
-            # decoding sta rendendo.
-            if not usage_emesso and (fuori_standard or done_reason):
-                yield StreamEvent(
-                    "usage", usage={"done_reason": done_reason, **fuori_standard}
-                )
-        except Exception as exc:  # noqa: BLE001
-            yield StreamEvent("error", text=f"{type(exc).__name__}: {exc}")
+            payload["tools"] = tools
+            payload["tool_choice"] = "auto"
+        yield from _stream_with_retries(
+            lambda deadline: self._openai_attempt(payload, should_stop, deadline),
+            self.timeout_s, should_stop,
+        )
 
 
 class LlamaCppBackend(OpenAICompatBackend):
@@ -921,7 +1236,7 @@ class LlamaCppBackend(OpenAICompatBackend):
                 f"{self.root_url}/props", headers=self._auth_headers(), timeout=4.0
             )
             resp.raise_for_status()
-            dati = resp.json()
+            dati = loads_object(resp.json())
         except Exception:  # noqa: BLE001 - diagnostica, non un errore di turno
             self._props_falliti_at = adesso
             return self._props      # meglio l'ultimo noto che niente
@@ -1024,7 +1339,7 @@ class LlamaCppBackend(OpenAICompatBackend):
         gen = props.get("default_generation_settings")
         for sorgente in (gen if isinstance(gen, dict) else {}, props):
             valore = sorgente.get("n_ctx")
-            if isinstance(valore, int) and valore > 0:
+            if type(valore) is int and valore > 0:
                 return valore
         # Ripiego: /slots dichiara n_ctx per slot. Esiste solo se il server e'
         # partito con --slots, quindi puo' mancare senza che sia un problema.
@@ -1040,7 +1355,7 @@ class LlamaCppBackend(OpenAICompatBackend):
             return None
         if isinstance(slots, list) and slots and isinstance(slots[0], dict):
             valore = slots[0].get("n_ctx")
-            if isinstance(valore, int) and valore > 0:
+            if type(valore) is int and valore > 0:
                 return valore
         return None
 
@@ -1091,6 +1406,42 @@ class LlamaCppBackend(OpenAICompatBackend):
 
     # -- dialetto ---------------------------------------------------------
 
+    def reasoning_control(self, params: GenParams) -> dict[str, Any]:
+        """Use the template already fetched by context/capability inspection.
+
+        No network request in the generation hot path. /props is populated by
+        the normal clamp_num_ctx/supports_thinking calls; absent metadata stays
+        unknown. llama.cpp documents top-level 'none' to disable reasoning,
+        but other top-level effort values can be ignored. Send effort inside
+        chat_template_kwargs only when the cached template references it.
+        https://github.com/ggml-org/llama.cpp/blob/master/tools/server/README.md
+        """
+        think = params.think_payload
+        if think is None:
+            return _reasoning_report(params, {}, "omitted")
+        template = self._props.get("chat_template")
+        keys = _template_reasoning_keys(template) if isinstance(template, str) else set()
+        kwargs: dict[str, Any] = {}
+        # Prefer the actual server template over model-name heuristics. Both
+        # variables can occur in a template and are then explicit controls.
+        for key in ("enable_thinking", "thinking"):
+            if key in keys:
+                kwargs[key] = bool(think)
+        body: dict[str, Any] = {}
+        if think is False:
+            body["reasoning_effort"] = "none"
+            support = "disable_unverified"
+        elif isinstance(think, str) and "reasoning_effort" in keys:
+            kwargs["reasoning_effort"] = think
+            support = "template_unverified"
+        elif kwargs:
+            support = "boolean_only" if isinstance(think, str) else "template_unverified"
+        else:
+            support = "unknown"
+        if kwargs:
+            body["chat_template_kwargs"] = kwargs
+        return _reasoning_report(params, body, support)
+
     def _extra_body(self, params: GenParams) -> dict[str, Any]:
         """Sampler nel dialetto di llama.cpp.
 
@@ -1100,15 +1451,15 @@ class LlamaCppBackend(OpenAICompatBackend):
         """
         body: dict[str, Any] = {
             "top_k": int(params.top_k),
+            "repeat_penalty": float(params.repetition_penalty),
             # Fa arrivare i timings -- e con essi i contatori del draft --
             # dentro lo stream, invece di doverli chiedere a /slots dopo.
             "timings_per_token": True,
+            **self.reasoning_control(params)["payload"],
         }
         # Fuori si chiama repetition_penalty, sul filo di llama.cpp
-        # repeat_penalty: stesso cambio di nome che c'e' su Ollama. 1.0 e' il
-        # neutro e non si manda.
-        if params.repetition_penalty != 1.0:
-            body["repeat_penalty"] = float(params.repetition_penalty)
+        # repeat_penalty: stesso cambio di nome che c'e' su Ollama. Anche
+        # 1.0 va inviato: ometterlo conserverebbe il default del server.
         if params.presence_penalty:
             body["presence_penalty"] = float(params.presence_penalty)
         if params.seed is not None:
@@ -1120,7 +1471,7 @@ class LlamaCppBackend(OpenAICompatBackend):
     @staticmethod
     def _timings(chunk: Any) -> dict[str, Any]:
         """Il blocco ``timings``, che nello standard OpenAI non esiste."""
-        grezzo = getattr(chunk, "timings", None)
+        grezzo = chunk.get("timings") if isinstance(chunk, dict) else getattr(chunk, "timings", None)
         if grezzo is None:
             extra = getattr(chunk, "model_extra", None) or {}
             grezzo = extra.get("timings")
@@ -1143,11 +1494,13 @@ class LlamaCppBackend(OpenAICompatBackend):
         fuori: dict[str, Any] = {}
         prompt_ms = t.get("prompt_ms")
         eval_ms = t.get("predicted_ms")
-        if isinstance(prompt_ms, (int, float)):
+        if prompt_ms is not None:
+            prompt_ms = _counter(prompt_ms, "timings.prompt_ms")
             fuori["prompt_eval_ms"] = round(prompt_ms)
-        if isinstance(eval_ms, (int, float)):
+        if eval_ms is not None:
+            eval_ms = _counter(eval_ms, "timings.predicted_ms")
             fuori["eval_ms"] = round(eval_ms)
-        if isinstance(prompt_ms, (int, float)) and isinstance(eval_ms, (int, float)):
+        if prompt_ms is not None and eval_ms is not None:
             fuori["total_ms"] = round(prompt_ms + eval_ms)
         coppie = (
             ("draft_n", self.ALIAS_DRAFT_N),
@@ -1156,8 +1509,8 @@ class LlamaCppBackend(OpenAICompatBackend):
         for chiave, alias in coppie:
             for nome in alias:
                 valore = t.get(nome)
-                if isinstance(valore, (int, float)):
-                    fuori[chiave] = int(valore)
+                if valore is not None:
+                    fuori[chiave] = int(_counter(valore, f"timings.{nome}"))
                     break
         return fuori
 

@@ -914,7 +914,14 @@ function setRunning(sessionId, running) {
   if (running) state.running.add(sessionId);
   else state.running.delete(sessionId);
   const busyHere = state.running.has(state.sessionId);
+  const activityChanged = busyHere !== state.busy;
   state.busy = busyHere;
+  // Decorative feedback follows actual activity in the visible conversation.
+  const companion = typeof window !== 'undefined' && window.HarnessCompanion;
+  if (companion) {
+    if (busyHere && activityChanged) companion.setState('working');
+    else if (!busyHere && companion.getState() === 'working') companion.setState('idle');
+  }
 
   // Mentre l'agente lavora il tasto non si spegne: diventa stop. Un tasto
   // disabilitato lascia l'utente senza via d'uscita se il modello parte per
@@ -1143,12 +1150,14 @@ async function leggiLoStream(response, turn, stillMine) {
   let buffer = '';
   let idle = false;
   let frames = 0;
+  let completed = false;
 
   try {
     while (true) {
       const { value, done } = await reader.read();
       if (done) break;
       buffer += decoder.decode(value, { stream: true });
+      if (buffer.length > 2 * 1024 * 1024) throw new Error('Frame SSE troppo grande');
       const pezzi = buffer.split('\n\n');
       buffer = pezzi.pop();
 
@@ -1156,8 +1165,9 @@ async function leggiLoStream(response, turn, stillMine) {
         const line = frame.split('\n').find((l) => l.startsWith('data: '));
         if (!line) continue;                       // commento di keepalive
         let event;
-        try { event = JSON.parse(line.slice(6)); } catch { continue; }
+        event = JSON.parse(line.slice(6));
         if (event.type === 'idle') { idle = true; continue; }
+        if (event.type === 'done') completed = true;
         if (!stillMine()) return { tipo: 'estraneo', idle, frames };
         frames += 1;
         handleEvent(event, turn, turn.statusNode, setStatus);
@@ -1171,9 +1181,12 @@ async function leggiLoStream(response, turn, stillMine) {
     // sul server e continua. Questa e' solo la nostra finestra che si e'
     // chiusa, e se ne apre un'altra.
     return { tipo: 'caduto', idle, frames };
+  } finally {
+    await reader.cancel().catch(() => {});
+    reader.releaseLock();
   }
   if (!stillMine()) return { tipo: 'estraneo', idle, frames };
-  return { tipo: 'fine', idle, frames };
+  return { tipo: completed || idle ? 'fine' : 'caduto', idle, frames };
 }
 
 /** Rilegge dal disco la conversazione aperta e la rimette in pari.
@@ -1301,9 +1314,17 @@ function handleEvent(event, turn, status, setStatus) {
         setStatus('Riconnessione al modello in corso…');
       } else {
         turn.append(el('div', 'error-box', esc(event.message)));
+        turn.companionFailed = true;
+        if (typeof window !== 'undefined') window.HarnessCompanion?.setState('error');
       }
       break;
     case 'done':
+      // A stop, question or step limit must never look like a successful delivery.
+      if (typeof window !== 'undefined' && !turn.companionSettled) {
+        turn.companionSettled = true;
+        window.HarnessCompanion?.setState(turn.companionFailed || event.reason === 'error' ? 'error'
+          : event.reason === 'completed' && event.steps > 1 ? 'success' : 'idle');
+      }
       // Le gocce chiudono il ciclo: su una pausa per domanda il ciclo non e'
       // finito, e mostrarle li' direbbe "ho consegnato" quando invece sta
       // ancora aspettando una risposta.
@@ -2574,6 +2595,7 @@ function bindGlobalEvents() {
  * sparire da sola la pagina che l'agente ha appena finito di costruire.
  */
 async function showSession(payload, { entrando = false } = {}) {
+  const conversationChanged = state.sessionId !== payload.session_id;
   state.sessionId = payload.session_id;
   // Il workspace segue la conversazione: aprendo una chat di ieri il server
   // ci rimette sulla cartella su cui era stata fatta, e qui se ne prende
@@ -2610,6 +2632,9 @@ async function showSession(payload, { entrando = false } = {}) {
   if (payload.running) state.running.add(payload.session_id);
   else state.running.delete(payload.session_id);
   setRunning(payload.session_id, payload.running);
+  if (conversationChanged && typeof window !== 'undefined') {
+    window.HarnessCompanion?.setState(payload.running ? 'working' : 'idle');
+  }
   if (payload.running) attachStream(payload.session_id);
 }
 
@@ -3464,6 +3489,10 @@ async function boot() {
   renderHeader();
 
   await showSession(data.session, { entrando: true });
+  window.HarnessCompanion?.init({
+    mounts: ['#sidebar .logo', '#composer-companion'],
+    state: data.session.running ? 'working' : 'welcome',
+  });
   bindGlobalEvents();
   bindSveglie();
   refreshSandbox();

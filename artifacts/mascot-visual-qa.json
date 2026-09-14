@@ -1,0 +1,61 @@
+{
+  "initial": {
+    "hosts": 2,
+    "robot": {
+      "x": 1046.5,
+      "y": 830.15625,
+      "width": 42,
+      "height": 42,
+      "right": 1088.5,
+      "bottom": 872.15625
+    },
+    "send": {
+      "x": 1052,
+      "y": 878.40625,
+      "width": 31,
+      "height": 31,
+      "right": 1083,
+      "bottom": 909.40625
+    },
+    "bubble": {
+      "x": 940.296875,
+      "y": 834.15625,
+      "width": 94.203125,
+      "height": 32.796875,
+      "right": 1034.5,
+      "bottom": 866.953125
+    },
+    "text": {
+      "x": 366,
+      "y": 876.15625,
+      "width": 465.515625,
+      "height": 33.25,
+      "right": 831.515625,
+      "bottom": 909.40625
+    },
+    "speech": [
+      "Ci penso io…",
+      "Ci penso io…"
+    ],
+    "animated": [
+      "companion-working",
+      "companion-working"
+    ]
+  },
+  "multiline": {
+    "bubbleBottom": 820.203125,
+    "textTop": 829.40625,
+    "gesture": "shake"
+  },
+  "reduced": [
+    "none",
+    "none"
+  ],
+  "speechHidden": true,
+  "narrowLogo": {
+    "bubble": 152,
+    "edge": 168,
+    "wordmarkOpacity": "0"
+  },
+  "errors": []
+}

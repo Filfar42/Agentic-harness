@@ -19,6 +19,8 @@ eventi del ciclo agentico e si serializzano, niente di piu'.
 from __future__ import annotations
 
 import hashlib
+import copy
+import logging
 import json
 import mimetypes
 import os
@@ -28,17 +30,19 @@ import subprocess
 import sys
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import AsyncIterator, Callable, Iterator
 from contextlib import asynccontextmanager
 from dataclasses import asdict, is_dataclass, replace
 from pathlib import Path
+from functools import wraps
 from typing import Any, Literal
 from urllib.parse import quote, urlparse
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, Field
+from starlette.concurrency import run_in_threadpool
 from starlette.datastructures import MutableHeaders
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -83,6 +87,7 @@ from core.prompts import (
 from core.textutils import estimate_messages_tokens, estimate_tokens
 from core.tools import (
     ATTACHMENTS_DIR,
+    ATTACHMENT_MAX_BYTES,
     MAX_IMAGE_BYTES,
     MAX_IMAGES_IN_CONTEXT,
     TOOLS_SCHEMA,
@@ -102,6 +107,19 @@ from server.nativedialog import DialogUnavailable, pick_folder
 from server.prep import Prep
 from server import runner as runner_mod
 from server.runner import RunnerRegistry, TurnRunner
+from server.security import LocalAccessGuard
+
+_LOGGER = logging.getLogger(__name__)
+_ADMISSION_LOCK = threading.RLock()
+
+
+def serialized_admission(function: Callable[..., Any]) -> Callable[..., Any]:
+    """Make session mutation and background-run admission one transaction."""
+    @wraps(function)
+    def guarded(*args: Any, **kwargs: Any) -> Any:
+        with _ADMISSION_LOCK:
+            return function(*args, **kwargs)
+    return guarded
 
 WEB_DIR = Path(__file__).resolve().parents[1] / "web"
 # Il conto dei token degli schemi dipende da quale versione si sta mandando.
@@ -191,6 +209,7 @@ class ServerTiming:
 
 
 app.add_middleware(ServerTiming)
+app.add_middleware(LocalAccessGuard)
 
 
 # ---------------------------------------------------------------------------
@@ -469,9 +488,12 @@ class AppState:
             # lanciato da li'. Su una chat riletta domani -- o mandata a
             # qualcuno per confrontare due modelli -- era proprio
             # l'informazione che mancava.
-            session["model_name"] = self.settings["model_name"]
-            session["workspace_dir"] = self.settings["workspace_dir"]
-            session_mod.save_session(session, force=True, riscrivi=riscrivi)
+            session.setdefault("model_name", self.settings["model_name"])
+            session.setdefault("workspace_dir", self.settings["workspace_dir"])
+            if session_mod.save_session(session, force=True, riscrivi=riscrivi) is False:
+                detail = str(session.get("save_error") or "Salvataggio della conversazione fallito.")
+                _LOGGER.error("Session %s persistence failed: %s", session_id, detail)
+                raise OSError(detail)
 
     def workspace_di(self, session_id: str) -> str:
         """La cartella su cui questa conversazione ha lavorato.
@@ -934,7 +956,7 @@ class EventBus:
         runner_mod.al_spegnimento(self.stacca_tutti)
 
     def subscribe(self) -> queue.Queue[str | None]:
-        sub: queue.Queue[str | None] = queue.Queue()
+        sub = runner_mod.SubscriberQueue(self._QUEUE_MAX)
         with self._lock:
             self._subscribers.append(sub)
         return sub
@@ -944,7 +966,7 @@ class EventBus:
         with self._lock:
             subscribers = list(self._subscribers)
         for sub in subscribers:
-            sub.put(None)
+            runner_mod.disconnect_subscriber(sub)
 
     def unsubscribe(self, sub: queue.Queue[str | None]) -> None:
         with self._lock:
@@ -956,8 +978,30 @@ class EventBus:
         with self._lock:
             subscribers = list(self._subscribers)
         for sub in subscribers:
-            if sub.qsize() < self._QUEUE_MAX:
-                sub.put(frame)
+            try:
+                sub.put_nowait(frame)
+            except queue.Full:
+                self.unsubscribe(sub)
+                runner_mod.disconnect_subscriber(sub)
+
+    async def async_stream(self) -> AsyncIterator[str]:
+        """Wait on loop notifications, leaving request-worker capacity available."""
+        sub = self.subscribe()
+        assert isinstance(sub, runner_mod.SubscriberQueue)
+        sub.attach_loop()
+        try:
+            yield sse("hello", {"ts": time.time()})
+            while not runner_mod.SPEGNIMENTO.is_set():
+                try:
+                    frame = await sub.next_frame(self._KEEPALIVE_S)
+                except TimeoutError:
+                    yield ": keepalive\n\n"
+                    continue
+                if frame is None:
+                    return
+                yield frame
+        finally:
+            self.unsubscribe(sub)
 
     def stream(self) -> Iterator[str]:
         """SSE: saluto, poi ogni evento finche' il client resta collegato.
@@ -1171,9 +1215,16 @@ def start_turn(
     messages = STATE.messages(session_id)
     snapshot = [dict(m) for m in messages]
 
-    images, esclusi = STATE.turn_images(session_id)
+    # The worker may start after the UI switches workspace or model. Keep
+    # its configuration fixed while sharing the session registry and lock.
+    turn_state = copy.copy(STATE)
+    turn_state.settings = copy.deepcopy(STATE.settings)
+    turn_state.settings["workspace_dir"] = STATE.workspace_di(session_id) or STATE.settings["workspace_dir"]
+    STATE.session(session_id)["model_name"] = turn_state.settings["model_name"]
+    images, esclusi = turn_state.turn_images(session_id)
 
     def work(runner: TurnRunner) -> None:
+        terminal_frame = sse("done", {"reason": "error"})
         runner.emit(sse("start", {"session_id": session_id}))
         # Gli allegati che non sono entrati in contesto si dicono, e si dicono
         # PRIMA che il modello parli.
@@ -1197,7 +1248,7 @@ def start_turn(
             # Il livello della goccia e' un override puntuale: sostituisce
             # ``native_think`` per questo turno soltanto, senza toccare le
             # impostazioni, che restano quelle salvate.
-            params_turno = STATE.gen_params()
+            params_turno = turn_state.gen_params()
             pensiero_forzato = None
             if think_level in ("low", "medium", "high"):
                 params_turno = replace(params_turno, think=think_level)
@@ -1206,36 +1257,44 @@ def start_turn(
                 # modello di non usarlo mentre il backend lo chiede.
                 pensiero_forzato = True
             events = agent_mod.run_turn(
-                backend=STATE.backend(),
+                backend=turn_state.backend(),
                 params=params_turno,
-                tools_schema=STATE.tools_schema(web_search),
-                tool_ctx=STATE.tool_ctx(session_id, web_search),
+                tools_schema=turn_state.tools_schema(web_search),
+                tool_ctx=turn_state.tool_ctx(session_id, web_search),
                 ui_messages=messages,
-                system_prompt=STATE.system_prompt(web_search, pensiero=pensiero_forzato),
+                system_prompt=turn_state.system_prompt(web_search, pensiero=pensiero_forzato),
                 # Il turno rilegge il disco: e' qui che l'agente deve vedere
                 # il workspace com'e' adesso, non com'era all'ultimo click.
-                env_header=STATE.context_header(session_id, fresh=True),
+                env_header=turn_state.context_header(session_id, fresh=True),
                 images=images,
                 should_stop=runner.cancelled.is_set,
-                max_steps=int(STATE.settings["max_agent_loops"]),
-                strip_thinking=bool(STATE.settings["strip_think_from_context"]),
-                compact_old_tools=bool(STATE.settings["compact_old_tool_results"]),
-                require_plan=bool(STATE.settings["require_plan"]),
-                plan_gate=bool(STATE.settings["plan_gate"]),
+                max_steps=int(turn_state.settings["max_agent_loops"]),
+                strip_thinking=bool(turn_state.settings["strip_think_from_context"]),
+                compact_old_tools=bool(turn_state.settings["compact_old_tool_results"]),
+                require_plan=bool(turn_state.settings["require_plan"]),
+                plan_gate=bool(turn_state.settings["plan_gate"]),
                 # Le skill si scelgono sull'ultima richiesta vera dell'utente,
                 # non su tutta la cronologia: quello che ha chiesto tre turni
                 # fa non deve continuare a tirarsi dietro le sue istruzioni.
-                skills_block=STATE.skills_block(ultima_richiesta(messages)),
-                compact_history=bool(STATE.settings["compact_history"]),
-                soglia=float(STATE.settings["compact_threshold"]),
-                compact_max_tokens=int(STATE.settings["compact_max_tokens"]),
-                libreria_attiva=bool(STATE.settings["libreria_concetti"]),
-                estratto_pensiero=bool(STATE.settings["estratto_pensiero"]),
-                spec_delega=bool(STATE.settings["spec_delega"]),
-                auto_preview=bool(STATE.settings["preview_enabled"]),
-                think_watchdog=bool(STATE.settings["think_watchdog"]),
+                skills_block=turn_state.skills_block(ultima_richiesta(messages)),
+                compact_history=bool(turn_state.settings["compact_history"]),
+                soglia=float(turn_state.settings["compact_threshold"]),
+                compact_max_tokens=int(turn_state.settings["compact_max_tokens"]),
+                libreria_attiva=bool(turn_state.settings["libreria_concetti"]),
+                estratto_pensiero=bool(turn_state.settings["estratto_pensiero"]),
+                spec_delega=bool(turn_state.settings["spec_delega"]),
+                auto_preview=bool(turn_state.settings["preview_enabled"]),
+                think_watchdog=bool(turn_state.settings["think_watchdog"]),
             )
             for event in events:
+                # A terminal result is acknowledged only after persistence.
+                if isinstance(event, agent_mod.TurnFinished):
+                    session_mod.record_turn_telemetry(
+                        STATE.session(session_id), getattr(event, "telemetry", {}),
+                        reason=event.reason, steps=event.steps,
+                    )
+                    terminal_frame = event_to_sse(event)
+                    continue
                 if isinstance(event, agent_mod.AgentError) and _e_un_guasto_del_backend(
                     event
                 ):
@@ -1260,15 +1319,23 @@ def start_turn(
                 # risposta senza refresh, come sul desktop.
                 if isinstance(event, agent_mod.AwaitingUserInput):
                     EVENTS.publish("question", session_id=session_id)
-        except Exception as exc:  # noqa: BLE001 - l'errore va mostrato, non nascosto
+        except Exception as exc:
+            _LOGGER.exception("Agent turn failed for session %s", session_id)
             runner.emit(sse("error", {"message": f"{type(exc).__name__}: {exc}"}))
+            terminal_frame = sse("done", {"reason": "error"})
         finally:
             # Riscrittura completa della coda, una volta per turno: durante il
             # turno si accoda, e l'accodamento non vede le modifiche fatte a
             # messaggi gia' scritti (la traccia del pensiero che si attacca
             # all'assistente del passo prima, una compattazione). Qui la
             # cronologia e' ferma, ed e' il posto giusto per rimetterla in pari.
-            STATE.save(session_id, riscrivi=True)
+            try:
+                STATE.save(session_id, riscrivi=True)
+            except OSError as exc:
+                runner.error = f"Salvataggio fallito: {exc}"
+                runner.emit(sse("error", {"message": runner.error}))
+                terminal_frame = sse("done", {"reason": "persistence_error"})
+            runner.emit(terminal_frame)
             runner.emit(sse("state", session_stats(session_id)))
             # Fine turno su TUTTE le interfacce: chi ha la chat aperta la
             # ricarica dal disco (ora c'e' il messaggio finale), gli altri
@@ -1279,7 +1346,7 @@ def start_turn(
     return RUNNERS.start(session_id, snapshot, work)
 
 
-def sse_response(generator: Iterator[str]) -> StreamingResponse:
+def sse_response(generator: Iterator[str] | AsyncIterator[str]) -> StreamingResponse:
     return StreamingResponse(
         generator,
         media_type="text/event-stream",
@@ -1299,14 +1366,15 @@ def sse_response(generator: Iterator[str]) -> StreamingResponse:
 
 
 class ChatRequest(BaseModel):
-    session_id: str
-    prompt: str
+    model_config = ConfigDict(extra="forbid", strict=True)
+    session_id: str = Field(pattern=r"^[A-Za-z0-9_-]{1,128}$")
+    prompt: str = Field(max_length=200_000)
     # Nomi degli allegati che l'utente ha messo nella barra del composer prima
     # di premere invio. Vengono agganciati al messaggio: un file allegato e'
     # parte della richiesta, non un accessorio della conversazione, e in una
     # chat lunga "quale messaggio portava quel CSV?" e' una domanda che si
     # risponde da sola solo se il file sta nella riga giusta.
-    attachments: list[str] = []
+    attachments: list[str] = Field(default_factory=list, max_length=32)
     # Modalita' "Ricerca online" della goccia nel composer: vale per questo
     # messaggio soltanto. Vero -> il turno vede lo schema di web_search e la
     # riga di prompt che lo descrive; falso -> il modello non sa nemmeno che
@@ -1320,7 +1388,8 @@ class ChatRequest(BaseModel):
 
 
 class AnswerRequest(BaseModel):
-    session_id: str
+    model_config = ConfigDict(extra="forbid", strict=True)
+    session_id: str = Field(pattern=r"^[A-Za-z0-9_-]{1,128}$")
     answer: str | list[str]
 
 
@@ -1400,7 +1469,7 @@ def index() -> Response:
     resta apribile a mano durante lo sviluppo.
     """
     html = (WEB_DIR / "index.html").read_text(encoding="utf-8")
-    for nome in ("app.js", "style.css"):
+    for nome in ("app.js", "style.css", "companion.js", "companion.css"):
         html = html.replace(f"/static/{nome}", f"/static/{nome}?v={_impronta(nome)}")
     return Response(
         html,
@@ -1575,6 +1644,9 @@ def open_payload(session_id: str) -> dict[str, Any]:
         # scritto e' finito ieri.
         "plan": STATE.plan(session_id).to_list(),
         "notes": STATE.notes(session_id).to_list(),
+        "turn_telemetry": session_mod.bounded_turn_telemetry(
+            STATE.session(session_id).get("turn_telemetry", [])
+        ),
         "preview": STATE.preview(session_id),
         "stats": session_stats(session_id),
         # La cartella di **questa** conversazione. Viaggia nel payload perche'
@@ -1808,6 +1880,7 @@ def read_messages(session_id: str, before: int, limit: int = MESSAGGI_PER_PAGINA
 
 
 @app.delete("/api/sessions/{session_id}")
+@serialized_admission
 def delete_session(session_id: str) -> dict[str, Any]:
     if RUNNERS.is_running(session_id):
         raise HTTPException(409, "Un turno e' in corso in questa conversazione.")
@@ -1828,6 +1901,7 @@ def delete_session(session_id: str) -> dict[str, Any]:
 
 
 @app.post("/api/chat")
+@serialized_admission
 def chat(request: ChatRequest) -> dict[str, Any]:
     prompt = (request.prompt or "").strip()
     if not prompt:
@@ -1844,7 +1918,11 @@ def chat(request: ChatRequest) -> dict[str, Any]:
     if agganciati:
         entry["attachments"] = agganciati
     messages.append(entry)
-    STATE.save(session_id)
+    try:
+        STATE.save(session_id)
+    except OSError as exc:
+        messages.remove(entry)
+        raise HTTPException(507, f"Conversazione non salvata: {exc}") from exc
     start_turn(
         session_id,
         web_search=bool(request.web_search),
@@ -1865,14 +1943,25 @@ def chat(request: ChatRequest) -> dict[str, Any]:
 
 
 @app.post("/api/answer")
+@serialized_admission
 def answer(request: AnswerRequest) -> dict[str, Any]:
     session_id = request.session_id
     messages = STATE.messages(session_id)
+    runner = RUNNERS.get(session_id)
+    if runner is not None and agent_mod.pending_question(messages):
+        # The question is visible before the final fsync completes. Wait for
+        # that worker to relinquish the session before appending the answer.
+        runner.finished.wait(timeout=2.0)
     if RUNNERS.is_running(session_id):
         raise HTTPException(409, "Un turno e' gia' in corso in questa conversazione.")
+    before_answer = copy.deepcopy(messages)
     if not agent_mod.resume_with_answer(messages, request.answer):
         raise HTTPException(409, "Nessuna domanda in attesa.")
-    STATE.save(session_id)
+    try:
+        STATE.save(session_id)
+    except OSError as exc:
+        messages[:] = before_answer
+        raise HTTPException(507, f"Risposta non salvata: {exc}") from exc
     # La ricerca online era accesa quando il turno si e' fermato per fare la
     # domanda: riprendendo deve restare accesa. Senza questo, un compito che
     # passava da ``ask_user_question`` perdeva il permesso a meta' strada, e
@@ -2539,21 +2628,26 @@ async def add_attachments(
     file del progetto, e l'utente se li ritrova in Esplora risorse anche
     quando la conversazione e' chiusa.
     """
-    entries = STATE.attachments(session_id)
+    entries = await run_in_threadpool(STATE.attachments, session_id)
+    workspace = STATE.workspace_di(session_id) or STATE.settings["workspace_dir"]
+    if len(files) > 32:
+        raise HTTPException(413, "Massimo 32 allegati per richiesta.")
     added: list[dict[str, Any]] = []
     for upload in files:
-        data = await upload.read()
+        data = await upload.read(ATTACHMENT_MAX_BYTES + 1)
+        if len(data) > ATTACHMENT_MAX_BYTES:
+            raise HTTPException(413, "Allegato troppo grande (massimo 25 MiB).")
         if not data:
             continue
         try:
-            entry = store_attachment(
-                STATE.settings["workspace_dir"], upload.filename or "allegato", data
+            entry = await run_in_threadpool(store_attachment,
+                workspace, upload.filename or "allegato", data
             )
         except (WorkspaceError, OSError) as exc:
             raise HTTPException(400, str(exc)) from exc
         entries.append(entry)
         added.append(entry)
-    STATE.save(session_id)
+    await run_in_threadpool(STATE.save, session_id)
     return {"added": added, "attachments": entries, "stats": session_stats(session_id)}
 
 
@@ -2626,7 +2720,7 @@ def stream(session_id: str) -> StreamingResponse:
     runner = RUNNERS.get(session_id)
     if runner is None:
         return sse_response(iter([sse("idle", {"session_id": session_id})]))
-    return sse_response(runner.stream())
+    return sse_response(runner.async_stream())
 
 
 @app.get("/api/events")
@@ -2638,7 +2732,7 @@ def global_events() -> StreamingResponse:
     l'evento arriva a entrambi e le pagine si ridisegnano da sole, senza
     polling ne' refresh manuale.
     """
-    return sse_response(EVENTS.stream())
+    return sse_response(EVENTS.async_stream())
 
 
 # ---------------------------------------------------------------------------
@@ -2647,6 +2741,7 @@ def global_events() -> StreamingResponse:
 
 
 @app.post("/api/settings")
+@serialized_admission
 def update_settings(request: SettingsRequest) -> dict[str, Any]:
     touched = set()
     rifiutate: list[str] = []
@@ -2670,9 +2765,9 @@ def update_settings(request: SettingsRequest) -> dict[str, Any]:
             continue
         if STATE.settings.get(key) != value:
             touched.add(key)
-        STATE.settings[key] = value
     if rifiutate:
         raise HTTPException(400, "Valori non validi -- " + "; ".join(rifiutate))
+    STATE.settings.update({key: request.values[key] for key in touched})
     # Le cache dei derivati valgono finche' non si cambia a cosa puntano.
     if touched & {"transport", "api_base", "api_key", "timeout_seconds",
                   "stream_tools", "model_name"}:

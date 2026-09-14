@@ -47,12 +47,13 @@ contrario -- stessa regola gia' applicata a ``delega`` e ``compaction``.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import replace
 from typing import Any
 
 from .prompts import PROMPT_ESTRATTO_PENSIERO
-from .textutils import chars_for_tokens, estrai_think, smart_truncate, strip_think
+from .inference import service_text
+from .textutils import chars_for_tokens, estrai_think, smart_truncate
 
 # Tetto all'estratto. Piu' stretto del riassunto di compattazione (700) perche'
 # copre un punto solo di piano, non un tratto intero di conversazione: se ne
@@ -64,6 +65,7 @@ MAX_TOKEN_ESTRATTO = 500
 # tutti significherebbe pagare per la distillazione piu' di quanto la
 # distillazione fa risparmiare.
 QUOTA_PENSIERO = 0.25
+MAX_TOKEN_PENSIERO = 4096
 
 # Sotto questa soglia non si chiama nessuno. Un punto chiuso dopo due passi di
 # pensiero corto non ha dentro niente che valga una chiamata al modello: la
@@ -115,6 +117,7 @@ def estrai(
     punto: str,
     backend: Any,
     params: Any,
+    should_stop: Callable[[], bool] | None = None,
 ) -> str:
     """Distilla ``SCOPERTO``/``SCARTATO`` dal pensiero di un punto.
 
@@ -129,12 +132,16 @@ def estrai(
         return ""
 
     finestra = int(getattr(params, "num_ctx", 0) or 0)
-    if finestra > 0:
-        grezzo = smart_truncate(
-            grezzo,
-            chars_for_tokens(finestra * QUOTA_PENSIERO),
-            label="ragionamento del punto",
-        )
+    limite_token = min(MAX_TOKEN_PENSIERO, finestra * QUOTA_PENSIERO) if finestra > 0 else MAX_TOKEN_PENSIERO
+    limite_chars = max(1, chars_for_tokens(limite_token) - 1)
+    # Include the point label in the input budget. smart_truncate's marker
+    # may exceed its allowance on tiny windows, so enforce the bound too.
+    ingresso = smart_truncate(
+        f"Punto di lavoro: {punto}\n\nRagionamento:\n{grezzo}",
+        limite_chars,
+        label="ragionamento del punto",
+        consiglio="Riassumi solo il testo visibile.",
+    )[:limite_chars]
 
     p = replace(
         params,
@@ -148,20 +155,10 @@ def estrai(
         {"role": "system", "content": PROMPT_ESTRATTO_PENSIERO},
         {
             "role": "user",
-            "content": f"Punto di lavoro: {punto}\n\nRagionamento:\n{grezzo}",
+            "content": ingresso,
         },
     ]
-    pezzi: list[str] = []
-    try:
-        for evento in backend.stream(messaggi, None, p):
-            if evento.kind == "content":
-                pezzi.append(evento.text)
-            elif evento.kind == "error":
-                return ""
-    except Exception:  # noqa: BLE001
-        return ""
-
-    testo = strip_think("".join(pezzi)).strip()
+    testo = service_text(backend, messaggi, p, should_stop=should_stop)
     return "" if _e_niente(testo) else testo
 
 

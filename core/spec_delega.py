@@ -45,9 +45,16 @@ i ``*.md`` -- non lo vede nemmeno. Una cartella nascosta sola invece di due.
 from __future__ import annotations
 
 import json
-import os
+import logging
+import threading
 from pathlib import Path
 from typing import Any
+
+from .atomic import write_text
+
+logger = logging.getLogger(__name__)
+_FACT_LOCK = threading.RLock()
+MAX_STORAGE_BYTES = 1024 * 1024
 
 NOME = ".deleghe.json"
 
@@ -67,16 +74,37 @@ SOGLIA_ESAURIMENTO = 0.5
 
 
 def _percorso(base: Path) -> Path:
-    return Path(base) / ".memoria" / NOME
+    root = Path(base).resolve()
+    path = root / ".memoria" / NOME
+    if not path.resolve().is_relative_to(root):
+        raise ValueError("L'archivio delle deleghe esce dal workspace.")
+    return path
 
 
 def leggi(base: Path) -> list[dict[str, Any]]:
     """I fatti su disco. Un file illeggibile vale come nessun fatto."""
     try:
-        dati = json.loads(_percorso(base).read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+        path = _percorso(base)
+        if path.stat().st_size > MAX_STORAGE_BYTES:
+            return []
+        with path.open("rb") as stream:
+            content = stream.read(MAX_STORAGE_BYTES + 1)
+        if len(content) > MAX_STORAGE_BYTES:
+            return []
+        dati = json.loads(content.decode("utf-8"))
+    except (OSError, ValueError, RecursionError):
         return []
-    return [f for f in dati if isinstance(f, dict)] if isinstance(dati, list) else []
+    if not isinstance(dati, list):
+        return []
+    return [f for f in dati[-MAX_FATTI:] if (
+        isinstance(f, dict)
+        and isinstance(f.get("domanda"), str)
+        and type(f.get("passi")) is int
+        and f["passi"] >= 0
+        and all(type(f.get(key)) is bool for key in (
+            "riuscito", "esaurito", "chiuso_a_forza"
+        ))
+    )]
 
 
 def registra(
@@ -93,36 +121,29 @@ def registra(
     Solo cose osservate, mai dedotte: sono gli stessi quattro campi che
     ``delega.esegui`` mette nel referto per il padre.
     """
-    domanda = " ".join(str(domanda or "").split())[:200]
-    if not domanda:
-        return
-    fatti = leggi(base)
-    fatti.append(
-        {
-            "domanda": domanda,
-            "passi": int(passi),
-            "riuscito": bool(riuscito),
-            "esaurito": bool(esaurito),
-            "chiuso_a_forza": bool(chiuso_a_forza),
-        }
-    )
     try:
-        percorso = _percorso(base)
-        percorso.parent.mkdir(parents=True, exist_ok=True)
-        marker = percorso.parent / ".gitignore"
-        if not marker.exists():
-            marker.write_text("*\n", encoding="utf-8")
-        # tmp + replace, come le preferenze: ``write_text`` tronca il file e
-        # poi scrive, quindi un'interruzione a meta' -- o due turni che
-        # archiviano insieme, e ``RUNNERS`` li fa girare in thread di sfondo --
-        # lascia un JSON monco. Al giro dopo ``_leggi`` non lo parsa e i fatti
-        # accumulati spariscono tutti insieme, in silenzio.
-        tmp = percorso.with_suffix(percorso.suffix + ".tmp")
-        tmp.write_text(
-            json.dumps(fatti[-MAX_FATTI:], ensure_ascii=False, indent=1), encoding="utf-8"
-        )
-        os.replace(tmp, percorso)
-    except OSError:
+        domanda = " ".join(str(domanda or "").split())[:200]
+        if not domanda:
+            return
+        fatto = {"domanda": domanda, "passi": max(0, int(passi)),
+                 "riuscito": bool(riuscito), "esaurito": bool(esaurito),
+                 "chiuso_a_forza": bool(chiuso_a_forza)}
+        # Serialize the whole read/append/replace transaction. Unique temporary
+        # files alone avoid partial JSON but do not avoid lost updates.
+        with _FACT_LOCK:
+            fatti = leggi(base)
+            fatti.append(fatto)
+            percorso = _percorso(base)
+            percorso.parent.mkdir(parents=True, exist_ok=True)
+            marker = percorso.parent / ".gitignore"
+            try:
+                with marker.open("x", encoding="utf-8") as stream:
+                    stream.write("*\n")
+            except FileExistsError:
+                pass
+            write_text(percorso, json.dumps(fatti[-MAX_FATTI:], ensure_ascii=False, indent=1))
+    except (OSError, ValueError, TypeError, OverflowError):
+        logger.warning("Impossibile registrare l'esito della delega", exc_info=True)
         return
 
 

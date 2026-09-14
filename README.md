@@ -3,6 +3,20 @@
 Harness agentico per modelli locali (Ollama / vLLM): workspace su disco, tool
 di lettura-scrittura-esecuzione, memoria a lungo termine, interfaccia web.
 
+Audit e refactoring del 6 settembre 2026: relazione in quattro fasi in
+`docs/audit/AUDIT.md`, verifiche in `docs/audit/VALIDAZIONE.md`, prompt completo
+in `core/system_prompt.py`. Questa revisione rende rigorosi JSON e schemi dei
+tool, limita i retry e il buffering, protegge le API locali e rende visibili
+i fallimenti di persistenza. Il deployment previsto resta un singolo processo
+per archivio e utente fidato; i rischi residui sono elencati nella relazione.
+Per riprodurre l'ambiente verificato usa `uv sync --locked --extra dev`.
+
+La revisione **2.37.0** interviene sul loop e sulla conservazione del contesto:
+checkpoint incrementali con stato aperto, recupero nel corpo degli archivi,
+risultati JSON integri, controllo del ragionamento per punto del piano e
+telemetria di tutte le chiamate. Dettagli e limiti delle verifiche in
+[Implementazione loop e contesto](docs/research/IMPLEMENTAZIONE_LOOP_CONTESTO_2026-09-14.md).
+
 ```bash
 uv sync --extra dev                 # oppure: pip install -r requirements.txt
 uv run python run.py                # apre http://127.0.0.1:8123
@@ -42,13 +56,16 @@ core/
   backend.py           transport Ollama nativo + fallback OpenAI-compatible
   prompts.py           system prompt ed environment header
   agent.py             ciclo agentico a eventi, contesto, sospensione
+  context.py           riduzione strutturata dei risultati e riferimenti recuperabili
+  inference.py         chiamate ausiliarie cancellabili, senza pubblicare output parziali
+  telemetry.py         tempi e token di ogni chiamata, separati per scopo
   profiles.py          parametri consigliati per famiglia di modello
   plan.py              piano di lavoro della conversazione e sue regole
   sandbox.py           esecuzione dei comandi in container Docker
   settings.py          preferenze persistenti fra un avvio e l'altro
   vault.py             vault LLM Wiki: struttura, schema, prompt del manutentore
   vault_search.py      sotto-turno che interroga una wiki senza cambiare workspace
-tests/                 915 test, nessun modello reale richiesto
+tests/                 suite di regressione, nessun modello reale richiesto
 ```
 
 `core/` non importa nulla del livello di presentazione: il ciclo agentico e' un
@@ -402,6 +419,27 @@ del backend. La sandbox si prova con un finto `docker` messo sul PATH. Nessun
 modello richiesto.
 
 ## Storia delle revisioni
+
+**v2.37.0** — checkpoint, recupero e misure del loop.
+
+La compattazione elabora i nuovi eventi e riporta esplicitamente attivita'
+aperte e vincoli. Le richieste e i chiarimenti umani restano testuali. I
+risultati dei tool conservano JSON valido, esiti, hash e percorsi del deposito;
+una scrittura fallita mantiene gli argomenti originali. La libreria cerca
+anche dentro gli archivi e restituisce frammenti pertinenti entro un budget.
+
+Il ragionamento si ripristina a un nuovo punto del piano o dopo un errore.
+Il controllo della finestra conta anche gli schemi dei tool; compattazione,
+estrazione e riepilogo rispettano lo stop e scartano le risposte incomplete.
+`think=false` e `repeat_penalty=1.0` vengono trasmessi esplicitamente quando
+supportati, con diagnostica che distingue richiesta e supporto conosciuto.
+
+Ogni turno conserva tempi, token riportati e stime per le chiamate principali
+e ausiliarie. I dettagli stanno in `<id>.telemetry.json`, aggiornato quando
+cambia lo snapshot, entro 50 turni e 2 MiB; il salvataggio dei tool non
+riscrive le metriche. La lettura resta compatibile con sessioni precedenti.
+Le prove sono deterministiche: non quantificano guadagni di qualita' o
+velocita' su un modello reale.
 
 **v2.36.1** — le ultime due attese, tolte alla radice.
 

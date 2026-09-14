@@ -406,21 +406,12 @@ def test_gli_schemi_pesano_piu_del_prompt():
     assert c["schemi_snelli"] > c["prompt_snello"]
 
 
-def test_il_prompt_snello_e_piu_lungo_di_quello_esteso():
-    """Il nome descrive gli schemi, non il prompt.
-
-    Non e' un difetto da correggere di corsa -- il totale del percorso snello
-    resta piu' basso, che e' cio' che conta -- ma va saputo: chi legge
-    "snello" si aspetta un testo piu' corto, e non lo e'. Il giorno in cui
-    qualcuno accorcia SYSTEM_PROMPT_LEAN, questo test glielo dice.
-    """
+def test_il_prompt_snello_e_piu_corto_di_quello_esteso():
+    """The revised contract is shared; only the extended prompt adds examples."""
     from core.prompts import costi_del_prefisso
 
     c = costi_del_prefisso()
-    assert c["prompt_snello"] > c["prompt_esteso"], (
-        "SYSTEM_PROMPT_LEAN e' diventato davvero piu' corto di SYSTEM_PROMPT: "
-        "aggiorna questo test e i commenti che spiegano la differenza"
-    )
+    assert c["prompt_snello"] < c["prompt_esteso"]
 
 
 # ---------------------------------------------------------------------------

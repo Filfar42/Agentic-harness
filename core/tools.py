@@ -13,17 +13,22 @@ Principi di design degli schemi, tutti pagati con dei bug veri:
 
 from __future__ import annotations
 
+from .process import run_bounded, OutputLimitExceeded
+
 import fnmatch
 import hashlib
 import json
+import logging
 import os
 import platform
 import posixpath
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import time
+import threading
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -31,6 +36,7 @@ from typing import Any
 from collections.abc import Callable
 
 from . import sandbox as sandbox_mod
+from . import atomic
 from . import vault as vault_mod
 from .config import Budgets
 from .memory import add_memory, remove_memory
@@ -38,6 +44,14 @@ from .notes import NoteError, Notes
 from . import deposito as deposito_mod
 from .plan import DONE, SKIPPED, Plan, PlanError
 from .textutils import smart_truncate, truncate_lines
+from .tool_validation import validate_arguments
+from .jsonsafe import JsonBoundaryError, loads_object
+
+logger = logging.getLogger(__name__)
+# Bounded striped locks serialize file read/modify/write transactions made by
+# concurrent turns. They do not claim to synchronize unrelated host processes.
+_FILE_LOCKS = tuple(threading.RLock() for _ in range(64))
+MAX_TEXT_FILE_BYTES = 8 * 1024 * 1024
 
 # Cartelle che non hanno mai valore informativo per l'agente e che, se listate,
 # saturano il contesto in un colpo solo.
@@ -314,11 +328,8 @@ class ToolContext:
     # Servono a distinguere una verifica verde che misura il codice nuovo da
     # una che misura tutt'altro.
     new_symbols: dict[str, str] = field(default_factory=dict)
-    # Verifiche rosse chiuse dichiarandole non pertinenti (``ignore_red``):
-    # comando, punto del piano e motivo scritto dal modello. Sono l'uscita di
-    # sicurezza del guard-rail, quindi vanno **contate**: un turno che ne usa
-    # tre non e' un turno andato bene, e senza questo elenco la differenza fra
-    # "tutto verde" e "tre rossi archiviati" non si vedrebbe da nessuna parte.
+    # Acknowledgment delle verifiche ancora irrisolte (opzione legacy
+    # ``ignore_red``): documentano una scelta, senza cancellare i fallimenti.
     rossi_ignorati: list[dict[str, str]] = field(default_factory=list)
     # Punti di piano chiusi in questo passo, in attesa che ``agent`` ne
     # distilli il ragionamento. E' una **casella postale, non una callback**:
@@ -334,9 +345,10 @@ class ToolContext:
     # essere perduta. Vedi ``core/deposito.py``.
     deposito_attivo: bool = True
     deposito_max_mb: int = deposito_mod.MAX_MB_DEFAULT
-    # Tracker per le verifiche rosse, impostato da agent.py per permetterne
-    # l'azzeramento automatico o manuale quando un comando non e' pertinente.
+    # Il ciclo possiede il tracker; il piano ne mostra la qualita' senza mutarla.
     verification: Any = None
+    verification_state: dict[str, Any] = field(default_factory=dict)
+    on_verification_changed: Callable[[dict[str, Any]], None] | None = None
     # I tool che questo turno puo' eseguire. ``None`` = tutti (il turno
     # normale); un insieme = solo quelli, ed e' cosi' che i sotto-turni --
     # l'esploratore della delega e il cercatore del vault -- restano di sola
@@ -358,9 +370,26 @@ class ToolContext:
         return self.tool_consentiti is None or name in self.tool_consentiti
 
     def clear_red_command(self) -> None:
+        """Reset esplicito del tracker; le operazioni sul piano non lo usano."""
         self.red_command = None
         if self.verification is not None and hasattr(self.verification, "clear"):
             self.verification.clear()
+
+    def quality_summary(self) -> dict[str, Any]:
+        """Qualita' delle verifiche, indipendente dalla chiusura dei punti."""
+        if self.verification is not None:
+            snapshot = getattr(self.verification, "snapshot", None)
+            if callable(snapshot):
+                return snapshot()
+            pending_checks = getattr(self.verification, "pending_checks", None)
+            if callable(pending_checks):
+                pending = pending_checks()
+                return {"status": "failing" if pending else "unverified", "pending": pending}
+        if self.verification_state:
+            return dict(self.verification_state)
+        pending = ([{"command": self.red_command, "returncode": None, "attempts": 0}]
+                   if self.red_command else [])
+        return {"status": "failing" if pending else "unverified", "pending": pending}
 
     @property
     def base(self) -> Path:
@@ -440,13 +469,19 @@ def store_attachment(workspace: str | Path, filename: str, data: bytes) -> dict[
 
     name = safe_attachment_name(filename)
     stem, suffix = Path(name).stem, Path(name).suffix
-    target = folder / name
-    counter = 1
-    while target.exists():
-        target = folder / f"{stem}-{counter}{suffix}"
-        counter += 1
-
-    target.write_bytes(data)
+    # Exclusive creation is both the collision check and the write boundary.
+    # exists()+write_bytes() overwrote concurrent uploads and followed dangling
+    # symlinks planted at a candidate filename.
+    for counter in range(10_000):
+        target = folder / (name if counter == 0 else f"{stem}-{counter}{suffix}")
+        try:
+            with target.open("xb") as stream:
+                stream.write(data)
+            break
+        except FileExistsError:
+            continue
+    else:
+        raise WorkspaceError("Troppi allegati con lo stesso nome: usa un altro nome.")
     return {
         "name": target.name,
         "path": f"{ATTACHMENTS_DIR}/{target.name}",
@@ -860,7 +895,8 @@ def load_images_b64(
             continue
         try:
             path = resolve_path(workspace, str(entry.get("path") or ""))
-            data = path.read_bytes()
+            with path.open("rb") as stream:
+                data = stream.read(MAX_IMAGE_BYTES + 1)
         except (WorkspaceError, OSError):
             skipped.append(name)
             continue
@@ -879,8 +915,19 @@ def resolve_path(workspace: str | Path, target: str) -> Path:
     ``/workspace-altrui`` superava il controllo. Qui si usa
     ``Path.is_relative_to``, che confronta i componenti del path.
     """
+    if not isinstance(target, str) or "\0" in target:
+        raise WorkspaceError("Percorso non valido: usa una stringa senza caratteri NUL.")
     base = Path(workspace).resolve()
     raw = (target or ".").strip().replace("\\", "/")
+    # NTFS alternate data streams bypass ordinary file semantics, and reserved
+    # device names can refer to devices even under an otherwise confined path.
+    if os.name == "nt":
+        relative_part = raw[2:] if re.match(r"^[A-Za-z]:", raw) else raw
+        if ":" in relative_part or any(
+            re.fullmatch(r"(?:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\..*)?", part, re.I)
+            for part in relative_part.split("/")
+        ):
+            raise WorkspaceError("Percorso non valido: stream NTFS e dispositivi Windows vietati.")
 
     candidate = Path(raw)
     if candidate.is_absolute():
@@ -901,10 +948,29 @@ def resolve_path(workspace: str | Path, target: str) -> Path:
     return resolved
 
 
+def _read_text_bounded(path: Path, *, errors: str = "replace") -> str:
+    """Read only regular, bounded files; growth during the read remains bounded."""
+    metadata = path.stat()
+    if not stat.S_ISREG(metadata.st_mode):
+        raise WorkspaceError("Il percorso non e' un file regolare.")
+    if metadata.st_size > MAX_TEXT_FILE_BYTES:
+        raise WorkspaceError(
+            f"Il file supera il limite di {MAX_TEXT_FILE_BYTES // (1024 * 1024)} MiB.",
+            hint="Usa un comando mirato per estrarre una porzione in un file piu' piccolo.",
+        )
+    with path.open("rb") as stream:
+        data = stream.read(MAX_TEXT_FILE_BYTES + 1)
+    if len(data) > MAX_TEXT_FILE_BYTES:
+        raise WorkspaceError("Il file e' cresciuto oltre il limite durante la lettura.")
+    return data.decode("utf-8", errors=errors).replace("\r\n", "\n").replace("\r", "\n")
+
+
 def _is_probably_binary(path: Path) -> bool:
     if path.suffix.lower() in BINARY_SUFFIXES:
         return True
     try:
+        if not stat.S_ISREG(path.stat().st_mode):
+            return True
         with open(path, "rb") as fh:
             return b"\0" in fh.read(2048)
     except OSError:
@@ -1073,8 +1139,8 @@ def tool_read_file(
         )
 
     try:
-        text = path.read_text(encoding="utf-8", errors="replace")
-    except OSError as exc:
+        text = _read_text_bounded(path)
+    except (OSError, WorkspaceError) as exc:
         return _err(f"Impossibile leggere '{filepath}': {exc}")
 
     # Rilettura di un file non toccato: e' il caso piu' frequente del ciclo
@@ -1183,21 +1249,21 @@ def tool_write_file(ctx: ToolContext, filepath: str, content: str = "") -> str:
             # copre ``UnicodeDecodeError``, che e' una ValueError. Un file
             # salvato in latin-1 faceva uscire l'eccezione dal tool e arrivare
             # al dispatch come "errore interno".
-            previous_text = path.read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            previous_text = ""
+            previous_text = _read_text_bounded(path)
+        except (OSError, WorkspaceError) as exc:
+            return _err(f"Impossibile verificare il contenuto prima di scrivere '{filepath}': {exc}")
     refusal = _refuse_test_edit(ctx, filepath, previous_text, content or "")
     if refusal:
         return refusal
 
-    previous_size = path.stat().st_size if existed else 0
     try:
+        previous_size = path.stat().st_size if existed else 0
         if is_scratch_path(filepath):
             # Crea la cartella con il suo .gitignore: il banco di prova non deve
             # mai comparire in `git status` del progetto dell'utente.
             ensure_scratch(ctx)
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(content or "", encoding="utf-8", newline="\n")
+        atomic.write_text(path, content or "")
     except OSError as exc:
         return _err(f"Scrittura fallita su '{filepath}': {exc}")
 
@@ -1214,6 +1280,7 @@ def tool_write_file(ctx: ToolContext, filepath: str, content: str = "") -> str:
             "filepath": rel,
             "bytes_before": previous_size,
             "bytes_after": len((content or "").encode("utf-8")),
+            "sha256": hashlib.sha256((content or "").encode("utf-8")).hexdigest(),
             "lines": (content or "").count("\n") + 1,
         }
     )
@@ -1256,8 +1323,8 @@ def tool_edit_file(
     try:
         # Stessa ragione della lettura in edit_file: UnicodeDecodeError non e'
         # una OSError e sfuggiva al ramo d'errore di questo tool.
-        text = path.read_text(encoding="utf-8", errors="replace")
-    except OSError as exc:
+        text = _read_text_bounded(path)
+    except (OSError, WorkspaceError) as exc:
         return _err(f"Impossibile leggere '{filepath}': {exc}")
 
     occurrences = text.count(old_string)
@@ -1289,7 +1356,7 @@ def tool_edit_file(
         return refusal
 
     try:
-        path.write_text(nuovo_testo, encoding="utf-8")
+        atomic.write_text(path, nuovo_testo)
     except OSError as exc:
         return _err(f"Scrittura fallita su '{filepath}': {exc}")
 
@@ -1300,6 +1367,7 @@ def tool_edit_file(
         {
             "status": "ok",
             "action": "modificato",
+            "sha256": hashlib.sha256(nuovo_testo.encode("utf-8")).hexdigest(),
             "filepath": rel,
             "replacements": quante,
             # Righe del frammento cercato e di quello messo al suo posto,
@@ -1389,13 +1457,21 @@ def tool_search_files(
             if _da_saltare(name) or not fnmatch.fnmatch(name, glob or "*"):
                 continue
             fpath = Path(dirpath) / name
+            # os.walk does not follow directory links, but its file entries can
+            # themselves be links. Resolve before even probing binary content.
+            try:
+                fpath = resolve_path(ctx.workspace, str(fpath))
+                if not fpath.is_file():
+                    continue
+            except (WorkspaceError, OSError, ValueError):
+                continue
             if _is_probably_binary(fpath):
                 continue
             files_scanned += 1
-            rel = fpath.relative_to(root).as_posix()
+            rel = (Path(dirpath) / name).relative_to(root).as_posix()
             try:
-                righe = fpath.read_text(encoding="utf-8", errors="ignore").splitlines()
-            except OSError:
+                righe = _read_text_bounded(fpath, errors="ignore").splitlines()
+            except (OSError, WorkspaceError):
                 continue
             for i, line in enumerate(righe):
                 if not regex.search(line):
@@ -1627,17 +1703,15 @@ def tool_run_command(ctx: ToolContext, command: str, timeout_sec: int | None = N
             f"{ctx.base}{os.pathsep}{precedente}" if precedente else str(ctx.base)
         )
         try:
-            proc = subprocess.run(
+            proc = run_bounded(
                 command,
                 shell=True,
                 cwd=str(ctx.base),
                 env=env,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
                 timeout=timeout,
             )
+        except OutputLimitExceeded as exc:
+            return _err(str(exc), hint="Riduci l'output e controlla gli effetti prima di ripetere il comando.")
         except subprocess.TimeoutExpired:
             return _err(
                 f"Comando interrotto dopo {timeout}s (timeout).",
@@ -1931,7 +2005,8 @@ _RE_FLASK = re.compile(r"^\s*(\w+)\s*=\s*Flask\s*\(", re.M)
 
 def _leggi_un_po(path: Path, limite: int = 40_000) -> str:
     try:
-        return path.read_text(encoding="utf-8", errors="replace")[:limite]
+        with path.open(encoding="utf-8", errors="replace") as stream:
+            return stream.read(limite)
     except OSError:
         return ""
 
@@ -1987,11 +2062,13 @@ def preview_backend(root: str | Path, port: int) -> dict[str, str] | None:
     pacchetto = root / "package.json"
     if pacchetto.is_file():
         try:
-            dati = json.loads(_leggi_un_po(pacchetto) or "{}")
-        except json.JSONDecodeError:
+            dati = loads_object(_leggi_un_po(pacchetto) or "{}")
+        except JsonBoundaryError:
             dati = {}
-        scripts = dati.get("scripts") or {}
-        deps = {**(dati.get("dependencies") or {}), **(dati.get("devDependencies") or {})}
+        scripts = dati.get("scripts")
+        scripts = scripts if isinstance(scripts, dict) else {}
+        deps = {**(dati.get("dependencies") if isinstance(dati.get("dependencies"), dict) else {}),
+                **(dati.get("devDependencies") if isinstance(dati.get("devDependencies"), dict) else {})}
         if "vite" in deps and "dev" in scripts:
             return {
                 "command": f"npm run dev -- --host 0.0.0.0 --port {porta}",
@@ -3083,8 +3160,37 @@ _ALLOWED_ARGS: dict[str, set[str]] = {
 }
 
 
+def validate_tool_arguments(name: str, args: Any) -> dict[str, Any] | None:
+    """Validate a tool call without executing it, including question tools.
+
+    Error fields preserve the existing ``error``/``hint`` protocol and add
+    machine-readable diagnostics for bounded self-correction in the agent loop.
+    """
+    schema = _TOOL_PARAMETER_SCHEMAS.get(name) if isinstance(name, str) else None
+    if schema is None:
+        return {"error": "Tool sconosciuto.", "error_code": "unknown_tool",
+                "tool": str(name)[:80], "retryable": False,
+                "hint": "Scegli un tool presente nello schema di questo turno."}
+    details = validate_arguments(args, schema)
+    if not details and isinstance(args, dict):
+        for field_name in ("filepath", "subfolder", "path", "command"):
+            value = args.get(field_name)
+            if isinstance(value, str) and "\0" in value:
+                details.append({"path": f"$.{field_name}", "message": "Carattere NUL vietato."})
+        if name == "read_file" and args.get("start_line", 1) > args.get("end_line", 2**63):
+            details.append({"path": "$.end_line", "message": "Deve essere >= start_line."})
+    if not details:
+        return None
+    return {"error": f"Argomenti non validi per '{name}'.", "error_code": "invalid_arguments",
+            "tool": name, "retryable": False, "details": details,
+            "hint": "Correggi i campi indicati e invia una nuova chiamata conforme allo schema. "
+                    "Nessuna azione e' stata eseguita; non ripetere gli stessi argomenti. "
+                    + " ".join(d["message"] for d in details)}
+
+
 def dispatch(ctx: ToolContext, name: str, args: dict[str, Any]) -> str:
-    impl = TOOL_IMPLS.get(name)
+    """Authorize and validate before entering a tool's side-effect boundary."""
+    impl = TOOL_IMPLS.get(name) if isinstance(name, str) else None
     if impl is None:
         return _err(
             f"Tool '{name}' inesistente.",
@@ -3101,14 +3207,21 @@ def dispatch(ctx: ToolContext, name: str, args: dict[str, Any]) -> str:
             hint="Strumenti di questo turno: "
             + ", ".join(sorted(ctx.tool_consentiti or ())),
         )
-    allowed = _ALLOWED_ARGS.get(name, set())
-    clean = {k: v for k, v in (args or {}).items() if k in allowed}
-    dropped = sorted(set((args or {}).keys()) - allowed)
+    invalid = validate_tool_arguments(name, args)
+    if invalid is not None:
+        return _ok(invalid)
     try:
-        result = impl(ctx, **clean)
+        # Keep file transactions ordered across contexts sharing a workspace.
+        if name in {"read_file", "write_file", "edit_file"}:
+            path = resolve_path(ctx.workspace, args["filepath"])
+            with _FILE_LOCKS[hash(str(path)) % len(_FILE_LOCKS)]:
+                result = impl(ctx, **args)
+        else:
+            result = impl(ctx, **args)
     except WorkspaceError as exc:
         return _err(str(exc), hint=getattr(exc, "hint", ""))
-    except Exception as exc:  # noqa: BLE001 - rete di sicurezza del dispatch
+    except Exception as exc:
+        logger.exception("Unexpected failure in tool %s", name)
         # C'era un ramo ``except TypeError`` separato che diceva al modello
         # "argomenti non validi" e gli allegava l'elenco dei parametri ammessi.
         # Ma ``clean`` e' gia' filtrato su ``_ALLOWED_ARGS`` due righe sopra,
@@ -3129,13 +3242,6 @@ def dispatch(ctx: ToolContext, name: str, args: dict[str, Any]) -> str:
             "guasto nella risposta.",
         )
 
-    if dropped:
-        try:
-            payload = json.loads(result)
-            payload["ignored_args"] = dropped
-            return json.dumps(payload, ensure_ascii=False)
-        except json.JSONDecodeError:
-            return result
     return result
 
 
@@ -3780,6 +3886,38 @@ WEB_SEARCH_TOOLS: list[dict[str, Any]] = [
 # Il perimetro vero -- spento vuol dire inutilizzabile -- lo tiene
 # ``ToolContext.web_search_enabled`` dentro ``tool_web_search``, che e' il
 # posto dove un permesso si controlla.
+_TOOL_PARAMETER_SCHEMAS = {
+    tool["function"]["name"]: tool["function"]["parameters"]
+    for tool in (*TOOLS_SCHEMA, *WEB_SEARCH_TOOLS)
+}
+for _parameters in _TOOL_PARAMETER_SCHEMAS.values():
+    _parameters["additionalProperties"] = False
+for _tool_name, _field_name, _minimum, _maximum in (
+    ("list_files", "depth", 1, 4),
+    ("read_file", "start_line", 1, 2**31 - 1),
+    ("read_file", "end_line", 1, 2**31 - 1),
+    ("search_files", "context_lines", 0, 4),
+    ("run_command", "timeout_sec", 1, 3600),
+    (PREVIEW_TOOL, "port", 1, 65535),
+    (PREVIEW_TOOL, "wait_s", 1, 60),
+    (WEB_SEARCH_TOOL, "max_results", 1, 10),
+):
+    _TOOL_PARAMETER_SCHEMAS[_tool_name]["properties"][_field_name].update(
+        {"minimum": _minimum, "maximum": _maximum}
+    )
+for _parameters in _TOOL_PARAMETER_SCHEMAS.values():
+    for _field_name, _property in _parameters["properties"].items():
+        if _property.get("type") == "string":
+            _property["maxLength"] = 2 * 1024 * 1024 if _field_name in {
+                "content", "old_string", "new_string"
+            } else 32768
+            if _field_name in _parameters["required"] and _field_name not in {
+                "content", "new_string"
+            }:
+                _property["minLength"] = 1
+        elif _property.get("type") == "array":
+            _property["maxItems"] = 128
+
 TOOL_NAMES = frozenset(
     t["function"]["name"] for t in (*TOOLS_SCHEMA, *WEB_SEARCH_TOOLS)
 )

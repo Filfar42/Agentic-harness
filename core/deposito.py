@@ -32,17 +32,17 @@ Tre scelte che sembrano dettagli e non lo sono
 * **Non sta dentro `.analisi/`.** Il banco di prova si svuota all'inizio di
   ogni turno: un handle imbucato li' morirebbe fra un turno e il successivo,
   mentre la cronologia continuerebbe a portarne il puntatore.
-* **Si pota a tetto di spazio, dal piu' vecchio.** Le conversazioni non
-  muoiono da sole, quindi legare la vita del deposito alla sessione vorrebbe
-  dire non potarlo mai. Un handle molto vecchio puo' sparire, e va bene: la
-  testa e la coda restano scritte in contesto: quello che si perde e' il resto,
-  cioe' esattamente cio' che oggi si perde sempre.
+* **Si pota a tetto di spazio, dal piu' vecchio.** I riferimenti ancora usati
+  dal contesto vengono protetti dal chiamante. Se da soli superano il tetto,
+  si conserva l'evidenza: il limite di spazio non rende falsi i puntatori.
 """
 
 from __future__ import annotations
 
 import re
+import stat
 import unicodedata
+from collections.abc import Iterable
 from pathlib import Path
 
 SCHEDARIO = ".deposito"
@@ -62,6 +62,35 @@ _TAGLIO = "\n\n[... deposito: il testo superava il tetto ed e' stato tagliato qu
 
 def cartella(base: Path) -> Path:
     return Path(base) / SCHEDARIO
+
+
+def _cartella_sicura(base: Path) -> Path | None:
+    """Il deposito e' una cartella fisica del workspace, mai un rimando."""
+    try:
+        cart = cartella(base)
+        if cart.is_symlink() or cart.is_junction():
+            return None
+        if cart.resolve().parent != Path(base).resolve():
+            return None
+        return cart
+    except (OSError, RuntimeError, ValueError):
+        return None
+
+
+def _files(cart: Path) -> list[tuple[float, int, Path]]:
+    """File regolari diretti, senza seguire link o interrompersi su un errore."""
+    files = []
+    try:
+        for path in cart.glob("*.txt"):
+            try:
+                st = path.lstat()
+                if stat.S_ISREG(st.st_mode) and not path.is_junction():
+                    files.append((st.st_mtime, st.st_size, path))
+            except OSError:
+                continue
+    except OSError:
+        pass
+    return files
 
 
 def _slug(testo: str) -> str:
@@ -94,13 +123,18 @@ def deposita(base: Path, testo: str, *, etichetta: str, intestazione: str = "") 
     if len(testo) > MAX_TESTO_CHARS:
         testo = testo[:MAX_TESTO_CHARS] + _TAGLIO
     try:
-        cart = cartella(base)
+        cart = _cartella_sicura(base)
+        if cart is None:
+            return None
         cart.mkdir(parents=True, exist_ok=True)
         # `*` in un .gitignore della cartella stessa: git la ignora per intero
         # senza toccare il .gitignore del progetto, che e' roba dell'utente.
         marker = cart / ".gitignore"
-        if not marker.exists():
-            marker.write_text("*\n", encoding="utf-8")
+        try:
+            with marker.open("x", encoding="utf-8") as stream:
+                stream.write("*\n")
+        except FileExistsError:
+            pass
         corpo = f"# {intestazione}\n\n{testo}" if intestazione else testo
         # ``open(..., "x")`` e non ``write_text``: fra il calcolo del numero e
         # la scrittura ci puo' stare un altro turno -- ``RUNNERS`` li fa girare
@@ -123,29 +157,38 @@ def deposita(base: Path, testo: str, *, etichetta: str, intestazione: str = "") 
     return f"{SCHEDARIO}/{nome}"
 
 
-def pota(base: Path, max_mb: int = MAX_MB_DEFAULT) -> int:
+def pota(
+    base: Path, max_mb: int = MAX_MB_DEFAULT, *, protetti: Iterable[str | Path] = (),
+) -> int:
     """Porta il deposito sotto il tetto buttando i file piu' vecchi.
 
     Torna quanti ne ha tolti. Si chiama a inizio turno e non a ogni scrittura:
     e' una stat per file su una cartella piccola, e farlo dodici volte per
     turno non cambierebbe niente se non il numero di syscall.
+
+    ``protetti`` contiene riferimenti relativi al workspace (.deposito/...) o
+    assoluti interni al deposito. Questi file restano anche sopra il tetto;
+    riferimenti esterni o non validi non proteggono file omonimi del deposito.
     """
     if max_mb <= 0:
         return 0
-    cart = cartella(base)
-    if not cart.is_dir():
+    cart = _cartella_sicura(base)
+    if cart is None or not cart.is_dir():
         return 0
     tetto = int(max_mb) * 1024 * 1024
-    try:
-        # Una ``stat`` per file, non due: la comprehension la chiamava una volta
-        # per il tempo e una per la dimensione, e su un deposito pieno sono il
-        # doppio delle syscall per la stessa risposta.
-        files = []
-        for p in cart.glob("*.txt"):
-            st = p.stat()
-            files.append((st.st_mtime, st.st_size, p))
-    except OSError:
-        return 0
+    radice = cart.resolve()
+    percorsi_protetti: set[Path] = set()
+    for riferimento in protetti:
+        try:
+            path = Path(riferimento)
+            if not path.is_absolute():
+                path = Path(base) / path
+            risolto = path.resolve()
+            if risolto.parent == radice:
+                percorsi_protetti.add(risolto)
+        except (OSError, RuntimeError, ValueError, TypeError):
+            continue
+    files = _files(cart)
     totale = sum(size for _, size, _ in files)
     if totale <= tetto:
         return 0
@@ -153,6 +196,8 @@ def pota(base: Path, max_mb: int = MAX_MB_DEFAULT) -> int:
     for _, size, path in sorted(files):
         if totale <= tetto:
             break
+        if radice / path.name in percorsi_protetti:
+            continue
         try:
             path.unlink()
         except OSError:
@@ -164,10 +209,7 @@ def pota(base: Path, max_mb: int = MAX_MB_DEFAULT) -> int:
 
 def occupazione(base: Path) -> int:
     """Byte occupati dal deposito. Serve a dirlo, non a decidere."""
-    cart = cartella(base)
-    if not cart.is_dir():
+    cart = _cartella_sicura(base)
+    if cart is None or not cart.is_dir():
         return 0
-    try:
-        return sum(p.stat().st_size for p in cart.glob("*.txt"))
-    except OSError:
-        return 0
+    return sum(size for _, size, _ in _files(cart))

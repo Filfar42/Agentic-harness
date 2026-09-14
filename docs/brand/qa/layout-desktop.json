@@ -1,0 +1,95 @@
+{
+  "viewport": {
+    "width": 1280,
+    "height": 720
+  },
+  "baseline": {
+    "app": {
+      "height": 720,
+      "width": 1280,
+      "x": 0,
+      "y": 0
+    },
+    "composer": {
+      "height": 51.25,
+      "width": 696,
+      "x": 274,
+      "y": 627.15625
+    },
+    "main": {
+      "height": 720,
+      "width": 740,
+      "x": 252,
+      "y": 0
+    },
+    "panel": {
+      "height": 720,
+      "width": 288,
+      "x": 992,
+      "y": 0
+    },
+    "sidebar": {
+      "height": 720,
+      "width": 252,
+      "x": 0,
+      "y": 0
+    },
+    "thread": {
+      "height": 496,
+      "width": 740,
+      "x": 252,
+      "y": 75.1875
+    },
+    "topbar": {
+      "height": 75.1875,
+      "width": 740,
+      "x": 252,
+      "y": 0
+    }
+  },
+  "refined": {
+    "app": {
+      "height": 720,
+      "width": 1280,
+      "x": 0,
+      "y": 0
+    },
+    "composer": {
+      "height": 51.25,
+      "width": 696,
+      "x": 274,
+      "y": 627.15625
+    },
+    "main": {
+      "height": 720,
+      "width": 740,
+      "x": 252,
+      "y": 0
+    },
+    "panel": {
+      "height": 720,
+      "width": 288,
+      "x": 992,
+      "y": 0
+    },
+    "sidebar": {
+      "height": 720,
+      "width": 252,
+      "x": 0,
+      "y": 0
+    },
+    "thread": {
+      "height": 496,
+      "width": 740,
+      "x": 252,
+      "y": 75.1875
+    },
+    "topbar": {
+      "height": 75.1875,
+      "width": 740,
+      "x": 252,
+      "y": 0
+    }
+  },
+  "identical": true
+}

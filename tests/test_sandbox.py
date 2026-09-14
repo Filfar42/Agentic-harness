@@ -109,6 +109,17 @@ def fake_docker(tmp_path, monkeypatch):
             f'@echo off\r\n"{sys.executable}" "{script}" %*\r\n', encoding="utf-8"
         )
         percorso = os.pathsep.join([str(bin_dir), os.environ.get("PATH", "")])
+        # A .cmd shim interprets Docker's Go-template pipes as shell syntax.
+        # Keep the real executable lookup/error handling, but execute this
+        # Python fixture directly so argv is identical to docker.exe's argv.
+        original_run = sandbox.run_bounded
+
+        def run_stub(args, **kwargs):
+            if str(args[0]).lower() == str(bin_dir / "docker.cmd").lower():
+                args = [sys.executable, str(script), *args[1:]]
+            return original_run(args, **kwargs)
+
+        monkeypatch.setattr(sandbox, "run_bounded", run_stub)
     else:
         stub = bin_dir / "docker"
         stub.write_text(STUB, encoding="utf-8")
@@ -404,23 +415,14 @@ def test_the_dockerfile_builds_even_without_a_requirements_file():
 # --- le porte non si litigano tra istanze -----------------------------------
 
 
-def test_other_workspaces_lets_go_of_the_ports_we_need(fake_docker, workspace, monkeypatch):
-    """Un'altra istanza dell'harness tiene le nostre porte: va via PRIMA del run.
-
-    Senza questo il bind fallisce con 'port is already allocated' e l'agente
-    resta appeso a un errore che non capisce (il proprio shell gira dentro un
-    container che proprio per quello non parte).
-    """
-    monkeypatch.setenv(
-        "DOCKER_FOREIGN_PS",
-        "fed456|agentic-harness-9c1d|127.0.0.1:8204-8207->8204-8207/tcp",
-    )
-    sandbox.ensure_container(workspace, ports=(8204, 8207))
-
+def test_other_workspace_port_conflict_never_removes_its_container(fake_docker, workspace, monkeypatch):
+    """A live container in another workspace is not an automatic eviction target."""
+    monkeypatch.setenv("DOCKER_FOREIGN_PS", "fed456|agentic-harness-9c1d|127.0.0.1:8204-8207->8204-8207/tcp")
+    with pytest.raises(sandbox.SandboxError, match="altro workspace"):
+        sandbox.ensure_container(workspace, ports=(8204, 8207))
     calls = fake_docker()
-    idx_run = next(i for i, c in enumerate(calls) if c[0] == "run")
-    rimosse_prima_del_run = [c[-1] for c in calls[:idx_run] if c[0] == "rm"]
-    assert "agentic-harness-9c1d" in rimosse_prima_del_run
+    assert not any(c[0] == "rm" and c[-1] == "agentic-harness-9c1d" for c in calls)
+    assert not any(c[0] == "run" for c in calls)
 
 
 def test_no_overlap_means_no_removals(fake_docker, workspace, monkeypatch):
