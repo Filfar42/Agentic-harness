@@ -43,15 +43,28 @@ html[data-theme="dark"] .harness-companion {
 .harness-companion[data-state="error"] .harness-companion__eyes rect { transform: rotate(-18deg) scaleY(.7); }
 .harness-companion[data-state="error"] .harness-companion__eyes rect:last-child { transform: rotate(18deg) scaleY(.7); }
 
-/* Reserve space clear of text and attachments. Align with the 31 px send button. */
+/* La mascotte sta **sopra** il riquadro di scrittura, appoggiata al suo bordo.
+   Prima occupava una fascia riservata dentro il composer -- 52 px di altezza
+   piu' 4 di margine -- e il riquadro di input cresceva di quasi sessanta pixel
+   per farle posto, su una colonna dove quello spazio serve al testo. Adesso la
+   fascia e' fuori dal flusso: il composer torna alto quanto la riga di
+   scrittura e la mascotte gli poggia sopra.
+
+   ``right`` centra i 42 px della mascotte sui 31 del tasto invio: 8 px di
+   padding del composer meno la meta' della differenza. */
+#composer { position: relative; }
 .companion-rail {
+  position: absolute;
+  right: 2.5px;
+  bottom: calc(100% - 3px);
   display: flex;
   justify-content: flex-end;
   align-items: flex-end;
-  min-height: 52px;
-  margin-bottom: 4px;
+  height: 42px;
+  pointer-events: none;
+  z-index: 3;
 }
-#composer-companion { width: 42px; height: 42px; margin-right: -5.5px; flex: none; }
+#composer-companion { width: 42px; height: 42px; flex: none; }
 #composer-companion .harness-companion { width: 42px; height: 42px; }
 #composer-companion::before {
   content: "";
@@ -60,9 +73,18 @@ html[data-theme="dark"] .harness-companion {
   width: 26px;
   height: 5px;
   border-radius: 50%;
-  background: var(--accent, #0b7169);
-  opacity: .15;
+  /* Piu' scura di prima (era accent al 15%): appoggiata sul bordo del riquadro
+     invece che dentro una fascia, un'ombra cosi' tenue non la faceva posare da
+     nessuna parte -- sembrava che fluttuasse. Sul chiaro il colore e' quello
+     del testo, che e' cio' che un'ombra fa davvero; sullo scuro resta la tinta
+     d'accento, perche' un'ombra scura su fondo scuro non si vede. */
+  background: var(--text, #1c2b30);
+  opacity: .3;
   filter: blur(2px);
+}
+html[data-theme="dark"] #composer-companion::before {
+  background: var(--accent, #68d5c4);
+  opacity: .3;
 }
 
 .harness-companion__speech {

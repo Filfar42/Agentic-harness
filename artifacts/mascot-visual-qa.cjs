@@ -21,7 +21,10 @@ const assert = require('node:assert/strict');
     };
     return {
       hosts: document.querySelectorAll('.harness-companion').length,
-      robot: rect('#composer-companion'), send: rect('#send'),
+      robot: rect('#composer-companion'), send: rect('#send'), composer: rect('#composer'),
+      railPosition: getComputedStyle(document.querySelector('.companion-rail')).position,
+      mouths: document.querySelectorAll('.harness-companion__mouth').length,
+      poseParts: [...document.querySelectorAll('.harness-companion__pose')].map(n => n.childNodes.length),
       bubble: rect('#composer-companion .harness-companion__speech'), text: rect('#composer textarea'),
       speech: [...document.querySelectorAll('.harness-companion__speech')].map(n => n.textContent),
       animated: [...document.querySelectorAll('.harness-companion__pose')].map(n => getComputedStyle(n).animationName),
@@ -30,6 +33,13 @@ const assert = require('node:assert/strict');
   assert.equal(initial.hosts, 2);
   assert.ok(Math.abs(initial.robot.x + initial.robot.width / 2 - initial.send.x - initial.send.width / 2) < 1);
   assert.ok(initial.robot.bottom < initial.send.y);
+  // La fascia e' fuori dal flusso: il riquadro di scrittura non cresce per
+  // farle posto, la mascotte gli poggia sopra.
+  assert.equal(initial.railPosition, 'absolute');
+  assert.ok(Math.abs(initial.robot.bottom - initial.composer.y) < 6);
+  // Fedelta' al simbolo: testa con antenna e occhi, niente bocca.
+  assert.equal(initial.mouths, 0);
+  assert.deepEqual(initial.poseParts, [2, 2]);
   assert.ok(initial.bubble.bottom < initial.text.y);
   assert.deepEqual(initial.animated, ['companion-working', 'companion-working']);
   assert.deepEqual(initial.speech, ['Ci penso io…', 'Ci penso io…']);

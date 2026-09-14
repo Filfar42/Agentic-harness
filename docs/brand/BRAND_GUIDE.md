@@ -37,7 +37,7 @@ Il report `CONTRAST.md` misura 189 combinazioni di testo, superficie e stato. Qu
 
 ## 2. Marchio
 
-Il simbolo statico nasce da una griglia di **32 unità**: testa compatta con angoli morbidi, due occhi verticali e antenna centrale. Gli asset del marchio non hanno bocca, riflessi, ombre o decorazioni e restano invariati. La mascotte animata aggiunge espressioni facciali, come descritto nella sezione 3. L'approcciabilità del marchio deriva dalle proporzioni, la precisione dalla geometria.
+Il simbolo statico nasce da una griglia di **32 unità**: testa compatta con angoli morbidi, due occhi verticali e antenna centrale. Gli asset del marchio non hanno bocca, riflessi, ombre o decorazioni e restano invariati. **La mascotte animata ha la stessa geometria**: le espressioni le portano gli occhi, come descritto nella sezione 3. L'approcciabilità del marchio deriva dalle proporzioni, la precisione dalla geometria.
 
 Il nome del prodotto resta **Local Agent Harness**. Il wordmark breve “Harness”, già coerente con il nome dell'app mobile, è accompagnato dalla denominazione completa. Non è stato rinominato il prodotto nell'interfaccia.
 
@@ -70,7 +70,11 @@ Serve Node con `sharp` disponibile. Quando si usa un runtime condiviso, impostar
 
 ## 3. Mascotte
 
-`web/companion.js` e `web/companion.css` realizzano il robot con SVG nativo. Due copie sincronizzate accompagnano la conversazione attiva: una nello **slot del logo da 28 px** in alto a sinistra e una da **42 px sopra il tasto di invio**, nell'host `#composer-companion`. La seconda occupa una fascia riservata dentro il composer, senza sovrapporsi all'area di testo. La mascotte animata ha una bocca espressiva; i file statici del marchio mantengono la geometria originale. Sul mobile l'identità resta nelle icone dell'app.
+`web/companion.js` e `web/companion.css` realizzano il robot con SVG nativo. Due copie sincronizzate accompagnano la conversazione attiva: una nello **slot del logo da 28 px** in alto a sinistra e una da **42 px appoggiata al bordo superiore del composer**, centrata sul tasto di invio, nell'host `#composer-companion`.
+
+La fascia che la contiene è **fuori dal flusso** (`position: absolute`): il riquadro di scrittura non cresce per farle posto. Prima occupava una banda riservata di 52 px più 4 di margine dentro il composer, cioè quasi sessanta pixel sottratti alla colonna del testo. L'ombra ellittica sotto i piedi la fa posare sul bordo invece che fluttuare: colore del testo al 30% sul chiaro, tinta d'accento sullo scuro, dove un'ombra scura non si vedrebbe.
+
+**La mascotte non ha bocca**, come il simbolo statico: le due copie stanno una accanto al logo e una sopra l'invio, e una bocca presente solo nell'animata rendeva visibile la differenza proprio dove le due geometrie si confrontano. L'espressione la portano gli occhi. Sul mobile l'identità resta nelle icone dell'app.
 
 | Stato | Evento | Movimento ed espressione | Nuvoletta |
 | --- | --- | --- | --- |
@@ -79,13 +83,13 @@ Serve Node con `sharp` disponibile. Quando si usa un runtime condiviso, impostar
 | `success` | `done: completed`, più di un passo, senza errore del turno | Triplo saltino fino a 10 px ed espressione felice | Fatto! ✨ |
 | `idle` | Quiete, annullamento, domanda o limite di passi | Nessuna animazione | Nessuna |
 | `resting` | 45 secondi di inattività senza editing | Inclinazione fino a 13°, sguardo curioso e battito degli occhi | Sono qui! |
-| `error` | Errore effettivo o conclusione con motivo `error` | Scuotimento laterale e bocca preoccupata; i dettagli restano nel messaggio operativo | Ops, riproviamo? |
+| `error` | Errore effettivo o conclusione con motivo `error` | Scuotimento laterale e occhi inclinati; i dettagli restano nel messaggio operativo | Ops, riproviamo? |
 
 Non esiste una schermata di login in questa UI: il saluto è legato all'avvio dell'app. Una riconnessione annunciata non è trattata come fallimento definitivo. Cambiare conversazione azzera l'espressione della chat precedente. Eventi ripetuti non riavviano il gesto. La chiusura tecnica dello stream non annulla una conferma di successo appena ricevuta.
 
 I gesti durano **1.400 ms**, una sola volta. Durante `working`, oscillazione e saltini si ripetono con un ciclo CSS di **1.700 ms** e lo sguardo con un ciclo di **2.100 ms**, finché il turno resta attivo. Le nuvolette compaiono per **4 secondi** all'ingresso nello stato. Non ci sono tracciamento del puntatore o richieste di rete. Il timer d'inattività è singolo, non ricorrente: il focus in un campo sospende il conteggio, mantenendo disponibili i gesti espliciti di saluto, attività, successo ed errore.
 
-Nascondere la scheda cancella il gesto e la nuvoletta in corso. Tornare alla scheda non riproduce vecchi festeggiamenti. Con `prefers-reduced-motion` le animazioni si fermano; espressioni facciali e testo delle nuvolette restano disponibili.
+Nascondere la scheda cancella il gesto e la nuvoletta in corso. Tornare alla scheda non riproduce vecchi festeggiamenti. Con `prefers-reduced-motion` le animazioni si fermano; le espressioni degli occhi e il testo delle nuvolette restano disponibili.
 
 Il controller espone `init`, `setState`, `getState` e `destroy`. `init({mounts: [...]})` collega più host a un unico controller, condividendo stato, timer e listener; resta supportata la forma precedente `init({mount: ...})`. La distruzione libera timer e listener e ripristina i nodi originali di tutti gli host, mantenendone l'identità. La grafica e le nuvolette sono decorative, `aria-hidden`, e non entrano nell'ordine di tabulazione. Le animazioni usano trasformazioni SVG, adatte a un rendering fluido: non è stata effettuata una misura FPS su dispositivi fisici, quindi non viene garantito un valore di 60 fps.
 

@@ -137,7 +137,7 @@ function advance(milliseconds) {
 function graphic() { return host.childNodes[0]; }
 function gesture() { return graphic().getAttribute('data-gesture'); }
 function speech() { return host.childNodes[1]; }
-function mouth() { return graphic().childNodes[0].childNodes[2]; }
+function pose() { return graphic().childNodes[0]; }
 function hide(value) { document.hidden = value; document.dispatch('visibilitychange'); }
 function reduce(value) { motion.matches = value; motion.dispatch('change'); }
 """
@@ -326,7 +326,14 @@ def test_idle_cue_is_finite_and_user_activity_rearms_one_deadline(js) -> None:
 
 
 def test_failure_gesture_is_finite_and_expression_persists_until_explicit_recovery(js) -> None:
-    js.eval("companion.init({state: 'working'}); companion.setState('error'); var errorMouth = mouth().getAttribute('d');")
+    """L'espressione resta finche' non si dichiara il contrario.
+
+    Prima la misura era il tracciato della bocca. La bocca non c'e' piu' -- il
+    simbolo del marchio non ne ha una, e disegnarla solo nella mascotte faceva
+    due robot diversi -- quindi l'espressione e' ``data-state`` sulla grafica,
+    che e' cio' che il CSS legge per inclinare e stringere gli occhi.
+    """
+    js.eval("companion.init({state: 'working'}); companion.setState('error');")
     assert js.eval("gesture()") == "shake"
     assert js.eval("speech().textContent") == "Ops, riproviamo?"
     js.eval("advance(600000);")
@@ -335,9 +342,23 @@ def test_failure_gesture_is_finite_and_expression_persists_until_explicit_recove
     assert js.eval("timers.size") == 0
     js.eval("document.dispatch('pointerdown');")
     assert js.eval("companion.getState()") == "error"
-    assert js.eval("mouth().getAttribute('d') === errorMouth") is True
+    assert js.eval("graphic().getAttribute('data-state')") == "error"
     assert js.eval("companion.setState('idle')") is True
-    assert js.eval("mouth().getAttribute('d') === errorMouth") is False
+    assert js.eval("graphic().getAttribute('data-state')") == "idle"
+
+
+def test_the_face_has_no_mouth(js) -> None:
+    """Fedelta' al simbolo: testa, occhi, antenna. Niente altro.
+
+    Le due copie della mascotte stanno una accanto al logo e una sopra l'invio:
+    una bocca presente solo nell'animata rendeva visibile la differenza proprio
+    dove le due geometrie si confrontano.
+    """
+    js.eval("companion.init({state: 'welcome'});")
+    assert js.eval("pose().childNodes.length") == 2
+    for stato in ("welcome", "working", "success", "idle", "resting", "error"):
+        js.eval(f"companion.setState('{stato}');")
+        assert js.eval("pose().childNodes.length") == 2, stato
 
 
 def test_multiple_mounts_share_feedback_timers_and_restore_all_original_content(js) -> None:

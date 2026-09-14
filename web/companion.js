@@ -24,15 +24,6 @@
     welcome: 'Ciao! ✨', working: 'Ci penso io…', success: 'Fatto! ✨',
     resting: 'Sono qui!', error: 'Ops, riproviamo?', idle: '',
   };
-  const MOUTHS = {
-    welcome: 'M11 23 Q16 29 21 23',
-    working: 'M17.5 24 A1.5 1.8 0 1 1 14.5 24 A1.5 1.8 0 1 1 17.5 24',
-    success: 'M10.5 23 Q16 29.5 21.5 23',
-    idle: 'M12.5 24 Q16 26 19.5 24',
-    resting: 'M13.5 24 Q16 25.5 18.5 24',
-    error: 'M12 25 Q16 21 20 25',
-  };
-
   let mounts = [];
   let currentState = 'idle';
   let gestureTimer = null;
@@ -64,16 +55,15 @@
     const eyes = svgNode('g', {class: 'harness-companion__eyes'});
     eyes.appendChild(svgNode('rect', {x: 9, y: 15, width: 4, height: 6, rx: 2}));
     eyes.appendChild(svgNode('rect', {x: 19, y: 15, width: 4, height: 6, rx: 2}));
-    const mouth = svgNode('path', {
-      class: 'harness-companion__mouth', d: MOUTHS.idle,
-      fill: 'none', stroke: 'var(--companion-eye)', 'stroke-width': 1.8,
-      'stroke-linecap': 'round', 'stroke-linejoin': 'round',
-    });
+    // Niente bocca: il simbolo del marchio ha testa, occhi e antenna, e basta.
+    // Una bocca disegnata solo nella versione animata faceva due robot diversi
+    // -- quello statico degli asset e quello della chat -- e la differenza si
+    // vedeva proprio dove le due copie stanno vicine, nello slot del logo.
+    // L'espressione la portano gli occhi, che nel marchio ci sono gia'.
     pose.appendChild(face);
     pose.appendChild(eyes);
-    pose.appendChild(mouth);
     svg.appendChild(pose);
-    return {graphic: svg, mouth};
+    return {graphic: svg};
   }
 
   function clearGesture() {
@@ -151,10 +141,9 @@
     clearGesture();
     clearIdleTimer();
     currentState = next;
-    mounts.forEach(({host, graphic, mouth}) => {
+    mounts.forEach(({host, graphic}) => {
       host.setAttribute('data-state', next);
       graphic.setAttribute('data-state', next);
-      mouth.setAttribute('d', MOUTHS[next]);
     });
     showSpeech(next);
     if (CUES[next]) gesture(CUES[next]);
@@ -243,14 +232,14 @@
       const hadHostClass = host.classList.contains('harness-companion-host');
       previousNodes.forEach((node) => node.remove());
       host.classList.add('harness-companion-host');
-      const {graphic, mouth} = makeGraphic();
+      const {graphic} = makeGraphic();
       const speech = document.createElement('span');
       speech.setAttribute('class', 'harness-companion__speech');
       speech.setAttribute('aria-hidden', 'true');
       speech.hidden = true;
       host.appendChild(graphic);
       host.appendChild(speech);
-      return {host, graphic, mouth, speech, previousNodes, hadHostClass, previousAttributes};
+      return {host, graphic, speech, previousNodes, hadHostClass, previousAttributes};
     });
     motionPreference = typeof global.matchMedia === 'function'
       ? global.matchMedia('(prefers-reduced-motion: reduce)') : null;
