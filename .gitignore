@@ -22,3 +22,6 @@ agent_settings.json
 # altri archivi qui sopra -- il nome sta scritto perche' senza estensione la
 # regola *.zip non lo prende.
 ziln0aV3
+
+# Uscite consegnate dall'app di Claude: file di lavoro, non sorgenti.
+Claude outputs/
