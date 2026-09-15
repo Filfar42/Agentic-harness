@@ -28,7 +28,7 @@ import tests.test_agent_loop as fake
 from core import agent as agent_mod
 from core.backend import OllamaBackend
 from core.config import GenParams
-from core.plan import DONE, Plan, PlanError, render_block, render_summary
+from core.plan import DOING, DONE, Plan, PlanError, render_block, render_summary
 from core.textutils import chars_for_tokens
 from core.tools import PLAN_TOOL, TOOLS_SCHEMA, ToolContext, dispatch
 from core.verifiche import RegistroVerifiche
@@ -237,6 +237,65 @@ def test_un_punto_si_chiude_anche_con_una_verifica_rossa(tmp_path):
 
     # E il punto successivo si apre da solo: era proprio la mossa che mancava.
     assert risposta["aperto_in_automatico"]["id"] == "2"
+
+
+def test_chiudere_senza_step_id_chiude_il_punto_in_corso(tmp_path):
+    """Il punto lo sanno tutti e due: e' quello aperto, ed e' scritto in coda.
+
+    Il modello finiva un punto e chiamava ``complete`` senza ``step_id``. Il
+    piano rispondeva "Nel piano non c'e' nessun punto ''" -- formalmente vero e
+    praticamente inutile: ce n'e' uno solo in corso per costruzione, e sta nel
+    blocco che il modello ha appena letto. Su un modello piccolo quel
+    round-trip finisce spesso in un secondo errore invece che nella risposta.
+    """
+    ctx = ctx_vuoto(tmp_path)
+    dispatch(ctx, PLAN_TOOL, {"action": "set", "steps": ["leggere", "correggere"]})
+    assert ctx.plan.current.id == "1"
+
+    risposta = json.loads(dispatch(ctx, PLAN_TOOL, {"action": "complete", "note": "4 test verdi"}))
+    assert risposta["status"] == "ok"
+    assert ctx.plan.get("1").status == DONE
+    assert ctx.plan.get("1").note == "4 test verdi"
+    # Senza questa riga il modello dovrebbe dedurre al passo dopo su cosa ha
+    # agito, che e' proprio il passo che si vuole risparmiare.
+    assert risposta["punto_chiuso"] == {"id": "1", "text": "leggere"}
+    assert any("step_id non indicato" in a for a in risposta["avvisi"])
+    # E il successivo si apre da solo, come con l'id esplicito.
+    assert risposta["aperto_in_automatico"]["id"] == "2"
+
+
+def test_saltare_e_aprire_senza_step_id(tmp_path):
+    ctx = ctx_vuoto(tmp_path)
+    dispatch(ctx, PLAN_TOOL, {"action": "set", "steps": ["uno", "due"]})
+
+    saltato = json.loads(dispatch(ctx, PLAN_TOOL, {"action": "skip", "note": "non serve piu'"}))
+    assert ctx.plan.get("1").status == "skipped"
+    assert saltato["punto_chiuso"]["id"] == "1"
+
+    # ``start`` senza id vale "riprendi da dove sei": un no-op sul punto aperto,
+    # non un errore.
+    ripreso = json.loads(dispatch(ctx, PLAN_TOOL, {"action": "start"}))
+    assert ripreso["status"] == "ok"
+    assert ctx.plan.get("2").status == DOING
+
+
+def test_senza_punti_aperti_lo_step_id_mancante_torna_a_chiedere(tmp_path):
+    """Quando l'intenzione non e' univoca non si indovina."""
+    ctx = ctx_vuoto(tmp_path)
+    vuoto = json.loads(dispatch(ctx, PLAN_TOOL, {"action": "complete"}))
+    assert "non c'e' ancora un piano" in vuoto["error"].lower()
+
+    dispatch(ctx, PLAN_TOOL, {"action": "set", "steps": ["uno"]})
+    dispatch(ctx, PLAN_TOOL, {"action": "complete", "step_id": "1"})
+    finito = json.loads(dispatch(ctx, PLAN_TOOL, {"action": "complete"}))
+    assert "gia' chiusi" in finito["error"]
+
+    # Piu' punti aperti e nessuno in corso: il caso in cui indovinare
+    # significherebbe chiudere un punto al posto di un altro.
+    ctx.plan.set_steps(["a", "b"])
+    ambiguo = json.loads(dispatch(ctx, PLAN_TOOL, {"action": "complete"}))
+    assert "non so quale intendi" in ambiguo["error"]
+    assert "(a)" in ambiguo["hint"] and "(b)" in ambiguo["hint"]
 
 
 def test_il_risultato_non_rimanda_indietro_il_piano(tmp_path):

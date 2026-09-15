@@ -2553,6 +2553,40 @@ def _annota_chiusura(
     )
 
 
+def _punto_sottinteso(plan: Any, action: str) -> tuple[Any, str] | None:
+    """Su quale punto agire quando il modello non l'ha detto.
+
+    Il caso: il modello finisce un punto e chiama ``complete`` senza
+    ``step_id``. Il piano rispondeva "Nel piano non c'e' nessun punto ''" --
+    formalmente vero e praticamente inutile, perche' il punto lo sapevano tutti
+    e due: e' quello aperto, ce n'e' uno solo per volta per costruzione
+    (``Plan.start``), ed e' scritto nel blocco di coda che il modello ha appena
+    letto. Chiedere di ripetere un'informazione che l'harness possiede gia' e'
+    un round-trip speso per niente, e su un modello piccolo e' un round-trip
+    che spesso finisce in un secondo errore.
+
+    Stessa famiglia della coercizione di ``steps`` da testo a lista poco piu'
+    sopra: quando l'intenzione e' univoca, rifiutare e' corretto e inutile.
+    Quando **non** e' univoca -- nessun punto aperto, o piu' d'uno senza che
+    nessuno sia in corso -- non si indovina: si torna a chiedere.
+    """
+    corrente = plan.current
+    aperti = plan.open_steps
+    if action in ("complete", "skip"):
+        if corrente is not None:
+            return (corrente, "quello in corso")
+        if len(aperti) == 1:
+            return (aperti[0], "l'unico rimasto aperto")
+        return None
+    # ``start``: senza id vale "riprendi da dove sei", che e' un no-op se un
+    # punto e' gia' aperto e apre il primo rimasto se non lo e'.
+    if corrente is not None:
+        return (corrente, "quello gia' in corso")
+    if aperti:
+        return (aperti[0], "il primo rimasto da fare")
+    return None
+
+
 def _e_chiuso(ctx: ToolContext, step_id: str) -> bool:
     """Lo stato del punto **prima** della mossa: dopo, sono tutti chiusi."""
     step = ctx.plan.get(str(step_id))
@@ -2585,6 +2619,38 @@ def tool_manage_plan(
     # passa la differenza fra "fatto" e "fatto bene": il punto si chiude, e
     # accanto c'e' scritto cosa resta rosso.
     avvisi: list[str] = []
+    # Il punto sottinteso si risolve **prima** di entrare nelle azioni, cosi'
+    # che complete, skip e start vedano tutti lo stesso id e la nota finisca sul
+    # punto giusto.
+    if action in ("start", "complete", "skip") and not str(step_id or "").strip():
+        sottinteso = _punto_sottinteso(ctx.plan, action)
+        if sottinteso is None:
+            if not ctx.plan.steps:
+                return _err(
+                    "Non c'e' ancora un piano.",
+                    hint="Scrivilo con action='set' e l'elenco dei punti; il primo si apre da solo.",
+                )
+            if not ctx.plan.open_steps:
+                return _err(
+                    "Tutti i punti del piano sono gia' chiusi.",
+                    hint=(
+                        "Se resta del lavoro aggiungilo con action='add', "
+                        "altrimenti scrivi il messaggio di chiusura."
+                    ),
+                )
+            elenco = ", ".join(f"{s.id} ({s.text})" for s in ctx.plan.open_steps[:5])
+            return _err(
+                "Nessun punto e' in corso, quindi non so quale intendi.",
+                hint=f"Passa step_id. Punti aperti: {elenco}.",
+            )
+        punto, perche = sottinteso
+        step_id = punto.id
+        avvisi.append(
+            f"step_id non indicato: ho agito sul punto {punto.id} ('{punto.text}'), "
+            f"{perche}. La prossima volta puoi ometterlo di nuovo, ma dirlo "
+            "costa meno di un fraintendimento."
+        )
+    chiuso_ora: Any = None
     try:
         if action == "set":
             if isinstance(steps, str):
@@ -2671,6 +2737,7 @@ def tool_manage_plan(
                         )
             gia_chiuso = _e_chiuso(ctx, step_id)
             chiuso = ctx.plan.complete(step_id, note)
+            chiuso_ora = chiuso
             _annota_chiusura(ctx, chiuso, saltato=False, era_gia_chiuso=gia_chiuso)
             aperto = ctx.plan.avanza()
         elif action == "skip":
@@ -2684,6 +2751,7 @@ def tool_manage_plan(
             motivo = str(note or "").strip()
             gia_chiuso = _e_chiuso(ctx, step_id)
             chiuso = ctx.plan.skip(step_id, motivo)
+            chiuso_ora = chiuso
             _annota_chiusura(ctx, chiuso, saltato=True, era_gia_chiuso=gia_chiuso)
             aperto = ctx.plan.avanza()
         elif action == "show":
@@ -2714,6 +2782,11 @@ def tool_manage_plan(
         "punti": len(ctx.plan.steps),
         "current": ctx.plan.current.id if ctx.plan.current else None,
     }
+    if chiuso_ora is not None:
+        # Con lo step_id sottinteso il modello non sa da solo su cosa ha agito:
+        # senza questa riga dovrebbe dedurlo dal blocco di coda al passo dopo,
+        # che e' esattamente il passo che si vuole risparmiare.
+        esito["punto_chiuso"] = {"id": chiuso_ora.id, "text": chiuso_ora.text}
     if ctx.rossi_ignorati:
         # Torna al modello ad ogni operazione sul piano: se ne ha gia'
         # archiviati due, deve saperlo prima di archiviarne un terzo.
@@ -3654,7 +3727,8 @@ TOOLS_SCHEMA: list[dict[str, Any]] = [
                         "type": "string",
                         "description": (
                             "Numero del punto su cui agire, per start, "
-                            "complete e skip."
+                            "complete e skip. Puoi ometterlo: senza, vale il "
+                            "punto attualmente in corso."
                         ),
                     },
                     "note": {
