@@ -861,6 +861,19 @@ details.drawer.failed { border-color: color-mix(in srgb, var(--err) 40%, var(--b
   color: var(--text-faint); word-break: break-word;
 }
 
+/* Tipo del punto: una sigla, non un colore solo. Pieno per diagnosi e
+   progettazione (dove l'agente pensa a lungo), a filo per esegui e indaga. */
+.plan-tipo {
+  display: inline-block; margin-right: 6px; padding: 0 5px;
+  font-size: 10px; line-height: 16px; border-radius: 4px;
+  border: 1px solid var(--border-strong); color: var(--text-muted);
+  text-transform: lowercase; vertical-align: 1px;
+}
+.plan-tipo-diagnosi, .plan-tipo-progetta {
+  background: var(--border-strong); color: var(--text);
+}
+.plan-ipotesi::before { content: "\2192  "; }
+
 /* Da fare: il grado zero. Nessuna tinta -- e' l'assenza di sfondo a dire
    "questo non e' ancora successo", e tutto il resto si stacca da qui. */
 .plan-step.todo .plan-text { color: var(--text-muted); }

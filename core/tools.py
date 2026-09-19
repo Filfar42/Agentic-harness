@@ -2663,7 +2663,9 @@ def tool_manage_plan(
                     "Con action='set' serve 'steps': l'elenco dei punti del piano.",
                     hint='Esempio: steps=["correggere _has_cycle", "far passare i test"]',
                 )
-            ctx.plan.set_steps([str(s) for s in steps])
+            # Gli elementi passano cosi' come sono: una stringa porta il tipo
+            # nel prefisso ('diagnosi: ...'), un oggetto nel campo 'tipo'.
+            ctx.plan.set_steps([s if isinstance(s, dict) else str(s) for s in steps])
             # Anche qui: il primo punto lo apre l'harness. Scrivere il piano e
             # poi chiedere il permesso di cominciarlo erano due round-trip per
             # una decisione che non ha alternative.
@@ -2673,7 +2675,11 @@ def tool_manage_plan(
             # un modello che ha appena scritto il piano ci ricasca. ``str()``
             # su una lista produceva un punto chiamato letteralmente ``['x']``.
             if isinstance(steps, (list, tuple)):
-                nuovi = [str(s).strip() for s in steps if str(s).strip()]
+                nuovi = [
+                    s if isinstance(s, dict) else str(s).strip()
+                    for s in steps
+                    if isinstance(s, dict) or str(s).strip()
+                ]
                 if not nuovi:
                     return _err(
                         "Nessun punto da aggiungere.",
@@ -2689,6 +2695,12 @@ def tool_manage_plan(
                         hint="Passa steps=['testo del punto'] oppure note='...'.",
                     )
                 ctx.plan.add(testo)
+        elif action == "ipotesi":
+            # Il registro delle prove di un punto di diagnosi. Non apre e non
+            # chiude niente: e' lo stato del ragionamento scritto fuori dal
+            # pensiero, che altrimenti si butta ad ogni turno e si ricostruisce
+            # da capo ad ogni passo del debugging.
+            ctx.plan.annota_ipotesi(str(note or ""), str(step_id or ""))
         elif action == "start":
             ctx.plan.start(step_id)
         elif action == "complete":
@@ -2759,7 +2771,7 @@ def tool_manage_plan(
         else:
             return _err(
                 f"Azione '{action}' non supportata.",
-                hint="Valori ammessi: set, start, complete, skip, add, show.",
+                hint="Valori ammessi: set, start, complete, skip, add, ipotesi, show.",
             )
     except PlanError as exc:
         return _err(str(exc))
@@ -3702,14 +3714,20 @@ TOOLS_SCHEMA: list[dict[str, Any]] = [
                 "quindi non serve rielencarli (se lo fai vengono ignorati). Il "
                 "piano ti viene rimostrato ad ogni passo, quindi non devi "
                 "ricordartelo ne' ripianificare: leggilo e fai la mossa "
-                "successiva."
+                "successiva. Ogni punto comincia col suo TIPO, che decide "
+                "quanto ragionerai su quel punto: 'esegui: ...' (modifica o "
+                "comando gia' deciso), 'indaga: ...' (leggere e capire), "
+                "'diagnosi: ...' (qualcosa e' rotto e non sai perche'), "
+                "'progetta: ...' (scegliere un approccio). Nei punti di "
+                "diagnosi usa action='ipotesi' per tenere il registro delle "
+                "prove."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["set", "start", "complete", "skip", "add", "show"],
+                        "enum": ["set", "start", "complete", "skip", "add", "ipotesi", "show"],
                         "description": "Operazione da eseguire sul piano.",
                     },
                     "steps": {
@@ -3719,8 +3737,10 @@ TOOLS_SCHEMA: list[dict[str, Any]] = [
                             "Solo per action='set': i punti ANCORA DA FARE, in "
                             "ordine. Ogni punto e' un obiettivo con un esito "
                             "verificabile (es. 'far passare i 4 test di "
-                            "test_dag_executor.py'), non un comando. Quelli "
-                            "gia' chiusi non vanno rimessi: restano da soli."
+                            "test_dag_executor.py'), non un comando, e comincia "
+                            "col tipo: 'esegui: ', 'indaga: ', 'diagnosi: ' o "
+                            "'progetta: '. Quelli gia' chiusi non vanno "
+                            "rimessi: restano da soli."
                         ),
                     },
                     "step_id": {
@@ -3734,6 +3754,9 @@ TOOLS_SCHEMA: list[dict[str, Any]] = [
                     "note": {
                         "type": "string",
                         "description": (
+                            "Con action='ipotesi': una riga 'ipotesi -> prova -> "
+                            "esito' (riscriverla con la stessa ipotesi ne "
+                            "aggiorna l'esito). "
                             "Esito in una riga, per complete e skip "
                             "(es. '4 test verdi' oppure 'saltato: manca "
                             "pytest-asyncio nella sandbox')."
@@ -4122,7 +4145,9 @@ LEAN_TOOL_DESCRIPTIONS: dict[str, str] = {
         "saltare fuori sequenza. Chiudi il punto nello stesso passo "
         "dell'ultima azione che lo conclude, non in un passo a parte. "
         "Il piano ti viene rimostrato ad ogni passo: leggilo e fai la mossa "
-        "successiva, non ripianificare."
+        "successiva, non ripianificare. Ogni punto comincia col tipo: "
+        "'esegui: ', 'indaga: ', 'diagnosi: ' o 'progetta: '; nei punti di "
+        "diagnosi tieni il registro con action='ipotesi'."
     ),
     # Questa descrizione resta lunga di proposito, contro la regola delle
     # altre. E' il tool che il modello non chiama mai da solo: accorciarla

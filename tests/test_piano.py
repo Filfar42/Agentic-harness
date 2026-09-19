@@ -480,9 +480,11 @@ def test_al_primo_passo_il_pensiero_resta_quello_configurato():
     assert agent_mod.think_for_step("high", p, step=1) == "high"
 
 
-def test_senza_punto_aperto_non_si_abbassa_niente():
-    assert agent_mod.think_for_step("high", piano("a"), step=4) == "high"
-    assert agent_mod.think_for_step("high", None, step=4) == "high"
+def test_anche_senza_punto_aperto_l_esecuzione_scende():
+    """Il piano delimita le fasi, ma non deve essere un requisito per evitare
+    di ripagare il ragionamento pieno dopo ogni risultato di tool."""
+    assert agent_mod.think_for_step("high", piano("a"), step=2) == "medium"
+    assert agent_mod.think_for_step("high", None, step=4) == "low"
 
 
 def test_un_pensiero_booleano_non_ha_manopole():

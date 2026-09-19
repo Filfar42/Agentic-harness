@@ -247,9 +247,11 @@ SUMMARY_NUDGE = (
     "chiesto -- spesso una richiesta ha due meta' e ci si ferma dopo la prima.\n"
     "Se invece hai davvero finito, chiudi con un messaggio breve in questo "
     "formato, senza altre chiamate a tool:\n"
-    "Fatto: i punti che hai chiuso, con i file toccati.\n"
-    "Verifica: come hai verificato i risultati, il comando eseguito e il suo esito reale. Se e' rosso dillo.\n"
-    "Poi: i punti rimasti aperti, e quale affronteresti per primo.\n"
+    "Fatto: solo i risultati confermati non ancora comunicati.\n"
+    "Verifica: solo comando ed esito reale; se e' rosso dillo.\n"
+    "Poi: solo i punti realmente aperti e la prima mossa. Ometti la voce se non ce ne sono.\n"
+    "Ogni fatto compare una volta sola: niente cronologia, preamboli o parafrasi "
+    "di testo gia' mostrato all'utente.\n"
 )
 
 # Iniettato quando il turno starebbe per chiudersi con una verifica rossa.
@@ -323,9 +325,11 @@ FAILED_SUMMARY_NUDGE = (
     "Chiudi adesso con un messaggio breve, e sii esplicito sul fatto che la "
     "verifica NON passa. Queste sono rimaste rosse:\n"
     "{verifiche}\n"
-    "Fatto: i punti che hai chiuso, con i file toccati.\n"
-    "Verifica: come li hai verificati -- comando ed esito reale. Se e' rosso dillo.\n"
-    "Poi: i punti rimasti aperti, e quale affronteresti per primo.\n"
+    "Fatto: solo i risultati confermati non ancora comunicati.\n"
+    "Verifica: solo comando ed esito reale; se e' rosso dillo.\n"
+    "Poi: solo i punti rimasti aperti e la prima mossa.\n"
+    "Ogni fatto compare una volta sola: niente cronologia o parafrasi del "
+    "testo gia' mostrato.\n"
     "Solo testo, nessuna nuova chiamata a tool."
 )
 
@@ -413,8 +417,9 @@ comando e' fallito dillo con l'errore, non contarlo fra le cose fatte.
 sono un fatto: di' a che punto era il lavoro.
 3. **La prossima mossa**, una riga: cosa dovresti fare al turno dopo.
 
-Niente preamboli, niente scuse, niente elenchi di intenzioni. Non promettere \
-di fare qualcosa adesso: adesso e' finita.\
+Ogni fatto compare una volta sola e in una sola delle tre sezioni. Niente \
+preamboli, scuse, cronologia, parafrasi di testo gia' mostrato o elenchi di \
+intenzioni. Non promettere di fare qualcosa adesso: adesso e' finita.\
 """
 
 # Iniettato quando il modello sta esplorando a mano da parecchi passi senza
@@ -448,10 +453,12 @@ DELEGA_ESEMPIO = (
 PLAN_SUMMARY_NUDGE = (
     "Chiudi adesso il turno con un messaggio breve, costruito **sul piano** "
     "({summary}):\n"
-    "Fatto: i punti che hai chiuso, con i file toccati.\n"
-    "Verifica: come li hai verificati -- comando ed esito reale. Se e' rosso dillo.\n"
-    "Poi: i punti rimasti aperti, e quale affronteresti per primo.\n"
+    "Fatto: solo i risultati confermati dei punti chiusi non ancora comunicati.\n"
+    "Verifica: solo comando ed esito reale; se e' rosso dillo.\n"
+    "Poi: solo i punti rimasti aperti e la prima mossa. Ometti la voce se non ce ne sono.\n"
     "Non dichiarare fatto un punto che nel piano non risulta chiuso. "
+    "Ogni fatto compare una volta sola: niente cronologia o parafrasi del "
+    "testo gia' mostrato. "
     "Solo testo, nessuna nuova chiamata a tool."
 )
 

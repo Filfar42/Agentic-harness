@@ -603,6 +603,28 @@ def test_tool_call_wrapper_is_stripped_but_json_survives_for_recovery():
     assert len(calls) == 1 and calls[0]["name"] == "list_files"
 
 
+def test_il_prompt_ricorda_che_il_testo_del_turno_e_gia_stato_comunicato():
+    storia = [
+        {"role": "user", "content": "sistema il progetto"},
+        {"role": "assistant", "content": "Ho trovato il problema."},
+        {"role": "tool", "tool_call_id": "x", "name": "read_file", "content": "ok"},
+    ]
+    api = build_api_messages(storia, system_prompt="SYS", env_header=None)
+    assert "<comunicazione_turno>" in api[-1]["content"]
+    assert "non ripeterle" in api[-1]["content"]
+
+
+def test_la_nota_di_comunicazione_non_compare_al_primo_passo():
+    api = build_api_messages(
+        [{"role": "user", "content": "sistema il progetto"}],
+        system_prompt="SYS",
+        env_header=None,
+    )
+    assert "comunicazione_turno" not in " ".join(
+        str(message.get("content", "")) for message in api
+    )
+
+
 # ---------------------------------------------------------------------------
 # Abitudine fissa: guardare il workspace prima di rispondere e di agire
 # ---------------------------------------------------------------------------

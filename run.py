@@ -13,7 +13,9 @@ due interfacce sincronizzate.
 from __future__ import annotations
 
 import argparse
+import asyncio
 import os
+import socket
 import threading
 import webbrowser
 from threading import Timer
@@ -60,10 +62,34 @@ class ServerCheSiFermaDavvero(uvicorn.Server):
     def handle_exit(self, sig: int, frame: FrameType | None) -> None:
         from server.runner import annuncia_spegnimento
 
+        if not self.should_exit:
+            # Con log_level=warning uvicorn non dice niente mentre aspetta, e
+            # un terminale muto dopo Ctrl+C invita a premerlo di nuovo -- che
+            # e' esattamente l'uscita forzata qui sotto.
+            print("  Spegnimento in corso...", flush=True)
         annuncia_spegnimento()
         for altro in self.compagni:
             altro.should_exit = True
         super().handle_exit(sig, frame)
+
+    async def shutdown(self, sockets: list[socket.socket] | None = None) -> None:
+        """Lo spegnimento di uvicorn, piu' la lifespan anche quando si forza.
+
+        Il secondo Ctrl+C mette ``force_exit``, e con quello uvicorn **salta**
+        ``lifespan.shutdown()``: il task della lifespan resta fermo su
+        ``receive()``, ``asyncio.run`` lo cancella uscendo, e Starlette
+        registra la ``CancelledError`` come ``ERROR:`` con due traceback
+        concatenati (KeyboardInterrupt -> CancelledError). Sembra un crash ed
+        e' solo un'uscita forzata; in piu' la nostra chiusura (anteprime,
+        client verso il backend) non girava. Qui la si fa comunque, con un
+        tetto breve: forzare deve restare veloce.
+        """
+        await super().shutdown(sockets=sockets)
+        if self.force_exit:
+            try:
+                await asyncio.wait_for(self.lifespan.shutdown(), timeout=2.0)
+            except Exception:  # noqa: BLE001 - TimeoutError compreso
+                pass
 
 
 def upstream_mobile(porta_principale: int) -> str:

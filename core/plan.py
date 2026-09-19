@@ -44,6 +44,8 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
+from .regia_pensiero import ISTRUZIONI_TIPO, normalizza_tipo, separa_tipo
+
 TODO = "todo"
 DOING = "doing"
 DONE = "done"
@@ -97,6 +99,27 @@ def pulisci_testo(text: str) -> str:
     testo = _NUMERAZIONE.sub("", testo, count=1).strip()
     return testo[:MAX_TEXT_CHARS]
 MAX_NOTE_CHARS = 200
+# Registro delle ipotesi di un punto di diagnosi. Poche righe e corte: e' il
+# posto dove il ragionamento di debugging sopravvive fra un passo e l'altro
+# (il pensiero viene scartato ad ogni turno), non un diario.
+MAX_IPOTESI = 6
+MAX_IPOTESI_CHARS = 180
+
+
+def testo_e_tipo(raw: Any) -> tuple[str, str | None]:
+    """Un punto come arriva dal modello: stringa con prefisso o oggetto.
+
+    ``"diagnosi: capire perche' fallisce"`` e ``{"text": ..., "tipo": ...}``
+    valgono uguale. Lo schema pubblicizza la stringa, che e' quella che i
+    modelli locali sbagliano meno; l'oggetto si accetta in silenzio.
+    """
+    if isinstance(raw, dict):
+        tipo = normalizza_tipo(raw.get("tipo") or raw.get("type"))
+        testo = str(raw.get("text") or raw.get("testo") or "")
+        tipo_prefisso, testo = separa_tipo(testo)
+        return pulisci_testo(testo), tipo or tipo_prefisso
+    tipo, testo = separa_tipo(str(raw))
+    return pulisci_testo(testo), tipo
 
 
 @dataclass(slots=True)
@@ -105,9 +128,19 @@ class PlanStep:
     text: str
     status: str = TODO
     note: str = ""
+    # Che tipo di lavoro e' il punto (vedi ``regia_pensiero.TIPI``). Lo scrive
+    # il modello quando fa il piano: decide il budget di pensiero dei passi
+    # che gli appartengono. ``None`` = non detto, e valgono i tetti di sempre.
+    tipo: str | None = None
+    ipotesi: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
-        return {"id": self.id, "text": self.text, "status": self.status, "note": self.note}
+        out: dict[str, Any] = {"id": self.id, "text": self.text, "status": self.status, "note": self.note}
+        if self.tipo:
+            out["tipo"] = self.tipo
+        if self.ipotesi:
+            out["ipotesi"] = list(self.ipotesi)
+        return out
 
 
 class PlanError(ValueError):
@@ -150,6 +183,12 @@ class Plan:
                         text=text,
                         status=status if status in STATUSES else TODO,
                         note=str(raw.get("note") or "")[:MAX_NOTE_CHARS],
+                        tipo=normalizza_tipo(raw.get("tipo")),
+                        ipotesi=[
+                            str(x)[:MAX_IPOTESI_CHARS]
+                            for x in (raw.get("ipotesi") or [])
+                            if str(x).strip()
+                        ][-MAX_IPOTESI:] if isinstance(raw.get("ipotesi"), list) else [],
                     )
                 )
         return cls(steps=steps)
@@ -214,7 +253,7 @@ class Plan:
 
     # --- mutazioni ---------------------------------------------------------
 
-    def set_steps(self, texts: list[str]) -> None:
+    def set_steps(self, texts: list[Any]) -> None:
         """Riscrive la **parte aperta** del piano. I punti chiusi non si toccano.
 
         Rivedere il piano a meta' lavoro e' legittimo: scoprire una dipendenza
@@ -236,7 +275,12 @@ class Plan:
         accodano. Un testo che coincide con un punto gia' chiuso non lo riapre e
         non lo duplica: quel lavoro e' fatto.
         """
-        puliti = [p for p in (pulisci_testo(t) for t in texts) if p]
+        coppie = [testo_e_tipo(t) for t in texts]
+        coppie = [(testo, tipo) for testo, tipo in coppie if testo]
+        tipi = {}
+        for testo, tipo in coppie:
+            tipi.setdefault(testo, tipo)
+        puliti = [testo for testo, _ in coppie]
         if not puliti:
             raise PlanError("Il piano non puo' essere vuoto: passa almeno un punto.")
 
@@ -254,7 +298,13 @@ class Plan:
             # Riusare l'oggetto e non ricrearlo: cosi' il punto in corso resta
             # in corso e conserva il suo numero, che e' quello che l'utente ha
             # sott'occhio nel pannello mentre l'agente ci sta lavorando.
-            nuovi_aperti.append(vecchio if vecchio is not None else PlanStep(id="", text=testo))
+            punto = vecchio if vecchio is not None else PlanStep(id="", text=testo)
+            # Riscrivere un punto col suo tipo lo aggiorna; riscriverlo senza
+            # non cancella quello che c'era: un set a meta' lavoro in cui il
+            # modello dimentica i prefissi non deve spegnere la regia.
+            if tipi.get(testo):
+                punto.tipo = tipi[testo]
+            nuovi_aperti.append(punto)
 
         # Il punto DOING non puo' sparire in silenzio. Un ``set`` che non lo
         # rinomina lo lascerebbe fuori dall'elenco nuovo: il pannello
@@ -285,16 +335,39 @@ class Plan:
             if not step.id:
                 step.id = self._new_id()
 
-    def add(self, text: str) -> PlanStep:
-        testo = pulisci_testo(text)
+    def add(self, text: Any) -> PlanStep:
+        testo, tipo = testo_e_tipo(text)
         if not testo:
             raise PlanError("Serve il testo del punto da aggiungere.")
         if len(self.open_steps) >= MAX_STEPS:
             raise PlanError(
                 f"Il piano ha gia' {MAX_STEPS} punti aperti: chiudine qualcuno."
             )
-        step = PlanStep(id=self._new_id(), text=testo)
+        step = PlanStep(id=self._new_id(), text=testo, tipo=tipo)
         self.steps.append(step)
+        return step
+
+    def annota_ipotesi(self, riga: str, step_id: str = "") -> PlanStep:
+        """Aggiunge una riga al registro delle ipotesi del punto.
+
+        Una riga che comincia come una gia' scritta (stessa ipotesi, prima
+        della freccia) la **aggiorna** invece di duplicarla: e' il modo in cui
+        il modello scrive l'esito di una prova che aveva annotato prima.
+        """
+        step = self._require(step_id) if str(step_id or "").strip() else self.current
+        if step is None:
+            raise PlanError("Nessun punto in corso a cui attaccare l'ipotesi.")
+        testo = " ".join(str(riga or "").split())[:MAX_IPOTESI_CHARS]
+        if not testo:
+            raise PlanError("Serve il testo dell'ipotesi, in note='ipotesi -> prova -> esito'.")
+        testa = testo.split("->")[0].strip().lower()
+        for i, vecchia in enumerate(step.ipotesi):
+            if testa and vecchia.split("->")[0].strip().lower() == testa:
+                step.ipotesi[i] = testo
+                break
+        else:
+            step.ipotesi.append(testo)
+            step.ipotesi = step.ipotesi[-MAX_IPOTESI:]
         return step
 
     def start(self, step_id: str) -> PlanStep:
@@ -413,7 +486,10 @@ def render_block(plan: Plan, *, steps_left: int | None = None) -> str:
         if step.status in (DONE, SKIPPED) and step.id not in mostrati:
             continue
         nota = f"  -> {step.note}" if step.note else ""
-        righe.append(f"{step.id}. [{_LABELS[step.status]}] {step.text}{nota}")
+        tipo = f"({step.tipo}) " if step.tipo and step.status in (TODO, DOING) else ""
+        righe.append(f"{step.id}. [{_LABELS[step.status]}] {tipo}{step.text}{nota}")
+        if step.status == DOING and step.ipotesi:
+            righe.extend(f"   ipotesi: {h}" for h in step.ipotesi)
 
     coda = ["<piano_di_lavoro>", *righe, "</piano_di_lavoro>", ""]
 
@@ -437,6 +513,8 @@ def render_block(plan: Plan, *, steps_left: int | None = None) -> str:
             "rossa, se il rosso e' cio' che il punto doveva dimostrare: lo stato "
             "delle verifiche si tiene per conto suo e non si cancella chiudendo."
         )
+        if corrente.tipo in ISTRUZIONI_TIPO:
+            coda.append(ISTRUZIONI_TIPO[corrente.tipo])
     elif plan.open_steps:
         prossimo = plan.open_steps[0]
         coda.append(

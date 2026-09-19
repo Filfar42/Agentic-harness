@@ -1865,8 +1865,16 @@ function renderPlan(steps) {
       `<span class="plan-num">${esc(step.id)}</span>` +
       `<span class="plan-mark" title="${stato}" aria-label="${stato}">` +
       `${PLAN_ICONS[step.status] || PLAN_ICONS.todo}</span>` +
-      `<span class="plan-text">${esc(step.text)}</span>` +
-      (step.note ? `<span class="plan-note">${esc(step.note)}</span>` : '');
+      // Il tipo del punto decide quanto ragionera' l'agente su quel punto:
+      // si vede accanto al testo, non in un tooltip, perche' e' la cosa da
+      // controllare quando un punto "esegui" si prende diecimila token.
+      `<span class="plan-text">` +
+      (step.tipo ? `<span class="plan-tipo plan-tipo-${esc(step.tipo)}">${esc(step.tipo)}</span>` : '') +
+      `${esc(step.text)}</span>` +
+      (step.note ? `<span class="plan-note">${esc(step.note)}</span>` : '') +
+      (step.status === 'doing' && Array.isArray(step.ipotesi)
+        ? step.ipotesi.map((h) => `<span class="plan-note plan-ipotesi">${esc(h)}</span>`).join('')
+        : '');
     root.appendChild(row);
   });
   segnalaScorrimento(root);

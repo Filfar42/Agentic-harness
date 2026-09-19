@@ -1,43 +1,22 @@
-# Consegna finale — 14 settembre 2026
+# Consegna - 15 settembre 2026 (sera): regia del pensiero
 
-Archivio completo del sorgente di Astra / Local Agent Harness 2.37.0,
-comprensivo delle modifiche al loop e al contesto e dell'ultima revisione grafica.
+Sorgente completo di Astra 2.38.0 con le modifiche della sera del 15/09:
 
-La mascotte ora esegue saltini più ampi, usa espressioni facciali e mostra
-nuvolette per quattro secondi. Una seconda copia da 42 px è allineata sopra
-l'invio della chat attiva. Le due copie condividono lo stato della conversazione;
-durante l'elaborazione il movimento prosegue, rispettando la preferenza di
-movimento ridotto. La fascia dedicata tiene mascotte e nuvolette sopra al testo.
+- comunicazione senza ripetizioni (contratto di chiusura Fatto/Verifica/Poi,
+  blocco <comunicazione_turno>);
+- regia del pensiero (core/regia_pensiero.py): tipo dei punti del piano
+  (esegui/indaga/diagnosi/progetta) e budget per tipo e fase, correzioni
+  retrospettive, chiusura per continuazione su Ollama con ricaduta sul
+  watchdog, rilevatore di oscillazione e di decisione scritta, registro delle
+  ipotesi (manage_plan action='ipotesi'), budget di sintesi per le indagini;
+- scripts/sonda_continuazione.py e scripts/analisi_regia_pensiero.py.
 
-## Verifiche della revisione grafica
+Verifiche eseguite da Linux, senza Docker e senza test_server.py:
+1.210 passati, 7 saltati, 0 falliti; ruff pulito su core, tests, scripts, server.
+Non eseguite: suite con Docker, e la sonda contro un Ollama vero -- da lanciare
+prima di fidarsi della continuazione:
 
-- 54 test del controller, dello streaming e delle integrazioni: passati.
-- 51 test delle colonne e dei controlli del composer: passati.
-- 1 test degli asset e della cache: passato.
-- Controllo sintattico Node di web/app.js e web/companion.js: passato.
-- Ruff su tests/test_companion.py: passato.
-- Verifica nel browser Edge: temi chiaro/scuro, messaggio su più righe,
-  sidebar nascosta e stretta, allineamento sopra invio, nuvolette temporanee,
-  movimento ridotto. Nessun errore JavaScript rilevato.
+    .venv\Scripts\python scripts\sonda_continuazione.py --model qwen3.8:27b
 
-Evidenze visive e report: artifacts/mascot-*. I rapporti precedenti in docs/
-e i log context-* conservano la data e l'ambito delle rispettive verifiche;
-non rappresentano una nuova esecuzione della suite completa dopo la grafica.
-
-## Avvio
-
-Estrarre la cartella Astra e seguire README.md. I comandi base sono:
-
-    uv sync --locked --extra dev
-    uv run python run.py
-
-Per provare gli stati grafici con dati simulati:
-
-    uv run python scripts/visual_preview.py
-
-Aprire http://127.0.0.1:8137/brand/index.html.
-
-L'archivio include sorgenti, asset, test, skill, documentazione e file delle
-dipendenze. Ambienti virtuali, cache, modelli e dati runtime non sono inclusi.
-MANIFEST-SHA256.json elenca dimensioni e hash dei file consegnati; la verifica
-del pacchetto confronta ogni voce con questi byte e controlla il CRC ZIP.
+Esclusi: ambienti virtuali, cache, sessioni, impostazioni locali
+(agent_settings.json contiene chiavi) e modelli.

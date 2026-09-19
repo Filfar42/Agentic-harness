@@ -316,3 +316,30 @@ def test_un_avvio_fallito_esce_con_un_codice_diverso_da_zero():
     with pytest.raises(SystemExit) as uscita:
         run_harness.corri(ServerCheNonParte())
     assert uscita.value.code != 0
+
+
+def test_un_ctrl_c_forzato_chiude_comunque_la_lifespan():
+    """Il secondo Ctrl+C mette ``force_exit`` e uvicorn salta la lifespan.
+
+    Il task restava fermo su ``receive()``, ``asyncio.run`` lo cancellava
+    uscendo e Starlette stampava ``ERROR:`` con KeyboardInterrupt ->
+    CancelledError: sembrava un crash.
+    """
+    import asyncio
+
+    run_harness = _run()
+    server = run_harness.ServerCheSiFermaDavvero(
+        run_harness.uvicorn.Config("server.main:app")
+    )
+    chiamate: list[str] = []
+
+    class FintaLifespan:
+        async def shutdown(self):
+            chiamate.append("shutdown")
+
+    server.lifespan = FintaLifespan()
+    server.servers = []
+    server.force_exit = True
+    asyncio.run(server.shutdown())
+
+    assert chiamate == ["shutdown"]

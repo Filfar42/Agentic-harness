@@ -231,12 +231,12 @@ def test_la_traccia_registra_il_livello_davvero_chiesto(tmp_path):
     assert all(t["configurato"] == "high" for t in tracce)
 
 
-def test_senza_piano_aperto_non_si_scende(tmp_path):
+def test_senza_piano_aperto_i_passi_di_esecuzione_scendono(tmp_path):
     be = BackendMuto()
     msgs, _ = _turno(be, tmp_path, require_summary=False)
     tracce = [m["think"] for m in msgs if m.get("role") == "assistant" and "think" in m]
     assert all(t["punto_aperto"] is False for t in tracce)
-    assert all(t["usato"] == "high" for t in tracce)
+    assert [t["usato"] for t in tracce] == ["high", "medium", "low"]
 
 
 def test_la_traccia_non_arriva_mai_al_modello(tmp_path):

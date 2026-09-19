@@ -39,6 +39,14 @@ MAX_FRAME_BYTES = 1_048_576
 MAX_STREAM_BYTES = 16_777_216
 MAX_TOOL_CALLS = 64
 MAX_ATTEMPTS = 3
+# I cataloghi dei modelli sono l'unica risposta non generativa che cresce con
+# il provider, non con noi: OpenRouter elenca centinaia di modelli, ognuno con
+# prezzi, architettura, parametri supportati -- ben oltre i 10.000 nodi che
+# ``loads_object`` concede di default a un argomento di tool. Il tetto resta
+# (una risposta ostile non deve poter crescere senza limite), ma misurato sul
+# catalogo e non sugli argomenti.
+MAX_CATALOG_NODES = 1_000_000
+MAX_CATALOG_CHARS = MAX_STREAM_BYTES
 RETRY_BASE_S = 0.25
 RETRY_CAP_S = 4.0
 RETRY_AFTER_CAP_S = 30.0
@@ -409,6 +417,12 @@ def to_ollama_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
             "role": role,
             "content": msg.get("content") or "",
         }
+        # Il pensiero precompilato di una continuazione (vedi
+        # ``OllamaBackend.modo_continuazione``). Solo su un assistant e solo se
+        # c'e': i messaggi della cronologia non lo portano mai, il pensiero dei
+        # passi vecchi resta scartato come prima.
+        if role == "assistant" and msg.get("thinking"):
+            converted["thinking"] = str(msg["thinking"])
         # Immagini per i modelli multimodali: Ollama le vuole come lista di
         # stringhe base64 sul messaggio, senza prefisso data:.
         if msg.get("images"):
@@ -515,6 +529,44 @@ class OllamaBackend:
         # da qui in poi si manda il booleano. Si impara dal server invece di
         # dichiararlo con una tabella di versioni che invecchia da sola.
         self._think_levels_ok: bool | None = None
+        # Chiusura del pensiero per continuazione. Il messaggio finale e' un
+        # assistant col solo ``thinking`` (il pensiero parziale piu' la frase che
+        # lo chiude) e il template lo rende senza <|im_end|>: il modello
+        # riprende da dopo </think>, cioe' dall'azione.
+        #
+        # Quale ``think`` mandare con la continuazione non e' scritto da nessuna
+        # parte che valga per tutte le versioni. ``False`` e' il primo tentativo
+        # perche' il parser di Ollama allora tratta l'uscita come contenuto e
+        # tool call; ``True`` il secondo. Chi fallisce (400, oppure il modello
+        # che ricomincia a pensare da capo) esce dalla lista, e con la lista
+        # vuota la continuazione si spegne per questa istanza: si torna al
+        # watchdog che interrompe. Stessa filosofia di ``_think_levels_ok``:
+        # imparato dal server, non dichiarato. ``scripts/sonda_continuazione.py``
+        # verifica sul server vero anche la cosa che da qui non si vede, cioe'
+        # che il modello il pensiero precompilato lo legga davvero.
+        self._modi_continuazione: list[bool] = [False, True]
+        self._continuazione_riuscita = False
+
+    supports_think_continuation = True
+
+    def modo_continuazione(self) -> bool | None:
+        """Il ``think`` da usare per continuare, o ``None`` se non si puo'."""
+        return self._modi_continuazione[0] if self._modi_continuazione else None
+
+    def esito_continuazione(self, modo: bool, riuscita: bool) -> None:
+        """Una continuazione fallita toglie il suo modo, se non ha mai funzionato.
+
+        Un solo fallimento dopo dei successi non spegne niente: un modello che
+        una volta ricomincia a pensare non dice che il server non sa
+        continuare.
+        """
+        if riuscita:
+            self._continuazione_riuscita = True
+            return
+        if self._continuazione_riuscita:
+            return
+        if self._modi_continuazione and self._modi_continuazione[0] == modo:
+            self._modi_continuazione.pop(0)
 
     # -- introspezione ----------------------------------------------------
 
@@ -556,7 +608,9 @@ class OllamaBackend:
         try:
             resp = get_client().get(f"{self.base_url}/api/tags", timeout=4.0)
             resp.raise_for_status()
-            data = loads_object(resp.json())
+            data = loads_object(
+                resp.json(), max_chars=MAX_CATALOG_CHARS, max_nodes=MAX_CATALOG_NODES
+            )
             raw_models = data.get("models", [])
             if not isinstance(raw_models, list) or any(not isinstance(m, dict) for m in raw_models):
                 raise TransportProtocolError("models deve essere una lista di oggetti.")
@@ -946,7 +1000,9 @@ class OpenAICompatBackend:
                 f"{self.base_url}/models", headers=self._auth_headers(), timeout=4.0
             )
             resp.raise_for_status()
-            data = loads_object(resp.json())
+            data = loads_object(
+                resp.json(), max_chars=MAX_CATALOG_CHARS, max_nodes=MAX_CATALOG_NODES
+            )
             raw_models = data.get("data", [])
             if not isinstance(raw_models, list) or any(not isinstance(m, dict) for m in raw_models):
                 raise TransportProtocolError("data deve essere una lista di oggetti.")

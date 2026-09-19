@@ -44,6 +44,7 @@ from . import delega as delega_mod
 from . import deposito as deposito_mod
 from . import libreria
 from . import pensiero
+from . import regia_pensiero as regia
 from . import spec_delega as spec_delega_mod
 from . import vault as vault_mod
 from . import vault_search as vault_search_mod
@@ -558,6 +559,22 @@ def build_api_messages(
     if images and last_visible_user >= 0:
         api[last_visible_user]["images"] = list(images)
 
+    # Il modello vede gia' il testo prodotto nei passi precedenti, ma in una
+    # cronologia agentica e' separato dall'ultima posizione da risultati di
+    # tool e solleciti nascosti. Qwen tende allora a trattarlo come materiale
+    # da riassumere di nuovo. Questa nota non duplica il contenuto: rende
+    # esplicito, nel punto piu' recente del prompt, che quelle risposte sono un
+    # registro di comunicazione e non una bozza da parafrasare.
+    gia_comunicato = False
+    for msg in reversed(ui_messages):
+        if msg.get("role") == "user" and not msg.get("hidden"):
+            break
+        if msg.get("role") == "assistant" and strip_think(
+            str(msg.get("content") or "")
+        ).strip():
+            gia_comunicato = True
+            break
+
     # Il piano va **in coda**, dopo tutta la cronologia, e con ruolo 'user'.
     # Le due scelte hanno la stessa ragione: non toccare il prefisso. Il
     # prefisso (system + environment) e' byte-identico fra un passo e l'altro
@@ -587,6 +604,16 @@ def build_api_messages(
             # e' quello che il piano e' per il padre, cioe' l'ultima cosa che
             # legge prima di muoversi. Sul padre e' sempre vuoto.
             delega_block,
+            (
+                "<comunicazione_turno>\n"
+                "Hai gia' mostrato testo all'utente in questo turno. Le "
+                "risposte assistant precedenti sono il registro di cio' che "
+                "e' gia' stato detto: non ripeterle e non parafrasarle. Se il "
+                "lavoro continua, preferisci la sola tool call; se chiudi, "
+                "aggiungi soltanto risultati, verifiche o residui nuovi.\n"
+                "</comunicazione_turno>"
+                if gia_comunicato else ""
+            ),
         )
         if blocco
     ]
@@ -1398,18 +1425,19 @@ def watchdog_chars_for_step(max_tokens: int, step: int) -> int:
     return chars_for_tokens(min(max_tokens * WATCHDOG_RATIO, tetto))
 
 
-def think_for_step(configured: Any, plan: Any, step: int) -> Any:
+def think_for_step(configured: Any, _plan: Any, step: int, tipo: str | None = None) -> Any:
     """Livello di pensiero da usare in questo passo.
 
-    L'idea: **pensare a lungo serve a decidere, non a eseguire**. Quando c'e'
-    un punto del piano gia' aperto, la decisione e' stata presa -- al passo in
-    cui e' stato aperto, pagando il pensiero pieno -- e ripensarla ad ogni tool
-    e' tempo di GPU speso per riottenere la stessa risposta. Il primo passo di
-    ogni turno resta al livello configurato: e' li' che si legge la richiesta
-    nuova e si decide come muoversi.
+    L'idea: **pensare a lungo serve a decidere, non a eseguire**. Il primo
+    passo di una fase resta al livello configurato: e' li' che si legge la
+    richiesta o il nuovo punto del piano. I passi successivi hanno gia' la
+    decisione e i risultati dei tool; ripagarla per intero e' tempo di GPU
+    speso per riottenere la stessa risposta. Vale anche senza piano: un lavoro
+    semplice non deve restare per sempre al livello massimo solo perche' non
+    aveva bisogno di manage_plan.
 
-    Si scende di uno appena il punto e' aperto e di **due** da ``DEEP_STEP`` in
-    poi. Il pavimento resta 'low' e non si azzera mai: su un modello che ragiona
+    Si scende di uno dal secondo passo della fase e di **due** da
+    ``DEEP_STEP`` in poi. Il pavimento resta 'low' e non si azzera mai: su un modello che ragiona
     togliere del tutto il pensiero peggiora le tool call, che e' esattamente il
     problema che si voleva evitare.
 
@@ -1434,9 +1462,12 @@ def think_for_step(configured: Any, plan: Any, step: int) -> Any:
     livello = configured.strip().lower()
     if livello not in _THINK_LEVELS:
         return configured
-    if step <= 1 or plan is None or getattr(plan, "current", None) is None:
+    # Il tipo del punto decide di quanto scendere (``regia.scalini_livello``):
+    # su un punto di diagnosi non si scende al secondo passo come su una
+    # modifica gia' decisa. Senza tipo il comportamento e' quello di prima.
+    scalini = regia.scalini_livello(tipo, step, DEEP_STEP)
+    if not scalini:
         return configured
-    scalini = 2 if step >= DEEP_STEP else 1
     return _THINK_LEVELS[max(0, _THINK_LEVELS.index(livello) - scalini)]
 
 
@@ -1646,7 +1677,7 @@ def _nome_livello(think: Any) -> str:
     return "?"
 
 
-def params_for_step(params: Any, plan: Any, step: int) -> Any:
+def params_for_step(params: Any, plan: Any, step: int, tipo: str | None = None) -> Any:
     """I parametri di generazione di questo passo, col pensiero modulato.
 
     Ritorna l'oggetto originale quando non c'e' niente da cambiare: cosi' i
@@ -1654,7 +1685,7 @@ def params_for_step(params: Any, plan: Any, step: int) -> Any:
     vedere esattamente quello che hanno passato.
     """
     configurato = getattr(params, "think", None)
-    livello = think_for_step(configurato, plan, step)
+    livello = think_for_step(configurato, plan, step, tipo)
     if livello == configurato:
         return params
     try:
@@ -1993,6 +2024,18 @@ def run_turn(
     traccia: dict[str, Any] = {}
     stato_traccia = {"da": -1}
 
+    # --- regia del pensiero (vedi ``core/regia_pensiero.py``) ---------------
+    # ``chiamate_passo`` raccoglie i tool del passo in corso con il loro esito;
+    # al passo dopo diventa ``ultimo_passo``, l'unico materiale su cui la regola
+    # retrospettiva puo' decidere quanto pensare.
+    stato_punto = regia.StatoPunto()
+    chiamate_passo: list[tuple[str, bool]] = []
+    nomi_tool_schema = [
+        str((t.get("function") or {}).get("name") or "")
+        for t in (tools_schema or [])
+        if isinstance(t, dict)
+    ]
+
     def marca_pensiero() -> None:
         """Attacca la traccia al messaggio dell'assistente che l'ha prodotta.
 
@@ -2068,6 +2111,34 @@ def run_turn(
         if phase_changed:
             blocco_libreria = _blocco_libreria()
 
+        # I tool del passo appena chiuso contano per il punto a cui
+        # appartenevano: si registrano **prima** di passare al punto nuovo, che
+        # riparte da zero fallimenti.
+        ultimo_passo, chiamate_passo = chiamate_passo, []
+        if ultimo_passo:
+            stato_punto.registra_passo(ultimo_passo)
+        stato_punto.nuovo_punto(new_phase)
+        regia_passo = regia.decidi(
+            getattr(current, "tipo", None) if current else None,
+            reasoning_phase,
+            stato_punto,
+            ha_piano=current is not None,
+            passo_nel_turno=step,
+            verifica_rossa=bool(getattr(tool_ctx, "red_command", None)),
+            ultimo_passo=ultimo_passo,
+        )
+        blocco_piano = render_block(tool_ctx.plan, steps_left=max_steps - step)
+        if regia_passo.sintesi and not stato_punto.sintesi_suggerita:
+            # Una volta per punto: ripeterlo ad ogni lettura diventerebbe il
+            # rumore di fondo che il modello impara a ignorare.
+            stato_punto.sintesi_suggerita = True
+            blocco_piano = "\n\n".join(
+                b for b in (
+                    blocco_piano,
+                    regia.SUGGERIMENTO_SINTESI.format(n=stato_punto.letture_di_fila),
+                ) if b
+            )
+
         api_messages = build_api_messages(
             ui_messages,
             system_prompt=system_prompt,
@@ -2078,7 +2149,7 @@ def run_turn(
             budgets=budgets,
             # ``max_steps - step`` e non ``- step + 1``: e' quanti passi
             # restano *dopo* questo, cioe' quelli su cui puo' contare.
-            plan_block=render_block(tool_ctx.plan, steps_left=max_steps - step),
+            plan_block=blocco_piano,
             delega_block=blocco_coda(max_steps - step) if blocco_coda else "",
             preview_block=render_preview_note(tool_ctx.preview),
             notes_block=render_notes(tool_ctx.notes),
@@ -2124,7 +2195,7 @@ def run_turn(
                     compact_old_tools=compact_old_tools,
                     images=images,
                     budgets=budgets,
-                    plan_block=render_block(tool_ctx.plan, steps_left=max_steps - step),
+                    plan_block=blocco_piano,
                     delega_block=blocco_coda(max_steps - step) if blocco_coda else "",
                     preview_block=render_preview_note(tool_ctx.preview),
                     notes_block=render_notes(tool_ctx.notes),
@@ -2190,15 +2261,46 @@ def run_turn(
         # La soglia si ricalcola ad ogni passo: il primo di un turno ha diritto
         # a piu' pensiero degli altri, e su una finestra larga la sola quota del
         # budget non e' piu' un limite (vedi ``watchdog_chars_for_step``).
-        params_passo = params_for_step(params, tool_ctx.plan, phase_step)
+        params_passo = params_for_step(
+            params, tool_ctx.plan, phase_step, regia_passo.tipo_effettivo
+        )
         # Il tetto si taglia **dopo** la compattazione e il drop dei turni
         # vecchi: prima di quelli il prompt non e' ancora quello che partira'.
         tetto_passo, spazio_finestra = tetto_per_la_finestra(
             api_messages, params.num_ctx, max_tokens_turno, reserved_tokens=schema_tokens
         )
-        watchdog_chars = (
-            watchdog_chars_for_step(tetto_passo, phase_step) if think_watchdog else 0
+        # Due modi di chiudere un pensiero troppo lungo, e la soglia dipende da
+        # quale e' disponibile:
+        #
+        # * **continuare** (Ollama, pensiero sul canale nativo): il pensiero
+        #   resta, gli si accoda una frase che chiude, e il modello riprende
+        #   dall'azione. Costa quasi niente, quindi vale il budget del tipo di
+        #   punto -- anche sotto i tetti storici;
+        # * **interrompere**: il pensiero si butta e il passo si rifa'. Costa
+        #   tutto quello che si era pensato, quindi non si scende mai sotto i
+        #   tetti storici (``watchdog_chars_for_step``), si puo' solo salire per
+        #   diagnosi e progettazione.
+        puo_continuare = bool(
+            think_watchdog
+            and getattr(backend, "supports_think_continuation", False) is True
+            and callable(getattr(backend, "modo_continuazione", None))
+            and backend.modo_continuazione() is not None
         )
+        if think_watchdog and tetto_passo > 0:
+            storico = watchdog_chars_for_step(tetto_passo, phase_step)
+            per_tipo = min(
+                chars_for_tokens(regia_passo.budget),
+                chars_for_tokens(tetto_passo * WATCHDOG_RATIO),
+            )
+            # La soglia per *buttare* il pensiero non scende mai sotto lo storico,
+            # nemmeno quando il backend saprebbe continuare: se la continuazione
+            # in quel passo non e' praticabile (pensiero nei tag di testo, poco
+            # spazio), il taglio che resta e' quello caro.
+            soglia_interrompi = max(storico, per_tipo)
+            watchdog_chars = per_tipo if puo_continuare else soglia_interrompi
+        else:
+            watchdog_chars = 0
+            soglia_interrompi = 0
         if tetto_passo != max_tokens_turno:
             try:
                 params_passo = replace(params_passo, max_tokens=tetto_passo)
@@ -2244,67 +2346,149 @@ def run_turn(
         # generazione e non per la prossima, che riparte da testo vuoto.
         rubinetto = Rubinetto()
         events: Iterator[StreamEvent] | None = None
+        osservatore = regia.OsservatorePensiero(
+            watchdog_chars,
+            tipo=regia_passo.tipo_effettivo,
+            nomi_tool=nomi_tool_schema,
+            # Chiudere su "decisione gia' scritta" ha senso solo se chiudere
+            # costa poco: col solo watchdog che butta il pensiero, no.
+            rileva_decisione=puo_continuare,
+        )
+        chiusura_passo: str | None = None
+        modo_continuazione: bool | None = None
+        continuazione_rifiutata = False
+        pensiero_al_taglio = 0
+        pensiero_nativo = False
+        messaggi_stream = api_messages
+        params_stream = params_passo
         try:
             stream_options = {"should_stop": stopped} if getattr(
                 backend, "supports_cancellation", False
             ) else {}
-            events = backend.stream(api_messages, tools_schema, params_passo, **stream_options)
-            for ev in events:
-                if stopped():
-                    # Chiudere il generatore fa cadere la connessione HTTP
-                    # verso Ollama: senza, la generazione continuerebbe a
-                    # occupare la GPU anche dopo che l'utente ha premuto stop.
-                    interrupted = True
-                    close = getattr(events, "close", None)
-                    if callable(close):
-                        close()
-                    break
-                if ev.kind == "reasoning":
-                    if parser.feed_reasoning(ev.text):
-                        yield from rubinetto.aggiorna(parser.reasoning, parser.answer)
-                elif ev.kind == "content":
-                    r_changed, a_changed = parser.feed(ev.text)
-                    if r_changed or a_changed:
-                        yield from rubinetto.aggiorna(parser.reasoning, parser.answer)
-                elif ev.kind == "tool_call" and ev.tool_call:
-                    if len(tool_calls) >= MAX_TOOL_CALLS_PER_STEP:
-                        stream_error = "Protocol error: too many tool calls in one step"
+            while True:
+                events = backend.stream(messaggi_stream, tools_schema, params_stream, **stream_options)
+                taglio: str | None = None
+                for ev in events:
+                    if stopped():
+                        # Chiudere il generatore fa cadere la connessione HTTP
+                        # verso Ollama: senza, la generazione continuerebbe a
+                        # occupare la GPU anche dopo che l'utente ha premuto stop.
+                        interrupted = True
+                        close = getattr(events, "close", None)
+                        if callable(close):
+                            close()
                         break
-                    tool_calls.append(ev.tool_call)
-                elif ev.kind == "usage" and ev.usage:
-                    step_done_reason = str(ev.usage.get("done_reason") or "")
-                    for key, value in ev.usage.items():
-                        if isinstance(value, (int, float)):
-                            total_usage[key] = total_usage.get(key, 0) + value
-                        else:
-                            total_usage[key] = value
-                elif ev.kind == "error":
-                    stream_error = ev.text
-                    break
+                    if ev.kind == "reasoning":
+                        pensiero_nativo = True
+                        if parser.feed_reasoning(ev.text):
+                            yield from rubinetto.aggiorna(parser.reasoning, parser.answer)
+                    elif ev.kind == "content":
+                        r_changed, a_changed = parser.feed(ev.text)
+                        if r_changed or a_changed:
+                            yield from rubinetto.aggiorna(parser.reasoning, parser.answer)
+                    elif ev.kind == "tool_call" and ev.tool_call:
+                        if len(tool_calls) >= MAX_TOOL_CALLS_PER_STEP:
+                            stream_error = "Protocol error: too many tool calls in one step"
+                            break
+                        tool_calls.append(ev.tool_call)
+                    elif ev.kind == "usage" and ev.usage:
+                        step_done_reason = str(ev.usage.get("done_reason") or "")
+                        for key, value in ev.usage.items():
+                            if isinstance(value, (int, float)):
+                                total_usage[key] = total_usage.get(key, 0) + value
+                            else:
+                                total_usage[key] = value
+                    elif ev.kind == "error":
+                        stream_error = ev.text
+                        break
 
-                # Watchdog sul ragionamento. Sta qui e non dentro il ramo
-                # "reasoning" perche' il pensiero puo' arrivare da due canali:
-                # quello nativo di Ollama e i tag <think> nel testo, che il
-                # parser riconosce lo stesso. Il controllo deve valere per
-                # entrambi, o sui modelli senza thinking nativo non scatterebbe
-                # mai -- proprio quelli che ne avrebbero piu' bisogno.
-                if (
-                    watchdog_chars
-                    and not tool_calls
-                    and watchdog_fires < MAX_WATCHDOG_FIRES
-                    and step < max_steps
-                    and len(parser.reasoning) > watchdog_chars
-                ):
-                    # Chiudere il generatore fa cadere la connessione verso
-                    # Ollama: la GPU smette subito di produrre un ragionamento
-                    # che sappiamo gia' non arrivera' da nessuna parte. E' lo
-                    # stesso meccanismo del pulsante stop, puntato contro un
-                    # modo di fallire invece che contro l'utente.
+                    if chiusura_passo is not None:
+                        # Dentro una continuazione. Se il modello, invece di
+                        # agire, ricomincia a pensare da capo, il server non ha
+                        # rispettato il pensiero precompilato: si smette subito
+                        # e si ricade sul watchdog che interrompe.
+                        if (
+                            not tool_calls
+                            and not parser.answer.strip()
+                            and len(parser.reasoning) - pensiero_al_taglio
+                            > regia.CONTINUAZIONE_MAX_PENSIERO
+                        ):
+                            continuazione_rifiutata = True
+                            taglio = "rifiutata"
+                            close = getattr(events, "close", None)
+                            if callable(close):
+                                close()
+                            break
+                        continue
+
+                    # Watchdog sul ragionamento. Sta qui e non dentro il ramo
+                    # "reasoning" perche' il pensiero puo' arrivare da due
+                    # canali: quello nativo di Ollama e i tag <think> nel testo,
+                    # che il parser riconosce lo stesso. Il controllo deve
+                    # valere per entrambi, o sui modelli senza thinking nativo
+                    # non scatterebbe mai -- proprio quelli che ne avrebbero
+                    # piu' bisogno. La continuazione invece vale solo per il
+                    # canale nativo: un <think> aperto nel testo non si chiude
+                    # precompilando un campo che quel modello non usa.
+                    if watchdog_chars and not tool_calls:
+                        ragione = osservatore.aggiorna(parser.reasoning)
+                        if (
+                            ragione
+                            and puo_continuare
+                            and pensiero_nativo
+                            and not parser.answer.strip()
+                            and tetto_passo - estimate_tokens(parser.reasoning)
+                            >= regia.CONTINUAZIONE_MIN_TOKEN
+                        ):
+                            taglio = ragione
+                        elif (
+                            len(parser.reasoning) > soglia_interrompi
+                            and watchdog_fires < MAX_WATCHDOG_FIRES
+                            and step < max_steps
+                        ):
+                            taglio = "interrompi"
+                        if taglio:
+                            # Chiudere il generatore fa cadere la connessione
+                            # verso Ollama: la GPU smette subito di produrre un
+                            # ragionamento che sta per essere chiuso comunque.
+                            close = getattr(events, "close", None)
+                            if callable(close):
+                                close()
+                            break
+
+                if taglio in regia.CHIUSURE and not (interrupted or stream_error):
+                    modo_continuazione = backend.modo_continuazione()
+                    rimasti = tetto_passo - estimate_tokens(parser.reasoning)
+                    params_continua = None
+                    if modo_continuazione is not None and rimasti >= regia.CONTINUAZIONE_MIN_TOKEN:
+                        try:
+                            params_continua = replace(
+                                params_passo, think=modo_continuazione, max_tokens=rimasti
+                            )
+                        except TypeError:      # non e' una dataclass
+                            params_continua = None
+                    if params_continua is not None:
+                        # La frase entra nel pensiero che l'utente vede: la
+                        # chiusura non e' un segreto, e' scritta dove e' successa.
+                        parser.feed_reasoning(regia.chiusura(taglio))
+                        yield from rubinetto.aggiorna(parser.reasoning, parser.answer)
+                        pensiero_al_taglio = len(parser.reasoning)
+                        chiusura_passo = taglio
+                        messaggi_stream = [
+                            *api_messages,
+                            {"role": "assistant", "content": "", "thinking": parser.reasoning},
+                        ]
+                        params_stream = params_continua
+                        continue
+                    # Continuare non si puo' (il modo si e' spento, parametri
+                    # non sostituibili): resta il vecchio modo. Lo stream e'
+                    # gia' chiuso, quindi non c'e' piu' niente da lasciar
+                    # correre -- l'unico esito onesto e' il sollecito.
+                    modo_continuazione = None
                     watchdog_hit = True
-                    close = getattr(events, "close", None)
-                    if callable(close):
-                        close()
-                    break
+                elif taglio in ("interrompi", "rifiutata"):
+                    watchdog_hit = True
+                break
         except Exception as exc:
             logger.exception("Model stream failed at step %s", step)
             stream_error = f"{type(exc).__name__}: {exc}"
@@ -2315,6 +2499,22 @@ def run_turn(
                     close()
                 except Exception:
                     logger.exception("Failed to close model stream")
+
+        if chiusura_passo is not None and modo_continuazione is not None and not interrupted:
+            esito_c = getattr(backend, "esito_continuazione", None)
+            if callable(esito_c):
+                esito_c(
+                    modo_continuazione,
+                    bool(
+                        not continuazione_rifiutata
+                        and not stream_error
+                        and (tool_calls or parser.answer.strip())
+                    ),
+                )
+        if continuazione_rifiutata:
+            # Il pensiero ricominciato e' spazzatura di questo tentativo: al
+            # modello torna il sollecito del watchdog, come prima.
+            count_nudge("continuazione_rifiutata")
 
         parser.finish()
 
@@ -2345,6 +2545,19 @@ def run_turn(
                 "risposto": len(parser.answer),
                 "chiamate": len(tool_calls),
                 "watchdog": bool(watchdog_hit),
+                # La regia: che tipo aveva il punto, come l'ha corretto
+                # l'harness, con che budget, e se e come il pensiero e' stato
+                # chiuso. Sono i campi con cui si misura se tutto questo serve
+                # (``scripts/analisi_regia_pensiero.py``).
+                "tipo": regia_passo.tipo,
+                "tipo_effettivo": regia_passo.tipo_effettivo,
+                "budget": int(regia_passo.budget),
+                "motivo_budget": regia_passo.motivo,
+                "soglia": int(watchdog_chars),
+                "chiusura": chiusura_passo,
+                "continuata": bool(chiusura_passo) and not continuazione_rifiutata,
+                "ripensamenti": int(osservatore.ripensamenti),
+                "oscillazione": bool(osservatore.oscillazione),
                 # Quanto spazio restava nella finestra prima di generare, e
                 # con che tetto si e' partiti. Sono i due numeri che spiegano
                 # una generazione tagliata: senza, in una sessione salvata non
@@ -2868,6 +3081,7 @@ def run_turn(
                 ok = False
             if not ok:
                 retry_reasoning = True
+            chiamate_passo.append((str(call["name"]), bool(ok)))
             tools_used = True
             ui_messages.append(
                 {

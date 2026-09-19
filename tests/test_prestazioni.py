@@ -275,10 +275,13 @@ def test_il_contesto_si_ricalcola_solo_quando_cambia(tmp_path, monkeypatch):
     assert len(conti) == 1, "cinque letture, un solo conto"
 
     # Ma un messaggio nuovo lo cambia davvero, e il numero deve accorgersene.
+    # Il costo non e' necessariamente monotono: al nuovo turno scompare anche
+    # l'eventuale nota di coda che impediva di ripetere il testo del turno
+    # precedente.
     server_main.STATE.messages(sid).append(
         {"role": "user", "content": "una domanda molto piu' lunga della precedente"}
     )
-    assert server_main.contesto_usato(sid) > primo
+    assert server_main.contesto_usato(sid) != primo
     assert len(conti) == 2
 
 

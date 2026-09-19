@@ -369,3 +369,32 @@ def test_bad_catalog_payload_is_a_diagnostic_failure(kind, payload, wire_client)
     wire_client(lambda request: httpx.Response(200, json=payload))
     online, detail, models = backend(kind).status()
     assert online is False and detail and models == []
+
+
+def test_un_catalogo_grande_come_quello_di_openrouter_passa(wire_client):
+    """``/v1/models`` di OpenRouter supera i 10.000 nodi del tetto di default.
+
+    Centinaia di modelli, ognuno con prezzi, architettura e parametri
+    supportati: con il tetto pensato per gli argomenti dei tool la sonda
+    rispondeva "JSON exceeds the nesting or item limit" e l'endpoint
+    risultava irraggiungibile.
+    """
+    modello = {
+        "id": "",
+        "name": "x",
+        "description": "d" * 400,
+        "architecture": {"modality": "text->text", "input_modalities": ["text", "image"],
+                         "output_modalities": ["text"], "tokenizer": "Other"},
+        "pricing": dict.fromkeys(("prompt", "completion", "request", "image",
+                                             "web_search", "internal_reasoning"), "0.000001"),
+        "top_provider": {"context_length": 131072, "max_completion_tokens": 8192,
+                         "is_moderated": False},
+        "supported_parameters": [f"p{i}" for i in range(20)],
+    }
+    catalogo = {"data": [dict(modello, id=f"vendor/model-{i}") for i in range(600)]}
+    wire_client(lambda request: httpx.Response(200, json=catalogo))
+
+    online, detail, models = backend("openai").status()
+
+    assert online, detail
+    assert len(models) == 600
