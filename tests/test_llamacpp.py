@@ -24,7 +24,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from core.backend import LlamaCppBackend, OpenAICompatBackend, build_backend
+from core.backend import _LIVELLI_APPRESI, LlamaCppBackend, OpenAICompatBackend, build_backend
 from core.config import GenParams
 
 CHUNKS = [
@@ -68,6 +68,13 @@ class _Handler(BaseHTTPRequestHandler):
     n_ctx = 65536
     caps: dict = {"supports_tools": True, "supports_reasoning": True}
     props_ok = True
+    # Il chat template che /props dichiara (None = campo assente) e se il
+    # server lo applica con la severita' del template ufficiale di Qwen3.8:
+    # 500 su un livello non ammesso e su un system che non sia il primo.
+    template: str | None = None
+    severo = False
+    # Un 500 del template forzato su ogni richiesta, per l'errore in chat.
+    rompi = ""
     # La chiave che il server pretende. Vuota = server aperto, come quello
     # di casa; valorizzata = llama-server lanciato con --api-key.
     chiave = ""
@@ -99,6 +106,7 @@ class _Handler(BaseHTTPRequestHandler):
                     "default_generation_settings": {"n_ctx": type(self).n_ctx},
                     "chat_template_caps": type(self).caps,
                     "model_path": "/m/Qwen3.8-27B-UD-Q4_K_XL.gguf",
+                    **({"chat_template": type(self).template} if type(self).template else {}),
                 }
             )
         elif self.path == "/slots":
@@ -114,6 +122,17 @@ class _Handler(BaseHTTPRequestHandler):
         type(self).corpi.append(json.loads(self.rfile.read(length) or b"{}"))
         if self.path != "/v1/chat/completions":
             self.send_error(404)
+            return
+        motivo = type(self).rompi or (type(self).severo and _eccezione_jinja(type(self).corpi[-1]))
+        if motivo:
+            corpo = json.dumps(
+                {"error": {"code": 500, "message": motivo, "type": "server_error"}}
+            ).encode()
+            self.send_response(500)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(corpo)))
+            self.end_headers()
+            self.wfile.write(corpo)
             return
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
@@ -132,9 +151,54 @@ class _Handler(BaseHTTPRequestHandler):
         self.wfile.flush()
 
 
+ERRORE_LIVELLO = (
+    "Jinja Exception: Unexpected reasoning effort {}. "
+    "Supported types are xhigh (default), medium, and low."
+)
+ERRORE_SYSTEM = "Jinja Exception: System message must be at the beginning."
+
+# Il pezzo del template ufficiale di Qwen3.8 che conta qui (QwenLM/Qwen3.8#217).
+TEMPLATE_UFFICIALE = (
+    "{%- if enable_thinking is defined and enable_thinking is false %}{%- else %}"
+    "{%- set resolved_reasoning_effort = reasoning_effort|default('xhigh') %}"
+    "{%- if resolved_reasoning_effort not in ('xhigh', 'medium', 'low') %}"
+    "{{- raise_exception('Unexpected reasoning effort ' ~ reasoning_effort ~ "
+    "'. Supported types are xhigh (default), medium, and low.') }}"
+    "{%- endif %}{%- endif %}"
+    "{%- for message in messages %}{%- if message.role == 'system' and not loop.first %}"
+    "{{- raise_exception('System message must be at the beginning.') }}"
+    "{%- endif %}{%- endfor %}{%- if tools %}<tools>{%- endif %}"
+)
+# Lo stesso controllo scritto in modo che l'elenco non si possa leggere: il
+# caso in cui resta solo il ripiego sul messaggio del 500.
+TEMPLATE_OPACO = (
+    "{%- set ammessi = livelli_del_modello %}"
+    "{%- if enable_thinking and reasoning_effort is defined "
+    "and reasoning_effort not in ammessi %}{{- raise_exception(errore) }}{%- endif %}"
+    "{%- if tools %}<tools>{%- endif %}"
+)
+
+
+def _eccezione_jinja(corpo: dict) -> str:
+    """Quello che il template ufficiale solleverebbe su questa richiesta."""
+    kwargs = corpo.get("chat_template_kwargs") or {}
+    if kwargs.get("enable_thinking") is not False:
+        livello = kwargs.get("reasoning_effort", corpo.get("reasoning_effort"))
+        if livello is not None and livello not in ("xhigh", "medium", "low"):
+            return ERRORE_LIVELLO.format(livello)
+    if any(m.get("role") == "system" for m in corpo.get("messages", [])[1:]):
+        return ERRORE_SYSTEM
+    return ""
+
+
 @pytest.fixture()
 def finto_llama():
     _Handler.corpi = []
+    _Handler.template = None
+    _Handler.severo = False
+    _Handler.rompi = ""
+    # I livelli imparati da un 500 sono di modulo: un test non li eredita.
+    _LIVELLI_APPRESI.clear()
     _Handler.hits = []
     _Handler.n_ctx = 65536
     _Handler.caps = {"supports_tools": True, "supports_reasoning": True}
@@ -457,3 +521,214 @@ def test_lo_stop_per_length_viaggia_nell_usage(finto_llama, monkeypatch):
     )
     usage = [e for e in eventi if e.kind == "usage"]
     assert usage and usage[-1].usage["done_reason"] == "length"
+
+
+# ---------------------------------------------------------------------------
+# Il template severo (Qwen3.8 ufficiale): livelli e system
+# ---------------------------------------------------------------------------
+#
+# Il finto server risponde 500 con i due corpi d'errore di llama-server quando
+# riceve un livello che il template non ammette o un system non in testa. Prima
+# della correzione ogni messaggio moriva cosi'; qui si prova che le richieste
+# passano, e passano al primo colpo quando il template si puo' leggere.
+
+
+def _conversazione():
+    return [
+        {"role": "system", "content": "SYS"},
+        {"role": "system", "content": "ENV"},
+        {"role": "user", "content": "ciao"},
+    ]
+
+
+def _eventi(backend, params, messaggi=None):
+    return list(backend.stream(messaggi or _conversazione(), None, params))
+
+
+def test_il_finto_server_e_severo_come_il_template(finto_llama):
+    """Il banco di prova: senza correzione, i due 500 della console."""
+    import httpx
+
+    url, handler = finto_llama
+    handler.severo = True
+    r = httpx.post(f"{url}/v1/chat/completions", json={
+        "messages": _conversazione(), "chat_template_kwargs": {"reasoning_effort": "high"},
+    })
+    assert r.status_code == 500
+    assert "Unexpected reasoning effort high" in r.json()["error"]["message"]
+    r = httpx.post(f"{url}/v1/chat/completions", json={"messages": _conversazione()})
+    assert r.status_code == 500
+    assert r.json()["error"]["message"] == ERRORE_SYSTEM
+
+
+def test_il_livello_si_legge_dal_template_e_passa_al_primo_colpo(finto_llama):
+    url, handler = finto_llama
+    handler.severo = True
+    handler.template = TEMPLATE_UFFICIALE
+    backend = LlamaCppBackend(url)
+    backend.props()                     # come fa gen_params() a ogni turno
+    params = GenParams(model="qwen", think="high")
+
+    eventi = _eventi(backend, params)
+
+    assert not [e for e in eventi if e.kind == "error"]
+    assert [e.text for e in eventi if e.kind == "content"] == ["ecco"]
+    assert len(handler.corpi) == 1                       # nessun 500 da pagare
+    corpo = handler.corpi[0]
+    assert corpo["chat_template_kwargs"]["reasoning_effort"] == "xhigh"
+    assert [m["role"] for m in corpo["messages"]] == ["system", "user"]
+    assert corpo["messages"][0]["content"] == "SYS\n\nENV"
+    assert backend.livello_inviato(params) == "xhigh"
+    report = backend.reasoning_control(params)
+    assert report["translated"] == {"from": "high", "to": "xhigh"}
+
+
+def test_un_livello_gia_ammesso_non_si_tocca(finto_llama):
+    url, handler = finto_llama
+    handler.severo = True
+    handler.template = TEMPLATE_UFFICIALE
+    backend = LlamaCppBackend(url)
+    backend.props()
+    params = GenParams(model="qwen", think="medium")
+
+    assert not [e for e in _eventi(backend, params) if e.kind == "error"]
+    assert handler.corpi[0]["chat_template_kwargs"]["reasoning_effort"] == "medium"
+    assert "translated" not in backend.reasoning_control(params)
+
+
+def test_senza_elenco_nel_template_ripiega_sul_messaggio_d_errore(finto_llama):
+    url, handler = finto_llama
+    handler.severo = True
+    handler.template = TEMPLATE_OPACO
+    backend = LlamaCppBackend(url)
+    backend.props()
+    params = GenParams(model="qwen", think="high")
+
+    eventi = _eventi(backend, params)
+
+    assert not [e for e in eventi if e.kind == "error"]
+    livelli = [c["chat_template_kwargs"]["reasoning_effort"] for c in handler.corpi]
+    assert livelli == ["high", "xhigh"]          # un 500, poi un solo nuovo giro
+    # L'elenco resta in cache: il turno dopo non ripaga il 500, anche con
+    # un'istanza nuova (il server ricostruisce il backend).
+    handler.corpi.clear()
+    altro = LlamaCppBackend(url)
+    altro.props()
+    assert not [e for e in _eventi(altro, params) if e.kind == "error"]
+    assert len(handler.corpi) == 1
+    assert handler.corpi[0]["chat_template_kwargs"]["reasoning_effort"] == "xhigh"
+
+
+def test_il_generico_impara_dal_500_e_riprova_una_volta(finto_llama):
+    """vLLM/OpenRouter col template ufficiale: stesso 500, stesso ripiego."""
+    url, handler = finto_llama
+    handler.severo = True
+    backend = OpenAICompatBackend(url, "")
+    params = GenParams(model="qwen3.8-27b", think="high")
+
+    assert not [e for e in _eventi(backend, params) if e.kind == "error"]
+    assert [c["reasoning_effort"] for c in handler.corpi] == ["high", "xhigh"]
+
+
+def test_il_generico_senza_errori_resta_com_era(finto_llama):
+    """OpenRouter & co.: un livello accettato viaggia identico, una richiesta."""
+    url, handler = finto_llama
+    backend = OpenAICompatBackend(url, "")
+    params = GenParams(model="qwen3.8-27b", think="high")
+
+    assert not [e for e in _eventi(backend, params) if e.kind == "error"]
+    assert len(handler.corpi) == 1
+    assert handler.corpi[0]["reasoning_effort"] == "high"
+
+
+def test_un_500_del_template_arriva_leggibile_e_senza_tre_tentativi(finto_llama):
+    url, handler = finto_llama
+    handler.rompi = ERRORE_SYSTEM
+    backend = LlamaCppBackend(url)
+
+    eventi = _eventi(backend, GenParams(model="qwen"))
+
+    errori = [e.text for e in eventi if e.kind == "error"]
+    assert len(errori) == 1
+    assert "System message must be at the beginning." in errori[0]
+    assert '{"error"' not in errori[0]           # il motivo, non l'involucro
+    assert len(handler.corpi) == 1               # deterministico: niente backoff
+
+
+def test_il_turno_passa_e_la_traccia_dice_richiesto_e_inviato(finto_llama, tmp_path):
+    """End-to-end sul ciclo: due system in testa, livello high, template severo.
+
+    E la cronologia salvata non si tocca: niente conversioni scritte su disco.
+    """
+    import copy
+
+    from core import agent as agent_mod
+    from core.tools import ToolContext
+
+    url, handler = finto_llama
+    handler.severo = True
+    handler.template = TEMPLATE_UFFICIALE
+    backend = LlamaCppBackend(url)
+    backend.props()
+    storia = [
+        {"role": "user", "content": "prima domanda"},
+        {"role": "assistant", "content": "", "tool_calls": [
+            {"id": "t1", "type": "function",
+             "function": {"name": "list_files", "arguments": "{}"}}]},
+        {"role": "tool", "tool_call_id": "t1", "name": "list_files", "content": "a.py"},
+        {"role": "assistant", "content": "fatto"},
+        {"role": "user", "content": "e adesso?"},
+    ]
+    prima = copy.deepcopy(storia)
+    eventi = list(agent_mod.run_turn(
+        backend=backend,
+        params=GenParams(model="qwen", num_ctx=8192, max_tokens=2048, think="high"),
+        tools_schema=[{"type": "function", "function": {"name": "list_files", "parameters": {}}}],
+        tool_ctx=ToolContext(workspace=str(tmp_path), sandbox="host"),
+        ui_messages=storia,
+        system_prompt="SYS",
+        env_header="ENV",
+        max_steps=1,
+        require_plan=False,
+        enable_nudge=False,
+    ))
+
+    assert not [e for e in eventi if type(e).__name__ == "AgentError"]
+    assert storia[: len(prima)] == prima
+    assert not any(m.get("role") == "system" for m in storia)
+    assert not any("[Nota dell'harness]" in str(m.get("content")) for m in storia)
+    corpo = handler.corpi[0]
+    assert sum(m["role"] == "system" for m in corpo["messages"]) == 1
+    traccia = next(m["think"] for m in storia if m.get("think"))
+    assert traccia["usato"] == "high"
+    assert traccia["inviato"] == "xhigh"
+    assert traccia["traduzione_livello"] == "high -> xhigh"
+
+
+def test_l_errore_che_chiude_il_turno_resta_nella_cronologia(finto_llama, tmp_path):
+    from core import agent as agent_mod
+    from core.tools import ToolContext
+
+    url, handler = finto_llama
+    handler.rompi = ERRORE_LIVELLO.format("high")
+    msgs = [{"role": "user", "content": "ciao"}]
+    eventi = list(agent_mod.run_turn(
+        backend=LlamaCppBackend(url),
+        params=GenParams(model="qwen", num_ctx=8192, max_tokens=2048),
+        tools_schema=[],
+        tool_ctx=ToolContext(workspace=str(tmp_path), sandbox="host"),
+        ui_messages=msgs,
+        system_prompt="SYS",
+        env_header="ENV",
+        max_steps=2,
+        require_plan=False,
+        enable_nudge=False,
+    ))
+
+    errori = [e for e in eventi if type(e).__name__ == "AgentError"]
+    assert errori and "Unexpected reasoning effort high" in errori[-1].message
+    assert msgs[-1]["role"] == "error"
+    assert "Supported types are xhigh" in msgs[-1]["content"]
+    # Il record non raggiunge mai il modello.
+    api = agent_mod.build_api_messages(msgs, system_prompt="S", env_header=None)
+    assert all(m["role"] != "error" for m in api)

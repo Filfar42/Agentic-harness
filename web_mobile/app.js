@@ -507,6 +507,11 @@ function renderConversation(messages, pending, withCard) {
         chiudiGruppoPassi();
         addBubble("agent", clean);
       }
+    } else if (m.role === "error") {
+      // L'errore che ha chiuso il turno: dal vivo arriva come toast, che
+      // sparisce; qui resta scritto nella conversazione.
+      chiudiGruppoPassi();
+      addBubble("agent", m.content || "", "errore");
     } else if (m.role === "tool") {
       if (m.name === "ask_user_question") {
         // Una domanda gia' risposta non e' un passo: e' un pezzo di

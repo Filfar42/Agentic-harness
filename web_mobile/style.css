@@ -203,6 +203,14 @@ html, body {
   border-bottom-left-radius: 4px;
 }
 
+/* L'errore che ha chiuso un turno, riletto dalla cronologia: resta scritto. */
+.msg.agent.errore {
+  background: var(--errore-bg);
+  color: var(--errore);
+  border-color: var(--errore);
+  white-space: pre-wrap;
+}
+
 .msg.pending {
   align-self: stretch;
   background: rgba(99, 213, 197, 0.12);

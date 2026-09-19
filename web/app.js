@@ -603,7 +603,11 @@ function makeTurn() {
     },
 
     isEmpty() {
-      return !this.wrap.querySelector('details.drawer, .question')
+      // Un turno con il solo riquadro d'errore NON e' vuoto: e' il turno che
+      // e' fallito, e il motivo e' proprio quello che l'utente deve leggere.
+      // Contarlo come vuoto lo faceva rimuovere a fine stream -- l'errore
+      // "che lampeggia e sparisce".
+      return !this.wrap.querySelector('details.drawer, .question, .error-box')
         && !(this._answer && this._answer.textContent.trim());
     },
   };
@@ -838,6 +842,13 @@ function renderHistory(messages, opzioni = {}) {
     if (msg.role === 'pending_question') {
       state.pending = msg;
       currentTurn().append(renderQuestion(msg, null));
+      return;
+    }
+
+    if (msg.role === 'error') {
+      // L'errore che ha chiuso il turno, salvato dal server (``registra_errore``):
+      // la rilettura dal disco a fine turno lo ridisegna invece di cancellarlo.
+      currentTurn().append(el('div', 'error-box', esc(msg.content || '')));
     }
   });
 

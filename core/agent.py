@@ -1677,6 +1677,39 @@ def _nome_livello(think: Any) -> str:
     return "?"
 
 
+def _livello_inviato(backend: Any, params: Any) -> str:
+    """Il livello che il template ha ricevuto davvero, in forma leggibile.
+
+    Diverso da "usato" quando il backend l'ha tradotto sull'elenco del
+    template (``high`` -> ``xhigh`` su Qwen3.8). "default" vuol dire che il
+    payload non portava nessun livello e ha deciso il template. Un backend
+    senza traduzione manda quello che riceve.
+    """
+    leggi = getattr(backend, "livello_inviato", None)
+    if not callable(leggi):
+        return _nome_livello(getattr(params, "think", None))
+    try:
+        valore = leggi(params)
+    except Exception:  # diagnostica: non deve fermare il turno
+        logger.exception("livello_inviato fallito")
+        return "?"
+    return "default" if valore is None else _nome_livello(valore)
+
+
+def registra_errore(ui_messages: list[dict[str, Any]], messaggio: str) -> None:
+    """Scrive nella cronologia l'errore che ha chiuso il turno.
+
+    Senza, l'errore viveva solo nello stream: a fine turno la pagina rilegge
+    la conversazione dal disco (evento ``turn`` del bus) e il riquadro rosso
+    spariva un istante dopo essere comparso -- con dentro l'unica riga utile,
+    l'eccezione del chat template. Il record ``error`` non raggiunge mai il
+    modello: ``build_api_messages`` conosce solo user/summary/assistant/tool.
+    """
+    testo = str(messaggio or "").strip()
+    if testo:
+        ui_messages.append({"role": "error", "content": testo, "ts": time.time()})
+
+
 def params_for_step(params: Any, plan: Any, step: int, tipo: str | None = None) -> Any:
     """I parametri di generazione di questo passo, col pensiero modulato.
 
@@ -2528,6 +2561,10 @@ def run_turn(
                 "passo_nel_punto": phase_step,
                 "configurato": _nome_livello(getattr(params, "think", None)),
                 "usato": _nome_livello(getattr(params_passo, "think", None)),
+                # Cosa ha ricevuto il template, dopo la traduzione sul suo
+                # elenco di livelli. Si legge **dopo** lo stream: l'elenco puo'
+                # essere stato imparato proprio in questo passo, da un 500.
+                "inviato": _livello_inviato(backend, params_passo),
                 "punto_aperto": bool(getattr(tool_ctx.plan, "current", None)),
                 # **Quale** punto, non solo se ce n'era uno. Il booleano
                 # sopra resta perche' e' quello che leggono gli script di
@@ -2566,6 +2603,10 @@ def run_turn(
                 "tetto": int(tetto_passo),
             }
         )
+        if traccia["inviato"] not in (traccia["usato"], "?"):
+            # La riga che si cerca quando un livello "non sembra funzionare":
+            # richiesto -> inviato, scritta dove e' successo.
+            traccia["traduzione_livello"] = f"{traccia['usato']} -> {traccia['inviato']}"
         stato_traccia["da"] = len(ui_messages)
 
         if interrupted or stopped():
@@ -2599,6 +2640,7 @@ def run_turn(
                 if PAUSA_RIPRESA_S:
                     time.sleep(PAUSA_RIPRESA_S)
                 continue
+            registra_errore(ui_messages, stream_error)
             yield AgentError(stream_error, guasto_backend=True)
             yield fine("error", step)
             return
@@ -2877,6 +2919,9 @@ def run_turn(
                 break
             seen_ids.add(call["id"])
         if malformed:
+            registra_errore(
+                ui_messages, "Protocol error: malformed or duplicate tool-call envelope"
+            )
             yield AgentError("Protocol error: malformed or duplicate tool-call envelope")
             yield fine("error", step)
             return

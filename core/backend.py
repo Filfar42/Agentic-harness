@@ -26,7 +26,7 @@ from datetime import UTC, datetime
 from dataclasses import dataclass
 from email.utils import parsedate_to_datetime
 from typing import Any, Literal
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 
 import httpx
 
@@ -65,10 +65,44 @@ class _HTTPFailure(Exception):
     """An HTTP rejection with bounded retry metadata and diagnostic text."""
 
     def __init__(self, status: int, body: str, retry_after: str = "") -> None:
-        super().__init__(f"HTTP {status}: {body[:600]}")
+        super().__init__(f"HTTP {status}: {_messaggio_dal_corpo(body)[:600]}")
         self.status = status
         self.body = body
         self.retry_after = retry_after
+
+
+def _messaggio_dal_corpo(body: str) -> str:
+    """Il motivo scritto dal server, senza l'involucro JSON quando c'e'.
+
+    llama-server risponde ``{"error": {"code": 500, "message": "...",
+    "type": "server_error"}}``, Ollama ``{"error": "..."}``: il testo utile
+    -- l'eccezione del chat template, per esempio -- sta li' dentro, e
+    mostrare all'utente l'involucro intero lo tagliava a meta' dopo 600
+    caratteri di punteggiatura. Un corpo che non e' JSON torna com'e'.
+    """
+    try:
+        dati = json.loads(body)
+    except (ValueError, TypeError):
+        return body
+    errore = dati.get("error") if isinstance(dati, dict) else None
+    if isinstance(errore, dict):
+        errore = errore.get("message")
+    return errore if isinstance(errore, str) and errore.strip() else body
+
+
+# Un 500 del chat template non e' un guasto passeggero: lo stesso payload
+# produce lo stesso errore, sempre. Riprovarlo tre volte con il backoff voleva
+# dire solo far aspettare l'utente prima di mostrargli il motivo.
+_RX_ERRORE_TEMPLATE = re.compile(
+    r"jinja|templateerror|chat[ _]template|Supported types are"
+    r"|must be at the beginning",
+    re.IGNORECASE,
+)
+
+
+def errore_del_template(body: str) -> bool:
+    """Il corpo di un errore HTTP viene dal rendering del chat template?"""
+    return bool(body) and bool(_RX_ERRORE_TEMPLATE.search(body))
 
 
 def _checkpoint(should_stop: StopCheck, deadline: float) -> None:
@@ -139,6 +173,7 @@ def _stream_with_retries(
             except (_HTTPFailure, httpx.TransportError) as exc:
                 retryable = (
                     exc.status in {408, 429, 500, 502, 503, 504}
+                    and not errore_del_template(exc.body)
                     if isinstance(exc, _HTTPFailure)
                     else isinstance(exc, (httpx.TimeoutException, httpx.NetworkError,
                                           httpx.RemoteProtocolError))
@@ -370,8 +405,204 @@ def _template_reasoning_keys(template: str) -> set[str]:
 
 
 # ---------------------------------------------------------------------------
+# Livelli di pensiero ammessi dal template
+# ---------------------------------------------------------------------------
+#
+# L'harness ragiona su una scala sua (``low``/``medium``/``high``/``max``, vedi
+# ``GenParams.LIVELLI_PENSIERO``), ma chi decide cosa si puo' mandare e' il
+# chat template del modello. Quello ufficiale di Qwen3.8 accetta solo
+# ``xhigh``/``medium``/``low`` e per tutto il resto -- ``high`` compreso --
+# solleva un'eccezione Jinja: llama-server e vLLM la trasformano in un 500 e
+# il turno muore sul primo messaggio. Il template unsloth usato prima non
+# controllava, ed e' per questo che il guasto e' comparso solo cambiando GGUF.
+#
+# I valori ammessi non si scrivono qui: si **leggono** dal template (GET
+# /props -> chat_template) o, se non c'e', dal messaggio d'errore del server.
+# Il livello richiesto si traduce nel piu' vicino ammesso su questa scala; a
+# parita' di distanza vince il piu' alto (``high`` -> ``xhigh``, non
+# ``medium``): abbassare il pensiero di default e' una decisione gia' scartata.
+ORDINE_LIVELLI: tuple[str, ...] = ("minimal", "low", "medium", "high", "xhigh", "max")
+
+_RX_TIPI_AMMESSI = re.compile(r"Supported types are\s+([^.\n\"'\\]+)", re.IGNORECASE)
+_RX_ELENCO_NEL_TEMPLATE = re.compile(
+    r"reasoning_effort\w*\s+(?:not\s+)?in\s*[\(\[]([^\)\]]*)[\)\]]", re.IGNORECASE
+)
+
+
+def livelli_dal_testo(testo: str) -> tuple[str, ...]:
+    """I livelli elencati nella frase "Supported types are ...".
+
+    La frase e' la stessa nel template (dentro ``raise_exception``) e nel
+    messaggio d'errore che il server ne ricava, quindi un solo lettore serve
+    entrambi: "xhigh (default), medium, and low" -> ("xhigh", "medium", "low").
+    """
+    if not isinstance(testo, str):
+        return ()
+    trovato = _RX_TIPI_AMMESSI.search(testo)
+    if not trovato:
+        return ()
+    elenco = re.sub(r"\([^)]*\)", " ", trovato.group(1))
+    livelli: list[str] = []
+    for pezzo in re.split(r",|\band\b|\bor\b", elenco):
+        parola = pezzo.strip().lower()
+        if re.fullmatch(r"[a-z][a-z0-9_-]*", parola) and parola not in livelli:
+            livelli.append(parola)
+    return tuple(livelli)
+
+
+def livelli_dal_template(template: Any) -> tuple[str, ...]:
+    """I livelli che il chat template accetta, se li dichiara.
+
+    Prima la frase dell'eccezione, poi la tupla del controllo
+    (``reasoning_effort not in ('xhigh', 'medium', 'low')``). Il template non
+    si esegue: e' codice del server, qui si legge soltanto.
+    """
+    if not isinstance(template, str) or "reasoning_effort" not in template:
+        return ()
+    livelli = livelli_dal_testo(template)
+    if livelli:
+        return livelli
+    trovato = _RX_ELENCO_NEL_TEMPLATE.search(template)
+    if not trovato:
+        return ()
+    return tuple(
+        dict.fromkeys(v.lower() for v in re.findall(r"['\"]([^'\"]+)['\"]", trovato.group(1)))
+    )
+
+
+def livello_piu_vicino(richiesto: str, ammessi: Sequence[str]) -> str | None:
+    """Il livello ammesso piu' vicino a quello richiesto.
+
+    ``None`` quando non si sa tradurre (livello fuori scala, o nessun ammesso
+    che stia sulla scala): chi chiama omette il campo e lascia il default del
+    template, invece di mandare un valore che sa gia' rifiutato.
+    """
+    if richiesto in ammessi:
+        return richiesto
+    if richiesto not in ORDINE_LIVELLI:
+        return None
+    posizione = ORDINE_LIVELLI.index(richiesto)
+    candidati = [a for a in ammessi if a in ORDINE_LIVELLI]
+    if not candidati:
+        return None
+    return min(
+        candidati,
+        key=lambda a: (abs(ORDINE_LIVELLI.index(a) - posizione), -ORDINE_LIVELLI.index(a)),
+    )
+
+
+# Livelli imparati dai messaggi d'errore, per (endpoint, modello). Di modulo e
+# non di istanza per la stessa ragione di ``_MODEL_INFO_CACHE``: il server
+# ricostruisce il backend, e un elenco d'istanza si perderebbe al turno dopo --
+# cioe' si ripagherebbe il 500 a ogni messaggio. Si svuota con
+# ``forget_model_info()``, che e' il gesto di chi cambia endpoint o modello.
+_LIVELLI_APPRESI: dict[tuple[str, str], tuple[str, ...]] = {}
+
+
+def _effort_nel_payload(payload: dict[str, Any]) -> str | None:
+    """Il livello che questo payload manda, dovunque stia."""
+    for sorgente in (payload, payload.get("chat_template_kwargs") or {}):
+        valore = sorgente.get("reasoning_effort") if isinstance(sorgente, dict) else None
+        if isinstance(valore, str) and valore != "none":
+            return valore
+    return None
+
+
+def _traduci_effort(payload: dict[str, Any], ammessi: Sequence[str]) -> dict[str, Any]:
+    """Riscrive ``reasoning_effort`` (in testa e nei kwargs) sul livello ammesso.
+
+    Senza elenco non tocca niente: e' il caso di OpenRouter e di ogni endpoint
+    che non si e' mai lamentato. ``"none"`` resta com'e': e' lo spegnimento,
+    non un livello, e llama.cpp lo documenta a parte.
+    """
+    if not ammessi:
+        return payload
+    fuori = dict(payload)
+    for dove in ("top", "kwargs"):
+        sorgente = fuori if dove == "top" else fuori.get("chat_template_kwargs")
+        if not isinstance(sorgente, dict):
+            continue
+        valore = sorgente.get("reasoning_effort")
+        if not isinstance(valore, str) or valore == "none" or valore in ammessi:
+            continue
+        sorgente = dict(sorgente)
+        nuovo = livello_piu_vicino(valore, ammessi)
+        if nuovo is None:
+            sorgente.pop("reasoning_effort")
+        else:
+            sorgente["reasoning_effort"] = nuovo
+        if dove == "top":
+            fuori = {**sorgente}
+        elif sorgente:
+            fuori["chat_template_kwargs"] = sorgente
+        else:
+            fuori.pop("chat_template_kwargs")
+    return fuori
+
+
+# ---------------------------------------------------------------------------
 # Conversione dei messaggi
 # ---------------------------------------------------------------------------
+
+
+PREFISSO_NOTA_HARNESS = "[Nota dell'harness]"
+
+
+def messaggi_per_il_filo(messages: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Un solo messaggio ``system``, e solo in testa: la forma che i template
+    severi pretendono.
+
+    Il template ufficiale di Qwen3.8 solleva "System message must be at the
+    beginning." per qualunque system che non sia il primo, e l'harness ne
+    manda sempre almeno due in testa (prompt di sistema ed environment) piu'
+    la nota di ``trim_to_window`` quando taglia. Qui, **al confine**, e non
+    nella cronologia: la sessione su disco resta com'e', cambia solo cio' che
+    viaggia.
+
+    * I system contigui in testa si fondono nel primo -- quello che
+      ``to_ollama_messages`` faceva gia' per Ollama: stessa forma su tutti i
+      transport, e il prefisso resta byte-identico fra un passo e l'altro.
+    * Un system piu' avanti diventa un ``user`` con il prefisso
+      ``[Nota dell'harness]``, nella sua posizione. Se cadrebbe fra un
+      assistant con ``tool_calls`` e i suoi risultati, scivola dopo l'ultimo
+      ``tool`` del gruppo: in mezzo spezzerebbe l'abbinamento chiamata-esito,
+      che i template rifiutano.
+
+    Non modifica i dizionari ricevuti.
+    """
+    elenco = list(messages)
+    inizio = 0
+    while inizio < len(elenco) and elenco[inizio].get("role") == "system":
+        inizio += 1
+    if inizio <= 1 and not any(m.get("role") == "system" for m in elenco[inizio:]):
+        return elenco
+    out: list[dict[str, Any]] = []
+    if inizio == 1:
+        out.append(elenco[0])
+    elif inizio > 1:
+        testa = dict(elenco[0])
+        parti = [str(m.get("content") or "").strip() for m in elenco[:inizio]]
+        testa["content"] = "\n\n".join(p for p in parti if p)
+        out.append(testa)
+    rinviate: list[dict[str, Any]] = []
+    in_gruppo = False
+    for msg in elenco[inizio:]:
+        ruolo = msg.get("role")
+        if ruolo == "system":
+            testo = str(msg.get("content") or "").strip()
+            if testo:
+                nota = {"role": "user", "content": f"{PREFISSO_NOTA_HARNESS} {testo}"}
+                (rinviate if in_gruppo else out).append(nota)
+            continue
+        if ruolo == "tool":
+            out.append(msg)
+            continue
+        out.extend(rinviate)
+        rinviate = []
+        out.append(msg)
+        in_gruppo = ruolo == "assistant" and bool(msg.get("tool_calls"))
+    out.extend(rinviate)
+    return out
 
 
 def to_ollama_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -500,6 +731,9 @@ def forget_model_info() -> None:
     sarebbe rispondergli con la fotografia di prima."""
     _MODEL_INFO_CACHE.clear()
     _MODEL_INFO_FALLITI.clear()
+    # Anche i livelli di pensiero imparati da un errore: un altro modello, o
+    # lo stesso con un altro GGUF, puo' avere un altro template.
+    _LIVELLI_APPRESI.clear()
 
 
 class OllamaBackend:
@@ -749,16 +983,46 @@ class OllamaBackend:
     # -- generazione ------------------------------------------------------
 
     def reasoning_control(self, params: GenParams) -> dict[str, Any]:
-        """Pure diagnostic of the native payload, including learned fallback."""
+        """Pure diagnostic of the native payload, including learned fallback.
+
+        Un livello che il template ha gia' rifiutato una volta si traduce nel
+        piu' vicino fra quelli che ha elencato (vedi ``livello_piu_vicino``);
+        senza elenco imparato il payload e' quello di sempre.
+        """
         think = params.think_payload
         support = "native_unverified"
         if isinstance(think, str) and self._think_levels_ok is False:
             think = True
             support = "boolean_only"
+        elif isinstance(think, str):
+            ammessi = _LIVELLI_APPRESI.get((self.base_url, params.model), ())
+            if ammessi and think not in ammessi:
+                # Fuori scala: acceso e basta, il livello lo sceglie il template.
+                think = livello_piu_vicino(think, ammessi) or True
+                support = "translated_from_error"
         return _reasoning_report(
             params, {"think": think} if think is not None else {},
             support if think is not None else "omitted",
         )
+
+    def livello_inviato(self, params: GenParams) -> Any:
+        """Il valore di ``think`` che parte davvero, dopo le traduzioni."""
+        return self.reasoning_control(params)["payload"].get("think")
+
+    def _impara_livelli(self, params: GenParams, payload: dict[str, Any], corpo: str) -> bool:
+        """Il template ha rifiutato il livello ed elenca quelli buoni? Allora
+        si impara l'elenco e si riprova una volta sola.
+
+        Stesso schema di ``_livello_rifiutato``: tre condizioni insieme --
+        avevamo mandato un livello, il server ne elenca altri, e l'elenco non
+        contiene quello mandato. Un errore diverso non tocca niente.
+        """
+        mandato = payload.get("think")
+        ammessi = livelli_dal_testo(corpo)
+        if not isinstance(mandato, str) or not ammessi or mandato in ammessi:
+            return False
+        _LIVELLI_APPRESI[(self.base_url, params.model)] = ammessi
+        return True
 
     def build_payload(
         self,
@@ -770,7 +1034,7 @@ class OllamaBackend:
     ) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "model": params.model,
-            "messages": to_ollama_messages(messages),
+            "messages": to_ollama_messages(messaggi_per_il_filo(messages)),
             "stream": stream,
             "options": params.ollama_options(),
             "keep_alive": params.keep_alive,
@@ -865,11 +1129,17 @@ class OllamaBackend:
         Tool calls are translated as they arrive but released only after
         ``done: true``. EOF, invalid JSON or cancellation discards the buffer.
         """
-        for compatibility_attempt in range(2):
+        # Al piu' due ripieghi, uno per specie: il livello tradotto sull'elenco
+        # del template, e il livello spento in booleano da un 400 di Ollama
+        # (che puo' seguire il primo, se Ollama non conosce il livello tradotto).
+        livelli_imparati = False
+        livello_booleano = False
+        for _compatibility_attempt in range(3):
             _checkpoint(should_stop, deadline)
             payload = self.build_payload(messages, tools, params, stream=streaming)
             pending_tools: list[StreamEvent] = []
             tool_index = 0
+            emesso = False
             try:
                 with get_client().stream(
                     "POST", f"{self.base_url}/api/chat", json=payload,
@@ -888,9 +1158,11 @@ class OllamaBackend:
                     for chunk in chunks:
                         _checkpoint(should_stop, deadline)
                         if chunk.get("error"):
-                            raise TransportProtocolError(
-                                f"Ollama: {_text_field(chunk['error'], 'error')[:600]}"
-                            )
+                            motivo = _text_field(chunk["error"], "error")
+                            if (not emesso and not livelli_imparati
+                                    and self._impara_livelli(params, payload, motivo)):
+                                raise _HTTPFailure(500, motivo)
+                            raise TransportProtocolError(f"Ollama: {motivo[:600]}")
                         done = chunk.get("done", False)
                         if not isinstance(done, bool):
                             raise TransportProtocolError("done deve essere booleano.")
@@ -902,6 +1174,7 @@ class OllamaBackend:
                             if event.kind == "tool_call":
                                 pending_tools.append(event)
                             else:
+                                emesso = True
                                 yield event
                         if done:
                             usage = self._usage_event(chunk)
@@ -913,8 +1186,12 @@ class OllamaBackend:
                             return
                     raise TransportProtocolError("Stream Ollama incompleto: manca done=true.")
             except _HTTPFailure as exc:
-                if (compatibility_attempt == 0 and exc.status == 400
+                if not livelli_imparati and self._impara_livelli(params, payload, exc.body):
+                    livelli_imparati = True
+                    continue
+                if (not livello_booleano and exc.status == 400
                         and self._livello_rifiutato(payload, exc.body)):
+                    livello_booleano = True
                     continue
                 raise
 
@@ -1050,7 +1327,49 @@ class OpenAICompatBackend:
         if key is not None and think is not None:
             payload["chat_template_kwargs"] = {key: bool(think)}
             support = "template_unverified" if isinstance(think, bool) else "effort_template_unverified"
-        return _reasoning_report(params, payload, support)
+        return self._con_livelli_ammessi(params, payload, support)
+
+    # -- livelli di pensiero ammessi ---------------------------------------
+
+    def livelli_ammessi(self, model: str) -> tuple[str, ...]:
+        """Quelli imparati da un errore di questo endpoint. Qui non si sonda
+        niente: il generico non ha un ``/props`` da leggere."""
+        return _LIVELLI_APPRESI.get((self.base_url, model), ())
+
+    def _con_livelli_ammessi(
+        self, params: GenParams, payload: dict[str, Any], support: str
+    ) -> dict[str, Any]:
+        """Applica la traduzione del livello e la scrive nel referto."""
+        richiesto = _effort_nel_payload(payload)
+        tradotto = _traduci_effort(payload, self.livelli_ammessi(params.model))
+        report = _reasoning_report(params, tradotto, support)
+        inviato = _effort_nel_payload(tradotto)
+        if richiesto is not None and inviato != richiesto:
+            report["translated"] = {"from": richiesto, "to": inviato}
+        return report
+
+    def livello_inviato(self, params: GenParams) -> Any:
+        """Il livello che parte davvero, dopo la traduzione.
+
+        Per la traccia ``think`` del messaggio: "configurato" e "usato" dicono
+        cosa voleva l'harness, questo cosa ha ricevuto il template. ``None``
+        vuol dire: nessun livello nel payload, decide il template.
+        """
+        think = params.think_payload
+        if not isinstance(think, str):
+            return think
+        return _effort_nel_payload(self.reasoning_control(params)["payload"])
+
+    def _impara_livelli(self, params: GenParams, payload: dict[str, Any], corpo: str) -> bool:
+        """Ripiego quando il template non si e' potuto leggere: l'elenco lo
+        da' il messaggio del 500 ("Supported types are ..."). Si impara e si
+        riprova una volta sola; un errore diverso non tocca niente."""
+        mandato = _effort_nel_payload(payload)
+        ammessi = livelli_dal_testo(corpo)
+        if mandato is None or not ammessi or mandato in ammessi:
+            return False
+        _LIVELLI_APPRESI[(self.base_url, params.model)] = ammessi
+        return True
 
     # -- ganci per i dialetti (llama.cpp, vLLM, ...) -----------------------
     #
@@ -1188,9 +1507,20 @@ class OpenAICompatBackend:
         should_stop: StopCheck = None,
     ) -> Iterator[StreamEvent]:
         """Stream validated SSE with pooled HTTP connections and bounded retries."""
+        yield from _stream_with_retries(
+            lambda deadline: self._tentativo(messages, tools, params, should_stop, deadline),
+            self.timeout_s, should_stop,
+        )
+
+    def _payload(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None,
+        params: GenParams,
+    ) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "model": params.model,
-            "messages": messages,
+            "messages": messaggi_per_il_filo(messages),
             "temperature": params.temperature,
             "top_p": params.top_p,
             "max_tokens": params.max_tokens,
@@ -1201,10 +1531,31 @@ class OpenAICompatBackend:
         if tools:
             payload["tools"] = tools
             payload["tool_choice"] = "auto"
-        yield from _stream_with_retries(
-            lambda deadline: self._openai_attempt(payload, should_stop, deadline),
-            self.timeout_s, should_stop,
-        )
+        return payload
+
+    def _tentativo(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None,
+        params: GenParams,
+        should_stop: StopCheck,
+        deadline: float,
+    ) -> Iterator[StreamEvent]:
+        """Una richiesta, piu' al massimo un secondo giro col livello tradotto.
+
+        Il 500 del template arriva prima di qualunque byte di stream, quindi
+        riprovare non duplica niente. Il secondo giro ricostruisce il payload:
+        ``reasoning_control`` ora trova l'elenco imparato.
+        """
+        for giro in range(2):
+            payload = self._payload(messages, tools, params)
+            try:
+                yield from self._openai_attempt(payload, should_stop, deadline)
+                return
+            except _HTTPFailure as exc:
+                if giro == 0 and self._impara_livelli(params, payload, exc.body):
+                    continue
+                raise
 
 
 class LlamaCppBackend(OpenAICompatBackend):
@@ -1262,6 +1613,9 @@ class LlamaCppBackend(OpenAICompatBackend):
         self._props: dict[str, Any] = {}
         self._props_at: float = 0.0
         self._props_falliti_at: float = 0.0
+        # Memo della lettura dei livelli: si rifa' solo se il template cambia.
+        self._livelli_template: tuple[str, ...] = ()
+        self._livelli_template_da: Any = None
 
     # -- introspezione ----------------------------------------------------
 
@@ -1490,13 +1844,26 @@ class LlamaCppBackend(OpenAICompatBackend):
         elif isinstance(think, str) and "reasoning_effort" in keys:
             kwargs["reasoning_effort"] = think
             support = "template_unverified"
+            if self.livelli_ammessi(params.model):
+                support = "template_levels"
         elif kwargs:
             support = "boolean_only" if isinstance(think, str) else "template_unverified"
         else:
             support = "unknown"
         if kwargs:
             body["chat_template_kwargs"] = kwargs
-        return _reasoning_report(params, body, support)
+        return self._con_livelli_ammessi(params, body, support)
+
+    def livelli_ammessi(self, model: str) -> tuple[str, ...]:
+        """Letti dal template di ``/props``; se non li dichiara, quelli
+        imparati da un 500. Nessuna richiesta di rete: ``_props`` lo riempiono
+        ``clamp_num_ctx``/``supports_thinking`` a ogni turno, come per le
+        chiavi del template qui sopra."""
+        template = self._props.get("chat_template")
+        if template is not self._livelli_template_da:
+            self._livelli_template = livelli_dal_template(template)
+            self._livelli_template_da = template
+        return self._livelli_template or super().livelli_ammessi(model)
 
     def _extra_body(self, params: GenParams) -> dict[str, Any]:
         """Sampler nel dialetto di llama.cpp.

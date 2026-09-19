@@ -420,6 +420,43 @@ modello richiesto.
 
 ## Storia delle revisioni
 
+**v2.38.1** — i template severi: il GGUF ufficiale di Qwen3.8 non rifiuta piu'
+ogni messaggio.
+
+Con `ISTA-DASLab/Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp` su llama-server ogni turno
+moriva al primo passo con due eccezioni del chat template: `Unexpected
+reasoning effort high. Supported types are xhigh (default), medium, and low.`
+e `System message must be at the beginning.` Il template unsloth usato prima
+non controllava ne' l'una ne' l'altra cosa.
+
+**Il livello di pensiero si traduce su quelli che il template ammette.** I
+valori non stanno scritti nel codice: si leggono dal `chat_template` di
+`/props` (la frase dell'eccezione o la tupla del controllo) e, se il template
+non li lascia leggere, dal messaggio del 500, che si impara una volta e si
+riprova una volta sola (cache per endpoint e modello, svuotata da
+`forget_model_info`). Scala `low < medium < high < xhigh` (`max` sopra
+tutti); a parita' di distanza vince il piu' alto, quindi `high` -> `xhigh`: il
+pensiero di default non si abbassa. Vale anche su Ollama e sul generico
+compatibile (vLLM, OpenRouter): se il livello e' gia' ammesso il payload e'
+identico a prima. La traccia `think` del messaggio ha il campo `inviato` e,
+quando differisce da `usato`, `traduzione_livello` (`high -> xhigh`).
+
+**Un solo system, in testa, al confine di serializzazione.** Gli unici system
+dopo il primo erano in testa: l'environment (sempre) e la nota di
+`trim_to_window` (quando taglia); i solleciti erano gia' messaggi `user`.
+`messaggi_per_il_filo` fonde i system contigui in testa nel primo -- quello che
+`to_ollama_messages` faceva gia' per Ollama -- e trasforma un eventuale system
+piu' avanti in un `user` "[Nota dell'harness] ...", spostato dopo l'ultimo
+`tool` se cadrebbe dentro un gruppo `tool_calls`. Tutti i transport. La
+cronologia salvata non cambia.
+
+**L'errore resta in chat.** Il turno con il solo riquadro d'errore contava
+come vuoto e veniva rimosso a fine stream, e la rilettura dal disco di fine
+turno non lo ritrovava. Ora l'errore che chiude il turno si salva come record
+`error` (mai inviato al modello) e si ridisegna, anche sul telefono. Il
+messaggio mostrato e' quello del server senza l'involucro JSON, e un 500 del
+template non si riprova tre volte col backoff: e' deterministico.
+
 **v2.37.0** — checkpoint, recupero e misure del loop.
 
 La compattazione elabora i nuovi eventi e riporta esplicitamente attivita'
