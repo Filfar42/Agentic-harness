@@ -1271,6 +1271,9 @@ class OpenAICompatBackend:
     # Nello standard OpenAI ``usage.prompt_tokens`` e' il prompt intero, parte
     # in cache compresa (che sta in ``prompt_tokens_details.cached_tokens``).
     prompt_tokens_is_total = True
+    # ``id_slot`` e' un campo di llama-server: solo ``LlamaCppBackend`` lo
+    # manda (vedi ``slot_per``).
+    supports_id_slot = False
 
 
     def __init__(self, base_url: str, api_key: str, timeout_s: float = 180.0) -> None:
@@ -1542,10 +1545,13 @@ class OpenAICompatBackend:
         params: GenParams,
         *,
         should_stop: StopCheck = None,
+        id_slot: int | None = None,
     ) -> Iterator[StreamEvent]:
         """Stream validated SSE with pooled HTTP connections and bounded retries."""
         yield from _stream_with_retries(
-            lambda deadline: self._tentativo(messages, tools, params, should_stop, deadline),
+            lambda deadline: self._tentativo(
+                messages, tools, params, should_stop, deadline, id_slot
+            ),
             self.timeout_s, should_stop,
         )
 
@@ -1554,6 +1560,7 @@ class OpenAICompatBackend:
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None,
         params: GenParams,
+        id_slot: int | None = None,
     ) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "model": params.model,
@@ -1568,6 +1575,8 @@ class OpenAICompatBackend:
         if tools:
             payload["tools"] = tools
             payload["tool_choice"] = "auto"
+        if id_slot is not None and self.supports_id_slot:
+            payload["id_slot"] = int(id_slot)
         return payload
 
     def _tentativo(
@@ -1577,6 +1586,7 @@ class OpenAICompatBackend:
         params: GenParams,
         should_stop: StopCheck,
         deadline: float,
+        id_slot: int | None = None,
     ) -> Iterator[StreamEvent]:
         """Una richiesta, piu' al massimo un secondo giro col livello tradotto.
 
@@ -1585,7 +1595,7 @@ class OpenAICompatBackend:
         ``reasoning_control`` ora trova l'elenco imparato.
         """
         for giro in range(2):
-            payload = self._payload(messages, tools, params)
+            payload = self._payload(messages, tools, params, id_slot)
             try:
                 yield from self._openai_attempt(payload, should_stop, deadline)
                 return
@@ -1623,6 +1633,10 @@ class LlamaCppBackend(OpenAICompatBackend):
     """
 
     name = "llamacpp"
+    supports_id_slot = True
+    # Lo slot delle chiamate di servizio (impostazione ``slot_servizio``);
+    # -1 = spento. Lo assegna il server a ogni turno.
+    slot_servizio: int = -1
 
     # ``/props`` non cambia mentre il server e' vivo -- ma il server si
     # riavvia, ed e' proprio riavviandolo che si cambia ``-c``. Una cache
@@ -1818,7 +1832,35 @@ class LlamaCppBackend(OpenAICompatBackend):
             return vero
         return richiesto
 
+    def slot_per(self, scopo: str) -> int | None:
+        """Lo slot per una chiamata con questo scopo, o None per lasciar fare
+        al server.
+
+        Con un solo slot, ogni chiamata di servizio -- un riassunto, un
+        estratto del pensiero, i passi di una delega -- carica nello slot un
+        prompt diverso da quello della conversazione, e al passo dopo il server
+        deve ritrovarlo: dalla RAM (``--cache-ram``) se ci sta, altrimenti
+        ricalcolandolo. Su un modello ibrido e a contesto lungo sono decine di
+        secondi. Con due slot la conversazione tiene il suo, sempre lo stesso,
+        e il servizio lavora nell'altro.
+
+        Si manda solo se ``/props`` dichiara abbastanza slot: un ``id_slot``
+        che non esiste fa fallire la richiesta, e un'impostazione rimasta
+        accesa dopo aver rilanciato il server con ``-np 1`` non deve spegnere
+        l'harness.
+        """
+        servizio = int(self.slot_servizio)
+        if servizio < 0:
+            return None
+        totali = self.props().get("total_slots")
+        if type(totali) is not int or totali < 2 or servizio >= totali:
+            return None
+        if scopo == "main":
+            return 0 if servizio != 0 else 1
+        return servizio
+
     def _caps(self) -> dict[str, Any]:
+
         caps = self.props().get("chat_template_caps")
         return caps if isinstance(caps, dict) else {}
 

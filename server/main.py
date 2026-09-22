@@ -611,7 +611,12 @@ class AppState:
                     stream_tools=s["stream_tools"],
                 )
                 self._backend_key = key
+            if hasattr(self._backend, "slot_servizio"):
+                # Fuori dalla chiave: cambiarlo non deve ricostruire il
+                # backend (e buttarne le cache), basta riassegnarlo.
+                self._backend.slot_servizio = int(s.get("slot_servizio", -1))
             return self._backend
+
 
     def _backend_se_gia_pronto(self):
         """Il backend, ma solo se esiste gia'. Non lo costruisce.

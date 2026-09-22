@@ -37,6 +37,7 @@ from collections.abc import Callable
 
 from . import sandbox as sandbox_mod
 from . import atomic
+from . import sintassi
 from . import vault as vault_mod
 from .config import Budgets
 from .memory import add_memory, remove_memory
@@ -318,6 +319,10 @@ class ToolContext:
     # Quante volte la guardia ha respinto una modifica, per file: dopo il
     # secondo tentativo il messaggio cambia tono e indica l'uscita.
     test_guard_refusals: dict[str, int] = field(default_factory=dict)
+    # Scritture gia' respinte una volta dalla guardia di sintassi in questo
+    # turno (impronte di percorso + contenuto): la stessa, ripetuta identica,
+    # passa. Vedi ``core/sintassi.py``.
+    sintassi_insistite: set[str] = field(default_factory=set)
     readonly_request: bool = False
     # La goccia "Ricerca online" era accesa quando il turno e' partito. Senza
     # questo flag un modello che ricorda il tool da un turno precedente
@@ -1300,6 +1305,11 @@ def tool_write_file(ctx: ToolContext, filepath: str, content: str = "") -> str:
     refusal = _refuse_test_edit(ctx, filepath, previous_text, content or "")
     if refusal:
         return refusal
+    verdetto = sintassi.valuta(
+        filepath, previous_text if existed else None, content or "", ctx.sintassi_insistite
+    )
+    if verdetto.rifiuta and verdetto.errore is not None:
+        return sintassi.rifiuto(filepath, verdetto.errore)
 
     try:
         previous_size = path.stat().st_size if existed else 0
@@ -1318,17 +1328,20 @@ def tool_write_file(ctx: ToolContext, filepath: str, content: str = "") -> str:
     if not existed and looks_like_test_file(rel):
         # Da qui in poi questo test e' roba sua: puo' correggerlo.
         ctx.authored_tests.add(rel)
-    return _ok(
-        {
-            "status": "ok",
-            "action": "sovrascritto" if existed else "creato",
-            "filepath": rel,
-            "bytes_before": previous_size,
-            "bytes_after": len((content or "").encode("utf-8")),
-            "sha256": hashlib.sha256((content or "").encode("utf-8")).hexdigest(),
-            "lines": (content or "").count("\n") + 1,
-        }
-    )
+    esito: dict[str, Any] = {
+        "status": "ok",
+        "action": "sovrascritto" if existed else "creato",
+        "filepath": rel,
+        "bytes_before": previous_size,
+        "bytes_after": len((content or "").encode("utf-8")),
+        "sha256": hashlib.sha256((content or "").encode("utf-8")).hexdigest(),
+        "lines": (content or "").count("\n") + 1,
+    }
+    if verdetto.errore is not None:
+        # Scritto lo stesso (file nuovo, gia' rotto, o insistenza): il modello
+        # deve saperlo adesso, non dal traceback di un test fra tre passi.
+        esito["avviso_sintassi"] = verdetto.errore.come_dict()
+    return _ok(esito)
 
 
 def tool_edit_file(
@@ -1399,6 +1412,9 @@ def tool_edit_file(
     refusal = _refuse_test_edit(ctx, filepath, text, nuovo_testo)
     if refusal:
         return refusal
+    verdetto = sintassi.valuta(filepath, text, nuovo_testo, ctx.sintassi_insistite)
+    if verdetto.rifiuta and verdetto.errore is not None:
+        return sintassi.rifiuto(filepath, verdetto.errore)
 
     try:
         atomic.write_text(path, nuovo_testo)
@@ -1408,8 +1424,13 @@ def tool_edit_file(
     rel = ctx.touch(path)
     ctx.known_files.add(rel)
     record_new_symbols(ctx, rel, text, nuovo_testo)
+    avviso = {"avviso_sintassi": verdetto.errore.come_dict()} if verdetto.errore else {}
     return _ok(
         {
+            **avviso,
+            "dopo_la_modifica": finestra_modifica(
+                nuovo_testo, text.find(old_string), new_string or "", quante
+            ),
             "status": "ok",
             "action": "modificato",
             "sha256": hashlib.sha256(nuovo_testo.encode("utf-8")).hexdigest(),
@@ -1426,7 +1447,42 @@ def tool_edit_file(
     )
 
 
+# Righe mostrate attorno a una modifica, per parte, e tetto complessivo.
+RIGHE_ATTORNO_MODIFICA = 3
+MAX_RIGHE_MODIFICA = 30
+
+
+def finestra_modifica(nuovo: str, inizio: int, sostituto: str, quante: int) -> dict[str, Any]:
+    """Il punto modificato, riga per riga, com'e' adesso sul disco.
+
+    Un'altra regola dell'ACI di SWE-agent: dopo una modifica il tool mostra la
+    finestra del file modificato. Senza, il modello piccolo fa quello che fa
+    sempre dopo una ``edit_file``: una ``read_file`` dell'intero file per
+    controllare -- un passo e qualche migliaio di token per guardare dieci
+    righe. Qui le vede subito, con i numeri di riga veri, e un'indentazione
+    sbagliata salta all'occhio prima di lanciare i test.
+    """
+    if inizio < 0:
+        return {}
+    righe = nuovo.splitlines()
+    prima = nuovo.count("\n", 0, inizio) + 1
+    ultima = prima + sostituto.count("\n")
+    da = max(1, prima - RIGHE_ATTORNO_MODIFICA)
+    a = min(len(righe), ultima + RIGHE_ATTORNO_MODIFICA, da + MAX_RIGHE_MODIFICA - 1)
+    larghezza = len(str(a))
+    testo = "\n".join(
+        f"{n:>{larghezza}} | {righe[n - 1][:200]}" for n in range(da, a + 1)
+    )
+    finestra: dict[str, Any] = {"righe": f"{da}-{a}", "testo": testo}
+    if a < ultima + RIGHE_ATTORNO_MODIFICA and a < len(righe):
+        finestra["nota"] = f"finestra tagliata a {MAX_RIGHE_MODIFICA} righe"
+    if quante > 1:
+        finestra["nota_occorrenze"] = f"mostrata la prima di {quante} sostituzioni"
+    return finestra
+
+
 # Quante righe di contesto al massimo attorno a una corrispondenza. Oltre,
+
 # tanto vale leggere il file: il contesto serve a capire *se* la corrispondenza
 # e' quella giusta, non a sostituire read_file.
 MAX_CONTESTO = 4
@@ -1845,6 +1901,15 @@ def tool_run_command(ctx: ToolContext, command: str, timeout_sec: int | None = N
         payload["stdout_deposito"] = dep_out
     if dep_err:
         payload["stderr_deposito"] = dep_err
+    if not out_intero.strip() and not err_intero.strip():
+        # Due stringhe vuote lasciano il modello a chiedersi se il comando e'
+        # partito davvero (SWE-agent, "explicit feedback for silent
+        # commands"): su un modello piccolo la risposta tipica e' rilanciarlo.
+        payload["output"] = (
+            "nessuno: il comando e' terminato senza stampare niente"
+            + (" (e senza errori)" if not failed else "")
+        )
+
     return _ok(
         {
             **payload,

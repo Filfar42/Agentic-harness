@@ -386,8 +386,16 @@ DEFAULTS: dict[str, Any] = {
     # riesce, il testo arriva, ma le tool_calls no. 'auto' rileva la versione
     # del server e sceglie da solo.
     "stream_tools": "auto",  # auto | sempre | mai
+    # Secondi di **silenzio** tollerati dal server (prefill compreso): non la
+    # durata massima di una generazione, che ha un tetto a parte nel transport.
     "timeout_seconds": 180,
+    # Solo llama-server lanciato con ``-np 2`` o piu': lo slot riservato alle
+    # chiamate di servizio (compattazione, estratto del pensiero, riepilogo,
+    # delega, ricerca nel vault). La conversazione usa un altro slot, e il suo
+    # KV cache non viene spostato da quelle chiamate. -1 = spento.
+    "slot_servizio": -1,
     # generazione
+
     "temperature": 0.2,
     "top_p": 0.9,
     # Qwen 3.x raccomanda top_k 20; 40 e' il default di Ollama.

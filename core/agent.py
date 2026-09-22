@@ -64,6 +64,7 @@ from .prompts import (
     PLAN_SUMMARY_NUDGE,
     PROMPT_RIEPILOGO_FINALE,
     RIPETIZIONE_NUDGE,
+    OSCILLAZIONE_NUDGE,
     STALLO_NUDGE,
     SUMMARY_NUDGE,
     THINK_WATCHDOG_NUDGE,
@@ -1974,6 +1975,9 @@ def run_turn(
     ripetizione_dovuta: tuple[str, int] | None = None
     stallo_nudged = False
     stallo_dovuto: tuple[str, int] | None = None
+    ritorni = RitorniDeiFile()
+    oscillazione_nudged = False
+    oscillazione_dovuta: tuple[str, int] | None = None
     ripetizioni = RipetizioniTool()
     summary_requested = False
     coverage_nudged = False
@@ -3303,6 +3307,18 @@ def run_turn(
                     # qualcosa, quindi riprovare non e' piu' girare a vuoto.
                     ripetizioni.dimentica_letture()
                     ripetizioni.dimentica_fallimenti()
+                    # ...a meno che il "qualcosa" sia tornare indietro: il
+                    # contatore dei fallimenti si azzera anche su una modifica
+                    # che ripristina il contenuto di due passi fa, e il
+                    # modello che alterna due versioni non lo vedeva nessuno.
+                    ritornato = ritorni.registra(result)
+                    if (
+                        ritornato is not None
+                        and ritornato[1] >= RitorniDeiFile.SOGLIA
+                        and not oscillazione_nudged
+                    ):
+                        oscillazione_nudged = True
+                        oscillazione_dovuta = ritornato
                 else:
                     quante = ripetizioni.registra(call["name"], args)
                     if quante >= RipetizioniTool.SOGLIA and not ripetizione_nudged:
@@ -3514,6 +3530,18 @@ def run_turn(
                 {
                     "role": "user",
                     "content": STALLO_NUDGE.format(tool=nome_tool, quante=quante),
+                    "hidden": True,
+                }
+            )
+
+        if oscillazione_dovuta is not None:
+            nome_file, quante = oscillazione_dovuta
+            oscillazione_dovuta = None
+            count_nudge("oscillazione")
+            ui_messages.append(
+                {
+                    "role": "user",
+                    "content": OSCILLAZIONE_NUDGE.format(file=nome_file, quante=quante),
                     "hidden": True,
                 }
             )
@@ -3784,7 +3812,51 @@ class RipetizioniTool:
         self._falliti.clear()
 
 
+class RitorniDeiFile:
+    """File che tornano a un contenuto gia' avuto nello stesso turno.
+
+    E' il ping-pong dello StuckDetector di OpenHands ("two different
+    action-observation pairs alternate"), nella forma in cui lo fa un modello
+    piccolo che scrive codice: ``edit_file`` da A a B, il test fallisce,
+    ``edit_file`` da B ad A, il test fallisce in un altro modo, di nuovo da A a
+    B. Ogni modifica riesce, quindi ``RipetizioniTool`` azzera i suoi contatori
+    a ogni passo e lo stallo non si vede. L'impronta del contenuto dopo la
+    scrittura -- che ``write_file`` ed ``edit_file`` restituiscono gia' come
+    ``sha256`` -- lo rende visibile senza rileggere il disco.
+    """
+
+    __slots__ = ("_storia",)
+
+    # Al secondo ritorno: un ritorno solo e' un "annulla" legittimo.
+    SOGLIA = 2
+
+    def __init__(self) -> None:
+        self._storia: dict[str, tuple[list[str], int]] = {}
+
+    def registra(self, risultato: str) -> tuple[str, int] | None:
+        """``(file, ritorni)`` dopo una scrittura riuscita, o None se illeggibile."""
+        try:
+            esito = json.loads(risultato)
+        except (json.JSONDecodeError, TypeError):
+            return None
+        if not isinstance(esito, dict):
+            return None
+        percorso, impronta = esito.get("filepath"), esito.get("sha256")
+        if not isinstance(percorso, str) or not isinstance(impronta, str):
+            return None
+        viste, ritorni = self._storia.get(percorso, ([], 0))
+        # Tornare al contenuto **immediatamente** precedente non e' possibile
+        # (sarebbe una scrittura che non cambia niente); qualunque altro gia'
+        # visto e' un passo indietro.
+        if impronta in viste[:-1]:
+            ritorni += 1
+        viste.append(impronta)
+        self._storia[percorso] = (viste, ritorni)
+        return percorso, ritorni
+
+
 # Il registro delle verifiche vive in ``core/verifiche.py``. Stava qui dentro
+
 # come ``VerificationTracker``: un dizionario ``comando -> (tentativi, codice)``
 # che sapeva dire qual era il rosso piu' insistente e dimenticarli tutti insieme.
 # Erano due limiti. L'identita' per stringa faceva di ``pytest x -q`` e

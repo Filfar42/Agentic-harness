@@ -3632,6 +3632,8 @@ async function boot() {
   bindField('#s-model', 'model_name');
   $('#s-model').addEventListener('change', () => setTimeout(refreshProfile, 120));
   bindField('#s-timeout', 'timeout_seconds', Number);
+  bindField('#s-slot-servizio', 'slot_servizio', Number);
+
   bindField('#s-numctx', 'num_ctx', Number);
   bindField('#s-numgpu', 'num_gpu', Number);
   bindField('#s-keepalive', 'keep_alive');

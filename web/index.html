@@ -502,9 +502,16 @@ try {
               <div class="help">Serve solo con transport <code>openai</code>. Con Ollama lascia vuoto.</div>
             </div>
             <div class="field">
-              <label for="s-timeout">Timeout richieste (s)</label>
+              <label for="s-timeout">Timeout di inattività (s)</label>
               <input type="number" id="s-timeout" min="10" max="1800" step="10">
+              <div class="help">Quanto aspettare un server muto, prefill compreso. Non limita la durata di una generazione.</div>
             </div>
+            <div class="field">
+              <label for="s-slot-servizio">Slot di servizio (llama-server)</label>
+              <input type="number" id="s-slot-servizio" min="-1" max="15" step="1">
+              <div class="help">Con <code>-np 2</code>: lo slot per riassunti, estratti e deleghe, così non spostano la cache della conversazione. -1 = spento.</div>
+            </div>
+
           </div>
 
           <!-- Seconda colonna: tutto quello che riguarda il recinto in cui

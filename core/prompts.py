@@ -366,7 +366,19 @@ VERIFY_NUDGE = (
 # rifatta; il caso osservato -- ``manage_plan`` rifiutato, rilanciato, rifiutato
 # di nuovo -- non era ne' l'uno ne' l'altro, perche' le chiamate **fallite** non
 # entravano affatto nel conteggio delle ripetizioni.
+# Iniettato quando un file torna a un contenuto che aveva gia' avuto nello
+# stesso turno: la modifica viene fatta e disfatta. Vedi ``agent.RitorniDeiFile``.
+OSCILLAZIONE_NUDGE = (
+    "Il file `{file}` e' tornato {quante} volte a un contenuto che aveva gia' "
+    "avuto in questo turno: stai facendo e disfacendo la stessa modifica.\n"
+    "Fermati prima di riscriverlo. Rileggi l'errore che ti ha fatto cambiare "
+    "idea l'ultima volta, scegli UNA delle versioni e verificala con un "
+    "comando. Se nessuna delle due passa, il problema non e' in quelle righe: "
+    "leggi il file e la riga che il traceback indica."
+)
+
 STALLO_NUDGE = (
+
     "Hai chiamato `{tool}` {quante} volte di fila con lo stesso esito e senza "
     "cambiare niente in mezzo: ripetere non lo sbloccera'.\n"
     "Scegline una: (1) leggi con read_file il file che l'errore indica e cambia "

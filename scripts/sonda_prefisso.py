@@ -201,7 +201,31 @@ def sonda_server(server: str, ui: list[dict[str, Any]], livelli: list[str]) -> N
                 print(f"  {base} -> {livello}: {esito}")
         print("  Se la divergenza e' vicina a 0, cambiare livello a meta' turno ricalcola tutto il prompt.")
 
+        print("\n== il template conserva il pensiero dei passi del turno? ==")
+        # Il template di Qwen3 rende ``reasoning_content`` solo per gli
+        # assistant dopo l'ultima "query" -- e per lui e' query qualunque
+        # messaggio user, compreso il blocco di coda dell'harness (piano, note).
+        segno = "PENSIERO_DI_PROVA_7391"
+        passo = [
+            {"role": "system", "content": "Sei un assistente."},
+            {"role": "user", "content": "leggi a.py"},
+            {"role": "assistant", "content": "", "reasoning_content": segno,
+             "tool_calls": [{"id": "c1", "type": "function",
+                             "function": {"name": "read_file", "arguments": "{\"filepath\": \"a.py\"}"}}]},
+            {"role": "tool", "tool_call_id": "c1", "content": "x = 1"},
+        ]
+        for etichetta, messaggi_prova in (
+            ("senza blocco di coda", passo),
+            ("con blocco di coda", [*passo, {"role": "user", "content": "<piano>...</piano>"}]),
+        ):
+            try:
+                reso = _post(client, f"{server}/apply-template", {"messages": messaggi_prova})["prompt"]
+                print(f"  {etichetta}: pensiero {'CONSERVATO' if segno in reso else 'scartato'}")
+            except Exception as exc:  # noqa: BLE001 - diagnostica
+                print(f"  {etichetta}: /apply-template ha rifiutato ({exc})")
+
         print("\n== due passi consecutivi della sessione ==")
+
         reqs = richieste(ui, num_ctx=131_072, tetto=COMPACT_MAX_TOKENS,
                          system="Sei un assistente.", env="<environment/>")
         for k in range(min(3, max(0, len(reqs) - 1))):

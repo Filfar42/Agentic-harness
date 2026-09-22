@@ -251,8 +251,15 @@ class TrackedBackend:
         }
         output_chars = 0
         stream = None
+        slot_per = getattr(self._backend, "slot_per", None)
+        if getattr(self._backend, "supports_id_slot", False) is True and callable(slot_per):
+            slot = slot_per(self._purpose)
+            if slot is not None:
+                kwargs["id_slot"] = slot
+                call["config"]["id_slot"] = slot
         try:
             stream = self._backend.stream(messages, tools, params, **kwargs)
+
             for event in stream:
                 kind = getattr(event, "kind", "")
                 if kind in ("content", "reasoning", "tool_call"):
