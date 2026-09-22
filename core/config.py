@@ -126,6 +126,26 @@ QUOTA_RISULTATI_INTEGRALI = 0.75
 # e' il pavimento dell'invariante, non un obiettivo.
 MIN_RISULTATI_INTEGRALI = 3
 
+# Quanta parte della quota puo' riempirsi prima che la finestra dei risultati
+# integrali scorra (vedi ``agent.risultati_integrali``). E' un baratto fra due
+# costi, e il numero viene da ``scripts/sonda_prefisso.py`` su due sessioni
+# sintetiche da 40 passi a num_ctx 131.072 (compattazione non simulata):
+#
+#     frazione  token ricalcolati  token inviati  passi con ricalcolo
+#       0 (prima)     ~246.000        ~492.000          37
+#       0,5           ~165.000        ~573.000          14
+#       0,75          ~121.000        ~640.000           8
+#       1             ~87.000         ~735.000           4
+#
+# I ricalcolati costano prefill vero (secondi per passo su un 27B); gli
+# inviati in piu' sono in cache e costano poco in locale, ma avvicinano la
+# soglia di compattazione e su un endpoint a pagamento si pagano. 0,5 prende
+# un terzo del risparmio al prezzo di un sesto di contesto in piu'. Chi gira
+# solo in locale con finestre larghe puo' alzarla; a 0 torna il comportamento
+# di prima (la finestra scorre a ogni passo).
+ISTERESI_RISULTATI = 0.5
+
+
 
 def finestra_efficace(num_ctx: int, tetto: int = COMPACT_MAX_TOKENS) -> int:
     """La finestra su cui si decide di compattare, che non e' quella vera.
@@ -174,6 +194,14 @@ class Budgets:
     list_files_max_entries: int = LIST_FILES_MAX_ENTRIES
     search_max_matches: int = SEARCH_MAX_MATCHES
     tool_result_full_window: int = TOOL_RESULT_FULL_WINDOW
+    # Quanti token possono occupare, insieme, i risultati tenuti integrali
+    # prima che la finestra scorra. Zero vuol dire "solo il conteggio": e' il
+    # comportamento storico, e resta quello di chi costruisce un ``Budgets`` a
+    # mano (i test, il figlio della delega). ``budgets_for`` lo valorizza con
+    # la stessa quota da cui ricava ``tool_result_full_window``: vedi
+    # ``agent.risultati_integrali`` per perche' la finestra non deve scorrere
+    # a ogni passo.
+    tool_result_full_tokens: int = 0
     scale: float = 1.0
 
 
@@ -235,7 +263,9 @@ def budgets_for(num_ctx: int, tetto_compattazione: int = COMPACT_MAX_TOKENS) -> 
         list_files_max_entries=int(LIST_FILES_MAX_ENTRIES * min(scale, 3.0)),
         search_max_matches=int(SEARCH_MAX_MATCHES * min(scale, 3.0)),
         tool_result_full_window=integrali,
+        tool_result_full_tokens=int(quota * ISTERESI_RISULTATI),
         scale=scale,
+
     )
 
 

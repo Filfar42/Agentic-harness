@@ -118,12 +118,92 @@ def append_web_search_clause(base: str, *, enabled: bool) -> str:
     return base if not enabled else base + WEB_SEARCH_CLAUSE
 
 
+# Oltre queste righe di differenze la nota non conviene piu': si riscrive
+# l'albero nell'environment (un ricalcolo del prefisso, una volta) invece di
+# far leggere al modello un elenco lungo quanto l'albero stesso.
+MAX_RIGHE_AGGIORNAMENTO = 40
+TAG_AGGIORNAMENTO = "aggiornamento_workspace"
+
+
+def _voci_albero(albero: str) -> dict[str, str]:
+    """``percorso -> dimensione`` (vuota per le cartelle) dall'albero testuale.
+
+    Legge il formato di ``tools.workspace_snapshot``: due spazi per livello,
+    ``nome/`` per le cartelle, ``nome (1,234 B)`` per i file, righe fra
+    parentesi quadre come pie' di pagina.
+    """
+    voci: dict[str, str] = {}
+    pila: list[str] = []
+    for riga in albero.splitlines():
+        if not riga.strip() or riga.lstrip().startswith(("[", "(")):
+            continue
+        livello = (len(riga) - len(riga.lstrip(" "))) // 2
+        nome = riga.strip()
+        del pila[livello:]
+        if nome.endswith("/"):
+            pila.append(nome[:-1])
+            voci["/".join(pila) + "/"] = ""
+            continue
+        dimensione = ""
+        if nome.endswith(" B)") and " (" in nome:
+            nome, _, dimensione = nome.rpartition(" (")
+            dimensione = dimensione[:-1]
+        voci["/".join([*pila, nome])] = dimensione
+    return voci
+
+
+def aggiornamento_albero(base: str, adesso: str) -> tuple[str, bool]:
+    """Cosa e' cambiato nel workspace rispetto all'albero dell'environment.
+
+    Ritorna ``(nota, rifai_base)``. La nota e' vuota se non e' cambiato
+    niente; ``rifai_base`` e' vero quando le differenze sono troppe per una
+    nota e conviene riscrivere l'albero nell'environment.
+
+    Esiste per il KV cache. L'albero stava nell'environment ed era riletto a
+    ogni turno, con le dimensioni dei file: basta che un turno scriva un file
+    perche' al turno dopo l'environment -- fuso nel primo messaggio di sistema
+    -- sia diverso, e il server ricalcoli **tutta** la conversazione dal
+    secondo blocco in poi. Su una chat da 40.000 token, a ogni messaggio
+    dell'utente. Con l'albero fermo e le differenze accodate in cronologia,
+    il prefisso resta quello del turno prima.
+    """
+    if base == adesso:
+        return "", False
+    prima, dopo = _voci_albero(base), _voci_albero(adesso)
+    nuovi = sorted(p for p in dopo if p not in prima)
+    rimossi = sorted(p for p in prima if p not in dopo)
+    cambiati = sorted(
+        p for p in dopo
+        if p in prima and dopo[p] != prima[p] and not p.endswith("/")
+    )
+    righe = (
+        [f"+ {p}" + (f" ({dopo[p]})" if dopo[p] else "") for p in nuovi]
+        + [f"- {p}" for p in rimossi]
+        + [f"~ {p} ({prima[p]} -> {dopo[p]})" for p in cambiati]
+    )
+    if not righe:
+        # Cambiato solo il pie' di pagina (per esempio l'elenco troncato):
+        # niente da dire che il modello possa usare.
+        return "", False
+    if len(righe) > MAX_RIGHE_AGGIORNAMENTO:
+        return "", True
+    nota = (
+        f"<{TAG_AGGIORNAMENTO}>\n"
+        "Differenze del disco, all'inizio di questo turno, rispetto all'albero "
+        "in <environment> (+ nuovo, - rimosso, ~ dimensione cambiata):\n"
+        + "\n".join(righe)
+        + f"\n</{TAG_AGGIORNAMENTO}>"
+    )
+    return nota, False
+
+
 def build_env_header(
     workspace: str,
     *,
     tool_names: list[str] | None = None,
     sandbox: str = "host",
     preview_ports: tuple[int, int] | None = None,
+    albero: str | None = None,
 ) -> str:
     """Contesto ambientale iniettato dopo il system prompt.
 
@@ -150,6 +230,10 @@ def build_env_header(
         if sandbox == "docker"
         else f"shell: diretta sulla macchina, working directory {workspace}\n"
     )
+    # ``albero`` lo passa il server quando riusa quello dell'inizio della
+    # conversazione (vedi ``aggiornamento_albero``): la frase qui sotto deve
+    # valere in entrambi i casi, quindi parla della nota e non di "adesso".
+    contenuto = albero if albero is not None else workspace_snapshot(workspace)
     return (
         "<environment>\n"
         f"working_directory: {workspace}\n"
@@ -157,15 +241,18 @@ def build_env_header(
         f"{shell_line}"
         f"{ports_line}"
         f"tool_disponibili: {tools_line}\n"
-        "\ncontenuto_del_workspace (letto dal disco adesso):\n"
-        f"{workspace_snapshot(workspace)}\n"
+        "\ncontenuto_del_workspace (letto dal disco):\n"
+        f"{contenuto}\n"
         "</environment>\n\n"
-        "Questo e' lo stato reale del disco all'inizio del turno: e' gia' la "
+        "Questo e' lo stato del disco quando e' stato letto: e' gia' la "
         "risposta a \"cosa c'e' nel progetto\", quindi non serve list_files per "
-        "saperlo. Usa list_files solo per scendere oltre i livelli mostrati, o "
-        "per rileggere una cartella dopo averci scritto dentro. Conosci i nomi "
-        "dei file, non il loro contenuto: quello richiede read_file."
+        "saperlo. Se da allora il disco e' cambiato, all'inizio del turno trovi "
+        f"in cronologia una nota <{TAG_AGGIORNAMENTO}> con le differenze. Usa "
+        "list_files solo per scendere oltre i livelli mostrati, o per rileggere "
+        "una cartella dopo averci scritto dentro. Conosci i nomi dei file, non "
+        "il loro contenuto: quello richiede read_file."
     )
+
 
 
 def _human_size(n: int) -> str:

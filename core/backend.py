@@ -50,6 +50,22 @@ MAX_CATALOG_CHARS = MAX_STREAM_BYTES
 RETRY_BASE_S = 0.25
 RETRY_CAP_S = 4.0
 RETRY_AFTER_CAP_S = 30.0
+# Durata massima di UNA generazione, dal primo tentativo all'ultimo byte.
+#
+# ``timeout_seconds`` delle impostazioni ("Timeout richieste") faceva da
+# scadenza totale: un passo che pensava 6.000 token a 25 tok/s, piu' il prefill
+# di un contesto da 30k, superava i 180 s di serie e veniva troncato con
+# "Budget temporale della generazione esaurito" -- con output gia' emesso,
+# quindi senza retry nel transport, e il ciclo lo riprendeva da capo fino a due
+# volte, ogni volta tagliato allo stesso punto. Su un 27B locale non e' un
+# caso limite: e' un passo di pianificazione normale.
+#
+# Ora ``timeout_seconds`` e' quello che l'etichetta promette, un timeout di
+# **inattivita'**: quanto si aspetta un byte (il prefill ne fa parte, perche'
+# llama-server tace finche' non ha finito il prompt). Questa costante resta
+# come tetto assoluto, perche' un server che sgocciola un byte ogni tanto non
+# deve poter tenere un worker per sempre.
+DURATA_MAX_GENERAZIONE_S = 3600.0
 StopCheck = Callable[[], bool] | None
 
 
@@ -112,9 +128,11 @@ def _checkpoint(should_stop: StopCheck, deadline: float) -> None:
         raise httpx.ReadTimeout("Budget temporale della generazione esaurito.")
 
 
-def _request_timeout(deadline: float) -> httpx.Timeout:
+def _request_timeout(deadline: float, inattivita: float | None = None) -> httpx.Timeout:
+    """Timeout di httpx: la lettura e' per singolo ``read``, cioe' inattivita'."""
     remaining = max(0.001, deadline - time.monotonic())
-    return httpx.Timeout(remaining, connect=min(10.0, remaining), pool=min(5.0, remaining))
+    lettura = remaining if not inattivita or inattivita <= 0 else min(remaining, inattivita)
+    return httpx.Timeout(lettura, connect=min(10.0, remaining), pool=min(5.0, remaining))
 
 
 def _retry_delay(attempt: int, retry_after: str = "") -> float:
@@ -155,7 +173,9 @@ def _stream_with_retries(
     or reasoning is visible a replay would duplicate content, so it fails the
     current generation explicitly. The caller's worker owns this sync iterator.
     """
-    deadline = time.monotonic() + timeout_s
+    # ``timeout_s`` e' l'inattivita' (lo applica httpx a ogni lettura, vedi
+    # ``_request_timeout``); la scadenza totale e' il tetto assoluto.
+    deadline = time.monotonic() + max(float(timeout_s), DURATA_MAX_GENERAZIONE_S)
     emitted = False
     try:
         for attempt in range(MAX_ATTEMPTS):
@@ -742,6 +762,10 @@ class OllamaBackend:
     name = "ollama"
     supports_cancellation = True
     manages_retries = True
+    # ``prompt_eval_count`` di Ollama, con la cache del prefisso attiva, non e'
+    # garantito essere il prompt intero: puo' contare solo i token ricalcolati.
+    # Il ciclo non ci calibra sopra la stima (``agent.calibra_stima``).
+    prompt_tokens_is_total = False
 
     def __init__(
         self,
@@ -1143,7 +1167,7 @@ class OllamaBackend:
             try:
                 with get_client().stream(
                     "POST", f"{self.base_url}/api/chat", json=payload,
-                    timeout=_request_timeout(deadline),
+                    timeout=_request_timeout(deadline, self.timeout_s),
                 ) as response:
                     _http_status(response, should_stop, deadline)
                     if streaming:
@@ -1244,6 +1268,10 @@ class OpenAICompatBackend:
     name = "openai"
     supports_cancellation = True
     manages_retries = True
+    # Nello standard OpenAI ``usage.prompt_tokens`` e' il prompt intero, parte
+    # in cache compresa (che sta in ``prompt_tokens_details.cached_tokens``).
+    prompt_tokens_is_total = True
+
 
     def __init__(self, base_url: str, api_key: str, timeout_s: float = 180.0) -> None:
         base = normalise_base_url(base_url)
@@ -1408,7 +1436,8 @@ class OpenAICompatBackend:
         done_reason = ""
         with get_client().stream(
             "POST", f"{self.base_url}/chat/completions", json=payload,
-            headers=self._auth_headers(), timeout=_request_timeout(deadline),
+            headers=self._auth_headers(), timeout=_request_timeout(deadline, self.timeout_s),
+
         ) as response:
             _http_status(response, should_stop, deadline)
             for data in _sse_data(_bounded_lines(response, should_stop, deadline)):
@@ -1447,6 +1476,14 @@ class OpenAICompatBackend:
                         value = raw_usage.get(field)
                         if value is not None:
                             usage[field] = _counter(value, field)
+                    # Standard OpenAI (e OpenRouter, vLLM, llama.cpp recenti):
+                    # quanti token del prompt il server ha preso dalla cache.
+                    # E' l'unica misura diretta di quanto il prefisso regge.
+                    dettagli = raw_usage.get("prompt_tokens_details")
+                    if isinstance(dettagli, dict) and dettagli.get("cached_tokens") is not None:
+                        usage["cached_tokens"] = _counter(
+                            dettagli["cached_tokens"], "prompt_tokens_details.cached_tokens"
+                        )
                 choices = chunk.get("choices", [])
                 if not isinstance(choices, list) or len(choices) > 1:
                     raise TransportProtocolError("Attesa una sola choice nello stream.")
@@ -1878,8 +1915,17 @@ class LlamaCppBackend(OpenAICompatBackend):
             # Fa arrivare i timings -- e con essi i contatori del draft --
             # dentro lo stream, invece di doverli chiedere a /slots dopo.
             "timings_per_token": True,
+            # llama-server tiene le chiamate multiple **spente** se non glielo
+            # si chiede (docs/function-calling.md: "disabled by default"),
+            # mentre il prompt e il ciclo le trattano come il comportamento
+            # buono -- cinque read_file in un passo invece che in cinque. Con
+            # la grammatica pigra attiva, spente vuol dire che il modello non
+            # puo' emetterne una seconda. Il ciclo ne regge fino a
+            # ``MAX_TOOL_CALLS_PER_STEP``.
+            "parallel_tool_calls": True,
             **self.reasoning_control(params)["payload"],
         }
+
         # Fuori si chiama repetition_penalty, sul filo di llama.cpp
         # repeat_penalty: stesso cambio di nome che c'e' su Ollama. Anche
         # 1.0 va inviato: ometterlo conserverebbe il default del server.
@@ -1925,10 +1971,20 @@ class LlamaCppBackend(OpenAICompatBackend):
             fuori["eval_ms"] = round(eval_ms)
         if prompt_ms is not None and eval_ms is not None:
             fuori["total_ms"] = round(prompt_ms + eval_ms)
+        # ``cache_n``: token del prompt riusati dal KV cache dello slot;
+        # ``prompt_n``: token del prompt davvero calcolati in questa richiesta.
+        # La loro somma e' il prompt intero. Sono i due numeri che dicono se
+        # il prefisso regge davvero, passo per passo, invece di stimarlo.
+        for chiave, nome in (("cached_tokens", "cache_n"),
+                             ("prompt_processed_tokens", "prompt_n")):
+            valore = t.get(nome)
+            if valore is not None:
+                fuori[chiave] = int(_counter(valore, f"timings.{nome}"))
         coppie = (
             ("draft_n", self.ALIAS_DRAFT_N),
             ("draft_accepted", self.ALIAS_DRAFT_OK),
         )
+
         for chiave, alias in coppie:
             for nome in alias:
                 valore = t.get(nome)

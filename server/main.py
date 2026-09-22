@@ -77,6 +77,8 @@ from core.config import (
 )
 from core.prompts import (
     SYSTEM_PROMPT,
+    TAG_AGGIORNAMENTO,
+    aggiornamento_albero,
     build_attachments_block,
     build_env_header,
     build_system_prompt,
@@ -102,6 +104,7 @@ from core.tools import (
     preview_root,
     resolve_path,
     store_attachment,
+    workspace_snapshot,
 )
 from server.nativedialog import DialogUnavailable, pick_folder
 from server.prep import Prep
@@ -710,7 +713,7 @@ class AppState:
             )
         return prompt + memory_mod.format_for_prompt(self.memories)
 
-    def env_header(self, *, fresh: bool = False) -> str | None:
+    def env_header(self, *, fresh: bool = False, albero: str | None = None) -> str | None:
         """Albero del workspace da mettere in testa al contesto.
 
         ``fresh=True`` (inizio di un turno) rilegge il disco: e' il momento in
@@ -722,6 +725,16 @@ class AppState:
         if not self.settings["auto_env_header"]:
             return None
         workspace = self.settings["workspace_dir"]
+        if albero is not None:
+            # L'albero lo fissa il turno (``albero_del_turno``): niente cache,
+            # che e' dell'albero fresco e serve alla stima della UI.
+            return build_env_header(
+                workspace,
+                tool_names=[t["function"]["name"] for t in TOOLS_SCHEMA],
+                sandbox=str(self.settings["sandbox"]),
+                preview_ports=self.preview_ports(),
+                albero=albero,
+            )
         key = (workspace, str(self.settings["sandbox"]), self.preview_ports())
         if not fresh and self._env_header_for == key:
             return self._env_header
@@ -817,9 +830,55 @@ class AppState:
             TOOL_SCHEMA_TOKENS_LEAN if self.thinking_enabled() else TOOL_SCHEMA_TOKENS_FULL
         )
 
-    def context_header(self, session_id: str, *, fresh: bool = False) -> str | None:
+    def albero_del_turno(self, session_id: str, messages: list[dict[str, Any]]) -> str:
+        """L'albero da mettere nell'environment, e la nota delle differenze.
+
+        L'albero resta quello letto all'inizio della conversazione, finche' le
+        differenze stanno in una nota (``aggiornamento_albero``); la nota si
+        accoda in cronologia come messaggio nascosto, una volta per turno e
+        solo se e' cambiata dall'ultima. Cosi' l'environment -- che il filo
+        fonde nel primo messaggio di sistema -- resta byte-identico fra un
+        turno e l'altro e il server non ricalcola la conversazione da capo a
+        ogni messaggio dell'utente.
+
+        La base vive in memoria, come ``web_search``: dopo un riavvio si
+        riparte dall'albero fresco, cioe' un ricalcolo in piu', non un errore.
+        """
+        workspace = str(self.settings["workspace_dir"])
+        adesso = workspace_snapshot(workspace)
+        sessione = self.session(session_id)
+        base = sessione.get("albero_base")
+        nota = ""
+        if isinstance(base, tuple) and len(base) == 2 and base[0] == workspace:
+            nota, rifai = aggiornamento_albero(base[1], adesso)
+            if rifai:
+                base = None
+        else:
+            base = None
+        if base is None:
+            base = (workspace, adesso)
+            sessione["albero_base"] = base
+            nota = ""
+        if nota:
+            ultima = ""
+            for msg in reversed(messages):
+                if msg.get("role") == "summary":
+                    break
+                if msg.get("kind") == TAG_AGGIORNAMENTO:
+                    ultima = str(msg.get("content") or "")
+                    break
+            if nota != ultima:
+                messages.append({
+                    "role": "user", "hidden": True, "kind": TAG_AGGIORNAMENTO,
+                    "content": nota, "ts": time.time(),
+                })
+        return base[1]
+
+    def context_header(
+        self, session_id: str, *, fresh: bool = False, albero: str | None = None
+    ) -> str | None:
         """Header ambientale + elenco degli allegati della conversazione."""
-        base = self.env_header(fresh=fresh)
+        base = self.env_header(fresh=fresh, albero=albero)
         block = build_attachments_block(self.attachments(session_id))
         if not block:
             return base
@@ -1265,7 +1324,11 @@ def start_turn(
                 system_prompt=turn_state.system_prompt(web_search, pensiero=pensiero_forzato),
                 # Il turno rilegge il disco: e' qui che l'agente deve vedere
                 # il workspace com'e' adesso, non com'era all'ultimo click.
-                env_header=turn_state.context_header(session_id, fresh=True),
+                env_header=turn_state.context_header(
+                    session_id, fresh=True,
+                    albero=turn_state.albero_del_turno(session_id, messages),
+                ),
+
                 images=images,
                 should_stop=runner.cancelled.is_set,
                 max_steps=int(turn_state.settings["max_agent_loops"]),

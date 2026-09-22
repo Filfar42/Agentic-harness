@@ -17,7 +17,8 @@ from pathlib import PurePath
 from typing import Any
 from collections.abc import Callable, Iterator, Sequence
 
-from .backend import StreamEvent
+from .backend import PREFISSO_NOTA_HARNESS, StreamEvent
+
 from .context import compact_result, deposit_references
 from .inference import service_text
 from .telemetry import track_backend
@@ -404,6 +405,85 @@ def _prune_tool_call(call: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _costo_argomenti_pesanti(call: dict[str, Any]) -> int:
+    """Token dei corpi che ``_prune_tool_call`` toglierebbe da questa chiamata."""
+    fn = call.get("function") or {}
+    chiavi = _ARGOMENTI_PESANTI.get(str(fn.get("name") or ""))
+    if not chiavi:
+        return 0
+    try:
+        args = json.loads(fn.get("arguments") or "{}")
+    except (json.JSONDecodeError, TypeError):
+        return 0
+    if not isinstance(args, dict):
+        return 0
+    return sum(
+        estimate_tokens(corpo)
+        for corpo in (args.get(k) for k in chiavi)
+        if isinstance(corpo, str) and len(corpo) >= 400
+    )
+
+
+def risultati_integrali(
+    ui_messages: Sequence[dict[str, Any]],
+    tool_positions: Sequence[int],
+    budgets: Budgets,
+) -> set[int]:
+    """Quali risultati di tool restano integrali, con isteresi.
+
+    La finestra "ultimi N integrali" scorreva di un risultato a ogni passo:
+    a ogni passo il risultato che ne usciva veniva compattato, cioe' si
+    riscriveva un messaggio a N risultati dalla fine, e il server doveva
+    ricalcolare da li' in poi -- anche gli N risultati che aveva gia' in cache.
+    Misurato con ``scripts/sonda_prefisso.py`` su una sessione sintetica da 40
+    passi con le proporzioni dei tool del 23/08/2026: 245.000 token ricalcolati
+    su 490.000 inviati, mediana 5.700 per passo, senza che nulla fosse cambiato
+    in quei messaggi.
+
+    Qui il confine fra compattati e integrali si sposta **a scatti**: resta
+    fermo finche' la zona integrale sta nella quota di token
+    (``budgets.tool_result_full_tokens``, la stessa da cui ``budgets_for``
+    ricava N), e quando la sfora salta in un colpo solo agli ultimi N. Il
+    prefisso diverge una volta per scatto invece che a ogni passo.
+
+    L'invariante di ``budgets_for`` regge: al momento dell'invio la zona
+    integrale o sta nella quota, o contiene esattamente N risultati -- che per
+    costruzione ci stanno. Nel costo entrano anche i corpi di ``write_file`` /
+    ``edit_file`` che la potatura toglierebbe dal messaggio assistant: seguono
+    la stessa finestra, e contarli zero terrebbe integrali dieci scritture da
+    diecimila caratteri perche' i loro risultati sono ``{"status": "ok"}``.
+
+    Pura funzione della cronologia: ricostruita a ogni passo dal primo
+    risultato, da' lo stesso confine che aveva dato al passo prima.
+    """
+    finestra = max(1, int(budgets.tool_result_full_window))
+    quota = int(getattr(budgets, "tool_result_full_tokens", 0) or 0)
+    if quota <= 0:
+        return set(tool_positions[-finestra:])
+    pesanti: dict[str, int] = {}
+    for msg in ui_messages:
+        if msg.get("role") == "assistant":
+            for call in msg.get("tool_calls") or []:
+                costo = _costo_argomenti_pesanti(call)
+                if costo:
+                    pesanti[str(call.get("id") or "")] = costo
+    confine = 0
+    zona = 0
+    costi: list[int] = []
+    for j, pos in enumerate(tool_positions):
+        msg = ui_messages[pos]
+        costo = estimate_tokens(
+            _compact_tool_result(str(msg.get("content", "")), full=True, budgets=budgets)
+        ) + pesanti.get(str(msg.get("tool_call_id") or ""), 0)
+        costi.append(costo)
+        zona += costo
+        if j - confine + 1 > finestra and zona > quota:
+            nuovo = j - finestra + 1
+            zona -= sum(costi[confine:nuovo])
+            confine = nuovo
+    return set(tool_positions[confine:])
+
+
 def build_api_messages(
     ui_messages: Sequence[dict[str, Any]],
     *,
@@ -463,10 +543,11 @@ def build_api_messages(
         i for i, m in enumerate(ui_messages) if m.get("role") == "tool"
     ]
     recent_tools = (
-        set(tool_positions[-budgets.tool_result_full_window:])
+        risultati_integrali(ui_messages, tool_positions, budgets)
         if compact_old_tools
         else set(tool_positions)
     )
+
     # Gli id delle chiamate ancora "recenti". La potatura degli argomenti segue
     # la stessa finestra dei risultati, e non e' una comodita': se si potasse
     # l'argomento di una chiamata il cui risultato e' ancora integrale, il
@@ -892,12 +973,20 @@ def compatta_cronologia(
     )
 
 
+# Di quanto scendere sotto la soglia quando si buttano turni: senza margine si
+# tornava esattamente alla parete, il passo dopo la superava di nuovo e si
+# buttava un altro turno. Ogni scarto sposta l'inizio della cronologia, cioe'
+# il server ricalcola tutto il prompt: a finestra piena, a ogni passo.
+MARGINE_SCARTO = 0.10
+
+
 def drop_oldest_turns(
     api_messages: list[dict],
     num_ctx: int,
     soglia: float = HISTORY_COMPACT_THRESHOLD,
     *,
     reserved_tokens: int = 0,
+    fattore: float = 1.0,
 ) -> list[dict]:
     """Sliding window: elimina i turni piu' vecchi mantenendo system + coda.
 
@@ -913,32 +1002,51 @@ def drop_oldest_turns(
     head = [m for m in api_messages if m.get("role") == "system"]
     body = [m for m in api_messages if m.get("role") != "system"]
 
-    costi = [estimate_messages_tokens([m]) for m in body]
-    totale = estimate_messages_tokens(head) + sum(costi) + max(0, reserved_tokens)
+    # L'ancora: il primo messaggio della cronologia visibile al modello, se e'
+    # dell'utente. E' la richiesta che ha aperto la conversazione o il
+    # riassunto che la porta con se' (``render_messaggio`` ci scrive le
+    # richieste dell'utente). Buttarla lasciava il modello a lavorare su una
+    # coda di tool senza sapere piu' per chi: la prima cosa che usciva dalla
+    # finestra era proprio il compito.
+    ancora = body[:1] if body and body[0].get("role") == "user" else []
+    resto = body[len(ancora):]
+
+    scala = max(1.0, fattore)
+    costi = [estimate_messages_tokens([m]) * scala for m in resto]
+    totale = (
+        (estimate_messages_tokens(head) + estimate_messages_tokens(ancora)
+         + max(0, reserved_tokens)) * scala
+        + sum(costi)
+    )
     tetto = num_ctx * soglia
+    obiettivo = num_ctx * max(0.0, soglia - MARGINE_SCARTO)
     i = 0
-    while i < len(body) and totale > tetto and len(body) - i > 2:
-        totale -= costi[i]
-        i += 1
-        # I risultati seguono la chiamata che li ha chiesti: un ``tool`` senza
-        # l'``assistant`` che lo precede e' un messaggio che il backend rifiuta.
-        while i < len(body) and body[i].get("role") == "tool":
+    if totale > tetto:
+        while i < len(resto) and totale > obiettivo and len(resto) - i > 2:
             totale -= costi[i]
             i += 1
-    body = body[i:]
+            # I risultati seguono la chiamata che li ha chiesti: un ``tool``
+            # senza l'``assistant`` che lo precede e' un messaggio che il
+            # backend rifiuta.
+            while i < len(resto) and resto[i].get("role") == "tool":
+                totale -= costi[i]
+                i += 1
+    if not i:
+        return head + body
 
-    if len(body) < len([m for m in api_messages if m.get("role") != "system"]):
-        head.append(
-            {
-                "role": "system",
-                "content": (
-                    "[Nota: i turni piu' vecchi di questa conversazione sono stati "
-                    "rimossi dal contesto per rientrare nella finestra. Se ti serve "
-                    "un'informazione precedente, rileggila dal disco con read_file.]"
-                ),
-            }
-        )
-    return head + body
+    # La nota sta dopo l'ancora e con ruolo 'user', non in testa come
+    # 'system': ``messaggi_per_il_filo`` fonde i system iniziali nel prompt di
+    # sistema, e una frase in piu' li' cambia il prefisso dal primo messaggio.
+    nota = {
+        "role": "user",
+        "content": (
+            f"{PREFISSO_NOTA_HARNESS} i turni piu' vecchi di questa conversazione "
+            "sono stati rimossi dal contesto per rientrare nella finestra. Se ti "
+            "serve un'informazione precedente, rileggila dal disco con read_file."
+        ),
+    }
+    return head + ancora + [nota] + resto[i:]
+
 
 
 # ---------------------------------------------------------------------------
@@ -1221,7 +1329,14 @@ _ARTEFATTO = re.compile(
     r"|[\w-]+(?:/[\w-]+)*/",
 )
 
+# I candidati su cui cercare artefatti: sequenze dei caratteri che un percorso
+# puo' contenere. Linear-time, e fuori da questi caratteri ``_ARTEFATTO`` non
+# puo' comunque trovare niente.
+_PAROLA_PERCORSO = re.compile(r"[\w./-]+")
+MAX_PAROLA_PERCORSO = 200
+
 # Quanti artefatti distinti fanno una richiesta strutturata. Quattro: sotto,
+
 # "scrivi il modulo e il suo test" ne conta due o tre ed e' un compito solo.
 MIN_ARTEFATTI = 4
 
@@ -1245,7 +1360,19 @@ def artefatti_nominati(text: str) -> set[str]:
     passi. Contare le cose da consegnare coglie la struttura anche quando chi
     scrive descrive un risultato invece di ordinare delle azioni.
     """
-    trovati = {m.group(0).lower().lstrip("./") for m in _ARTEFATTO.finditer(text or "")}
+    # La regex si applica **parola per parola**, e le parole troppo lunghe per
+    # essere un percorso si saltano. Sul testo intero il suo costo era cubico
+    # nella lunghezza di una sequenza senza spazi (``[\w./-]*`` e ``\w[\w-]*``
+    # si contendono gli stessi caratteri): misurato, 0,5 s a 1.000 caratteri,
+    # 31 s a 4.000. Una riga di base64 o di JS minificato incollata nella
+    # richiesta bloccava l'avvio del turno -- tenendo il GIL, quindi anche il
+    # resto del server. Su una parola di 200 caratteri il caso peggiore e' 5 ms.
+    trovati = {
+        m.group(0).lower().lstrip("./")
+        for parola in _PAROLA_PERCORSO.findall(text or "")
+        if len(parola) <= MAX_PAROLA_PERCORSO
+        for m in _ARTEFATTO.finditer(parola)
+    }
     # `cantiere/` e `cantiere/grezzi/` sono due contenitori diversi, ma
     # `cantiere/` e `cantiere/misura.py` non vanno contati due volte: la
     # cartella che contiene una cosa gia' contata non e' un lavoro in piu'.
@@ -1326,9 +1453,36 @@ MARGINE_FINESTRA = 768
 TETTO_INUTILE = 512
 
 
+# Estremi del fattore con cui la stima dei token si corregge sulla misura del
+# server (vedi ``calibra_stima``). Sotto 1 non si scende: sovrastimare costa un
+# tetto di generazione un po' piu' basso, sottostimare costa la chiamata
+# tagliata a meta'. Sopra 2 la misura e' piu' probabilmente sbagliata della
+# stima (un prompt con immagini, un server che conta altro).
+FATTORE_STIMA_MIN = 1.0
+FATTORE_STIMA_MAX = 2.0
+
+
+def calibra_stima(prompt_reale: Any, stimati: int) -> float | None:
+    """Rapporto fra i token del prompt contati dal server e quelli stimati.
+
+    La stima e' una regola sui caratteri (3,6 per token). Su JSON con molti
+    escape, codice indentato o testo con accenti il tokenizer di Qwen ne fa di
+    piu': a 60.000 token stimati un errore del 15% sono 9.000 token, contro un
+    ``MARGINE_FINESTRA`` di 768. E' la stessa specie di guasto della chiamata
+    tagliata del 29/08: il tetto di generazione promette spazio che non c'e'.
+
+    Il server il numero vero lo dice gia', in ``usage.prompt_tokens``, a ogni
+    passo. Qui lo si usa per correggere i passi successivi dello stesso turno.
+    ``None`` quando la misura non e' utilizzabile.
+    """
+    if type(prompt_reale) not in (int, float) or prompt_reale <= 0 or stimati <= 0:
+        return None
+    return max(FATTORE_STIMA_MIN, min(FATTORE_STIMA_MAX, float(prompt_reale) / float(stimati)))
+
+
 def tetto_per_la_finestra(
     api_messages: Sequence[dict[str, Any]], num_ctx: int, max_tokens: int,
-    *, reserved_tokens: int = 0,
+    *, reserved_tokens: int = 0, fattore: float = 1.0,
 ) -> tuple[int, int]:
     """Il tetto di generazione che ci sta **davvero**, e lo spazio rimasto.
 
@@ -1350,8 +1504,12 @@ def tetto_per_la_finestra(
     """
     if num_ctx <= 0 or max_tokens <= 0:
         return max_tokens, 0
-    spazio = num_ctx - estimate_messages_tokens(api_messages) - MARGINE_FINESTRA - reserved_tokens
+    # ``fattore`` e' la correzione misurata dal server (``calibra_stima``):
+    # 1.0 finche' non c'e' una misura, cioe' il comportamento di sempre.
+    stimati = (estimate_messages_tokens(api_messages) + reserved_tokens) * max(1.0, fattore)
+    spazio = int(num_ctx - stimati - MARGINE_FINESTRA)
     return min(max_tokens, max(spazio, 0)), spazio
+
 
 
 def argomenti_illeggibili(
@@ -2038,6 +2196,15 @@ def run_turn(
     tools_used = False
     total_usage: dict[str, Any] = {}
     stopped = should_stop or (lambda: False)
+    # Correzione della stima dei token misurata sul server (``calibra_stima``).
+    # Vale per il turno: al primo passo non c'e' ancora una misura.
+    fattore_stima = 1.0
+    # Dopo una compattazione non riuscita non si riprova al passo dopo. Senza
+    # questa pausa, un riassunto che fallisce sempre allo stesso modo (tagliato
+    # da MAX_TOKEN_RIASSUNTO, server che rifiuta) costava una chiamata in piu'
+    # a OGNI passo -- e con llama-server a uno slot ogni chiamata di servizio
+    # sposta anche il KV cache della conversazione.
+    compattazione_ferma_fino_a = 0
     phase_key: tuple[str, str] | None = None
     phase_step = 0
     retry_reasoning = False
@@ -2093,7 +2260,8 @@ def run_turn(
         telemetry["turn_wall_ms"] = round((time.monotonic() - turn_started) * 1000, 3)
         totals = telemetry["totals"]
         usage = dict(total_usage)
-        for key in ("prompt_eval_ms", "eval_ms", "draft_n", "draft_accepted"):
+        for key in ("prompt_eval_ms", "eval_ms", "draft_n", "draft_accepted",
+                    "cached_tokens", "prompt_processed_tokens"):
             if totals.get(key) is not None:
                 usage[key] = totals[key]
         for source, target in (("usage_input_tokens", "prompt_tokens"),
@@ -2200,7 +2368,7 @@ def run_turn(
         # vera di oggi (131k) la soglia in percentuale non e' raggiungibile in
         # pratica -- vedi il commento a ``TETTO_TOKEN_DEFAULT``.
         finestra_compat = finestra_efficace(params.num_ctx, compact_max_tokens)
-        if compact_history and context_pressure(
+        if compact_history and step >= compattazione_ferma_fino_a and context_pressure(
             api_messages, finestra_compat, reserved_tokens=schema_tokens,
         ) > soglia:
             prima_tok = estimate_messages_tokens(api_messages)
@@ -2214,6 +2382,9 @@ def run_turn(
                 schedario=schedario,
                 should_stop=stopped,
             )
+            if esito is None and not stopped():
+                compattazione_ferma_fino_a = step + PAUSA_COMPATTAZIONE_FALLITA
+                count_nudge("compattazione_rinviata")
             if esito is not None:
                 count_nudge("compattazione")
                 # L'indice si rilegge dal disco solo qui: e' l'unico momento in
@@ -2268,11 +2439,14 @@ def run_turn(
         margine_sfondamento = max(HISTORY_COMPACT_THRESHOLD, float(soglia))
         if context_pressure(
             api_messages, params.num_ctx, reserved_tokens=schema_tokens,
-        ) > margine_sfondamento:
+        ) * fattore_stima > margine_sfondamento:
             api_messages = drop_oldest_turns(
                 api_messages, params.num_ctx, soglia=margine_sfondamento,
-                reserved_tokens=schema_tokens,
+                reserved_tokens=schema_tokens, fattore=fattore_stima,
             )
+        # Quanto pesa, secondo la stima, la richiesta che parte davvero: e' il
+        # denominatore della calibrazione, a fine stream.
+        stima_passo = estimate_messages_tokens(api_messages) + schema_tokens
 
         # Il budget di servizio e' finito: si dice, invece di smettere in
         # silenzio. Da qui in poi i solleciti automatici non scattano piu' e
@@ -2300,7 +2474,8 @@ def run_turn(
         # Il tetto si taglia **dopo** la compattazione e il drop dei turni
         # vecchi: prima di quelli il prompt non e' ancora quello che partira'.
         tetto_passo, spazio_finestra = tetto_per_la_finestra(
-            api_messages, params.num_ctx, max_tokens_turno, reserved_tokens=schema_tokens
+            api_messages, params.num_ctx, max_tokens_turno, reserved_tokens=schema_tokens,
+            fattore=fattore_stima,
         )
         # Due modi di chiudere un pensiero troppo lungo, e la soglia dipende da
         # quale e' disponibile:
@@ -2394,6 +2569,7 @@ def run_turn(
         pensiero_nativo = False
         messaggi_stream = api_messages
         params_stream = params_passo
+        usage_passo: dict[str, Any] = {}
         try:
             stream_options = {"should_stop": stopped} if getattr(
                 backend, "supports_cancellation", False
@@ -2426,6 +2602,7 @@ def run_turn(
                         tool_calls.append(ev.tool_call)
                     elif ev.kind == "usage" and ev.usage:
                         step_done_reason = str(ev.usage.get("done_reason") or "")
+                        usage_passo = dict(ev.usage)
                         for key, value in ev.usage.items():
                             if isinstance(value, (int, float)):
                                 total_usage[key] = total_usage.get(key, 0) + value
@@ -2551,6 +2728,19 @@ def run_turn(
 
         parser.finish()
 
+        # La calibrazione vale solo se la richiesta misurata e' quella stimata:
+        # una continuazione aggiunge un messaggio, e su Ollama
+        # ``prompt_eval_count`` non e' garantito essere il prompt intero (con
+        # la cache puo' contare solo i token ricalcolati). Per questo la chiede
+        # il backend, con ``prompt_tokens_is_total``.
+        if (
+            chiusura_passo is None
+            and getattr(backend, "prompt_tokens_is_total", False) is True
+        ):
+            misurato = calibra_stima(usage_passo.get("prompt_tokens"), stima_passo)
+            if misurato is not None:
+                fattore_stima = misurato
+
         # La traccia di questo passo: cosa era configurato, cosa e' stato
         # davvero chiesto al modello, e quanto ha pensato. Vedi ``marca_pensiero``.
         traccia.clear()
@@ -2601,6 +2791,15 @@ def run_turn(
                 # resta traccia di quanto poco margine ci fosse.
                 "spazio": int(spazio_finestra),
                 "tetto": int(tetto_passo),
+                # Il prompt visto dal server e quanto ne ha preso dalla cache:
+                # su llama.cpp e' la misura diretta del riuso del prefisso
+                # (vedi ``scripts/sonda_prefisso.py``). Assenti se il server
+                # non li dichiara.
+                "prompt_stimato": int(stima_passo),
+                "prompt_reale": usage_passo.get("prompt_tokens"),
+                "cache": usage_passo.get("cached_tokens"),
+                "ricalcolati": usage_passo.get("prompt_processed_tokens"),
+                "fattore_stima": round(fattore_stima, 3),
             }
         )
         if traccia["inviato"] not in (traccia["usato"], "?"):
@@ -2971,13 +3170,24 @@ def run_turn(
             return ToolFinished(call_id=call["id"], name=call["name"], args={},
                                 result=result, duration_s=0.0, ok=False)
 
-        def close_remaining(calls: list[dict[str, Any]]) -> Iterator[ToolFinished]:
+        def close_remaining(
+            calls: list[dict[str, Any]], *, per_stop: bool = False
+        ) -> Iterator[ToolFinished]:
+            # Due cause diverse, due frasi diverse. Prima anche lo stop
+            # dell'utente diceva "il turno e' sospeso / attendi la risposta":
+            # al turno dopo il modello leggeva di dover aspettare una risposta
+            # a una domanda che nessuno aveva fatto.
+            errore = ({
+                "error": "Chiamata non eseguita: il turno e' stato interrotto dall'utente.",
+                "error_code": "turn_stopped", "retryable": False,
+                "hint": "Se serve ancora, rivalutala alla prossima richiesta.",
+            } if per_stop else {
+                "error": "Chiamata non eseguita: il turno e' sospeso.",
+                "error_code": "turn_suspended", "retryable": False,
+                "hint": "Attendi la risposta dell'utente e rivaluta questa azione.",
+            })
             for pending in calls:
-                yield reject_call(pending, {
-                    "error": "Chiamata non eseguita: il turno e' sospeso.",
-                    "error_code": "turn_suspended", "retryable": False,
-                    "hint": "Attendi la risposta dell'utente e rivaluta questa azione.",
-                })
+                yield reject_call(pending, dict(errore))
 
         for call_index, call in enumerate(ordered):
             if call["name"] not in allowed_tools:
@@ -2988,7 +3198,7 @@ def run_turn(
                 })
                 continue
             if stopped():
-                yield from close_remaining(ordered[call_index:])
+                yield from close_remaining(ordered[call_index:], per_stop=True)
                 yield from halt(step)
                 return
             try:
@@ -3010,25 +3220,17 @@ def run_turn(
                 question = normalise_question(raw_args if isinstance(raw_args, dict) else {})
 
                 if not question["question"]:
-                    ui_messages.append(
-                        {
-                            "role": "tool",
-                            "tool_call_id": call["id"],
-                            "name": ASK_USER_TOOL,
-                            "content": json.dumps(
-                                {
-                                    "error": "Parametro 'question' mancante.",
-                                    "hint": "Riformula la domanda in una frase.",
-                                },
-                                ensure_ascii=False,
-                            ),
-                            "args": raw_args if isinstance(raw_args, dict) else {},
-                            "duration_s": 0.0,
-                            "ok": False,
-                            "ts": time.time(),
-                        }
-                    )
+                    # Passa da ``reject_call`` come ogni altra chiamata
+                    # rifiutata: prima il risultato finiva in cronologia ma la
+                    # UI non riceveva il ToolFinished, e la tendina del tool
+                    # restava "in corso" fino al ricaricamento.
+                    yield reject_call(call, {
+                        "error": "Parametro 'question' mancante.",
+                        "error_code": "invalid_arguments", "retryable": False,
+                        "hint": "Riformula la domanda in una frase.",
+                    })
                     continue
+
 
                 # Il risultato di questo tool arriva dall'utente: lo si scrive
                 # in cronologia solo alla ripresa (vedi resume_with_answer).
@@ -3421,6 +3623,9 @@ def run_turn(
 # oltre, si consumerebbe l'intero budget di passi su un problema che il modello
 # evidentemente non sa risolvere da solo.
 MAX_VERIFY_NUDGES = 2
+# Passi di attesa prima di ritentare una compattazione che non e' riuscita.
+PAUSA_COMPATTAZIONE_FALLITA = 3
+
 # I tool con cui si guarda e basta. Un passo fatto solo di questi e' una mossa
 # di esplorazione, e l'esplorazione e' esattamente cio' che si puo' delegare.
 TOOL_ESPLORATIVI = ("read_file", "search_files", "list_files")

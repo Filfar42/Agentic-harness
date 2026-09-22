@@ -31,8 +31,9 @@ _CONFIG_FIELDS = (
 _USAGE_FIELDS = (
     "prompt_tokens", "completion_tokens", "total_tokens", "cached_tokens",
     "reasoning_tokens", "prompt_eval_ms", "eval_ms", "total_ms", "load_ms",
-    "draft_n", "draft_accepted",
+    "draft_n", "draft_accepted", "prompt_processed_tokens",
 )
+
 _NUMERIC_TOTALS = (
     "calls", "completed", "error", "interrupted", "input_tokens_estimated",
     "schema_tokens_estimated", "output_tokens_estimated", "wall_time_ms",
