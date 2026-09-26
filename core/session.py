@@ -351,6 +351,20 @@ def _scrivi_messaggi(
     return True
 
 
+# Ruoli che stanno nella cronologia salvata ma non sono messaggi per nessuno:
+# l'``intento`` e' il diario degli effetti (``core/ciclo/ripresa.py``), scritto
+# prima di un'azione perche' un crash lasci traccia che l'azione era partita.
+RUOLI_DI_SERVIZIO = frozenset({"intento"})
+
+
+def conta_visibili(messages: list[dict]) -> int:
+    """I messaggi che la sidebar conta: niente solleciti, niente diario."""
+    return sum(
+        1 for m in messages
+        if not m.get("hidden") and m.get("role") not in RUOLI_DI_SERVIZIO
+    )
+
+
 def derive_title(messages: list[dict]) -> str:
     """Il titolo e' il primo messaggio **visibile** dell'utente.
 
@@ -411,7 +425,7 @@ def save_session(state: Any, *, force: bool = False, riscrivi: bool = False) -> 
         # servono alla sidebar: senza, l'indice dovrebbe aprire la cronologia
         # di ogni conversazione per contarla -- che e' esattamente quello che
         # faceva, e costava megabyte riletti ad ogni avvio.
-        "n_messages": sum(1 for m in messages if not m.get("hidden")),
+        "n_messages": conta_visibili(messages),
         "pending": bool(messages) and messages[-1].get("role") == "pending_question",
         "touched_files": sorted(state.get("touched_files", set())),
         # File di cui l'agente conosce il contenuto: sopravvive fra i turni,
@@ -516,7 +530,7 @@ def _session_summary(path: Path) -> dict[str, Any] | None:
         n_messaggi = int(data.get("n_messages") or 0)
         pending = bool(data.get("pending"))
     else:
-        n_messaggi = sum(1 for m in messages if not m.get("hidden"))
+        n_messaggi = conta_visibili(messages)
         pending = bool(messages) and messages[-1].get("role") == "pending_question"
     summary = {
         "id": data.get("id", path.stem),

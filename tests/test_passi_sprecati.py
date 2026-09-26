@@ -202,14 +202,24 @@ def test_il_riepilogo_e_esente_dal_budget_di_servizio():
     Un turno che ha bruciato il budget in correzioni e' proprio quello che
     rischia di piu' di finire in silenzio davanti all'utente.
     """
-    import inspect
+    # Dal 25/09 le reti sono funzioni pure in ``core/ciclo/reti.py``: la
+    # proprieta' si verifica sul comportamento, non cercando una riga nel
+    # sorgente di ``run_turn``.
+    from core.ciclo import reti
+    from core.ciclo.stato import StatoTurno
 
-    from core import agent as A
-
-    sorgente = inspect.getsource(A.run_turn)
-    blocco = sorgente[sorgente.index("if (\n                require_summary"):]
-    blocco = blocco[: blocco.index("continue")]
-    assert "passi_di_servizio <" not in blocco
+    stato = StatoTurno(max_passi=10, max_passi_di_servizio=2)
+    stato.passi_di_servizio = 2          # budget delle correzioni bruciato
+    stato.tools_used = True
+    assert not stato.servizio_disponibile
+    c = reti.Contesto(
+        stato=stato, passo=3, max_passi=10, risposta="", ragionamento="",
+        done_reason="stop", richiesta="sistema il test", piano=None,
+        verifiche=None, tool_ctx=None,
+    )
+    iv = reti.rete_riepilogo(c)
+    assert iv is not None, "a budget esaurito il riepilogo deve ancora scattare"
+    assert iv.servizio is False, "e non deve consumare il budget di servizio"
 
 
 def test_una_finestra_senza_spazio_chiude_il_turno_invece_di_generare():

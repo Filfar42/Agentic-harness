@@ -33,6 +33,8 @@ CORREZIONI APPLICATE
 
 from __future__ import annotations
 
+from typing import Any
+
 from .tools import platform_summary, workspace_snapshot
 
 from .system_prompt import SYSTEM_PROMPT, SYSTEM_PROMPT_LEAN
@@ -560,6 +562,156 @@ PLAN_SUMMARY_NUDGE = (
     "testo gia' mostrato. "
     "Solo testo, nessuna nuova chiamata a tool."
 )
+
+
+# ---------------------------------------------------------------------------
+# Reti nuove del 25/09/2026 (vedi ``core/ciclo/reti.py``)
+# ---------------------------------------------------------------------------
+
+# La chiamata e' finita nel canale testuale. Non e' "hai risposto a parole" --
+# il modello ha provato a chiamare il tool, nel posto sbagliato -- e dirgli la
+# cosa sbagliata e' il modo per ottenere la mossa sbagliata. Osservato: col
+# sollecito generico il modello rispondeva "Fatto." senza aver toccato il file.
+CANALE_NUDGE = (
+    "La chiamata a {tool} e' finita nel testo della risposta, scritta come "
+    "JSON: cosi' non e' stata eseguita e non ha prodotto nessun effetto.\n"
+    "Riemettila adesso con il meccanismo nativo di function calling, con gli "
+    "stessi argomenti e senza testo attorno."
+)
+
+# Il modello ha scritto da se' un <tool_response>. Sono i risultati che
+# l'harness scrive dopo l'esecuzione: inventarli vuol dire ragionare su un
+# esito che non esiste.
+TOOL_RESPONSE_NUDGE = (
+    "Hai scritto tu un <tool_response>: i risultati dei tool li scrive solo "
+    "l'harness, dopo averli eseguiti. Non e' stato eseguito niente e quel "
+    "risultato non esiste. Chiama il tool con il function calling e aspetta "
+    "il suo risultato vero."
+)
+
+# Risposta finale con il piano ancora aperto: la "vittoria dichiarata troppo
+# presto" dei compiti lunghi. Le tre uscite sono le stesse del resto
+# dell'harness: continuare, saltare con una nota, chiedere.
+PIANO_APERTO_NUDGE = (
+    "Il piano ha ancora {quanti} punti aperti ({elenco}), e la risposta che hai "
+    "scritto chiude il turno come se il lavoro fosse finito.\n"
+    "Se c'e' ancora lavoro, fai adesso la prossima azione del punto {punto}. Se "
+    "un punto non serve piu', chiudilo con manage_plan action='skip' e una nota "
+    "che dica perche'. Se ti serve una decisione dell'utente, chiedila con "
+    "ask_user_question."
+)
+
+# "Fatto" su una richiesta di modifica, e in questo turno nessuna scrittura
+# riuscita. Il fatto e' verificabile dall'harness, quindi si dice il fatto.
+SENZA_PROVA_NUDGE = (
+    "Dichiari il lavoro fatto, ma in questo turno non c'e' nessuna scrittura "
+    "riuscita: sul disco non e' cambiato niente.\n"
+    "Se la modifica serve, falla adesso con edit_file o write_file. Se invece "
+    "non serve, dillo in una riga e spiega perche'."
+)
+
+# Il monitor di avanzamento (``core/ciclo/avanzamento.py``): per troppi passi
+# non e' successo niente di verificabile. Si dicono i fatti e le tre uscite;
+# da qui una chiusura onesta non viene piu' rimandata indietro.
+RIORIENTA_NUDGE = (
+    "Negli ultimi {passi} passi non e' cambiato niente di verificabile: nessun "
+    "file nuovo letto, nessuna scrittura andata a segno, nessuna verifica "
+    "passata, nessun punto del piano chiuso.\n"
+    "Ultime chiamate: {ultime}.\n"
+    "Continuare cosi' consuma i passi senza avvicinarti al risultato. Scegli "
+    "adesso una di queste tre:\n"
+    "1. cambia approccio: riscrivi il piano con manage_plan action='set' "
+    "partendo da cio' che hai scoperto;\n"
+    "2. se ti manca una decisione o un'informazione che ha solo l'utente, "
+    "chiedila con ask_user_question;\n"
+    "3. se sei bloccato, chiudi il turno dicendo cosa blocca e cosa hai gia' "
+    "provato."
+)
+
+# Il riepilogo forzato quando il turno lo ha chiuso il monitor, non il tetto
+# dei passi. La frase del riepilogo normale ("i passi sono finiti") qui
+# sarebbe falsa -- e una frase falsa diventa una convinzione.
+PROMPT_RIEPILOGO_STALLO = """\
+L'harness ha fermato questo turno: per troppi passi di fila non e' cambiato \
+niente di verificabile. Non puoi piu' chiamare tool.
+
+Scrivi ORA all'utente, in italiano, cosa e' successo. Tre cose, brevi:
+1. **Cosa hai fatto davvero**, con i file toccati. Solo azioni riuscite.
+2. **Dove sei bloccato**, e cosa hai gia' provato senza esito: e' la parte \
+che serve all'utente per sbloccarti.
+3. **Cosa ti servirebbe** per andare avanti, in una riga.
+
+Ogni fatto compare una volta sola. Niente preamboli, scuse o promesse.\
+"""
+
+
+def render_verifiche_aperte(pendenti: list[Any]) -> str:
+    """Le verifiche rosse, in coda al contesto: il cammino critico non si perde.
+
+    Stanno anche in cronologia, ma in mezzo, e dopo una compattazione solo nel
+    riassunto. In coda sono l'ultima cosa che il modello legge prima di agire
+    (*lost in the middle*), e costano una riga per verifica.
+    """
+    if not pendenti:
+        return ""
+    righe = [
+        f"- `{getattr(v, 'comando', '?')}`: rossa (exit {getattr(v, 'returncode', '?')}, "
+        f"{getattr(v, 'tentativi', 0)} tentativ{'o' if getattr(v, 'tentativi', 0) == 1 else 'i'})"
+        for v in pendenti[:4]
+    ]
+    return "<verifiche_aperte>\n" + "\n".join(righe) + "\n</verifiche_aperte>"
+
+
+def render_promemoria_batch(passi: int) -> str:
+    """Dopo piu' passi con una sola lettura: le chiamate indipendenti vanno insieme."""
+    return (
+        "<avanzamento>\n"
+        f"Negli ultimi {passi} passi hai letto un file alla volta. Se te ne "
+        "servono altri, chiedili tutti in questo passo: le chiamate indipendenti "
+        "partono insieme e risparmi un passo per ciascuna.\n"
+        "</avanzamento>"
+    )
+
+
+def render_ripresa(checkpoint: dict[str, Any], piano_aperto: list[str]) -> str:
+    """La nota di consegna fra un turno interrotto e il "continua" dell'utente.
+
+    La scrive l'harness con i fatti che ha registrato -- esiti, impronte,
+    conteggi -- e non il modello: un riassunto in prosa puo' dimenticare
+    proprio il rosso o la strada gia' fallita, un elenco di fatti no.
+    """
+    motivi = {
+        "max_steps": "i passi del turno sono finiti",
+        "stallo": "l'harness l'ha fermato per mancanza di progresso",
+        "stopped": "l'utente l'ha interrotto",
+        "finestra_piena": "la finestra di contesto era piena",
+        "reasoning_budget": "e' finito il budget dei recuperi",
+        "error": "si e' chiuso con un errore",
+    }
+    righe = [
+        "<ripresa>",
+        f"Il turno precedente si e' fermato al passo {checkpoint.get('passi', '?')}: "
+        f"{motivi.get(str(checkpoint.get('motivo')), str(checkpoint.get('motivo')))}.",
+    ]
+    if piano_aperto:
+        righe.append("Punti del piano ancora aperti: " + "; ".join(piano_aperto[:5]) + ".")
+    rosse = checkpoint.get("verifiche_rosse") or []
+    if rosse:
+        righe.append("Verifiche ancora rosse (sono di nuovo nel registro di questo turno):")
+        righe.extend(
+            f"- `{v.get('comando')}` (exit {v.get('returncode')}, {v.get('tentativi')} tentativi)"
+            for v in rosse[:4]
+        )
+    falliti = checkpoint.get("falliti") or []
+    if falliti:
+        righe.append("Chiamate gia' fallite piu' volte, da non ripetere uguali:")
+        righe.extend(f"- {f.get('tool')} {f.get('argomenti')} ({f.get('volte')} volte)"
+                     for f in falliti[:5])
+    scritti = checkpoint.get("scritti") or []
+    if scritti:
+        righe.append("File scritti nel turno precedente: " + ", ".join(scritti[:10]) + ".")
+    righe.append("</ripresa>")
+    return "\n".join(righe)
 
 
 # ---------------------------------------------------------------------------

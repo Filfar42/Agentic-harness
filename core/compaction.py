@@ -240,7 +240,11 @@ def blocchi(ui_messages: Sequence[dict[str, Any]]) -> list[tuple[int, int]]:
     confini: list[tuple[int, int]] = []
     inizio: int | None = None
     for i, msg in enumerate(ui_messages):
-        if msg.get("role") == "tool":
+        # L'``intento`` del diario degli effetti (``core/ciclo/ripresa.py``)
+        # sta fra la chiamata e il suo risultato: fa parte del blocco, come il
+        # risultato. Contarlo come messaggio a se' spezzerebbe il blocco in due
+        # e un taglio li' lascerebbe un risultato senza la sua chiamata.
+        if msg.get("role") in ("tool", "intento"):
             if inizio is None:  # risultato orfano: blocco a se'
                 inizio = i
             continue

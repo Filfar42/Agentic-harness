@@ -53,24 +53,12 @@ from . import verifiche as verifiche_mod
 from .notes import render_block as render_notes
 from .plan import render_block, render_summary
 from .prompts import (
-    ASK_NUDGE,
-    COVERAGE_NUDGE,
     DELEGA_ESEMPIO,
-    DELEGA_NUDGE,
-    FAILED_SUMMARY_NUDGE,
-    JSON_LEAK_NUDGE,
-    LOOP_NUDGE,
-    PLAN_NUDGE,
-    PLAN_SUMMARY_NUDGE,
     PROMPT_RIEPILOGO_FINALE,
-    RIPETIZIONE_NUDGE,
-    OSCILLAZIONE_NUDGE,
-    STALLO_NUDGE,
-    SUMMARY_NUDGE,
-    THINK_WATCHDOG_NUDGE,
-    TOOL_NUDGE,
-    TRUNCATED_NUDGE,
-    VERIFY_NUDGE,
+    PROMPT_RIEPILOGO_STALLO,
+    render_promemoria_batch,
+    render_ripresa,
+    render_verifiche_aperte,
 )
 from .textutils import (
     ThinkStreamParser,
@@ -85,7 +73,6 @@ from .tools import (
     NOTES_TOOL,
     PLAN_TOOL,
     PREVIEW_TOOL,
-    TOOL_NAMES,
     ToolContext,
     dispatch,
     looks_like_readonly_request,
@@ -93,8 +80,46 @@ from .tools import (
     preview_kind,
     preview_root,
     reset_scratch,
-    uncovered_symbols,
     validate_tool_arguments,
+)
+
+# Il ciclo a stati (25/09/2026): stato del turno, reti di sicurezza, monitor di
+# avanzamento, ripresa. I segnali testuali e i rilevatori di stallo stavano qui:
+# si ri-esportano con gli stessi nomi, perche' test e script li importano da
+# ``core.agent``.
+from .ciclo import reti as reti_mod
+from .ciclo import ripresa as ripresa_mod
+from .ciclo.avanzamento import Chiamata, leggi_esito
+from .ciclo.reti import (  # noqa: F401 - ri-esportati
+    LOOP_THRESHOLD,
+    MAX_ESPLORAZIONI_SENZA_DELEGA,
+    MAX_TRUNCATED_NUDGES,
+    MAX_VERIFY_NUDGES,
+)
+from .ciclo.segnali import (  # noqa: F401 - ri-esportati
+    MAX_PAROLA_PERCORSO,
+    MIN_ARTEFATTI,
+    REQUIRED_ARGS,
+    _as_tool_call,
+    _PAROLA_PERCORSO,
+    artefatti_nominati,
+    extract_json_objects,
+    is_streaming_tool_json,
+    looks_like_clarifying_question,
+    looks_like_raw_tool_json,
+    looks_like_unexecuted_action,
+    looks_multi_step,
+    nomi_chiamate_nel_testo,
+    parse_text_tool_call,
+    parse_text_tool_calls,
+    user_expects_tool_use,
+)
+from .ciclo.stato import (  # noqa: F401 - ri-esportati
+    TOOL_ESPLORATIVI,
+    RipetizioniTool,
+    RitorniDeiFile,
+    StatoTurno,
+    _firma,
 )
 
 logger = logging.getLogger(__name__)
@@ -243,6 +268,11 @@ class TurnFinished:
     # verificato, cosa e' rimasto rosso e cosa e' stato giustificato per
     # iscritto. Vedi ``core/verifiche.py``.
     qualita: dict[str, Any] = field(default_factory=dict)
+    # L'istantanea del turno per il turno dopo (``StatoTurno.istantanea``):
+    # perche' si e' fermato, le verifiche rimaste rosse, le chiamate fallite
+    # piu' volte, i file scritti. Il server la salva nella sessione e la
+    # ripassa a ``run_turn`` al messaggio successivo (``core/ciclo/ripresa.py``).
+    checkpoint: dict[str, Any] = field(default_factory=dict)
     # I file creati o modificati nel turno non passano di qui: la UI li ricava
     # dai risultati di write_file/edit_file che gia' riceve (vedi fileTocca in
     # web/app.js). Cosi' la stessa regola vale sia in diretta sia quando una
@@ -502,6 +532,8 @@ def build_api_messages(
     vault_notes_block: str = "",
     vault_state_block: str = "",
     delega_block: str = "",
+    verifiche_block: str = "",
+    avanzamento_block: str = "",
 ) -> list[dict[str, Any]]:
     """Costruisce l'array da inviare al modello a partire dal log della UI.
 
@@ -681,7 +713,14 @@ def build_api_messages(
             vault_state_block,
             vault_notes_block,
             notes_block,
+            # Le verifiche rosse subito prima del piano: e' il cammino critico,
+            # e in coda -- l'ultima cosa letta -- non si perde in mezzo alla
+            # cronologia ne' dentro un riassunto (vedi ``render_verifiche_aperte``).
+            verifiche_block,
             plan_block,
+            # Il promemoria di batch dopo il piano: e' un suggerimento sulla
+            # forma della prossima mossa, non sullo stato del lavoro.
+            avanzamento_block,
             # Ultimo perche' e' l'unico che il figlio della delega ha: per lui
             # e' quello che il piano e' per il padre, cioe' l'ultima cosa che
             # legge prima di muoversi. Sul padre e' sempre vuoto.
@@ -1050,382 +1089,6 @@ def drop_oldest_turns(
 
 
 
-# ---------------------------------------------------------------------------
-# Parser di fallback (sostituisce il vecchio parser a regex)
-# ---------------------------------------------------------------------------
-
-REQUIRED_ARGS: dict[str, set[str]] = {
-    "read_file": {"filepath"},
-    "write_file": {"filepath", "content"},
-    "edit_file": {"filepath", "old_string"},
-    "search_files": {"pattern"},
-    "run_command": {"command"},
-    "manage_memory": {"action"},
-    "list_files": set(),
-    ASK_USER_TOOL: {"question"},
-}
-
-_DECODER = json.JSONDecoder()
-
-
-def extract_json_objects(text: str) -> list[tuple[int, int, dict[str, Any]]]:
-    """Trova tutti gli oggetti JSON di primo livello in un testo.
-
-    Usa ``JSONDecoder.raw_decode`` invece di una regex a graffe bilanciate.
-    Motivo: una regex non puo' distinguere le graffe *di struttura* da quelle
-    *dentro una stringa*. Il caso reale che rompeva il recupero era una
-    ``write_file`` il cui ``content`` conteneva codice Python::
-
-        {"name": "write_file", "arguments": {"filepath": "x.py",
-         "content": "shopping_lists = {}\\n..."}}
-
-    Le graffe di ``{}`` nel codice facevano fallire il match, il recupero non
-    scattava e il JSON finiva stampato in chat come testo. ``raw_decode``
-    conosce la grammatica JSON, quindi gestisce annidamento, stringhe con
-    graffe, escape e virgolette senza casi particolari.
-
-    Restituisce ``(inizio, fine, oggetto)`` per ogni oggetto trovato, in ordine.
-    """
-    results: list[tuple[int, int, dict[str, Any]]] = []
-    if len(text) > 1_048_576:
-        return results
-    index = 0
-    length = len(text)
-    attempts = 0
-    while index < length:
-        attempts += 1
-        if attempts > 128:
-            break
-        start = text.find("{", index)
-        if start == -1:
-            break
-        try:
-            obj, end = _DECODER.raw_decode(text, start)
-        except (ValueError, RecursionError):
-            index = start + 1
-            continue
-        if isinstance(obj, dict):
-            try:
-                obj = loads_object(text[start:end])
-            except JsonBoundaryError:
-                index = end
-                continue
-            results.append((start, end, obj))
-            index = end
-        else:
-            index = start + 1
-    return results
-
-
-def _as_tool_call(data: dict[str, Any], seq: int) -> dict[str, Any] | None:
-    """Normalizza un dict JSON in una tool call, o ``None`` se non lo e'.
-
-    Accetta le forme che i modelli locali producono davvero:
-      ``{"name": ..., "arguments": {...}}``
-      ``{"name": ..., "parameters": {...}}``
-      ``{"function": {"name": ..., "arguments": {...}}}``
-      ``{"tool": ..., "args": {...}}``
-    """
-    inner = data.get("function")
-    if isinstance(inner, dict):
-        data = inner
-
-    name = data.get("name") or data.get("tool") or data.get("tool_name")
-    if not isinstance(name, str) or name not in TOOL_NAMES:
-        return None
-
-    args: Any = data.get("arguments")
-    if args is None:
-        args = data.get("parameters")
-    if args is None:
-        args = data.get("args")
-    if args is None:
-        args = {}
-    if isinstance(args, str):
-        try:
-            args = loads_object(args)
-        except JsonBoundaryError:
-            return None
-    if not isinstance(args, dict):
-        return None
-
-    # Nessun default inventato: se manca un parametro obbligatorio si rinuncia.
-    # E' la regola che impedisce il ritorno dei file spuri creati dalla v1.
-    if REQUIRED_ARGS.get(name, set()) - set(args):
-        return None
-
-    return {
-        "id": f"recovered_{int(time.time() * 1000) % 100000}_{seq}",
-        "name": name,
-        "arguments": json.dumps(args, ensure_ascii=False),
-    }
-
-
-def parse_text_tool_calls(text: str) -> tuple[list[dict[str, Any]], str]:
-    """Recupera le tool call che il modello ha stampato come testo.
-
-    Restituisce ``(chiamate, testo_residuo)``: il residuo e' il messaggio
-    ripulito dai blocchi JSON consumati, cosi' l'eventuale prosa attorno resta
-    visibile in chat mentre la chiamata finisce nella tendina del tool.
-    """
-    if not text or "{" not in text:
-        return [], text
-
-    calls: list[dict[str, Any]] = []
-    spans: list[tuple[int, int]] = []
-    for seq, (start, end, obj) in enumerate(extract_json_objects(text)):
-        call = _as_tool_call(obj, seq)
-        if call:
-            calls.append(call)
-            spans.append((start, end))
-
-    if not calls:
-        return [], text
-
-    leftover_parts: list[str] = []
-    cursor = 0
-    for start, end in spans:
-        leftover_parts.append(text[cursor:start])
-        cursor = end
-    leftover_parts.append(text[cursor:])
-    leftover = "".join(leftover_parts)
-    # Ripulisce i resti delle recinzioni markdown rimaste orfane.
-    leftover = re.sub(r"```(?:json|tool_call|tool_code)?\s*```", "", leftover)
-    leftover = re.sub(r"\n{3,}", "\n\n", leftover).strip()
-
-    return calls, leftover
-
-
-def parse_text_tool_call(text: str) -> dict[str, Any] | None:
-    """Compatibilita': la prima tool call recuperata, o ``None``."""
-    calls, _ = parse_text_tool_calls(text)
-    return calls[0] if calls else None
-
-
-def is_streaming_tool_json(text: str) -> bool:
-    """Il testo *in arrivo* e', molto probabilmente, una tool call in JSON.
-
-    Controllo volutamente grezzo perche' gira ad ogni refresh dello stream: la
-    prosa non comincia mai con una graffa o con una recinzione ```json. Serve
-    alla UI per sostituire il JSON con un segnaposto gia' mentre scorre,
-    invece di riversarlo in chat e toglierlo dopo.
-    """
-    stripped = (text or "").lstrip()
-    if not stripped:
-        return False
-    if stripped.startswith("```"):
-        newline = stripped.find("\n")
-        stripped = stripped[newline + 1:].lstrip() if newline != -1 else ""
-    return stripped.startswith("{") and '"' in stripped
-
-
-def looks_like_raw_tool_json(text: str) -> bool:
-    """Il testo e' (anche) un blob JSON di tool call non eseguibile?
-
-    Serve alla UI: un output del genere non va mai riversato in chat come
-    markdown, nemmeno quando il recupero fallisce.
-    """
-    if not text or "{" not in text:
-        return False
-    for _, _, obj in extract_json_objects(text):
-        candidate = obj.get("function") if isinstance(obj.get("function"), dict) else obj
-        name = candidate.get("name") or candidate.get("tool") or candidate.get("tool_name")
-        if isinstance(name, str) and name in TOOL_NAMES:
-            return True
-    return False
-
-
-# Segnali che il testo non e' un'azione mancata ma una domanda: il modello si
-# e' fermato perche' la richiesta non basta a decidere. Osservato in sessione:
-# qwen chiedeva correttamente cosa intendesse l'utente e l'harness gli
-# rispondeva "hai risposto a parole, esegui adesso l'azione", spingendolo a
-# inventarsi la specifica invece di aspettarla. Il nudge combatteva contro la
-# regola del system prompt che gli dice di chiedere.
-_QUESTION_MARKERS = (
-    "quale preferisci", "come preferisci", "cosa intendi", "che cosa intendi",
-    "vuoi che", "preferisci che", "ho bisogno di sapere", "mi serve sapere",
-    "prima di procedere ho bisogno", "prima di procedere mi serve",
-    "non e' chiaro se", "non è chiaro se", "non ho abbastanza",
-    "puoi chiarire", "puoi confermare", "confermi che", "fammi sapere",
-    "ci sono due possibili", "due interpretazioni", "ambiguo",
-    "which would you", "could you clarify", "do you want me to",
-)
-
-
-def looks_like_clarifying_question(text: str) -> bool:
-    """Il modello sta chiedendo un chiarimento, non rimandando un'azione?
-
-    Due indizi indipendenti, perche' uno solo sbaglia troppo: un marcatore
-    esplicito fra quelli sopra, oppure una densita' di punti interrogativi che
-    in una risposta operativa non ci sarebbe.
-    """
-    body = strip_think(text or "").strip()
-    if not body:
-        return False
-    lowered = body.lower()
-    if any(marker in lowered for marker in _QUESTION_MARKERS):
-        return True
-    # Almeno due domande, o una sola domanda in una risposta corta: e' una
-    # richiesta di chiarimento, non un preambolo prima di agire.
-    domande = body.count("?")
-    return domande >= 2 or (domande == 1 and len(body) < 400 and body.rstrip().endswith("?"))
-
-
-def looks_like_unexecuted_action(text: str) -> bool:
-    """Euristica: il modello promette un'azione invece di eseguirla."""
-    if not text:
-        return False
-    lowered = strip_think(text).lower()
-    if len(lowered) < 15:
-        return False
-    intents = (
-        "creo il file", "creero", "ora scrivo", "adesso scrivo", "procedo a",
-        "vado a creare", "vado a modificare", "eseguo il comando", "lancio il comando",
-        "ti creo", "scrivero", "modifichero", "posso creare", "dovrei leggere",
-        "let me create", "i will create", "i'll write", "i will run",
-    )
-    return any(token in lowered for token in intents)
-
-
-# Verbi che, nella richiesta dell'utente, implicano un'operazione sul disco.
-_ACTION_VERBS = (
-    "crea", "creare", "genera", "generare", "scrivi", "scrivere", "aggiungi",
-    "aggiungere", "modifica", "modificare", "correggi", "correggere", "sistema",
-    "rinomina", "rifattorizza", "refactor", "implementa", "implementare",
-    "cancella", "elimina", "leggi", "leggere", "apri", "mostrami il file",
-    "elenca", "lista", "guarda", "ispeziona", "analizza il", "controlla",
-    "verifica", "esegui", "eseguire", "lancia", "avvia", "installa", "testa",
-    "trova", "cerca", "dove si trova", "dove sta", "quali file", "che file",
-    "compila", "committa", "ricordati", "memorizza",
-)
-
-# Sostantivi che ancorano la richiesta al workspace.
-_WORKSPACE_NOUNS = (
-    "file", "cartella", "directory", "progetto", "repo", "repository", "codice",
-    "script", "modulo", "funzione", "classe", "test", "workspace", "comando",
-    ".py", ".js", ".ts", ".json", ".md", ".txt", ".toml", ".yml", ".yaml",
-)
-
-
-# Radici di verbi che, ripetute, segnalano una richiesta con piu' obiettivi.
-# Sono radici e non parole intere per contare "correggi" e "correggere" una
-# volta sola: con le forme complete il conteggio si gonfiava da solo e
-# qualunque frase lunga sembrava multi-step.
-_MULTI_STEP_STEMS = (
-    "crea", "genera", "scriv", "aggiung", "modific", "corregg", "implement",
-    "rimuov", "elimin", "esegu", "lanci", "verific", "analizz", "document",
-    "rifattorizz", "estend", "ottimizz", "riscriv", "sposta", "rinomin",
-)
-
-# "STEP 1", "1.", "2)" a inizio riga: la firma tipografica di un elenco di
-# compiti. Due occorrenze bastano -- una sola puo' essere un esempio.
-_STEP_MARKER = re.compile(r"(?:^|\n)\s*(?:step\s*\d+|\d+[.)])\s", re.I)
-
-# Un file con estensione nota, oppure un percorso di cartella. Le estensioni
-# sono un elenco chiuso e non `\w+` perche' altrimenti "3.12" e "art. 81" e
-# ogni frase che finisce con un punto diventerebbero file.
-_ARTEFATTO = re.compile(
-    r"[\w./-]*\w[\w-]*\.(?:py|md|txt|csv|tsv|json|ya?ml|toml|ini|cfg|sql|sh|"
-    r"bat|ps1|html?|css|jsx?|tsx?|rs|go|java|c|h|cpp|rb|php|xml|lock)\b"
-    r"|[\w-]+(?:/[\w-]+)*/",
-)
-
-# I candidati su cui cercare artefatti: sequenze dei caratteri che un percorso
-# puo' contenere. Linear-time, e fuori da questi caratteri ``_ARTEFATTO`` non
-# puo' comunque trovare niente.
-_PAROLA_PERCORSO = re.compile(r"[\w./-]+")
-MAX_PAROLA_PERCORSO = 200
-
-# Quanti artefatti distinti fanno una richiesta strutturata. Quattro: sotto,
-
-# "scrivi il modulo e il suo test" ne conta due o tre ed e' un compito solo.
-MIN_ARTEFATTI = 4
-
-# Le radici d'azione cercate a inizio parola. Il confronto per sottostringa
-# contava "gestendo" come "estend" e "documento" come "document": rumore che
-# faceva scattare il sollecito su richieste con un obiettivo solo.
-_RADICI_AZIONE = re.compile(
-    r"\b(?:" + "|".join(_MULTI_STEP_STEMS) + r")", re.I
-)
-
-
-def artefatti_nominati(text: str) -> set[str]:
-    """I file e le cartelle distinti che la richiesta nomina.
-
-    E' il terzo segnale, aggiunto dopo una prova andata male: una richiesta
-    scritta in prosa -- "dentro `cantiere/grezzi/` quattro file di testo...
-    `cantiere/misura.py` ne ricava `cantiere/misure.csv`..." -- non ha nessun
-    elenco numerato e nessun verbo all'imperativo, quindi passava sotto i primi
-    due segnali senza toccarli. Ma nominava otto artefatti da produrre, e otto
-    artefatti sono otto lavori: il modello e' partito senza piano e ha finito i
-    passi. Contare le cose da consegnare coglie la struttura anche quando chi
-    scrive descrive un risultato invece di ordinare delle azioni.
-    """
-    # La regex si applica **parola per parola**, e le parole troppo lunghe per
-    # essere un percorso si saltano. Sul testo intero il suo costo era cubico
-    # nella lunghezza di una sequenza senza spazi (``[\w./-]*`` e ``\w[\w-]*``
-    # si contendono gli stessi caratteri): misurato, 0,5 s a 1.000 caratteri,
-    # 31 s a 4.000. Una riga di base64 o di JS minificato incollata nella
-    # richiesta bloccava l'avvio del turno -- tenendo il GIL, quindi anche il
-    # resto del server. Su una parola di 200 caratteri il caso peggiore e' 5 ms.
-    trovati = {
-        m.group(0).lower().lstrip("./")
-        for parola in _PAROLA_PERCORSO.findall(text or "")
-        if len(parola) <= MAX_PAROLA_PERCORSO
-        for m in _ARTEFATTO.finditer(parola)
-    }
-    # `cantiere/` e `cantiere/grezzi/` sono due contenitori diversi, ma
-    # `cantiere/` e `cantiere/misura.py` non vanno contati due volte: la
-    # cartella che contiene una cosa gia' contata non e' un lavoro in piu'.
-    return {
-        a for a in trovati
-        # Via i contenitori gia' rappresentati da qualcosa che sta dentro
-        # (`cantiere/` accanto a `cantiere/misura.py`) e le citazioni in forma
-        # breve della stessa cosa (`lunghi/` accanto a `cantiere/lunghi/`):
-        # nominare un artefatto due volte non lo raddoppia.
-        if not any(b != a and (b.startswith(a) or b.endswith(a)) for b in trovati)
-    }
-
-
-def looks_multi_step(text: str) -> bool:
-    """La richiesta contiene piu' obiettivi distinti?
-
-    Serve a decidere se pretendere un piano. Volutamente conservativa: un
-    falso positivo costa un giro di manage_plan su un compito semplice
-    (fastidioso), un falso negativo riporta al problema di partenza -- il
-    modello che prova a fare tutto in un ragionamento solo (grave). La soglia
-    sulla lunghezza esiste perche' "leggi il file e dimmi cosa fa" ha due verbi
-    ma un obiettivo solo.
-
-    Tre segnali indipendenti, in ordine di quanto sono difficili da sbagliare:
-    la tipografia di un elenco, il numero di verbi d'azione, il numero di
-    artefatti nominati. Basta uno.
-    """
-    if not text or len(text) < 220:
-        return False
-    if len(_STEP_MARKER.findall(text)) >= 2:
-        return True
-    if len(_RADICI_AZIONE.findall(text)) >= 3:
-        return True
-    return len(artefatti_nominati(text)) >= MIN_ARTEFATTI
-
-
-def user_expects_tool_use(text: str) -> bool:
-    """La richiesta dell'utente implica un'operazione sul workspace?
-
-    Serve al nudge automatico: se l'utente ha chiesto di *fare* qualcosa e il
-    modello ha risposto solo a parole, l'harness lo sollecita da solo invece di
-    lasciare che sia l'utente a doverlo fare ogni volta -- che era esattamente
-    il sintomo riportato ("i tool li usa solo se glielo dico esplicitamente").
-    """
-    if not text:
-        return False
-    lowered = " " + text.lower().strip() + " "
-    has_verb = any(v in lowered for v in _ACTION_VERBS)
-    has_noun = any(n in lowered for n in _WORKSPACE_NOUNS)
-    return has_verb and has_noun
-
-
 # Livelli di pensiero, dal piu' economico al piu' caro. Solo questi si possono
 # abbassare: un ``think`` booleano non ha una manopola da girare.
 _THINK_LEVELS = ("low", "medium", "high", "max")
@@ -1782,6 +1445,7 @@ def riepilogo_finale(
     budgets: Any,
     strip_thinking: bool,
     should_stop: Callable[[], bool] | None = None,
+    prompt: str = PROMPT_RIEPILOGO_FINALE,
 ) -> str:
     """Chiede al modello cosa e' successo, quando i passi sono gia' finiti.
 
@@ -1791,7 +1455,7 @@ def riepilogo_finale(
     """
     api = build_api_messages(
         ui_messages,
-        system_prompt=PROMPT_RIEPILOGO_FINALE,
+        system_prompt=prompt,
         env_header=None,
         strip_thinking=strip_thinking,
         compact_old_tools=True,
@@ -1951,6 +1615,13 @@ def run_turn(
     images: list[str] | None = None,
     allow_text_tool_calls: bool = False,
     initialize_workspace: bool = True,
+    # Il monitor di avanzamento (``core/ciclo/avanzamento.py``): misura se i
+    # passi producono qualcosa di verificabile e, se no, riorienta e poi chiude.
+    monitor_avanzamento: bool = True,
+    # L'istantanea con cui si e' chiuso il turno precedente (``TurnFinished.
+    # checkpoint``, salvata dal server nella sessione). Serve alla ripresa dopo
+    # un turno rimasto a meta': vedi ``core/ciclo/ripresa.py``.
+    checkpoint_precedente: dict[str, Any] | None = None,
 ) -> Iterator[AgentEvent]:
     """Esegue un turno completo. Muta ``ui_messages`` in-place via append.
 
@@ -1961,188 +1632,289 @@ def run_turn(
     sicura: prima di chiamare il modello, mentre arrivano i token, e prima di
     eseguire ogni tool. Non si taglia mai *dentro* un tool gia' partito: un
     write_file interrotto a meta' lascerebbe un file monco sul disco.
+
+    Il ciclo e' una macchina a stati con le fasi che il 22/09 erano solo
+    implicite -- **prepara** (contesto, compattazione, finestra), **genera**
+    (stream, watchdog, continuazione), **valuta** (le reti di sicurezza in
+    ``core/ciclo/reti.py``), **esegui** (i tool), **dopo i tool** (note,
+    monitor di avanzamento) -- e lo stato del turno sta in un oggetto solo
+    (``core/ciclo/stato.StatoTurno``). Vedi il referto del 25/09/2026.
     """
-    # Displayed examples are data. Native function calls are the default
-    # execution boundary; legacy recovery requires an explicit caller opt-in.
-    backend = track_backend(backend)
-    telemetry_offset = backend.collector.offset()
-    turn_started = time.monotonic()
-    allowed_tools = {schema["function"]["name"] for schema in tools_schema}
-    schema_tokens = estimate_tokens(json.dumps(tools_schema, ensure_ascii=False)) if tools_schema else 0
-    nudged = False
-    leak_nudged = False
-    ripetizione_nudged = False
-    ripetizione_dovuta: tuple[str, int] | None = None
-    stallo_nudged = False
-    stallo_dovuto: tuple[str, int] | None = None
-    ritorni = RitorniDeiFile()
-    oscillazione_nudged = False
-    oscillazione_dovuta: tuple[str, int] | None = None
-    ripetizioni = RipetizioniTool()
-    summary_requested = False
-    coverage_nudged = False
-    verify_nudges = 0
-    # Tetto COMPLESSIVO ai passi che le reti di sicurezza possono consumare.
-    #
-    # Ogni sollecito ha gia' il suo contatore, e ognuno preso da solo e' tarato
-    # bene. Ma i tetti si sommano: 2 riprese di stream + 2 watchdog + 2
-    # troncamenti + 2 verifiche + 3 flag = 11, contro un ``max_agent_loops`` di
-    # serie di 12. Nel caso peggiore -- un modello debole su un compito
-    # difficile, cioe' esattamente quello per cui i solleciti esistono -- al
-    # lavoro restava UN passo, e ogni sollecito appende anche due messaggi in
-    # cronologia: si toglie tempo e spazio insieme.
-    #
-    # Qui i solleciti si contendono un budget unico. Quando finisce, il turno
-    # smette di correggersi e usa i passi che restano per lavorare.
-    passi_di_servizio = 0
-    max_passi_di_servizio = max(2, max_steps // 3)
-    servizio_esaurito = False
-    # Quante volte ogni rete di sicurezza e' entrata in funzione. Sono stampelle
-    # nate per i modelli piccoli: costano un round-trip in piu' quando scattano
-    # e zero quando non scattano, quindi la domanda non e' "servono in teoria"
-    # ma "questo modello le fa scattare". Contarle e' l'unico modo di decidere
-    # con i dati invece che a intuito quali si possono togliere.
-    nudge_counts: dict[str, int] = {}
-
-    def count_nudge(name: str) -> None:
-        nudge_counts[name] = nudge_counts.get(name, 0) + 1
-        # Stesso oggetto, non una copia: aggiornarlo qui basta perche' il
-        # conteggio arrivi in TurnFinished anche per i nudge contati dopo.
-        total_usage["nudges"] = nudge_counts
-
-    # I budget di troncamento seguono la finestra reale del modello, non le
-    # costanti tarate su 16k. Vanno messi nel ToolContext *prima* del primo
-    # passo: sono i tool a doverli rispettare, e li leggono da li'.
-    # Chi chiama puo' imporne uno suo (la delega passa al figlio i budget
-    # stretti): se non arriva, si ricalcola dalla finestra come sempre.
-    if budgets is None:
-        budgets = budgets_for(int(getattr(params, "num_ctx", 0) or 0), compact_max_tokens)
-    tool_ctx.budgets = budgets
-
-    # La delega si monta qui e non nel ToolContext perche' backend e parametri
-    # li conosce il ciclo, non i tool. Il figlio non riceve il tool di delega:
-    # un esploratore che delega e' una ricorsione che nessuno ha chiesto.
-    if abilita_delega and (tool_ctx.on_delega is None
-                          or getattr(tool_ctx.on_delega, "_harness_owned", False)):
-        def _delega(compito: str) -> dict[str, Any]:
-            return delega_mod.esegui(
-                compito,
-                backend=backend.scope("delegate"),
-                params=params,
-                tools_schema=tools_schema,
-                tool_ctx=tool_ctx,
-                env_header=env_header,
-                run_turn=run_turn,
-                registra_esiti=spec_delega,
-                # Serve al referto di chiusura: quando il figlio finisce i
-                # passi senza rispondere, si rilegge il suo contesto per
-                # ricavarne almeno un referto parziale.
-                build_messages=build_api_messages,
-                should_stop=should_stop,
-            )
-
-        _delega._harness_owned = True
-        tool_ctx.on_delega = _delega
-
-    # vault_search si monta come la delega: backend e parametri li conosce il
-    # ciclo, non i tool. Il cercatore non riceve ne' delega ne' vault_search
-    # (lo schema del figlio e' filtrato a tre tool di lettura), quindi non c'e'
-    # ricorsione possibile.
-    if tool_ctx.on_vault_search is None or getattr(tool_ctx.on_vault_search, "_harness_owned", False):
-        def _vault_search(vault: str, query: str) -> dict[str, Any]:
-            return vault_search_mod.cerca_nel_vault(
-                vault,
-                query,
-                backend=backend.scope("vault_search"),
-                params=params,
-                tools_schema=tools_schema,
-                tool_ctx=tool_ctx,
-                env_header=env_header,
-                run_turn=run_turn,
-                registri=getattr(tool_ctx, "registri_vault", None),
-                should_stop=should_stop,
-            )
-
-        _vault_search._harness_owned = True
-        tool_ctx.on_vault_search = _vault_search
-
-    plan_nudged = False
-    # Il cancello si apre una volta per turno: dopo che l'utente ha visto il
-    # piano, ogni action='set' successiva e' una revisione fatta lavorando, e
-    # fermare il lavoro ad ogni revisione lo renderebbe insopportabile.
-    gate_mostrato = any(m.get("kind") == GATE_PIANO for m in ui_messages)
-    truncated_nudges = 0
-    watchdog_fires = 0
-    riprese_stream = 0
-    # Letture esplorative di fila, cioe' passi in cui il modello ha solo
-    # guardato. Si azzera appena tocca il disco o delega: quello che si vuole
-    # riconoscere e' l'esplorazione lunga, non la lettura prima di una modifica.
-    esplorazioni_di_fila = 0
-    delega_nudged = False
-
-    # --- libreria dei concetti -------------------------------------------
-    # L'indice sta in coda, e il precarico d'ufficio ci si appoggia sopra: il
-    # recupero lo fa l'harness cercando nel titolo e nel contenuto archiviato,
-    # perche' la meta' che rilegge, se lasciata a un invito, non
-    # parte -- su questo progetto e' misurato (vedi ``core/libreria.py``).
-    schedario = (
-        tool_ctx.base if (libreria_attiva and getattr(tool_ctx, "base", None)) else None
+    turno = _Turno(
+        backend=backend, params=params, tools_schema=tools_schema, tool_ctx=tool_ctx,
+        ui_messages=ui_messages, system_prompt=system_prompt, env_header=env_header,
+        max_steps=max_steps, strip_thinking=strip_thinking, compact_old_tools=compact_old_tools,
+        budgets=budgets, enable_nudge=enable_nudge, require_summary=require_summary,
+        require_plan=require_plan, think_watchdog=think_watchdog, auto_preview=auto_preview,
+        compact_history=compact_history, soglia=soglia, compact_max_tokens=compact_max_tokens,
+        libreria_attiva=libreria_attiva, estratto_pensiero=estratto_pensiero,
+        blocco_coda=blocco_coda, spec_delega=spec_delega, plan_gate=plan_gate,
+        skills_block=skills_block, abilita_delega=abilita_delega, should_stop=should_stop,
+        images=images, allow_text_tool_calls=allow_text_tool_calls,
+        initialize_workspace=initialize_workspace, monitor_avanzamento=monitor_avanzamento,
+        checkpoint_precedente=checkpoint_precedente,
     )
+    yield from turno.esegui()
 
-    def _blocco_libreria() -> str:
-        if schedario is None:
+
+# Le transizioni fra le fasi di un passo. ``AVANTI`` va alla fase successiva
+# dello stesso passo; ``PROSSIMO`` chiude il passo e ne comincia un altro;
+# ``FINE`` chiude il turno (il ``TurnFinished`` e' gia' stato emesso).
+AVANTI = "avanti"
+PROSSIMO = "prossimo"
+FINE = "fine"
+
+
+@dataclass
+class _Preparazione:
+    """Cio' che la fase PREPARA consegna a GENERA."""
+
+    api_messages: list[dict[str, Any]]
+    params_passo: Any
+    tetto_passo: int
+    spazio_finestra: int
+    stima_passo: int
+    watchdog_chars: int
+    soglia_interrompi: int
+    puo_continuare: bool
+    regia_passo: Any
+    reasoning_phase: str
+
+
+@dataclass
+class _Generazione:
+    """Cio' che la fase GENERA consegna a VALUTA."""
+
+    parser: Any
+    tool_calls: list[dict[str, Any]]
+    stream_error: str | None = None
+    interrupted: bool = False
+    watchdog_hit: bool = False
+    done_reason: str = ""
+    usage_passo: dict[str, Any] = field(default_factory=dict)
+    chiusura_passo: str | None = None
+    continuazione_rifiutata: bool = False
+    osservatore: Any = None
+    params_passo: Any = None
+    # Riempiti da VALUTA: la risposta ripulita e se le chiamate vengono dal testo.
+    answer: str = ""
+    reasoning: str = ""
+    recovered: bool = False
+
+
+class _Turno:
+    """Un'esecuzione di ``run_turn``: dipendenze, stato e fasi.
+
+    Una classe e non un generatore unico per una ragione sola: ogni fase e'
+    una funzione con un nome, e le cose che le fasi si passano sono campi di un
+    oggetto invece di variabili che attraversano mille righe. Le decisioni --
+    quale rete si applica, se il turno sta avanzando -- stanno fuori, in
+    ``core/ciclo/``, come funzioni pure.
+    """
+
+    def __init__(self, **kw: Any) -> None:
+        self.__dict__.update(kw)
+        backend = track_backend(kw["backend"])
+        self.backend = backend
+        self.telemetry_offset = backend.collector.offset()
+        self.turn_started = time.monotonic()
+        self.allowed_tools = {schema["function"]["name"] for schema in self.tools_schema}
+        self.schema_tokens = (
+            estimate_tokens(json.dumps(self.tools_schema, ensure_ascii=False))
+            if self.tools_schema else 0
+        )
+        # Tetto COMPLESSIVO ai passi che le reti di sicurezza possono consumare.
+        #
+        # Ogni sollecito ha gia' il suo contatore, e ognuno preso da solo e'
+        # tarato bene. Ma i tetti si sommano, e nel caso peggiore -- un modello
+        # debole su un compito difficile, cioe' esattamente quello per cui i
+        # solleciti esistono -- al lavoro restava un passo. Qui i solleciti si
+        # contendono un budget unico; quando finisce, il turno smette di
+        # correggersi e usa i passi che restano per lavorare.
+        self.st = StatoTurno(
+            max_passi=self.max_steps,
+            max_passi_di_servizio=max(2, self.max_steps // 3),
+        )
+        self.total_usage: dict[str, Any] = {}
+        self.stopped = self.should_stop or (lambda: False)
+        tool_ctx = self.tool_ctx
+        ui_messages = self.ui_messages
+
+        # I budget di troncamento seguono la finestra reale del modello, non le
+        # costanti tarate su 16k. Vanno messi nel ToolContext *prima* del primo
+        # passo: sono i tool a doverli rispettare, e li leggono da li'.
+        if self.budgets is None:
+            self.budgets = budgets_for(
+                int(getattr(self.params, "num_ctx", 0) or 0), self.compact_max_tokens
+            )
+        tool_ctx.budgets = self.budgets
+        self._monta_servizi()
+
+        # Il cancello si apre una volta per turno: dopo che l'utente ha visto
+        # il piano, ogni action='set' successiva e' una revisione fatta
+        # lavorando.
+        self.st.gate_mostrato = any(m.get("kind") == GATE_PIANO for m in ui_messages)
+
+        # --- libreria dei concetti ------------------------------------------
+        self.schedario = (
+            tool_ctx.base
+            if (self.libreria_attiva and getattr(tool_ctx, "base", None)) else None
+        )
+        self.blocco_libreria = self._blocco_libreria()
+
+        # La richiesta ha piu' obiettivi: allora il piano non e' un suggerimento.
+        self.st.multi_step = looks_multi_step(last_user_request(ui_messages))
+        self.max_tokens_turno = int(getattr(self.params, "max_tokens", 0) or 0)
+        # Una richiesta di sola lettura vale per il turno intero. Se pero'
+        # l'utente ha appena risposto a un ask_user_question, ha parlato lui
+        # dopo: il vincolo decade, altrimenti l'unica uscita di sicurezza
+        # sarebbe murata.
+        tool_ctx.readonly_request = looks_like_readonly_request(
+            last_user_request(ui_messages)
+        ) and not answered_question_pending(ui_messages)
+        tool_ctx.new_symbols.clear()
+        if self.initialize_workspace and not answered_question_pending(ui_messages):
+            # Il banco di prova riparte vuoto ad ogni turno (non solo davanti a
+            # una richiesta di analisi): il prompt dice che `.analisi/` "viene
+            # svuotata", e una frase del prompt deve essere vera. Non si svuota
+            # quando l'utente ha appena risposto a una domanda: quel turno e'
+            # la continuazione del precedente.
+            reset_scratch(tool_ctx)
+        # La potatura del deposito sta qui e non a ogni scrittura. Il deposito
+        # **non** si svuota come il banco di prova: un handle imbucato in un
+        # turno deve restare valido per tutta la conversazione.
+        if (
+            self.initialize_workspace and getattr(tool_ctx, "deposito_attivo", False)
+            and getattr(tool_ctx, "base", None)
+        ):
+            deposito_mod.pota(tool_ctx.base, int(getattr(tool_ctx, "deposito_max_mb", 0)),
+                              protetti=deposit_references(ui_messages))
+        self.verification = VerificationTracker()
+        tool_ctx.verification = self.verification
+
+        # --- chiamate orfane e ripresa (``core/ciclo/ripresa.py``) ---------
+        # Una chiamata senza risultato in cronologia rompe i template severi e
+        # lascia il modello senza sapere se l'effetto c'e' stato. Il server le
+        # ripara gia' prima di chiamarci (e riscrive la coda); questo e' per chi
+        # chiama ``run_turn`` direttamente.
+        self.orfani_riparati = ripresa_mod.ripara_orfani(
+            ui_messages, str(getattr(tool_ctx, "workspace", "") or "")
+        )
+        self.ripreso = False
+        if ripresa_mod.va_ripreso(self.checkpoint_precedente, last_user_request(ui_messages)):
+            self.ripreso = True
+            ripresa_mod.ripristina_verifiche(self.verification, self.checkpoint_precedente)
+            red_now = self.verification.unresolved
+            tool_ctx.red_command = red_now[0] if red_now else None
+            aperti = [f"{p.id}. {p.text}" for p in (tool_ctx.plan.open_steps if tool_ctx.plan else [])]
+            ui_messages.append({
+                "role": "user", "hidden": True, "kind": "ripresa",
+                "content": render_ripresa(self.checkpoint_precedente, aperti),
+                "ts": time.time(),
+            })
+
+        # --- traccia del pensiero -------------------------------------------
+        # Sta sul messaggio dell'assistente e non in un file di log a parte:
+        # e' gia' persistita nella sessione, gia' isolata nei test, e si legge
+        # accanto al pensiero che descrive. Al modello non arriva mai.
+        self.traccia: dict[str, Any] = {}
+        self.stato_traccia = {"da": -1}
+        # --- regia del pensiero (``core/regia_pensiero.py``) ------------------
+        self.stato_punto = regia.StatoPunto()
+        self.chiamate_passo: list[tuple[str, bool]] = []
+        self.nomi_tool_schema = [
+            str((t.get("function") or {}).get("name") or "")
+            for t in (self.tools_schema or [])
+            if isinstance(t, dict)
+        ]
+
+    # ------------------------------------------------------------------
+    # Servizi montati sul ToolContext (delega, ricerca nel vault)
+    # ------------------------------------------------------------------
+    def _monta_servizi(self) -> None:
+        tool_ctx = self.tool_ctx
+        backend = self.backend
+        # La delega si monta qui e non nel ToolContext perche' backend e
+        # parametri li conosce il ciclo, non i tool. Il figlio non riceve il
+        # tool di delega: un esploratore che delega e' una ricorsione che
+        # nessuno ha chiesto.
+        if self.abilita_delega and (
+            tool_ctx.on_delega is None or getattr(tool_ctx.on_delega, "_harness_owned", False)
+        ):
+            def _delega(compito: str) -> dict[str, Any]:
+                return delega_mod.esegui(
+                    compito,
+                    backend=backend.scope("delegate"),
+                    params=self.params,
+                    tools_schema=self.tools_schema,
+                    tool_ctx=tool_ctx,
+                    env_header=self.env_header,
+                    run_turn=run_turn,
+                    registra_esiti=self.spec_delega,
+                    build_messages=build_api_messages,
+                    should_stop=self.should_stop,
+                )
+
+            _delega._harness_owned = True
+            tool_ctx.on_delega = _delega
+
+        # vault_search si monta come la delega. Il cercatore non riceve ne'
+        # delega ne' vault_search, quindi non c'e' ricorsione possibile.
+        if tool_ctx.on_vault_search is None or getattr(
+            tool_ctx.on_vault_search, "_harness_owned", False
+        ):
+            def _vault_search(vault: str, query: str) -> dict[str, Any]:
+                return vault_search_mod.cerca_nel_vault(
+                    vault,
+                    query,
+                    backend=backend.scope("vault_search"),
+                    params=self.params,
+                    tools_schema=self.tools_schema,
+                    tool_ctx=tool_ctx,
+                    env_header=self.env_header,
+                    run_turn=run_turn,
+                    registri=getattr(tool_ctx, "registri_vault", None),
+                    should_stop=self.should_stop,
+                )
+
+            _vault_search._harness_owned = True
+            tool_ctx.on_vault_search = _vault_search
+
+    # ------------------------------------------------------------------
+    # Blocchi di coda
+    # ------------------------------------------------------------------
+    def _blocco_libreria(self) -> str:
+        if self.schedario is None:
             return ""
-        elenco = libreria.voci(schedario)
+        elenco = libreria.voci(self.schedario)
         if not elenco:
             return ""
         indice = libreria.render_block(elenco)
-        aperto = tool_ctx.plan.current if tool_ctx.plan else None
-        contesto = (aperto.text if aperto else "") or last_user_request(ui_messages)
-        ripescato = libreria.precarico(schedario, elenco, contesto)
+        aperto = self.tool_ctx.plan.current if self.tool_ctx.plan else None
+        contesto = (aperto.text if aperto else "") or last_user_request(self.ui_messages)
+        ripescato = libreria.precarico(self.schedario, elenco, contesto)
         return "\n\n".join(p for p in (ripescato, indice) if p)
 
-    blocco_libreria = _blocco_libreria()
-
-    def _esempio_delega() -> str:
-        """L'ultima delega che in questo workspace ha funzionato al primo colpo.
-
-        Attaccata al sollecito invece che messa in coda al contesto: li'
-        sarebbe un costo a ogni passo per un'informazione che serve nel momento
-        in cui una delega si scrive, cioe' di rado. Un esempio vero vale piu'
-        di tre righe su come formulare bene una domanda.
-        """
-        if not spec_delega or not getattr(tool_ctx, "base", None):
+    def _esempio_delega(self) -> str:
+        """L'ultima delega che in questo workspace ha funzionato al primo colpo."""
+        if not self.spec_delega or not getattr(self.tool_ctx, "base", None):
             return ""
-        domanda = spec_delega_mod.esempio_riuscito(tool_ctx.base)
+        domanda = spec_delega_mod.esempio_riuscito(self.tool_ctx.base)
         return DELEGA_ESEMPIO.format(domanda=domanda) if domanda else ""
 
-    def blocco_stato_vault() -> str:
+    def _blocco_stato_vault(self) -> str:
         """Indice e coda del log della wiki, per i vault in modalita' wiki.
 
-        Stava nel prompt di **sistema** (misurato: ~1.670 token) e conteneva
-        ``wiki/index.md``, cioe' il file che ogni ingest riscrive: il prefisso
-        si invalidava sull'operazione per cui la modalita' wiki esiste, e non
-        di 1.670 token ma dal token zero.
+        Il **workspace**, non ``vault_dir``: la modalita' wiki si accende anche
+        sui vault nati prima di ``.vault.json``, riconosciuti dalla struttura.
         """
-        # Il **workspace**, non ``vault_dir``: quest'ultimo si valorizza solo
-        # se la cartella ha un ``.vault.json``, mentre la modalita' wiki si
-        # accende anche sui vault nati prima di quel file, riconosciuti dalla
-        # struttura ``raw/`` + ``wiki/``. Usando vault_dir, proprio quelli
-        # avrebbero perso l'indice che prima ricevevano nel prompt di sistema.
-        # La condizione e' la stessa che il server usa per il prompt.
-        cartella = getattr(tool_ctx, "workspace", "") or ""
+        cartella = getattr(self.tool_ctx, "workspace", "") or ""
         if not cartella or not vault_mod.is_modalita_vault(cartella):
             return ""
         return vault_mod.blocco_stato(cartella)
 
-    def blocco_memoria_vault() -> str:
-        """La memoria del vault, se si sta lavorando dentro uno.
-
-        Si ricostruisce ad ogni passo da ``tool_ctx.vault_notes`` e non dal
-        disco: il file cambia solo quando lo cambia il modello, e in quel caso
-        il tool aggiorna anche la lista. Rileggerlo ad ogni passo sarebbe una
-        stat e un ``json.load`` per un contenuto che quasi sempre e' lo stesso.
-        """
+    def _blocco_memoria_vault(self) -> str:
+        tool_ctx = self.tool_ctx
         if not tool_ctx.vault_dir or not tool_ctx.vault_notes:
             return ""
         return vault_mod.blocco_note(
@@ -2152,118 +1924,66 @@ def run_turn(
             )
         )
 
-    # La richiesta ha piu' obiettivi: allora il piano non e' un suggerimento.
-    multi_step = looks_multi_step(last_user_request(ui_messages))
-    # Soglia del watchdog sul ragionamento, in caratteri. Deve scattare
-    # **prima** di num_predict, altrimenti non serve a niente: se aspettassimo
-    # il tetto duro il modello avrebbe gia' speso tutto e non gli resterebbe
-    # budget per agire. Con il 55% il pensiero ha spazio per essere serio e ne
-    # resta abbastanza per emettere la tool call.
-    max_tokens_turno = int(getattr(params, "max_tokens", 0) or 0)
-    # L'avviso di finestra quasi piena si da' una volta per turno.
-    avvisato_finestra = False
-    # Una richiesta di sola lettura vale per il turno intero. Se pero' l'utente
-    # ha appena risposto a un ask_user_question, ha parlato lui dopo: il
-    # vincolo decade, altrimenti l'unica uscita di sicurezza sarebbe murata.
-    tool_ctx.readonly_request = looks_like_readonly_request(
-        last_user_request(ui_messages)
-    ) and not answered_question_pending(ui_messages)
-    tool_ctx.new_symbols.clear()
-    if initialize_workspace and not answered_question_pending(ui_messages):
-        # Il banco di prova riparte vuoto ad **ogni** turno, non solo davanti a
-        # una richiesta di analisi. Il prompt dice al modello che `.analisi/`
-        # "viene svuotata" e che non fa parte del progetto: finche' lo svuotava
-        # solo il ramo di sola lettura, su una richiesta di costruzione quella
-        # frase era falsa -- e il modello ci credeva. Osservato: ha lasciato
-        # `.analisi/caso_negativo/` nella radice del workspace ragionando
-        # "which gets cleared on every analysis anyway", violando il vincolo
-        # dell'utente sui confini del lavoro. Le cartelle col punto non
-        # compaiono in nessun elenco, quindi nemmeno lui poteva accorgersene.
-        #
-        # Non si svuota a fine turno di proposito: se una proposta e' stata
-        # provata, il codice della prova resta li' da guardare fino alla mossa
-        # successiva. E non si svuota quando l'utente ha appena risposto a una
-        # domanda: quel turno e' la continuazione del precedente, e la prova
-        # appena impostata dal modello e' esattamente cio' su cui deve tornare.
-        reset_scratch(tool_ctx)
-    # La potatura del deposito sta qui e non a ogni scrittura: e' una stat per
-    # file su una cartella piccola, e farla dodici volte per turno cambierebbe
-    # solo il numero di syscall. Il deposito **non** si svuota come il banco di
-    # prova: un handle imbucato in un turno deve restare valido per tutta la
-    # conversazione, o la cronologia porterebbe il puntatore a un file che non
-    # esiste piu'.
-    if initialize_workspace and getattr(tool_ctx, "deposito_attivo", False) and getattr(tool_ctx, "base", None):
-        deposito_mod.pota(tool_ctx.base, int(getattr(tool_ctx, "deposito_max_mb", 0)),
-                          protetti=deposit_references(ui_messages))
-    verification = VerificationTracker()
-    tool_ctx.verification = verification
-    tools_used = False
-    total_usage: dict[str, Any] = {}
-    stopped = should_stop or (lambda: False)
-    # Correzione della stima dei token misurata sul server (``calibra_stima``).
-    # Vale per il turno: al primo passo non c'e' ancora una misura.
-    fattore_stima = 1.0
-    # Dopo una compattazione non riuscita non si riprova al passo dopo. Senza
-    # questa pausa, un riassunto che fallisce sempre allo stesso modo (tagliato
-    # da MAX_TOKEN_RIASSUNTO, server che rifiuta) costava una chiamata in piu'
-    # a OGNI passo -- e con llama-server a uno slot ogni chiamata di servizio
-    # sposta anche il KV cache della conversazione.
-    compattazione_ferma_fino_a = 0
-    phase_key: tuple[str, str] | None = None
-    phase_step = 0
-    retry_reasoning = False
+    def _costruisci(self, step: int, blocco_piano: str) -> list[dict[str, Any]]:
+        tool_ctx = self.tool_ctx
+        return build_api_messages(
+            self.ui_messages,
+            system_prompt=self.system_prompt,
+            env_header=self.env_header,
+            strip_thinking=self.strip_thinking,
+            compact_old_tools=self.compact_old_tools,
+            images=self.images,
+            budgets=self.budgets,
+            # ``max_steps - step`` e non ``- step + 1``: e' quanti passi
+            # restano *dopo* questo, cioe' quelli su cui puo' contare.
+            plan_block=blocco_piano,
+            delega_block=self.blocco_coda(self.max_steps - step) if self.blocco_coda else "",
+            preview_block=render_preview_note(tool_ctx.preview),
+            notes_block=render_notes(tool_ctx.notes),
+            skills_block=self.skills_block,
+            libreria_block=self.blocco_libreria,
+            vault_state_block=self._blocco_stato_vault(),
+            vault_notes_block=self._blocco_memoria_vault(),
+            verifiche_block=render_verifiche_aperte(self.verification.pendenti),
+            avanzamento_block=(
+                render_promemoria_batch(self.st.letture_singole_di_fila)
+                if self.st.letture_singole_di_fila >= PASSI_PER_IL_PROMEMORIA_BATCH else ""
+            ),
+        )
 
-    # --- traccia del pensiero ---------------------------------------------
-    # Misurato il 23/08/2026 sulle quattro sessioni qwen3.8: il pensiero **non**
-    # si accorcia col passo -- mediana 3.327 caratteri al passo 1 e 3.452 al
-    # passo 8+ -- benche' ``think_for_step`` debba scendere di uno scalino col
-    # punto di piano aperto e di due dal terzo passo. Dai soli `<think>` salvati
-    # non si puo' dire se non si applica o se uno scalino non si vede, perche'
-    # il livello *chiesto* non era scritto da nessuna parte. Adesso lo e'.
-    #
-    # Sta sul messaggio dell'assistente e non in un file di log a parte: cosi'
-    # e' gia' persistito nella sessione, gia' isolato nei test, e si legge
-    # accanto al pensiero che descrive. Al modello non arriva mai --
-    # ``build_api_messages`` guarda solo ruolo, contenuto e tool_calls.
-    traccia: dict[str, Any] = {}
-    stato_traccia = {"da": -1}
+    # ------------------------------------------------------------------
+    # Telemetria, chiusura, conteggi
+    # ------------------------------------------------------------------
+    def conta(self, nome: str) -> None:
+        """Un sollecito in piu'. Lo stesso dizionario arriva in TurnFinished."""
+        self.st.conta(nome)
+        self.total_usage["nudges"] = self.st.solleciti
 
-    # --- regia del pensiero (vedi ``core/regia_pensiero.py``) ---------------
-    # ``chiamate_passo`` raccoglie i tool del passo in corso con il loro esito;
-    # al passo dopo diventa ``ultimo_passo``, l'unico materiale su cui la regola
-    # retrospettiva puo' decidere quanto pensare.
-    stato_punto = regia.StatoPunto()
-    chiamate_passo: list[tuple[str, bool]] = []
-    nomi_tool_schema = [
-        str((t.get("function") or {}).get("name") or "")
-        for t in (tools_schema or [])
-        if isinstance(t, dict)
-    ]
-
-    def marca_pensiero() -> None:
+    def marca_pensiero(self) -> None:
         """Attacca la traccia al messaggio dell'assistente che l'ha prodotta.
 
         Si cerca all'indietro e solo fra i messaggi nati **dopo** la fine dello
         stream: un passo che non ha prodotto nessun messaggio (errore, stop)
-        non deve marcare quello del passo precedente con numeri che non sono
-        suoi.
+        non deve marcare quello del passo precedente con numeri non suoi.
         """
-        if not traccia:
+        if not self.traccia:
             return
-        for i in range(len(ui_messages) - 1, stato_traccia["da"] - 1, -1):
+        ui_messages = self.ui_messages
+        for i in range(len(ui_messages) - 1, self.stato_traccia["da"] - 1, -1):
             if ui_messages[i].get("role") == "assistant":
-                ui_messages[i].setdefault("think", dict(traccia))
+                ui_messages[i].setdefault("think", dict(self.traccia))
                 break
-        traccia.clear()
+        self.traccia.clear()
 
-    def fine(reason: str, passi: int) -> TurnFinished:
+    def fine(self, reason: str, passi: int) -> TurnFinished:
         """Chiude il turno. Passa da qui per non perdere la traccia dell'ultimo
         passo, che e' proprio quello dei turni che finiscono male."""
-        marca_pensiero()
-        telemetry = backend.collector.snapshot(since=telemetry_offset)
-        telemetry["turn_wall_ms"] = round((time.monotonic() - turn_started) * 1000, 3)
+        self.marca_pensiero()
+        backend = self.backend
+        telemetry = backend.collector.snapshot(since=self.telemetry_offset)
+        telemetry["turn_wall_ms"] = round((time.monotonic() - self.turn_started) * 1000, 3)
         totals = telemetry["totals"]
-        usage = dict(total_usage)
+        usage = dict(self.total_usage)
         for key in ("prompt_eval_ms", "eval_ms", "draft_n", "draft_accepted",
                     "cached_tokens", "prompt_processed_tokens"):
             if totals.get(key) is not None:
@@ -2275,147 +1995,132 @@ def run_turn(
                 usage[target] = totals[source]
         usage["model_wall_ms"] = totals["wall_time_ms"]
         usage["total_ms"] = telemetry["turn_wall_ms"]
-        return TurnFinished(reason=reason, steps=passi, usage=usage,
-                            telemetry=telemetry, qualita=verification.riepilogo())
+        return TurnFinished(
+            reason=reason, steps=passi, usage=usage, telemetry=telemetry,
+            qualita=self.verification.riepilogo(),
+            checkpoint=self.st.istantanea(motivo=reason, passi=passi, verifiche=self.verification),
+        )
 
-    def halt(step: int, reasoning: str = "", answer: str = "") -> Iterator[AgentEvent]:
+    def halt(self, step: int, reasoning: str = "", answer: str = "") -> Iterator[AgentEvent]:
         """Chiude il turno salvando quel che il modello aveva gia' prodotto."""
         text = _wrap(reasoning.strip(), answer.strip())
         if text.strip():
-            ui_messages.append(
+            self.ui_messages.append(
                 {"role": "assistant", "content": text, "stopped": True, "ts": time.time()}
             )
             yield AssistantTurn(
                 content=answer.strip(), reasoning=reasoning.strip(), has_tool_calls=False
             )
-        yield fine("stopped", step)
+        yield self.fine("stopped", step)
 
-    for step in range(1, max_steps + 1):
-        if stopped():
-            yield from halt(step - 1)
-            return
-        # I tool sanno a che passo siamo: serve alla cache delle riletture,
-        # che puo' rispondere "invariato" solo finche' il contenuto precedente
-        # e' ancora nel contesto e non e' stato compattato via.
-        tool_ctx.step = step
-        # La traccia del passo precedente si attacca adesso: il suo messaggio
-        # e' stato appeso da uno qualsiasi dei rami che chiudono un passo, e
-        # farlo qui e' l'unico punto che li copre tutti senza toccarne otto.
-        marca_pensiero()
-        yield StepStarted(step=step, total=max_steps)
+    # ------------------------------------------------------------------
+    # Il ciclo
+    # ------------------------------------------------------------------
+    def esegui(self) -> Iterator[AgentEvent]:
+        for step in range(1, self.max_steps + 1):
+            if self.stopped():
+                yield from self.halt(step - 1)
+                return
+            # I tool sanno a che passo siamo: serve alla cache delle riletture.
+            self.tool_ctx.step = step
+            # La traccia del passo precedente si attacca adesso: il suo
+            # messaggio e' stato appeso da uno qualsiasi dei rami che chiudono
+            # un passo, e farlo qui e' l'unico punto che li copre tutti.
+            self.marca_pensiero()
+            yield StepStarted(step=step, total=self.max_steps)
 
+            prep = yield from self._prepara(step)
+            if prep is None:
+                return
+            gen = yield from self._genera(step, prep)
+            transizione = yield from self._valuta(step, gen)
+            if transizione == FINE:
+                return
+            if transizione == PROSSIMO:
+                continue
+            transizione = yield from self._esegui_tool(step, gen)
+            if transizione == FINE:
+                return
+            transizione = yield from self._dopo_tool(step, gen)
+            if transizione == FINE:
+                return
+
+        yield from self._passi_finiti()
+
+    # ------------------------------------------------------------------
+    # PREPARA
+    # ------------------------------------------------------------------
+    def _prepara(self, step: int) -> Iterator[AgentEvent]:
+        st = self.st
+        tool_ctx = self.tool_ctx
+        params = self.params
         current = tool_ctx.plan.current if tool_ctx.plan else None
         new_phase = (str(current.id), current.text) if current else None
-        phase_changed = new_phase != phase_key
-        phase_step = 1 if step == 1 or phase_changed or retry_reasoning else phase_step + 1
-        reasoning_phase = "recovery" if retry_reasoning else (
-            "decision" if phase_step == 1 else "execution"
+        phase_changed = new_phase != st.phase_key
+        st.phase_step = 1 if step == 1 or phase_changed or st.retry_reasoning else st.phase_step + 1
+        reasoning_phase = "recovery" if st.retry_reasoning else (
+            "decision" if st.phase_step == 1 else "execution"
         )
-        phase_key = new_phase
-        retry_reasoning = False
+        st.phase_key = new_phase
+        st.retry_reasoning = False
         if phase_changed:
-            blocco_libreria = _blocco_libreria()
+            self.blocco_libreria = self._blocco_libreria()
 
         # I tool del passo appena chiuso contano per il punto a cui
-        # appartenevano: si registrano **prima** di passare al punto nuovo, che
-        # riparte da zero fallimenti.
-        ultimo_passo, chiamate_passo = chiamate_passo, []
+        # appartenevano: si registrano **prima** di passare al punto nuovo.
+        ultimo_passo, self.chiamate_passo = self.chiamate_passo, []
         if ultimo_passo:
-            stato_punto.registra_passo(ultimo_passo)
-        stato_punto.nuovo_punto(new_phase)
+            self.stato_punto.registra_passo(ultimo_passo)
+        self.stato_punto.nuovo_punto(new_phase)
         regia_passo = regia.decidi(
             getattr(current, "tipo", None) if current else None,
             reasoning_phase,
-            stato_punto,
+            self.stato_punto,
             ha_piano=current is not None,
             passo_nel_turno=step,
             verifica_rossa=bool(getattr(tool_ctx, "red_command", None)),
             ultimo_passo=ultimo_passo,
         )
-        blocco_piano = render_block(tool_ctx.plan, steps_left=max_steps - step)
-        if regia_passo.sintesi and not stato_punto.sintesi_suggerita:
+        blocco_piano = render_block(tool_ctx.plan, steps_left=self.max_steps - step)
+        if regia_passo.sintesi and not self.stato_punto.sintesi_suggerita:
             # Una volta per punto: ripeterlo ad ogni lettura diventerebbe il
             # rumore di fondo che il modello impara a ignorare.
-            stato_punto.sintesi_suggerita = True
+            self.stato_punto.sintesi_suggerita = True
             blocco_piano = "\n\n".join(
                 b for b in (
                     blocco_piano,
-                    regia.SUGGERIMENTO_SINTESI.format(n=stato_punto.letture_di_fila),
+                    regia.SUGGERIMENTO_SINTESI.format(n=self.stato_punto.letture_di_fila),
                 ) if b
             )
 
-        api_messages = build_api_messages(
-            ui_messages,
-            system_prompt=system_prompt,
-            env_header=env_header,
-            strip_thinking=strip_thinking,
-            compact_old_tools=compact_old_tools,
-            images=images,
-            budgets=budgets,
-            # ``max_steps - step`` e non ``- step + 1``: e' quanti passi
-            # restano *dopo* questo, cioe' quelli su cui puo' contare.
-            plan_block=blocco_piano,
-            delega_block=blocco_coda(max_steps - step) if blocco_coda else "",
-            preview_block=render_preview_note(tool_ctx.preview),
-            notes_block=render_notes(tool_ctx.notes),
-            skills_block=skills_block,
-            libreria_block=blocco_libreria,
-            vault_state_block=blocco_stato_vault(),
-            vault_notes_block=blocco_memoria_vault(),
-        )
+        api_messages = self._costruisci(step, blocco_piano)
 
-        # Compattazione a soglia, *fra un passo e l'altro*. E' qui che il
-        # contesto esplode davvero: un compito da venti passi puo' saturare la
-        # finestra senza che l'utente scriva una riga, e aspettare la fine del
-        # turno vorrebbe dire aiutarlo dopo che e' morto.
-        # La pressione si misura sulla **finestra efficace**: alla finestra
-        # vera di oggi (131k) la soglia in percentuale non e' raggiungibile in
-        # pratica -- vedi il commento a ``TETTO_TOKEN_DEFAULT``.
-        finestra_compat = finestra_efficace(params.num_ctx, compact_max_tokens)
-        if compact_history and step >= compattazione_ferma_fino_a and context_pressure(
-            api_messages, finestra_compat, reserved_tokens=schema_tokens,
-        ) > soglia:
+        # Compattazione a soglia, *fra un passo e l'altro*, misurata sulla
+        # **finestra efficace** (vedi ``TETTO_TOKEN_DEFAULT``).
+        finestra_compat = finestra_efficace(params.num_ctx, self.compact_max_tokens)
+        if self.compact_history and step >= st.compattazione_ferma_fino_a and context_pressure(
+            api_messages, finestra_compat, reserved_tokens=self.schema_tokens,
+        ) > self.soglia:
             prima_tok = estimate_messages_tokens(api_messages)
             esito = compatta_cronologia(
-                ui_messages,
-                backend=backend.scope("compaction"),
+                self.ui_messages,
+                backend=self.backend.scope("compaction"),
                 params=params,
-                budgets=budgets,
-                strip_thinking=strip_thinking,
+                budgets=self.budgets,
+                strip_thinking=self.strip_thinking,
                 finestra=finestra_compat,
-                schedario=schedario,
-                should_stop=stopped,
+                schedario=self.schedario,
+                should_stop=self.stopped,
             )
-            if esito is None and not stopped():
-                compattazione_ferma_fino_a = step + PAUSA_COMPATTAZIONE_FALLITA
-                count_nudge("compattazione_rinviata")
+            if esito is None and not self.stopped():
+                st.compattazione_ferma_fino_a = step + PAUSA_COMPATTAZIONE_FALLITA
+                self.conta("compattazione_rinviata")
             if esito is not None:
-                count_nudge("compattazione")
+                self.conta("compattazione")
                 # L'indice si rilegge dal disco solo qui: e' l'unico momento in
-                # cui puo' essere cambiato, e rileggerlo ad ogni passo sarebbe
-                # un glob per niente.
-                blocco_libreria = _blocco_libreria()
-                api_messages = build_api_messages(
-                    ui_messages,
-                    system_prompt=system_prompt,
-                    env_header=env_header,
-                    strip_thinking=strip_thinking,
-                    compact_old_tools=compact_old_tools,
-                    images=images,
-                    budgets=budgets,
-                    plan_block=blocco_piano,
-                    delega_block=blocco_coda(max_steps - step) if blocco_coda else "",
-                    preview_block=render_preview_note(tool_ctx.preview),
-                    notes_block=render_notes(tool_ctx.notes),
-                    skills_block=skills_block,
-                    libreria_block=blocco_libreria,
-                    vault_state_block=blocco_stato_vault(),
-                    vault_notes_block=blocco_memoria_vault(),
-                )
-                # I due numeri si misurano qui e non dentro la compattazione:
-                # sono il contesto che il modello pagava davvero prima e quello
-                # che paga adesso, prefisso e blocco di coda compresi. Dentro
-                # si conoscono solo i messaggi, non la richiesta intera.
+                # cui puo' essere cambiato.
+                self.blocco_libreria = self._blocco_libreria()
+                api_messages = self._costruisci(step, blocco_piano)
                 yield HistoryCompacted(
                     messages=esito.messaggi_prima,
                     tokens_before=prima_tok,
@@ -2423,109 +2128,79 @@ def run_turn(
                     summary=esito.riassunto,
                 )
 
-        # Ultima spiaggia: se anche dopo il riassunto (o senza, perche' non e'
-        # riuscito) il contesto sfonda, si buttano i turni piu' vecchi dalla
-        # sola vista API. Perde informazione e va detto, ma e' pur sempre
-        # meglio di una richiesta che il server rifiuta.
-        #
-        # Il margine e' fisso e si misura su ``num_ctx``: e' un problema diverso
-        # dalla compattazione -- qui si tratta di non farsi rifiutare la
-        # richiesta -- e non deve seguire una preferenza dell'utente.
-        #
-        # Ma deve restare l'ULTIMA spiaggia, e non lo era. Con una soglia utente
-        # sopra 0,75 (il campo arriva a 0,95) e una finestra sotto i 32k, questo
-        # scattava PRIMA della compattazione: chi alzava la soglia per tenersi
-        # piu' cronologia se la vedeva buttare via senza che nessuno l'avesse
-        # riassunta, cioe' l'esatto contrario di quello che aveva chiesto.
-        if stopped():
-            yield from halt(step - 1)
-            return
-        margine_sfondamento = max(HISTORY_COMPACT_THRESHOLD, float(soglia))
+        # Ultima spiaggia: se anche dopo il riassunto il contesto sfonda, si
+        # buttano i turni piu' vecchi dalla sola vista API. Resta l'ULTIMA
+        # spiaggia: la soglia e' la maggiore fra quella dello scarto e quella
+        # dell'utente, cosi' non scatta mai prima della compattazione.
+        if self.stopped():
+            yield from self.halt(step - 1)
+            return None
+        margine_sfondamento = max(HISTORY_COMPACT_THRESHOLD, float(self.soglia))
         if context_pressure(
-            api_messages, params.num_ctx, reserved_tokens=schema_tokens,
-        ) * fattore_stima > margine_sfondamento:
+            api_messages, params.num_ctx, reserved_tokens=self.schema_tokens,
+        ) * st.fattore_stima > margine_sfondamento:
             api_messages = drop_oldest_turns(
                 api_messages, params.num_ctx, soglia=margine_sfondamento,
-                reserved_tokens=schema_tokens, fattore=fattore_stima,
+                reserved_tokens=self.schema_tokens, fattore=st.fattore_stima,
             )
         # Quanto pesa, secondo la stima, la richiesta che parte davvero: e' il
         # denominatore della calibrazione, a fine stream.
-        stima_passo = estimate_messages_tokens(api_messages) + schema_tokens
+        stima_passo = estimate_messages_tokens(api_messages) + self.schema_tokens
 
         # Il budget di servizio e' finito: si dice, invece di smettere in
-        # silenzio. Da qui in poi i solleciti automatici non scattano piu' e
-        # tutti i passi che restano vanno al lavoro.
-        if passi_di_servizio >= max_passi_di_servizio and not servizio_esaurito:
-            servizio_esaurito = True
+        # silenzio.
+        if not st.servizio_disponibile and not st.servizio_esaurito:
+            st.servizio_esaurito = True
             yield AgentError(
-                f"Passi di servizio esauriti ({max_passi_di_servizio} di "
-                f"{max_steps}): i solleciti automatici si spengono e i passi "
+                f"Passi di servizio esauriti ({st.max_passi_di_servizio} di "
+                f"{self.max_steps}): i solleciti automatici si spengono e i passi "
                 f"restanti vanno tutti al lavoro."
             )
 
-        parser = ThinkStreamParser()
-        tool_calls: list[dict[str, Any]] = []
-        stream_error: str | None = None
-        interrupted = False
-        watchdog_hit = False
-        step_done_reason = ""
         # La soglia si ricalcola ad ogni passo: il primo di un turno ha diritto
-        # a piu' pensiero degli altri, e su una finestra larga la sola quota del
-        # budget non e' piu' un limite (vedi ``watchdog_chars_for_step``).
+        # a piu' pensiero degli altri.
         params_passo = params_for_step(
-            params, tool_ctx.plan, phase_step, regia_passo.tipo_effettivo
+            params, tool_ctx.plan, st.phase_step, regia_passo.tipo_effettivo
         )
         # Il tetto si taglia **dopo** la compattazione e il drop dei turni
         # vecchi: prima di quelli il prompt non e' ancora quello che partira'.
         tetto_passo, spazio_finestra = tetto_per_la_finestra(
-            api_messages, params.num_ctx, max_tokens_turno, reserved_tokens=schema_tokens,
-            fattore=fattore_stima,
+            api_messages, params.num_ctx, self.max_tokens_turno,
+            reserved_tokens=self.schema_tokens, fattore=st.fattore_stima,
         )
-        # Due modi di chiudere un pensiero troppo lungo, e la soglia dipende da
-        # quale e' disponibile:
-        #
-        # * **continuare** (Ollama, pensiero sul canale nativo): il pensiero
-        #   resta, gli si accoda una frase che chiude, e il modello riprende
-        #   dall'azione. Costa quasi niente, quindi vale il budget del tipo di
-        #   punto -- anche sotto i tetti storici;
-        # * **interrompere**: il pensiero si butta e il passo si rifa'. Costa
-        #   tutto quello che si era pensato, quindi non si scende mai sotto i
-        #   tetti storici (``watchdog_chars_for_step``), si puo' solo salire per
-        #   diagnosi e progettazione.
+        # Due modi di chiudere un pensiero troppo lungo: **continuare** (il
+        # pensiero resta, gli si accoda una frase che chiude) o
+        # **interrompere** (il pensiero si butta e il passo si rifa'). Vedi
+        # ``core/regia_pensiero.py``.
+        backend = self.backend
         puo_continuare = bool(
-            think_watchdog
+            self.think_watchdog
             and getattr(backend, "supports_think_continuation", False) is True
             and callable(getattr(backend, "modo_continuazione", None))
             and backend.modo_continuazione() is not None
         )
-        if think_watchdog and tetto_passo > 0:
-            storico = watchdog_chars_for_step(tetto_passo, phase_step)
+        if self.think_watchdog and tetto_passo > 0:
+            storico = watchdog_chars_for_step(tetto_passo, st.phase_step)
             per_tipo = min(
                 chars_for_tokens(regia_passo.budget),
                 chars_for_tokens(tetto_passo * WATCHDOG_RATIO),
             )
-            # La soglia per *buttare* il pensiero non scende mai sotto lo storico,
-            # nemmeno quando il backend saprebbe continuare: se la continuazione
-            # in quel passo non e' praticabile (pensiero nei tag di testo, poco
-            # spazio), il taglio che resta e' quello caro.
+            # La soglia per *buttare* il pensiero non scende mai sotto lo
+            # storico, nemmeno quando il backend saprebbe continuare.
             soglia_interrompi = max(storico, per_tipo)
             watchdog_chars = per_tipo if puo_continuare else soglia_interrompi
         else:
             watchdog_chars = 0
             soglia_interrompi = 0
-        if tetto_passo != max_tokens_turno:
+        if tetto_passo != self.max_tokens_turno:
             try:
                 params_passo = replace(params_passo, max_tokens=tetto_passo)
             except TypeError:      # non e' una dataclass: si lascia stare
                 pass
-        # Una volta sola per turno: ripeterlo ad ogni passo sarebbe rumore, e
-        # il primo passo che ci arriva e' gia' quello che spiega tutti i
-        # successivi. Va detto perche' e' l'unica cosa che l'utente puo'
-        # sistemare -- alzare -c sul server, abbassare max_tokens, o cominciare
-        # una chat nuova -- e perche' senza, un turno che si ferma a meta'
-        # sembra un capriccio del modello.
-        if tetto_passo < TETTO_INUTILE and not avvisato_finestra:
-            avvisato_finestra = True
+        # Una volta sola per turno: e' l'unica cosa che l'utente puo' sistemare
+        # (alzare -c, abbassare max_tokens, chat nuova).
+        if tetto_passo < TETTO_INUTILE and not st.avvisato_finestra:
+            st.avvisato_finestra = True
             yield AgentError(
                 f"Finestra quasi piena: restano {max(spazio_finestra, 0)} token "
                 f"su {params.num_ctx}. Da qui in avanti la generazione verra' "
@@ -2534,15 +2209,8 @@ def run_turn(
                 "una conversazione nuova."
             )
         # ...e sotto il tetto inutile il turno **finisce**, invece di generare
-        # lo stesso. L'avviso qui sopra era informativo e il ciclo tirava
-        # dritto: con ``tetto_passo`` a zero si chiedeva al modello di produrre
-        # zero token, si otteneva una risposta vuota, e quella risposta vuota
-        # faceva scattare i solleciti -- che aggiungono altri messaggi, cioe'
+        # lo stesso: una risposta vuota farebbe scattare i solleciti, che
         # riducono ancora lo spazio. Un giro a vuoto che si stringe da solo.
-        #
-        # La soglia e' la stessa dell'avviso: sotto TETTO_INUTILE non ci sta un
-        # pensiero, una risposta e una chiamata, quindi non c'e' niente da
-        # tentare. Meglio chiudere dicendo perche'.
         if tetto_passo < TETTO_INUTILE:
             yield AgentError(
                 f"Turno interrotto al passo {step}: nella finestra non resta "
@@ -2551,42 +2219,58 @@ def run_turn(
                 "Il lavoro fatto finora e' salvo: comincia una conversazione "
                 "nuova, o alza la finestra del modello."
             )
-            yield fine("finestra_piena", step)
-            return
+            yield self.fine("finestra_piena", step)
+            return None
+        return _Preparazione(
+            api_messages=api_messages, params_passo=params_passo, tetto_passo=tetto_passo,
+            spazio_finestra=spazio_finestra, stima_passo=stima_passo,
+            watchdog_chars=watchdog_chars, soglia_interrompi=soglia_interrompi,
+            puo_continuare=puo_continuare, regia_passo=regia_passo,
+            reasoning_phase=reasoning_phase,
+        )
 
+    # ------------------------------------------------------------------
+    # GENERA
+    # ------------------------------------------------------------------
+    def _genera(self, step: int, prep: _Preparazione) -> Iterator[AgentEvent]:
+        st = self.st
+        backend = self.backend
+        stopped = self.stopped
+        parser = ThinkStreamParser()
+        gen = _Generazione(parser=parser, tool_calls=[], params_passo=prep.params_passo)
+        tool_calls = gen.tool_calls
         # Un rubinetto per passo: cosa e' gia' arrivato alla UI vale per questa
         # generazione e non per la prossima, che riparte da testo vuoto.
         rubinetto = Rubinetto()
         events: Iterator[StreamEvent] | None = None
         osservatore = regia.OsservatorePensiero(
-            watchdog_chars,
-            tipo=regia_passo.tipo_effettivo,
-            nomi_tool=nomi_tool_schema,
+            prep.watchdog_chars,
+            tipo=prep.regia_passo.tipo_effettivo,
+            nomi_tool=self.nomi_tool_schema,
             # Chiudere su "decisione gia' scritta" ha senso solo se chiudere
             # costa poco: col solo watchdog che butta il pensiero, no.
-            rileva_decisione=puo_continuare,
+            rileva_decisione=prep.puo_continuare,
         )
-        chiusura_passo: str | None = None
+        gen.osservatore = osservatore
         modo_continuazione: bool | None = None
-        continuazione_rifiutata = False
         pensiero_al_taglio = 0
         pensiero_nativo = False
-        messaggi_stream = api_messages
-        params_stream = params_passo
-        usage_passo: dict[str, Any] = {}
+        messaggi_stream = prep.api_messages
+        params_stream = prep.params_passo
+        tetto_passo = prep.tetto_passo
         try:
             stream_options = {"should_stop": stopped} if getattr(
                 backend, "supports_cancellation", False
             ) else {}
             while True:
-                events = backend.stream(messaggi_stream, tools_schema, params_stream, **stream_options)
+                events = backend.stream(messaggi_stream, self.tools_schema, params_stream,
+                                        **stream_options)
                 taglio: str | None = None
                 for ev in events:
                     if stopped():
-                        # Chiudere il generatore fa cadere la connessione HTTP
-                        # verso Ollama: senza, la generazione continuerebbe a
-                        # occupare la GPU anche dopo che l'utente ha premuto stop.
-                        interrupted = True
+                        # Chiudere il generatore fa cadere la connessione HTTP:
+                        # senza, la generazione continuerebbe a occupare la GPU.
+                        gen.interrupted = True
                         close = getattr(events, "close", None)
                         if callable(close):
                             close()
@@ -2601,22 +2285,22 @@ def run_turn(
                             yield from rubinetto.aggiorna(parser.reasoning, parser.answer)
                     elif ev.kind == "tool_call" and ev.tool_call:
                         if len(tool_calls) >= MAX_TOOL_CALLS_PER_STEP:
-                            stream_error = "Protocol error: too many tool calls in one step"
+                            gen.stream_error = "Protocol error: too many tool calls in one step"
                             break
                         tool_calls.append(ev.tool_call)
                     elif ev.kind == "usage" and ev.usage:
-                        step_done_reason = str(ev.usage.get("done_reason") or "")
-                        usage_passo = dict(ev.usage)
+                        gen.done_reason = str(ev.usage.get("done_reason") or "")
+                        gen.usage_passo = dict(ev.usage)
                         for key, value in ev.usage.items():
                             if isinstance(value, (int, float)):
-                                total_usage[key] = total_usage.get(key, 0) + value
+                                self.total_usage[key] = self.total_usage.get(key, 0) + value
                             else:
-                                total_usage[key] = value
+                                self.total_usage[key] = value
                     elif ev.kind == "error":
-                        stream_error = ev.text
+                        gen.stream_error = ev.text
                         break
 
-                    if chiusura_passo is not None:
+                    if gen.chiusura_passo is not None:
                         # Dentro una continuazione. Se il modello, invece di
                         # agire, ricomincia a pensare da capo, il server non ha
                         # rispettato il pensiero precompilato: si smette subito
@@ -2627,7 +2311,7 @@ def run_turn(
                             and len(parser.reasoning) - pensiero_al_taglio
                             > regia.CONTINUAZIONE_MAX_PENSIERO
                         ):
-                            continuazione_rifiutata = True
+                            gen.continuazione_rifiutata = True
                             taglio = "rifiutata"
                             close = getattr(events, "close", None)
                             if callable(close):
@@ -2635,20 +2319,14 @@ def run_turn(
                             break
                         continue
 
-                    # Watchdog sul ragionamento. Sta qui e non dentro il ramo
-                    # "reasoning" perche' il pensiero puo' arrivare da due
-                    # canali: quello nativo di Ollama e i tag <think> nel testo,
-                    # che il parser riconosce lo stesso. Il controllo deve
-                    # valere per entrambi, o sui modelli senza thinking nativo
-                    # non scatterebbe mai -- proprio quelli che ne avrebbero
-                    # piu' bisogno. La continuazione invece vale solo per il
-                    # canale nativo: un <think> aperto nel testo non si chiude
-                    # precompilando un campo che quel modello non usa.
-                    if watchdog_chars and not tool_calls:
+                    # Watchdog sul ragionamento: vale per il canale nativo e
+                    # per i tag <think> nel testo. La continuazione invece vale
+                    # solo per il canale nativo.
+                    if prep.watchdog_chars and not tool_calls:
                         ragione = osservatore.aggiorna(parser.reasoning)
                         if (
                             ragione
-                            and puo_continuare
+                            and prep.puo_continuare
                             and pensiero_nativo
                             and not parser.answer.strip()
                             and tetto_passo - estimate_tokens(parser.reasoning)
@@ -2656,28 +2334,28 @@ def run_turn(
                         ):
                             taglio = ragione
                         elif (
-                            len(parser.reasoning) > soglia_interrompi
-                            and watchdog_fires < MAX_WATCHDOG_FIRES
-                            and step < max_steps
+                            len(parser.reasoning) > prep.soglia_interrompi
+                            and st.watchdog_fires < MAX_WATCHDOG_FIRES
+                            and step < self.max_steps
                         ):
                             taglio = "interrompi"
                         if taglio:
-                            # Chiudere il generatore fa cadere la connessione
-                            # verso Ollama: la GPU smette subito di produrre un
-                            # ragionamento che sta per essere chiuso comunque.
                             close = getattr(events, "close", None)
                             if callable(close):
                                 close()
                             break
 
-                if taglio in regia.CHIUSURE and not (interrupted or stream_error):
+                if taglio in regia.CHIUSURE and not (gen.interrupted or gen.stream_error):
                     modo_continuazione = backend.modo_continuazione()
                     rimasti = tetto_passo - estimate_tokens(parser.reasoning)
                     params_continua = None
-                    if modo_continuazione is not None and rimasti >= regia.CONTINUAZIONE_MIN_TOKEN:
+                    if (
+                        modo_continuazione is not None
+                        and rimasti >= regia.CONTINUAZIONE_MIN_TOKEN
+                    ):
                         try:
                             params_continua = replace(
-                                params_passo, think=modo_continuazione, max_tokens=rimasti
+                                prep.params_passo, think=modo_continuazione, max_tokens=rimasti
                             )
                         except TypeError:      # non e' una dataclass
                             params_continua = None
@@ -2687,25 +2365,23 @@ def run_turn(
                         parser.feed_reasoning(regia.chiusura(taglio))
                         yield from rubinetto.aggiorna(parser.reasoning, parser.answer)
                         pensiero_al_taglio = len(parser.reasoning)
-                        chiusura_passo = taglio
+                        gen.chiusura_passo = taglio
                         messaggi_stream = [
-                            *api_messages,
+                            *prep.api_messages,
                             {"role": "assistant", "content": "", "thinking": parser.reasoning},
                         ]
                         params_stream = params_continua
                         continue
-                    # Continuare non si puo' (il modo si e' spento, parametri
-                    # non sostituibili): resta il vecchio modo. Lo stream e'
-                    # gia' chiuso, quindi non c'e' piu' niente da lasciar
-                    # correre -- l'unico esito onesto e' il sollecito.
+                    # Continuare non si puo': resta il vecchio modo, e l'unico
+                    # esito onesto e' il sollecito.
                     modo_continuazione = None
-                    watchdog_hit = True
+                    gen.watchdog_hit = True
                 elif taglio in ("interrompi", "rifiutata"):
-                    watchdog_hit = True
+                    gen.watchdog_hit = True
                 break
         except Exception as exc:
             logger.exception("Model stream failed at step %s", step)
-            stream_error = f"{type(exc).__name__}: {exc}"
+            gen.stream_error = f"{type(exc).__name__}: {exc}"
         finally:
             close = getattr(events, "close", None)
             if callable(close):
@@ -2714,59 +2390,54 @@ def run_turn(
                 except Exception:
                     logger.exception("Failed to close model stream")
 
-        if chiusura_passo is not None and modo_continuazione is not None and not interrupted:
+        if (
+            gen.chiusura_passo is not None and modo_continuazione is not None
+            and not gen.interrupted
+        ):
             esito_c = getattr(backend, "esito_continuazione", None)
             if callable(esito_c):
                 esito_c(
                     modo_continuazione,
                     bool(
-                        not continuazione_rifiutata
-                        and not stream_error
+                        not gen.continuazione_rifiutata
+                        and not gen.stream_error
                         and (tool_calls or parser.answer.strip())
                     ),
                 )
-        if continuazione_rifiutata:
-            # Il pensiero ricominciato e' spazzatura di questo tentativo: al
-            # modello torna il sollecito del watchdog, come prima.
-            count_nudge("continuazione_rifiutata")
+        if gen.continuazione_rifiutata:
+            self.conta("continuazione_rifiutata")
 
         parser.finish()
 
-        # La calibrazione vale solo se la richiesta misurata e' quella stimata:
-        # una continuazione aggiunge un messaggio, e su Ollama
-        # ``prompt_eval_count`` non e' garantito essere il prompt intero (con
-        # la cache puo' contare solo i token ricalcolati). Per questo la chiede
-        # il backend, con ``prompt_tokens_is_total``.
+        # La calibrazione vale solo se la richiesta misurata e' quella stimata
+        # e se il server dichiara il prompt intero (``prompt_tokens_is_total``).
         if (
-            chiusura_passo is None
+            gen.chiusura_passo is None
             and getattr(backend, "prompt_tokens_is_total", False) is True
         ):
-            misurato = calibra_stima(usage_passo.get("prompt_tokens"), stima_passo)
+            misurato = calibra_stima(gen.usage_passo.get("prompt_tokens"), prep.stima_passo)
             if misurato is not None:
-                fattore_stima = misurato
+                st.fattore_stima = misurato
+        self._traccia(step, prep, gen)
+        return gen
 
-        # La traccia di questo passo: cosa era configurato, cosa e' stato
-        # davvero chiesto al modello, e quanto ha pensato. Vedi ``marca_pensiero``.
+    def _traccia(self, step: int, prep: _Preparazione, gen: _Generazione) -> None:
+        """La traccia di questo passo sul messaggio dell'assistente (``think``)."""
+        params = self.params
+        tool_ctx = self.tool_ctx
+        parser = gen.parser
+        usage_passo = gen.usage_passo
+        traccia = self.traccia
         traccia.clear()
         traccia.update(
             {
                 "passo": step,
-                "fase": reasoning_phase,
-                "passo_nel_punto": phase_step,
+                "fase": prep.reasoning_phase,
+                "passo_nel_punto": self.st.phase_step,
                 "configurato": _nome_livello(getattr(params, "think", None)),
-                "usato": _nome_livello(getattr(params_passo, "think", None)),
-                # Cosa ha ricevuto il template, dopo la traduzione sul suo
-                # elenco di livelli. Si legge **dopo** lo stream: l'elenco puo'
-                # essere stato imparato proprio in questo passo, da un 500.
-                "inviato": _livello_inviato(backend, params_passo),
+                "usato": _nome_livello(getattr(prep.params_passo, "think", None)),
+                "inviato": _livello_inviato(self.backend, prep.params_passo),
                 "punto_aperto": bool(getattr(tool_ctx.plan, "current", None)),
-                # **Quale** punto, non solo se ce n'era uno. Il booleano
-                # sopra resta perche' e' quello che leggono gli script di
-                # analisi gia' scritti; questo campo e' cio' che rende
-                # possibile raccogliere, alla chiusura di un punto, il
-                # pensiero dei passi che gli sono appartenuti (vedi
-                # ``core/pensiero.py``). Senza, l'unico legame fra un
-                # ragionamento e il lavoro che stava servendo non esiste.
                 "punto": (
                     tool_ctx.plan.current.id
                     if getattr(tool_ctx.plan, "current", None)
@@ -2774,117 +2445,84 @@ def run_turn(
                 ),
                 "pensato": len(parser.reasoning),
                 "risposto": len(parser.answer),
-                "chiamate": len(tool_calls),
-                "watchdog": bool(watchdog_hit),
-                # La regia: che tipo aveva il punto, come l'ha corretto
-                # l'harness, con che budget, e se e come il pensiero e' stato
-                # chiuso. Sono i campi con cui si misura se tutto questo serve
-                # (``scripts/analisi_regia_pensiero.py``).
-                "tipo": regia_passo.tipo,
-                "tipo_effettivo": regia_passo.tipo_effettivo,
-                "budget": int(regia_passo.budget),
-                "motivo_budget": regia_passo.motivo,
-                "soglia": int(watchdog_chars),
-                "chiusura": chiusura_passo,
-                "continuata": bool(chiusura_passo) and not continuazione_rifiutata,
-                "ripensamenti": int(osservatore.ripensamenti),
-                "oscillazione": bool(osservatore.oscillazione),
-                # Quanto spazio restava nella finestra prima di generare, e
-                # con che tetto si e' partiti. Sono i due numeri che spiegano
-                # una generazione tagliata: senza, in una sessione salvata non
-                # resta traccia di quanto poco margine ci fosse.
-                "spazio": int(spazio_finestra),
-                "tetto": int(tetto_passo),
-                # Il prompt visto dal server e quanto ne ha preso dalla cache:
-                # su llama.cpp e' la misura diretta del riuso del prefisso
-                # (vedi ``scripts/sonda_prefisso.py``). Assenti se il server
-                # non li dichiara.
-                "prompt_stimato": int(stima_passo),
+                "chiamate": len(gen.tool_calls),
+                "watchdog": bool(gen.watchdog_hit),
+                "tipo": prep.regia_passo.tipo,
+                "tipo_effettivo": prep.regia_passo.tipo_effettivo,
+                "budget": int(prep.regia_passo.budget),
+                "motivo_budget": prep.regia_passo.motivo,
+                "soglia": int(prep.watchdog_chars),
+                "chiusura": gen.chiusura_passo,
+                "continuata": bool(gen.chiusura_passo) and not gen.continuazione_rifiutata,
+                "ripensamenti": int(gen.osservatore.ripensamenti),
+                "oscillazione": bool(gen.osservatore.oscillazione),
+                "spazio": int(prep.spazio_finestra),
+                "tetto": int(prep.tetto_passo),
+                "prompt_stimato": int(prep.stima_passo),
                 "prompt_reale": usage_passo.get("prompt_tokens"),
                 "cache": usage_passo.get("cached_tokens"),
                 "ricalcolati": usage_passo.get("prompt_processed_tokens"),
-                "fattore_stima": round(fattore_stima, 3),
+                "fattore_stima": round(self.st.fattore_stima, 3),
+                "senza_progresso": self.st.avanzamento.senza_progresso,
             }
         )
         if traccia["inviato"] not in (traccia["usato"], "?"):
-            # La riga che si cerca quando un livello "non sembra funzionare":
-            # richiesto -> inviato, scritta dove e' successo.
             traccia["traduzione_livello"] = f"{traccia['usato']} -> {traccia['inviato']}"
-        stato_traccia["da"] = len(ui_messages)
+        self.stato_traccia["da"] = len(self.ui_messages)
 
-        if interrupted or stopped():
-            yield from halt(step, parser.reasoning, parser.answer)
-            return
+    # ------------------------------------------------------------------
+    # VALUTA
+    # ------------------------------------------------------------------
+    def _valuta(self, step: int, gen: _Generazione) -> Iterator[AgentEvent]:
+        st = self.st
+        parser = gen.parser
+        ui_messages = self.ui_messages
+        if gen.interrupted or self.stopped():
+            yield from self.halt(step, parser.reasoning, parser.answer)
+            return FINE
 
-        if stream_error:
-            # Una chiamata caduta non e' un turno perso. La cronologia e i file
-            # gia' scritti sono intatti: quello che manca e' solo la risposta a
-            # questo passo, e la si puo' richiedere. Vedi ``errore_riprovabile``
-            # per il confine fra "riprova" e "e' inutile insistere".
+        if gen.stream_error:
+            # Una chiamata caduta non e' un turno perso: la cronologia e i file
+            # sono intatti, manca solo la risposta a questo passo.
             if (
-                step < max_steps
-                and riprese_stream < MAX_RIPRESE_STREAM
-                and errore_riprovabile(stream_error)
-                and not getattr(backend, "manages_retries", False)
-                and passi_di_servizio < max_passi_di_servizio
+                step < self.max_steps
+                and st.riprese_stream < MAX_RIPRESE_STREAM
+                and errore_riprovabile(gen.stream_error)
+                and not getattr(self.backend, "manages_retries", False)
+                and st.servizio_disponibile
             ):
-                riprese_stream += 1
-                count_nudge("ripresa_stream")
-                passi_di_servizio += 1
+                st.riprese_stream += 1
+                self.conta("ripresa_stream")
+                st.passi_di_servizio += 1
                 yield AgentError(
-                    f"Chiamata al modello interrotta ({stream_error}) — riprendo "
-                    f"da dove eravamo, tentativo {riprese_stream} di "
+                    f"Chiamata al modello interrotta ({gen.stream_error}) — riprendo "
+                    f"da dove eravamo, tentativo {st.riprese_stream} di "
                     f"{MAX_RIPRESE_STREAM}.",
                     guasto_backend=True,
                 )
-                # Una pausa breve, non per educazione: il caso piu' frequente e'
-                # il modello che sta entrando in VRAM, e ripartire nello stesso
-                # millisecondo trova la stessa porta chiusa.
+                # Il caso piu' frequente e' il modello che sta entrando in VRAM.
                 if PAUSA_RIPRESA_S:
                     time.sleep(PAUSA_RIPRESA_S)
-                continue
-            registra_errore(ui_messages, stream_error)
-            yield AgentError(stream_error, guasto_backend=True)
-            yield fine("error", step)
-            return
+                return PROSSIMO
+            registra_errore(ui_messages, gen.stream_error)
+            yield AgentError(gen.stream_error, guasto_backend=True)
+            yield self.fine("error", step)
+            return FINE
 
-        # Il testo completo, una volta per passo: e' la rete di sicurezza degli
-        # incrementi. Chi si e' perso un frame (abbonato lento, riattacco a
-        # meta') qui torna in pari, e chi non si e' perso niente riscrive lo
-        # stesso testo che ha gia'.
+        # Il testo completo, una volta per passo: la rete di sicurezza degli
+        # incrementi per chi si e' perso un frame.
         if parser.reasoning:
             yield ReasoningDelta(text=parser.reasoning)
         if parser.answer:
             yield ContentDelta(text=parser.answer)
 
-        if watchdog_hit and passi_di_servizio >= max_passi_di_servizio:
-            yield AgentError("Ragionamento interrotto: budget dei recuperi esaurito.")
-            _registra_il_detto(ui_messages, parser.reasoning, parser.answer)
-            yield AssistantTurn(content=parser.answer, reasoning=parser.reasoning, has_tool_calls=False)
-            yield fine("reasoning_budget", step)
-            return
-        if watchdog_hit:
-            watchdog_fires += 1
-            count_nudge("think_watchdog")
-            passi_di_servizio += 1
-            spesi = estimate_tokens(parser.reasoning)
-            # Il ragionamento interrotto **non** finisce in cronologia. Sono
-            # migliaia di token di un pensiero a meta': rimetterli nel contesto
-            # significherebbe pagarli ad ogni passo successivo per rileggere
-            # proprio il giro di pensieri che stiamo cercando di spezzare. Al
-            # modello resta il sollecito, che gli dice cosa fare adesso.
-            ui_messages.append(
-                {
-                    "role": "user",
-                    "content": THINK_WATCHDOG_NUDGE.format(tokens=spesi),
-                    "hidden": True,
-                }
-            )
-            yield AgentError(
-                f"Ragionamento interrotto a ~{spesi} token senza azione: "
-                "l'agente e' stato riportato sul piano."
-            )
-            continue
+        contesto = self._contesto_reti(step, gen, parser.answer, parser.reasoning)
+        if gen.watchdog_hit:
+            contesto.watchdog = True
+            contesto.pensiero_token = estimate_tokens(parser.reasoning)
+            intervento = reti_mod.rete_pensiero(contesto)
+            st.avanzamento.passo_a_vuoto("pensiero interrotto")
+            return (yield from self._applica(step, intervento, parser.answer, parser.reasoning))
 
         answer, faked_tool_output = strip_tool_wrappers(parser.answer.strip())
         reasoning = parser.reasoning.strip()
@@ -2896,215 +2534,98 @@ def run_turn(
                 f"(<tool_response>): {faked_tool_output[:200]}"
             )
 
-        # --- recupero delle tool call stampate come testo ------------------
-        # Molti modelli locali "intendono" chiamare il tool ma emettono il JSON
-        # nel canale testuale invece che con il function calling nativo. Qui lo
-        # si esegue comunque, e il JSON esce dal flusso della chat.
-        recovered = False
-        if allow_text_tool_calls and not tool_calls and answer:
+        # --- recupero delle tool call stampate come testo --------------------
+        # Solo se chi chiama lo chiede: di serie un esempio mostrato resta testo.
+        gen.recovered = False
+        if self.allow_text_tool_calls and not gen.tool_calls and answer:
             candidates, leftover = parse_text_tool_calls(answer)
             if candidates:
-                tool_calls = candidates
+                gen.tool_calls[:] = candidates
                 answer = leftover
-                recovered = True
+                gen.recovered = True
+        gen.answer = answer
+        gen.reasoning = reasoning
 
-        # --- nessuna tool call: fine turno, salvo nudge --------------------
-        if not tool_calls:
-            # Generazione tagliata dal tetto di num_predict. Va guardato per
-            # primo perche' cambia il significato di tutto il resto: senza,
-            # "niente tool call e niente risposta" veniva letto come "ha
-            # risposto a parole" e riceveva un sollecito che davanti a una
-            # risposta vuota non vuol dire niente. Il done_reason arrivava gia'
-            # da Ollama fin dal primo giorno: mancava solo qualcuno che lo
-            # leggesse.
-            if (
-                step_done_reason == "length"
-                and not answer
-                and truncated_nudges < MAX_TRUNCATED_NUDGES
-                and step < max_steps
-                and passi_di_servizio < max_passi_di_servizio
-            ):
-                truncated_nudges += 1
-                count_nudge("truncated")
-                passi_di_servizio += 1
-                ui_messages.append(
-                    {
-                        "role": "user",
-                        "content": TRUNCATED_NUDGE.format(
-                            tokens=int(getattr(params, "max_tokens", 0) or 0)
-                        ),
-                        "hidden": True,
-                    }
-                )
-                yield AgentError(
-                    "Il modello ha esaurito i token generabili mentre "
-                    "ragionava, senza arrivare a un'azione."
-                )
-                continue
+        if gen.tool_calls:
+            return AVANTI
 
-            # Ciclo di self-correction: se una verifica e' rossa il turno non
-            # e' finito, per quanto il modello si sia convinto del contrario.
-            red = verification.unresolved
-            if (
-                red
-                and verify_nudges < MAX_VERIFY_NUDGES
-                and step < max_steps
-                and passi_di_servizio < max_passi_di_servizio
-            ):
-                command, attempts, code = red
-                verify_nudges += 1
-                count_nudge("loop" if attempts >= LOOP_THRESHOLD else "verify")
-                passi_di_servizio += 1
-                ui_messages.append(
-                    {"role": "assistant", "content": _wrap(reasoning, answer), "ts": time.time()}
-                )
-                template = LOOP_NUDGE if attempts >= LOOP_THRESHOLD else VERIFY_NUDGE
-                ui_messages.append(
-                    {
-                        "role": "user",
-                        "content": template.format(
-                            command=command, code=code, count=attempts
-                        ),
-                        "hidden": True,
-                    }
-                )
-                yield AssistantTurn(
-                    content=answer, reasoning=reasoning, has_tool_calls=False
-                )
-                continue
+        # --- nessuna tool call: le reti di sicurezza, in ordine ---------------
+        contesto = self._contesto_reti(step, gen, answer, reasoning)
+        contesto.chiamate_nel_testo = nomi_chiamate_nel_testo(answer)
+        contesto.risposta_inventata = faked_tool_output or ""
+        intervento = reti_mod.decidi_senza_tool(contesto, reti_mod.RETI_SENZA_TOOL[1:])
+        if intervento is not None:
+            st.avanzamento.passo_a_vuoto(f"sollecito {intervento.rete}")
+            return (yield from self._applica(step, intervento, answer, reasoning))
 
-            # Verifica verde che non misura il codice nuovo. Il caso reale:
-            # aggiunge `media_mobile_pesata_stream`, non le scrive un test,
-            # lancia `pytest test_media_mobile.py` -- che esercita tutt'altra
-            # funzione -- ottiene 10 passed e dichiara "lavoro completato". La
-            # funzione lasciata sul disco era rotta su tutti e tre i casi di
-            # riferimento. Il tracker delle verifiche non se ne accorge: per
-            # lui il rosso non c'e', quindi va tutto bene.
-            if (
-                enable_nudge
-                and not coverage_nudged
-                and not red
-                and step < max_steps
-            ):
-                scoperti = uncovered_symbols(tool_ctx)
-                if scoperti and passi_di_servizio < max_passi_di_servizio:
-                    coverage_nudged = True
-                    count_nudge("coverage")
-                    passi_di_servizio += 1
-                    elenco = ", ".join(f"{n} (in {f})" for n, f in scoperti[:5])
-                    _registra_il_detto(ui_messages, reasoning, answer)
-                    ui_messages.append(
-                        {
-                            "role": "user",
-                            "content": COVERAGE_NUDGE.format(symbols=elenco),
-                            "hidden": True,
-                        }
-                    )
-                    yield AssistantTurn(
-                        content=answer, reasoning=reasoning, has_tool_calls=False
-                    )
-                    continue
+        ui_messages.append(
+            {"role": "assistant", "content": _wrap(reasoning, answer), "ts": time.time()}
+        )
+        yield AssistantTurn(content=answer, reasoning=reasoning, has_tool_calls=False)
+        yield self.fine("completed", step)
+        return FINE
 
-            # Il turno ha toccato il workspace ma finisce senza una parola:
-            # l'utente resterebbe a guardare delle tendine chiuse senza sapere
-            # cosa e' successo. Si chiede il riepilogo, una volta sola.
-            # Il riepilogo e' l'unico sollecito **esente** dal budget di
-            # servizio, e non e' un'eccezione di comodo: gli altri sette sono
-            # tentativi di correzione -- riprova, ripensa, verifica -- e quando
-            # il budget finisce e' giusto che smettano. Questo invece e' la
-            # parola di chiusura del turno, ed e' cio' che impedisce a un turno
-            # che ha lavorato di finire in silenzio davanti all'utente. Proprio
-            # un turno che ha bruciato il budget in correzioni e' quello che
-            # rischia di piu' di chiudersi senza dire com'e' andata.
-            if (
-                require_summary
-                and not summary_requested
-                and tools_used
-                and not answer
-                and step < max_steps
-            ):
-                summary_requested = True
-                count_nudge("summary_failed" if red else "summary")
-                # Il ragionamento di questo passo va conservato, come in tutti
-                # gli altri rami: senza, un turno che si e' fermato a meta'
-                # sparisce dalla cronologia e dal file di sessione, e capire
-                # *perche'* si e' fermato diventa impossibile.
-                _registra_il_detto(ui_messages, reasoning, answer)
-                if red:
-                    # L'elenco per nome: il riepilogo deve poter dire *quali*
-                    # verifiche restano rosse, non che "la verifica non passa".
-                    # Da quando il piano non si blocca piu' su un rosso, un
-                    # turno puo' chiudersi con piu' di uno, e un riepilogo che
-                    # ne nomina zero e' quello che l'utente legge al posto di
-                    # una verifica verde.
-                    righe = "\n".join(
-                        f"  - `{v.comando}` (exit {v.returncode}, "
-                        f"{v.tentativi} tentativ{'o' if v.tentativi == 1 else 'i'})"
-                        for v in verification.pendenti
-                    ) or f"  - `{red[0]}` (exit {red[2]})"
-                    testo = FAILED_SUMMARY_NUDGE.format(verifiche=righe)
-                elif tool_ctx.plan:
-                    # Con un piano il riepilogo non si fa a memoria: c'e' gia'
-                    # scritto cosa e' stato chiuso e cosa no, e un riassunto
-                    # che contraddice il piano si vede subito.
-                    testo = PLAN_SUMMARY_NUDGE.format(
-                        summary=render_summary(tool_ctx.plan)
-                    )
-                else:
-                    testo = SUMMARY_NUDGE
-                ui_messages.append(
-                    {"role": "user", "content": testo, "hidden": True}
-                )
-                continue
+    def _contesto_reti(self, step: int, gen: _Generazione, answer: str,
+                       reasoning: str) -> reti_mod.Contesto:
+        return reti_mod.Contesto(
+            stato=self.st,
+            passo=step,
+            max_passi=self.max_steps,
+            risposta=answer,
+            ragionamento=reasoning,
+            done_reason=gen.done_reason,
+            richiesta=last_user_request(self.ui_messages),
+            piano=self.tool_ctx.plan,
+            verifiche=self.verification,
+            tool_ctx=self.tool_ctx,
+            enable_nudge=self.enable_nudge,
+            require_summary=self.require_summary,
+            max_tokens=int(getattr(self.params, "max_tokens", 0) or 0),
+        )
 
-            # Due condizioni fanno scattare il sollecito automatico:
-            #  a) il modello ha *annunciato* un'azione senza eseguirla;
-            #  b) siamo al primo passo, l'utente ha chiesto un'operazione sul
-            #     workspace e il modello ha risposto solo a parole.
-            # La (b) e' la novita': prima toccava all'utente insistere a mano.
-            needs_push = looks_like_unexecuted_action(answer) or (
-                step == 1 and user_expects_tool_use(last_user_request(ui_messages))
-            )
-            # Chiedere non e' tergiversare: se il modello si e' fermato per un
-            # chiarimento, il sollecito giusto non e' "esegui", e' "usa il tool
-            # apposta cosi' la domanda arriva davvero all'utente".
-            if needs_push and looks_like_clarifying_question(answer):
-                needs_push = False
-                if enable_nudge and not nudged and step < max_steps and passi_di_servizio < max_passi_di_servizio:
-                    nudged = True
-                    count_nudge("ask")
-                    passi_di_servizio += 1
-                    _registra_il_detto(ui_messages, reasoning, answer)
-                    ui_messages.append(
-                        {"role": "user", "content": ASK_NUDGE, "hidden": True}
-                    )
-                    yield AssistantTurn(
-                        content=answer, reasoning=reasoning, has_tool_calls=False
-                    )
-                    continue
-            if (
-                enable_nudge
-                and not nudged
-                and step < max_steps
-                and needs_push
-                and passi_di_servizio < max_passi_di_servizio
-            ):
-                nudged = True
-                count_nudge("tool")
-                passi_di_servizio += 1
-                _registra_il_detto(ui_messages, reasoning, answer)
-                ui_messages.append({"role": "user", "content": TOOL_NUDGE, "hidden": True})
-                yield AssistantTurn(content=answer, reasoning=reasoning, has_tool_calls=False)
-                continue
-
+    def _applica(self, step: int, iv: reti_mod.Intervento, answer: str,
+                 reasoning: str) -> Iterator[AgentEvent]:
+        """Il punto unico in cui una rete diventa messaggi ed eventi."""
+        st = self.st
+        ui_messages = self.ui_messages
+        if iv.errore_prima:
+            yield AgentError(iv.errore_prima)
+        if iv.registra == "sempre":
             ui_messages.append(
                 {"role": "assistant", "content": _wrap(reasoning, answer), "ts": time.time()}
             )
+        elif iv.registra == "se_detto":
+            _registra_il_detto(ui_messages, reasoning, answer)
+        if iv.sollecito:
+            ui_messages.append({"role": "user", "content": iv.sollecito, "hidden": True})
+        if iv.turno_assistente:
             yield AssistantTurn(content=answer, reasoning=reasoning, has_tool_calls=False)
-            yield fine("completed", step)
-            return
+        if iv.errore_dopo and iv.chiudi == "error":
+            registra_errore(ui_messages, iv.errore_dopo)
+        if iv.errore_dopo:
+            yield AgentError(iv.errore_dopo)
+        if iv.conteggio:
+            self.conta(iv.conteggio)
+        st.segna(iv.rete)
+        if iv.rete == "pensiero" and not iv.chiudi:
+            st.watchdog_fires += 1
+        if iv.servizio:
+            st.passi_di_servizio += 1
+        if iv.chiudi:
+            yield self.fine(iv.chiudi, step)
+            return FINE
+        return PROSSIMO
 
-        # --- esecuzione dei tool -------------------------------------------
+    # ------------------------------------------------------------------
+    # ESEGUI
+    # ------------------------------------------------------------------
+    def _esegui_tool(self, step: int, gen: _Generazione) -> Iterator[AgentEvent]:
+        st = self.st
+        tool_ctx = self.tool_ctx
+        ui_messages = self.ui_messages
+        tool_calls = gen.tool_calls
+        answer, reasoning, recovered = gen.answer, gen.reasoning, gen.recovered
+        self.chiamate_eseguite: list[Chiamata] = []
         # Validate envelopes as a batch before any effect; duplicate ids make
         # results ambiguous and malformed envelopes must never reach indexing.
         seen_ids: set[str] = set()
@@ -3126,8 +2647,8 @@ def run_turn(
                 ui_messages, "Protocol error: malformed or duplicate tool-call envelope"
             )
             yield AgentError("Protocol error: malformed or duplicate tool-call envelope")
-            yield fine("error", step)
-            return
+            yield self.fine("error", step)
+            return FINE
 
         assistant_record: dict[str, Any] = {
             "role": "assistant",
@@ -3151,12 +2672,6 @@ def run_turn(
             recovered=recovered,
         )
 
-        # ...il sollecito viene accodato DOPO i risultati dei tool (vedi in
-        # fondo al passo): infilato qui spezzerebbe l'adiacenza fra il
-        # messaggio assistant con le tool_calls e i relativi risultati, che
-        # diversi chat template si aspettano contigui.
-        leak_nudge_due = recovered and not leak_nudged
-
         # ask_user_question sospende il turno, quindi va eseguito per ultimo:
         # cosi' tutti gli altri tool dello stesso passo hanno gia' il loro
         # risultato in cronologia e non restano tool_call_id scoperti.
@@ -3177,10 +2692,8 @@ def run_turn(
         def close_remaining(
             calls: list[dict[str, Any]], *, per_stop: bool = False
         ) -> Iterator[ToolFinished]:
-            # Due cause diverse, due frasi diverse. Prima anche lo stop
-            # dell'utente diceva "il turno e' sospeso / attendi la risposta":
-            # al turno dopo il modello leggeva di dover aspettare una risposta
-            # a una domanda che nessuno aveva fatto.
+            # Due cause diverse, due frasi diverse: lo stop dell'utente non e'
+            # una domanda in sospeso.
             errore = ({
                 "error": "Chiamata non eseguita: il turno e' stato interrotto dall'utente.",
                 "error_code": "turn_stopped", "retryable": False,
@@ -3194,23 +2707,23 @@ def run_turn(
                 yield reject_call(pending, dict(errore))
 
         for call_index, call in enumerate(ordered):
-            if call["name"] not in allowed_tools:
+            if call["name"] not in self.allowed_tools:
                 yield reject_call(call, {
                     "error": f"Tool '{call['name']}' non disponibile in questo turno.",
                     "error_code": "tool_not_allowed", "retryable": False,
                     "hint": "Usa solo i tool presenti nello schema della richiesta corrente.",
                 })
                 continue
-            if stopped():
+            if self.stopped():
                 yield from close_remaining(ordered[call_index:], per_stop=True)
-                yield from halt(step)
-                return
+                yield from self.halt(step)
+                return FINE
             try:
                 validated_args = loads_object(call["arguments"])
             except JsonBoundaryError as exc:
                 error = argomenti_illeggibili(
-                    call["arguments"], step_done_reason,
-                    int(getattr(params_passo, "max_tokens", 0) or 0),
+                    call["arguments"], gen.done_reason,
+                    int(getattr(gen.params_passo, "max_tokens", 0) or 0),
                 )
                 error.update(error_code="invalid_json", retryable=False,
                              details=[{"path": "$", "message": str(exc)}])
@@ -3224,17 +2737,12 @@ def run_turn(
                 question = normalise_question(raw_args if isinstance(raw_args, dict) else {})
 
                 if not question["question"]:
-                    # Passa da ``reject_call`` come ogni altra chiamata
-                    # rifiutata: prima il risultato finiva in cronologia ma la
-                    # UI non riceveva il ToolFinished, e la tendina del tool
-                    # restava "in corso" fino al ricaricamento.
                     yield reject_call(call, {
                         "error": "Parametro 'question' mancante.",
                         "error_code": "invalid_arguments", "retryable": False,
                         "hint": "Riformula la domanda in una frase.",
                     })
                     continue
-
 
                 # Il risultato di questo tool arriva dall'utente: lo si scrive
                 # in cronologia solo alla ripresa (vedi resume_with_answer).
@@ -3254,16 +2762,14 @@ def run_turn(
                     options=question["options"],
                     allow_multiple=question["allow_multiple"],
                 )
-                yield fine("awaiting_user", step)
-                return
+                yield self.fine("awaiting_user", step)
+                return FINE
 
             args = validated_args
 
-            if stopped():
+            if self.stopped():
                 # Il tool non parte, ma la sua tool_call e' gia' in cronologia:
-                # va comunque chiusa con un risultato, altrimenti resta un
-                # tool_call_id scoperto e il prossimo turno parte con una
-                # cronologia che diversi chat template rifiutano.
+                # va comunque chiusa con un risultato.
                 cancelled = json.dumps(
                     {"error": "Interrotto dall'utente prima dell'esecuzione."},
                     ensure_ascii=False,
@@ -3290,6 +2796,18 @@ def run_turn(
                 )
                 continue
 
+            # Diario degli effetti: l'intento si scrive **prima** dell'effetto.
+            # Il server salva su ToolStarted dei tool con effetti, quindi un
+            # crash durante l'esecuzione lascia su disco la traccia che la
+            # chiamata era partita (vedi ``core/ciclo/ripresa.py``).
+            # Niente ``hidden``: quel flag vuol dire "sollecito dell'harness al
+            # modello"; l'intento non arriva ne' al modello ne' alla UI, che
+            # ignorano il ruolo ``intento``.
+            if call["name"] in ripresa_mod.EFFETTI:
+                ui_messages.append(ripresa_mod.intento(
+                    call["id"], call["name"], args,
+                    str(getattr(tool_ctx, "workspace", "") or ""),
+                ))
             yield ToolStarted(call_id=call["id"], name=call["name"], args=args)
 
             started = time.monotonic()
@@ -3301,51 +2819,45 @@ def run_turn(
             # andata bene: rifare una chiamata che era fallita e' legittimo.
             if ok:
                 if call["name"] in ("write_file", "edit_file"):
-                    # Una scrittura invalida le letture: dopo, rileggere lo
-                    # stesso file ha senso e non e' una ripetizione. E invalida
-                    # i fallimenti: fra un tentativo e l'altro e' cambiato
-                    # qualcosa, quindi riprovare non e' piu' girare a vuoto.
-                    ripetizioni.dimentica_letture()
-                    ripetizioni.dimentica_fallimenti()
-                    # ...a meno che il "qualcosa" sia tornare indietro: il
-                    # contatore dei fallimenti si azzera anche su una modifica
-                    # che ripristina il contenuto di due passi fa, e il
-                    # modello che alterna due versioni non lo vedeva nessuno.
-                    ritornato = ritorni.registra(result)
+                    # Una scrittura invalida le letture e i fallimenti...
+                    st.ripetizioni.dimentica_letture()
+                    st.ripetizioni.dimentica_fallimenti()
+                    # ...a meno che il "qualcosa" sia tornare indietro.
+                    ritornato = st.ritorni.registra(result)
                     if (
                         ritornato is not None
                         and ritornato[1] >= RitorniDeiFile.SOGLIA
-                        and not oscillazione_nudged
+                        and not st.scattata("oscillazione")
                     ):
-                        oscillazione_nudged = True
-                        oscillazione_dovuta = ritornato
+                        st.segna("oscillazione")
+                        st.oscillazione_dovuta = ritornato
                 else:
-                    quante = ripetizioni.registra(call["name"], args)
-                    if quante >= RipetizioniTool.SOGLIA and not ripetizione_nudged:
-                        ripetizione_nudged = True
-                        ripetizione_dovuta = (call["name"], quante)
+                    quante = st.ripetizioni.registra(call["name"], args)
+                    if quante >= RipetizioniTool.SOGLIA and not st.scattata("ripetizione"):
+                        st.segna("ripetizione")
+                        st.ripetizione_dovuta = (call["name"], quante)
             else:
-                # La chiamata e' stata rifiutata o e' fallita. Finora finiva
-                # qui e basta, e lo stallo piu' comune -- stesso rifiuto, stessa
-                # riga, tre volte -- non veniva visto da nessuna delle difese.
-                quante = ripetizioni.registra_fallita(call["name"], args)
-                if quante >= RipetizioniTool.SOGLIA_STALLO and not stallo_nudged:
-                    stallo_nudged = True
-                    stallo_dovuto = (call["name"], quante)
-            verification.record(call["name"], result)
+                # Lo stallo piu' comune -- stesso rifiuto, stessa riga, tre
+                # volte -- non lo vedeva nessuna delle altre difese.
+                quante = st.ripetizioni.registra_fallita(call["name"], args)
+                if quante >= RipetizioniTool.SOGLIA_STALLO and not st.scattata("stallo"):
+                    st.segna("stallo")
+                    st.stallo_dovuto = (call["name"], quante)
+            self.verification.record(call["name"], result)
             # Il guard sui file di test ha bisogno di sapere se c'e' una
             # verifica rossa aperta: qui e' l'unico punto che lo sa.
-            red_now = verification.unresolved
+            red_now = self.verification.unresolved
             tool_ctx.red_command = red_now[0] if red_now else None
             if call["name"] == "run_command" and not _comando_riuscito(result):
-                # Rossa sia per una verifica fallita sia per un comando che non
-                # esiste: sono problemi diversi, ma entrambi l'utente li vuole
-                # vedere senza aprire la tendina.
                 ok = False
             if not ok:
-                retry_reasoning = True
-            chiamate_passo.append((str(call["name"]), bool(ok)))
-            tools_used = True
+                st.retry_reasoning = True
+            if reti_mod.e_una_possibile_scrittura(call["name"], args, ok):
+                st.scritture_riuscite += 1
+            self.chiamate_passo.append((str(call["name"]), bool(ok)))
+            self.chiamate_eseguite.append(Chiamata(str(call["name"]), dict(args), bool(ok),
+                                                   leggi_esito(result)))
+            st.tools_used = True
             ui_messages.append(
                 {
                     "role": "tool",
@@ -3372,18 +2884,14 @@ def run_turn(
                     summary=render_summary(tool_ctx.plan),
                 )
                 # Il cancello: su un piano lungo l'utente lo legge prima che
-                # parta il lavoro. Non e' una conferma di cortesia -- e' che
-                # correggere un piano costa dieci secondi e valutare trenta
-                # passi no, e su questo modello il piano e' la cosa che
-                # riesce peggio. Scatta una volta sola: una ripianificazione a
-                # meta' lavoro e' un aggiustamento, non una nuova partenza.
+                # parta il lavoro. Scatta una volta sola.
                 if (
-                    plan_gate
-                    and not gate_mostrato
+                    self.plan_gate
+                    and not st.gate_mostrato
                     and str(args.get("action") or "").strip().lower() == "set"
                     and len(tool_ctx.plan.steps) >= PUNTI_PER_IL_CANCELLO
                 ):
-                    gate_mostrato = True
+                    st.gate_mostrato = True
                     yield from close_remaining(ordered[call_index + 1:])
                     domanda = {
                         "question": (
@@ -3421,19 +2929,15 @@ def run_turn(
                         options=domanda["options"],
                         allow_multiple=False,
                     )
-                    yield fine("awaiting_user", step)
-                    return
+                    yield self.fine("awaiting_user", step)
+                    return FINE
             if call["name"] == NOTES_TOOL and ok:
                 yield NotesUpdated(notes=tool_ctx.notes.to_list())
             anteprima = preview_from_result(
-                call["name"], args, result, ok, auto=auto_preview
+                call["name"], args, result, ok, auto=self.auto_preview
             )
             if anteprima is not _NO_PREVIEW:
-                # La cartella servita si sa solo qui, dove c'e' il workspace:
-                # ``preview_from_result`` guarda una tool call e basta. Senza,
-                # la nota al modello direbbe "la cartella del workspace" anche
-                # per una pagina che sta in sito/ -- una frase falsa su cui poi
-                # ragiona.
+                # La cartella servita si sa solo qui, dove c'e' il workspace.
                 if (
                     isinstance(anteprima, dict)
                     and anteprima.get("path")
@@ -3442,25 +2946,25 @@ def run_turn(
                     anteprima["root"] = preview_root(
                         tool_ctx.workspace, str(anteprima["path"])
                     )
-                # Ricordarlo nel contesto del turno e' cio' che permette al
-                # passo successivo di sapere che il pannello e' gia' aperto.
                 tool_ctx.preview = anteprima
                 yield PreviewUpdated(payload=anteprima)
+        return AVANTI
 
-        # --- estratto del pensiero dei punti appena chiusi -----------------
-        # La casella postale che ``manage_plan`` riempie chiudendo un punto. Si
-        # svuota **sempre**, anche quando non si estrae: un punto chiuso al
-        # turno scorso e distillato al prossimo archivierebbe il ragionamento
-        # sbagliato, e ``ToolContext`` sopravvive ai turni.
+    # ------------------------------------------------------------------
+    # DOPO I TOOL
+    # ------------------------------------------------------------------
+    def _dopo_tool(self, step: int, gen: _Generazione) -> Iterator[AgentEvent]:
+        st = self.st
+        tool_ctx = self.tool_ctx
+        ui_messages = self.ui_messages
+        # --- estratto del pensiero dei punti appena chiusi ------------------
+        # La casella postale si svuota **sempre**, anche quando non si estrae.
         chiusi = list(tool_ctx.punti_chiusi)
         tool_ctx.punti_chiusi.clear()
-        if chiusi and estratto_pensiero and schedario is not None and not stopped():
-            # La traccia di questo passo si attacca adesso invece che
-            # all'inizio del prossimo: il pensiero del passo che ha chiuso il
-            # punto appartiene a quel punto, ed e' spesso quello che contiene
-            # la conclusione. Il ``marca_pensiero`` in cima al ciclo restera'
-            # muto, perche' la traccia e' gia' stata consumata.
-            marca_pensiero()
+        if chiusi and self.estratto_pensiero and self.schedario is not None and not self.stopped():
+            # La traccia di questo passo si attacca adesso: il pensiero del
+            # passo che ha chiuso il punto appartiene a quel punto.
+            self.marca_pensiero()
             for chiuso in chiusi:
                 blocchi = pensiero.blocchi_del_punto(ui_messages, chiuso["id"])
                 if not blocchi:
@@ -3468,204 +2972,124 @@ def run_turn(
                 distillato = pensiero.estrai(
                     blocchi,
                     punto=chiuso["text"],
-                    backend=backend.scope("memory_extract"),
-                    params=params,
-                    should_stop=stopped,
+                    backend=self.backend.scope("memory_extract"),
+                    params=self.params,
+                    should_stop=self.stopped,
                 )
                 if not distillato:
                     continue
                 voce = libreria.archivia_estratto(
-                    schedario,
+                    self.schedario,
                     punto=chiuso["text"],
                     estratto=distillato,
                     saltato=bool(chiuso.get("saltato")),
                 )
                 if voce is not None:
-                    # L'indice in coda cambia adesso, non al turno prossimo:
-                    # il passo successivo deve poter vedere che quella voce
-                    # esiste, altrimenti il precarico la ignora per un intero
-                    # turno. L'estratto **non** torna nel risultato del tool:
-                    # ``manage_plan`` e' stato snellito apposta perche' valeva
-                    # il 13,5% dei token di risultato.
-                    blocco_libreria = _blocco_libreria()
+                    # L'indice in coda cambia adesso, non al turno prossimo.
+                    self.blocco_libreria = self._blocco_libreria()
 
-        if stopped():
-            # Fermarsi qui, a tool conclusi e risultati in cronologia, e' il
-            # punto piu' pulito: la conversazione resta valida e riprendibile.
-            yield fine("stopped", step)
-            return
+        if self.stopped():
+            # A tool conclusi e risultati in cronologia: il punto piu' pulito.
+            yield self.fine("stopped", step)
+            return FINE
 
-        if leak_nudge_due:
-            leak_nudged = True
-            count_nudge("json_leak")
-            ui_messages.append(
-                {"role": "user", "content": JSON_LEAK_NUDGE, "hidden": True}
-            )
-
-        # La stessa chiamata per la terza volta. Non consuma un passo di
-        # servizio -- non fa ripartire il passo, si accoda ai risultati che il
-        # modello sta gia' per leggere -- ma va detta, perche' e' l'unico modo
-        # di guasto agentico comune che nessuna delle altre difese vedeva.
-        if ripetizione_dovuta is not None:
-            nome_tool, quante = ripetizione_dovuta
-            ripetizione_dovuta = None
-            count_nudge("ripetizione")
-            ui_messages.append(
-                {
-                    "role": "user",
-                    "content": RIPETIZIONE_NUDGE.format(tool=nome_tool, quante=quante),
-                    "hidden": True,
-                }
-            )
-
-        # Lo stallo ha la precedenza sul resto dei solleciti solo nel senso che
-        # arriva insieme a loro: il modello deve leggere "quello che stai
-        # facendo non cambia niente" nello stesso passo in cui legge l'ennesimo
-        # rifiuto, non due passi dopo.
-        if stallo_dovuto is not None:
-            nome_tool, quante = stallo_dovuto
-            stallo_dovuto = None
-            count_nudge("stallo")
-            ui_messages.append(
-                {
-                    "role": "user",
-                    "content": STALLO_NUDGE.format(tool=nome_tool, quante=quante),
-                    "hidden": True,
-                }
-            )
-
-        if oscillazione_dovuta is not None:
-            nome_file, quante = oscillazione_dovuta
-            oscillazione_dovuta = None
-            count_nudge("oscillazione")
-            ui_messages.append(
-                {
-                    "role": "user",
-                    "content": OSCILLAZIONE_NUDGE.format(file=nome_file, quante=quante),
-                    "hidden": True,
-                }
-            )
-
-        # Il modello si e' messo a lavorare su una richiesta con piu' obiettivi
-        # senza scrivere un piano. Il sollecito va **dopo** i risultati dei
-        # tool, come tutti gli altri: infilato prima spezzerebbe l'adiacenza
-        # fra l'assistant con le tool_calls e i suoi risultati. Le letture
-        # iniziali restano quindi valide -- non si butta via lavoro utile, si
-        # pretende solo che da qui in poi ci sia una traccia.
-        if (
-            require_plan
-            and enable_nudge
-            and multi_step
-            and not plan_nudged
-            and not tool_ctx.plan
-            and step < max_steps
-        ):
-            plan_nudged = True
-            count_nudge("plan")
-            ui_messages.append(
-                {"role": "user", "content": PLAN_NUDGE, "hidden": True}
-            )
-
-        # Esplorazione lunga senza mai delegare. Il tool `esplora` c'e' e
-        # funziona: misurato il 23/08/2026 compare in 4 sessioni su 24, mentre
-        # l'esplorazione fatta a mano vale il 46% dei token di risultato che
-        # restano in contesto per sempre. Non manca lo strumento, manca che
-        # qualcuno lo nomini nel momento in cui servirebbe.
-        #
-        # Si conta per passi interi e non per singole chiamate: un read_file
-        # dentro un passo che scrive anche e' il ciclo normale leggi-modifica,
-        # e sollecitare li' sarebbe rumore. Il segnale e' il passo che *solo*
-        # guarda, ripetuto.
-        nomi_del_passo = {c["name"] for c in tool_calls}
+        # --- conteggi del passo ---------------------------------------------
+        # Un passo, un punto: il segnale e' il passo che *solo* guarda.
+        nomi_del_passo = {c["name"] for c in gen.tool_calls}
         if nomi_del_passo and nomi_del_passo <= set(TOOL_ESPLORATIVI):
-            # Un passo, un punto -- come dice il commento qui sopra da sempre.
-            # La riga sommava ``len(tool_calls)``: un passo solo con cinque
-            # read_file in parallelo, che e' il comportamento *buono* di un
-            # modello capace di chiamate multiple, arrivava a cinque al primo
-            # passo e si prendeva il sollecito di delega senza aver esplorato
-            # niente.
-            esplorazioni_di_fila += 1
+            st.esplorazioni_di_fila += 1
         else:
-            esplorazioni_di_fila = 0
-        if (
-            enable_nudge
-            and abilita_delega
-            and not delega_nudged
-            and esplorazioni_di_fila >= MAX_ESPLORAZIONI_SENZA_DELEGA
-            and step < max_steps
-        ):
-            delega_nudged = True
-            count_nudge("delega")
-            ui_messages.append(
-                {
-                    "role": "user",
-                    "content": DELEGA_NUDGE.format(quante=esplorazioni_di_fila)
-                    + _esempio_delega(),
-                    "hidden": True,
-                }
-            )
+            st.esplorazioni_di_fila = 0
+        if len(gen.tool_calls) == 1 and gen.tool_calls[0]["name"] == "read_file":
+            st.letture_singole_di_fila += 1
+        else:
+            st.letture_singole_di_fila = 0
+        st.avanzamento.registra_passo(step, self.chiamate_eseguite)
 
-    # I passi sono finiti. Se il turno ha lavorato e non ha detto niente,
-    # l'utente ha davanti delle tendine di tool e nient'altro: una chiamata
-    # sola, senza tool, glielo racconta.
-    #
-    # Non e' un sollecito e non poteva esserlo: ``SUMMARY_NUDGE`` chiede al
-    # modello di scrivere al passo **successivo**, e qui un passo successivo
-    # non c'e' piu' -- ha in guardia ``step < max_steps`` esattamente per
-    # questo. E' lo stesso baratto di ``delega.referto_di_chiusura``: una
-    # generazione in piu' contro un turno intero buttato.
-    marca_pensiero()
-    if stopped():
-        yield from halt(max_steps)
-        return
-    if require_summary and tools_used and not ultima_risposta(ui_messages):
-        count_nudge("riepilogo_forzato")
+        # --- note in coda ai risultati (``core/ciclo/reti.note_dopo_tool``) --
+        # Dopo i risultati, mai in mezzo: spezzerebbero l'adiacenza fra
+        # l'assistant con le tool_calls e i suoi risultati.
+        for nota in reti_mod.note_dopo_tool(reti_mod.ContestoDopo(
+            stato=st, passo=step, max_passi=self.max_steps, recuperate=gen.recovered,
+            tool_ctx=tool_ctx, require_plan=self.require_plan, enable_nudge=self.enable_nudge,
+            abilita_delega=self.abilita_delega, monitor=self.monitor_avanzamento,
+            esempio_delega=self._esempio_delega,
+        )):
+            self.conta(nota.conteggio)
+            ui_messages.append({"role": "user", "content": nota.testo, "hidden": True})
+
+        # --- monitor di avanzamento: la chiusura ---------------------------
+        if (
+            self.monitor_avanzamento
+            and st.avanzamento.da_chiudere
+            and step < self.max_steps
+        ):
+            self.conta("stallo_chiuso")
+            yield AgentError(
+                f"Turno fermato: {st.avanzamento.senza_progresso} passi di fila senza "
+                "niente di verificabile (nessun file nuovo, nessuna scrittura andata "
+                "a segno, nessuna verifica passata, nessun punto chiuso)."
+            )
+            yield from self._riepilogo_forzato(PROMPT_RIEPILOGO_STALLO)
+            yield self.fine("stallo", step)
+            return FINE
+        return AVANTI
+
+    # ------------------------------------------------------------------
+    # CHIUSURA A PASSI FINITI
+    # ------------------------------------------------------------------
+    def _riepilogo_forzato(self, prompt: str) -> Iterator[AgentEvent]:
+        """Una chiamata sola, senza tool, per dire all'utente cosa e' successo."""
+        if not (self.require_summary and self.st.tools_used
+                and not ultima_risposta(self.ui_messages)):
+            return
+        self.conta("riepilogo_forzato")
         testo = riepilogo_finale(
-            ui_messages,
-            backend=backend.scope("final_summary"),
-            params=params,
-            budgets=budgets,
-            strip_thinking=strip_thinking,
-            should_stop=stopped,
+            self.ui_messages,
+            backend=self.backend.scope("final_summary"),
+            params=self.params,
+            budgets=self.budgets,
+            strip_thinking=self.strip_thinking,
+            should_stop=self.stopped,
+            prompt=prompt,
         )
         if testo:
-            ui_messages.append(
+            self.ui_messages.append(
                 {
                     "role": "assistant",
                     "content": testo,
                     # Detto, perche' non e' una risposta come le altre: e' un
-                    # referto chiesto dall'harness quando il turno era gia'
-                    # finito. La UI puo' segnalarlo, e chi rilegge la sessione
-                    # non deve credere che il modello si sia fermato da solo.
+                    # referto chiesto dall'harness a turno gia' finito.
                     "forzato": True,
                     "ts": time.time(),
                 }
             )
             yield AssistantTurn(content=testo, reasoning="", has_tool_calls=False)
 
-    yield fine("stopped" if stopped() else "max_steps", max_steps)
+    def _passi_finiti(self) -> Iterator[AgentEvent]:
+        # I passi sono finiti. Non e' un sollecito e non poteva esserlo:
+        # ``SUMMARY_NUDGE`` chiede di scrivere al passo **successivo**, e qui
+        # un passo successivo non c'e' piu'.
+        self.marca_pensiero()
+        if self.stopped():
+            yield from self.halt(self.max_steps)
+            return
+        yield from self._riepilogo_forzato(PROMPT_RIEPILOGO_FINALE)
+        yield self.fine("stopped" if self.stopped() else "max_steps", self.max_steps)
 
 
-# Quante volte l'harness insiste perche' una verifica rossa venga riparata,
-# prima di lasciar chiudere il turno con un rapporto onesto. Due spinte bastano:
-# oltre, si consumerebbe l'intero budget di passi su un problema che il modello
-# evidentemente non sa risolvere da solo.
-MAX_VERIFY_NUDGES = 2
+# ``MAX_VERIFY_NUDGES``, ``MAX_TRUNCATED_NUDGES``, ``LOOP_THRESHOLD`` e
+# ``MAX_ESPLORAZIONI_SENZA_DELEGA`` vivono in ``core/ciclo/reti.py`` con le reti
+# che li usano; ``TOOL_ESPLORATIVI`` in ``core/ciclo/stato.py``. Qui restano
+# importati con gli stessi nomi.
+
 # Passi di attesa prima di ritentare una compattazione che non e' riuscita.
 PAUSA_COMPATTAZIONE_FALLITA = 3
+# Passi di fila con una sola lettura prima del promemoria di batch in coda.
+# Due: il primo passo a lettura singola e' normale (si guarda una cosa e si
+# decide), il secondo di fila e' gia' una serie che si poteva chiedere insieme.
+PASSI_PER_IL_PROMEMORIA_BATCH = 2
 
-# I tool con cui si guarda e basta. Un passo fatto solo di questi e' una mossa
-# di esplorazione, e l'esplorazione e' esattamente cio' che si puo' delegare.
-TOOL_ESPLORATIVI = ("read_file", "search_files", "list_files")
-# Quante letture di fila prima di ricordare che esiste `esplora`. Cinque perche'
-# quattro sono ancora un giro di orientamento onesto: la delega conviene quando
-# la domanda e' aperta, non quando si stanno controllando due file noti. Il
-# sollecito scatta **una volta per turno** e si puo' ignorare.
-MAX_ESPLORAZIONI_SENZA_DELEGA = 5
-# Quota del budget di generazione oltre la quale un ragionamento senza nessuna
-# tool call viene interrotto. Il 55% non e' un numero tondo per caso: sotto, si
-# taglia un pensiero che stava per concludere; sopra, non resta abbastanza
-# budget per emettere l'azione, che e' il fallimento che si vuole evitare.
 # Errori della chiamata al modello che valgono una ripresa. Il confine non e'
 # "grave / non grave": e' **la conversazione e' ancora valida?**. Un timeout, una
 # connessione caduta, un 502 del reverse proxy davanti a Ollama lasciano intatti
@@ -3728,131 +3152,10 @@ THINK_CEILING_STEP = 2000
 # troncamento -- meglio un turno lento di un turno in cui l'harness e il modello
 # si contendono il controllo all'infinito.
 MAX_WATCHDOG_FIRES = 2
-# Stessa logica per il troncamento: due tentativi di riportarlo all'azione.
-MAX_TRUNCATED_NUDGES = 2
-# Stesso comando fallito questo numero di volte = il modello sta girando a
-# vuoto e va dirottato invece che spronato.
-LOOP_THRESHOLD = 3
 # Exit code che segnalano un comando sbagliato, non un progetto rotto.
 # La definizione vive nel registro, insieme al resto delle regole su cosa conta
 # come verifica; qui resta il nome con cui il ciclo e i test la chiamano.
 SHELL_NOT_A_VERIFICATION = verifiche_mod.SHELL_NON_E_UNA_VERIFICA
-
-
-def _firma(name: str, args: dict[str, Any] | None) -> tuple[str, str]:
-    """Identita' di una chiamata a tool.
-
-    Gli argomenti si normalizzano ordinandoli: ``{"a":1,"b":2}`` e
-    ``{"b":2,"a":1}`` sono la stessa chiamata, e un modello che rigenera il JSON
-    non li mette sempre nello stesso ordine.
-    """
-    try:
-        return (name, json.dumps(args or {}, sort_keys=True, ensure_ascii=False))
-    except (TypeError, ValueError):
-        return (name, repr(args))
-
-
-class RipetizioniTool:
-    """Chiamate identiche ripetute nello stesso turno.
-
-    Il modo di guasto piu' comune di un agente non e' il comando che fallisce
-    -- per quello c'e' ``VerificationTracker`` -- ma la chiamata che **riesce**
-    e che il modello rifa' perche' non ha usato il risultato. Costa un passo e
-    una seconda copia dello stesso contenuto in contesto, e nessuna delle altre
-    difese la vede: il tracker guarda solo ``run_command``, e
-    ``esplorazioni_di_fila`` conta le esplorazioni senza accorgersi che sono la
-    stessa.
-    """
-
-    __slots__ = ("_falliti", "_viste")
-
-    # Alla terza, non alla seconda: rileggere un file dopo averlo modificato e'
-    # legittimo, e sollecitare li' sarebbe rumore su un comportamento corretto.
-    SOGLIA = 3
-
-    # Stessa soglia per le chiamate che **falliscono**, e serviva un contatore
-    # separato. Le fallite non entravano affatto nel conteggio -- ``registra``
-    # veniva chiamata solo dentro un ``if ok:`` -- col ragionamento che rifare
-    # una chiamata fallita e' legittimo. Lo e', due volte: un timeout, un
-    # container che parte lento. Non lo e' alla terza, e il caso che ha fatto
-    # girare a vuoto un turno intero era proprio questo: ``manage_plan``
-    # rifiutato per una verifica rossa, richiamato identico, rifiutato di nuovo.
-    SOGLIA_STALLO = 3
-
-    def __init__(self) -> None:
-        self._viste: dict[tuple[str, str], int] = {}
-        self._falliti: dict[tuple[str, str], int] = {}
-
-    def registra(self, name: str, args: dict[str, Any] | None) -> int:
-        """Quante volte questa esatta chiamata e' gia' stata fatta nel turno."""
-        firma = _firma(name, args)
-        self._viste[firma] = self._viste.get(firma, 0) + 1
-        return self._viste[firma]
-
-    def registra_fallita(self, name: str, args: dict[str, Any] | None) -> int:
-        """Quante volte **di fila** questa chiamata e' gia' fallita nel turno."""
-        firma = _firma(name, args)
-        self._falliti[firma] = self._falliti.get(firma, 0) + 1
-        return self._falliti[firma]
-
-    def dimentica_letture(self) -> None:
-        """Una scrittura invalida le letture: dopo, rileggere ha senso."""
-        self._viste = {
-            k: v for k, v in self._viste.items() if k[0] not in TOOL_ESPLORATIVI
-        }
-
-    def dimentica_fallimenti(self) -> None:
-        """Dopo una modifica riuscita, ritentare non e' piu' stallo.
-
-        E' la meta' che rende il contatore dei fallimenti un rilevatore di
-        stallo invece di un tetto ai tentativi: quello che conta non e' quante
-        volte hai riprovato, e' se fra un tentativo e l'altro e' cambiato
-        qualcosa.
-        """
-        self._falliti.clear()
-
-
-class RitorniDeiFile:
-    """File che tornano a un contenuto gia' avuto nello stesso turno.
-
-    E' il ping-pong dello StuckDetector di OpenHands ("two different
-    action-observation pairs alternate"), nella forma in cui lo fa un modello
-    piccolo che scrive codice: ``edit_file`` da A a B, il test fallisce,
-    ``edit_file`` da B ad A, il test fallisce in un altro modo, di nuovo da A a
-    B. Ogni modifica riesce, quindi ``RipetizioniTool`` azzera i suoi contatori
-    a ogni passo e lo stallo non si vede. L'impronta del contenuto dopo la
-    scrittura -- che ``write_file`` ed ``edit_file`` restituiscono gia' come
-    ``sha256`` -- lo rende visibile senza rileggere il disco.
-    """
-
-    __slots__ = ("_storia",)
-
-    # Al secondo ritorno: un ritorno solo e' un "annulla" legittimo.
-    SOGLIA = 2
-
-    def __init__(self) -> None:
-        self._storia: dict[str, tuple[list[str], int]] = {}
-
-    def registra(self, risultato: str) -> tuple[str, int] | None:
-        """``(file, ritorni)`` dopo una scrittura riuscita, o None se illeggibile."""
-        try:
-            esito = json.loads(risultato)
-        except (json.JSONDecodeError, TypeError):
-            return None
-        if not isinstance(esito, dict):
-            return None
-        percorso, impronta = esito.get("filepath"), esito.get("sha256")
-        if not isinstance(percorso, str) or not isinstance(impronta, str):
-            return None
-        viste, ritorni = self._storia.get(percorso, ([], 0))
-        # Tornare al contenuto **immediatamente** precedente non e' possibile
-        # (sarebbe una scrittura che non cambia niente); qualunque altro gia'
-        # visto e' un passo indietro.
-        if impronta in viste[:-1]:
-            ritorni += 1
-        viste.append(impronta)
-        self._storia[percorso] = (viste, ritorni)
-        return percorso, ritorni
 
 
 # Il registro delle verifiche vive in ``core/verifiche.py``. Stava qui dentro

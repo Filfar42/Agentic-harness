@@ -353,7 +353,10 @@ def test_le_riprese_sono_contate_e_finite():
     sorgente = (Path(__file__).resolve().parents[1] / "core" / "agent.py").read_text(
         encoding="utf-8"
     )
-    assert 'count_nudge("ripresa_stream")' in sorgente
+    # Dal 25/09 il conteggio passa da ``_Turno.conta`` (telemetria
+    # ``usage["nudges"]``), non piu' dalla closure ``count_nudge``.
+    assert 'self.conta("ripresa_stream")' in sorgente
+    assert "st.riprese_stream < MAX_RIPRESE_STREAM" in sorgente
 
 
 # ---------------------------------------------------------------------------
