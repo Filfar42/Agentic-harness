@@ -45,10 +45,34 @@
         <span id="chat-workspace"></span>
       </div>
     </div>
+    <!-- Velocita' del modello: dal vivo mentre genera, la media dell'ultimo
+         turno a riposo. Toccandola dice anche contesto, cache e draft. -->
+    <button id="goccia-tok" class="goccia-tok hidden" type="button" title="Velocità di generazione">
+      <i aria-hidden="true"></i><b id="goccia-tok-v">—</b><span>tok/s</span>
+    </button>
     <button id="btn-refresh" class="icon-btn" title="Ricarica">&#8635;</button>
   </header>
 
-  <main id="messages" class="messages"></main>
+  <!-- Quanto e' pieno il contesto: una riga sola, sotto la barra. Si tinge
+       sopra il 70% e sopra il 90%, come la barra del desktop. -->
+  <div id="barra-contesto" class="barra-contesto" role="img" aria-label="Contesto">
+    <span id="barra-contesto-fill"></span>
+  </div>
+
+  <div class="messages-wrap" id="messages-wrap">
+    <main id="messages" class="messages"></main>
+    <!-- Il piano come una rotaia: un pallino per punto, pieno se fatto, che
+         pulsa se e' in corso, ambra se saltato. La linea si riempie fino
+         all'ultimo punto chiuso. Toccandola si apre l'elenco. -->
+    <button id="rotaia-piano" class="rotaia hidden" type="button" aria-label="Piano di lavoro">
+      <span class="rotaia-linea"><span id="rotaia-fatto" class="rotaia-fatto"></span></span>
+      <span id="rotaia-punti" class="rotaia-punti"></span>
+    </button>
+    <div id="piano-foglio" class="piano-foglio hidden" role="dialog" aria-label="Piano">
+      <div class="piano-testa"><b>Piano</b><span id="piano-conto"></span></div>
+      <ol id="piano-elenco" class="piano-elenco"></ol>
+    </div>
+  </div>
 
   <!-- Sta lavorando: una riga sola, animata, appiccicata sopra il composer.
        E' la risposta alla domanda che ci si fa guardando il telefono ("sta

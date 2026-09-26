@@ -428,6 +428,65 @@ modello richiesto.
 
 ## Storia delle revisioni
 
+**Colonna di destra: il cruscotto** (26/09/2026, ramo `barra-destra-2026-09-26`
+sopra `impostazioni-2026-09-26`, versione non ancora numerata) — rifatta da
+capo.
+
+La colonna aveva cinque righe di numeri ("Inviati al modello", "Prompt",
+"Generati", "Velocita'", "Totale") che si aggiornavano all'invio e a fine
+turno, cioe' quando non servivano piu', e la velocita' era una media su tutto
+il turno. Ora ci sono quattro schede dal vivo, poi piano, note e file toccati.
+
+- **Velocita'.** Token al secondo **adesso** (ultimi 1,5 s di generazione),
+  aggiornati quattro volte al secondo, con la fase (attesa, prefill, pensa,
+  risponde, scrive la chiamata, esegue un tool), la traccia del turno colorata
+  per fase, il tempo al primo token, la velocita' del prefill e i token
+  generati.
+- **Turno.** Una riga per passo: attesa, pensiero, risposta, argomenti delle
+  chiamate ed esecuzione dei tool, in scala fra i passi; sopra, dove e' andato
+  il tempo di tutto il turno in percentuale. I passi dopo una compattazione
+  hanno un segno. Al passaggio del puntatore: tempi, tok/s, prompt, tool.
+- **Contesto.** Il prompt del passo in corso sulla finestra vera, con la parte
+  ripresa dalla cache (piena) e quella ricalcolata (tratteggiata); sotto, il
+  draft MTP: quota di token accettati dal vivo e una barretta per passo.
+- **Velocita' e contesto.** Tok/s contro token di prompt, passo per passo e
+  turno per turno (grigi i turni vecchi, colorati l'ultimo, pulsa il passo in
+  corso), con la tendenza scritta: "−2,2 tok/s ogni 10k token di prompt".
+- **Telefono.** Una goccia con i tok/s in alto (toccandola: contesto, cache,
+  MTP), una riga sottile per il contesto sotto la barra, e la rotaia del piano
+  sul bordo destro: un pallino per punto, l'elenco toccandola.
+
+Da dove vengono i numeri (`core/cruscotto.py`):
+
+- `Tachimetro` guarda lo stream di un passo e produce l'evento `metriche`
+  (SSE), al piu' quattro al secondo e uno **definitivo** a fine passo. Con
+  llama.cpp usa i `timings` che il server manda a ogni token
+  (`timings_per_token`, gia' acceso) e il progresso del prefill
+  (`return_progress`, nuovo: un server che non lo conosce lo ignora); con
+  Ollama conta i pezzi dello stream (un token l'uno) e a fine passo prende
+  `eval_count`/`eval_duration`. `fonte` dice quale dei due.
+- I transport emettono `StreamEvent("battito")`: timings, progresso del
+  prefill e caratteri degli **argomenti delle tool call** mentre arrivano (un
+  `write_file` lungo prima era silenzio). Un battito non conta come output: dopo
+  un battito il transport puo' ancora riprovare.
+- Le metriche dal vivo sono frame **volatili** del runner: dell'arretrato si
+  tiene solo l'ultima, al posto in cui era stata emessa. Senza, un turno da
+  un'ora avrebbe aggiunto quindicimila frame e fatto scattare il limite degli
+  eventi. Le definitive restano tutte.
+- `Registro` fa le righe della timeline dagli stessi eventi; il server le
+  salva con la telemetria del turno, e `stats.cruscotto` (`storico`) le
+  restituisce a chi riapre la chat, insieme ai punti velocita'/contesto. Per i
+  turni registrati prima, le righe si ricostruiscono dalle chiamate della
+  telemetria (senza la ripartizione pensiero/risposta).
+- I file toccati si aggiornano a ogni `write_file`/`edit_file`, non a fine turno.
+
+Altro:
+
+- L'impronta anti-cache degli asset copre anche `impostazioni.*` e
+  `cruscotto.*`.
+- `scripts/finto_llama_server.py`: un llama-server finto (timings, prefill,
+  draft MTP, velocita' che cala col contesto) per vedere il cruscotto senza GPU.
+
 **Menu delle impostazioni** (26/09/2026, ramo `impostazioni-2026-09-26`,
 versione non ancora numerata) — rifatto da capo.
 

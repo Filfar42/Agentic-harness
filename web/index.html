@@ -30,6 +30,7 @@ try {
 <link rel="stylesheet" href="/static/style.css">
 <link rel="stylesheet" href="/static/companion.css">
 <link rel="stylesheet" href="/static/impostazioni.css">
+<link rel="stylesheet" href="/static/cruscotto.css">
 <!-- Raster fallbacks and an adaptive vector mark for modern browsers. -->
 <link rel="icon" type="image/png" sizes="64x64" href="/static/favicon-64.png">
 <link rel="icon" type="image/png" sizes="32x32" href="/static/favicon-32.png">
@@ -346,18 +347,89 @@ try {
       <div id="v-mem"></div>
     </div>
 
-    <!-- Il piano sta in cima perché è la risposta alla domanda che l'utente si
-         fa davvero mentre l'agente lavora: "a che punto è?". Prima l'unico
-         segnale era una tendina del pensiero che si apriva e si chiudeva.
-         Nascosto finché non c'è un piano: su una richiesta semplice sarebbe
-         una scatola vuota. -->
+    <!-- ============================ cruscotto ============================
+         La colonna risponde a tre domande, in quest'ordine: quanto va veloce
+         adesso, dove sta andando il tempo del turno, quanto spazio resta.
+         Prima c'erano cinque righe di numeri aggiornati a fine turno, cioe'
+         quando non servivano piu'. Ora arrivano dal vivo (evento `metriche`,
+         quattro al secondo, core/cruscotto.py) e li disegna web/cruscotto.js.
+         Ogni scheda e' una `.card` figlia diretta di #panel: e' cosi' che la
+         home del vault le nasconde tutte insieme (mostraVaultHome). -->
+
+    <!-- Velocita'. Il numero grande e' la velocita' ADESSO (ultimi 1,5 s di
+         generazione, sull'orologio del server quando lo dichiara); sotto, la
+         traccia del turno colorata per fase e i tre numeri che spiegano
+         un'attesa: primo token, prefill, token generati. -->
+    <section class="card cr-card" id="cr-tachimetro" aria-label="Velocità di generazione">
+      <button class="cr-head" type="button" data-cr-chiudi="tachimetro" aria-expanded="true">
+        <span class="cr-label">Velocità</span>
+        <span class="cr-fase" id="cr-fase" data-fase="riposo"><i aria-hidden="true"></i><span id="cr-fase-testo">a riposo</span></span>
+      </button>
+      <div class="cr-corpo">
+        <div class="cr-hero" id="cr-hero">
+          <span class="cr-num" id="cr-tok">—</span><span class="cr-unit" id="cr-unita">tok/s</span>
+        </div>
+        <div class="cr-sub" id="cr-sub">Nessun turno misurato in questa chat.</div>
+        <div class="cr-prefill" id="cr-prefill-barra" hidden><span id="cr-prefill-fill"></span></div>
+        <svg class="cr-traccia" id="cr-traccia" role="img" aria-label="Velocità nel turno" preserveAspectRatio="none"></svg>
+        <div class="cr-mini">
+          <div><span class="cr-mini-k">primo token</span><span class="cr-mini-v" id="cr-ttft">—</span></div>
+          <div><span class="cr-mini-k">prefill tok/s</span><span class="cr-mini-v" id="cr-prefill">—</span></div>
+          <div><span class="cr-mini-k">generati</span><span class="cr-mini-v" id="cr-gen">—</span></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Il turno passo per passo: ogni riga e' un passo, e la sua striscia
+         dice dove e' andato il tempo -- attesa del primo token (prefill
+         compreso), pensiero, risposta, argomenti delle chiamate, esecuzione
+         dei tool. Le strisce sono in scala fra loro, non sulla finestra: la
+         domanda e' "quale passo e' costato", non "quanto dura un minuto". -->
+    <section class="card cr-card" id="cr-turno" aria-label="Il turno passo per passo">
+      <button class="cr-head" type="button" data-cr-chiudi="turno" aria-expanded="true">
+        <span class="cr-label">Turno</span>
+        <span class="cr-meta" id="cr-turno-meta">—</span>
+      </button>
+      <div class="cr-corpo">
+        <div class="cr-somma" id="cr-somma" role="img" aria-label="Dove è andato il tempo"></div>
+        <div class="cr-legenda" id="cr-legenda"></div>
+        <div class="cr-righe" id="cr-righe"><div class="empty">I passi del prossimo turno compariranno qui.</div></div>
+        <div class="cr-piede" id="cr-turno-piede" hidden></div>
+      </div>
+    </section>
+
+    <!-- Contesto: quanto e' pieno, quanto del prompt il server ha ripreso
+         dalla cache e quanto ha dovuto ricalcolare. Si aggiorna a ogni passo
+         (prima: all'invio e a fine turno). Sotto, il draft MTP quando c'e':
+         la quota di token proposti e accettati dice se lo speculative
+         decoding sta rendendo -- la velocita' da sola non lo dice. -->
+    <section class="card cr-card" id="cr-contesto" aria-label="Contesto">
+      <button class="cr-head" type="button" data-cr-chiudi="contesto" aria-expanded="true">
+        <span class="cr-label">Contesto</span>
+        <span class="cr-meta" id="ctx-used">—</span>
+      </button>
+      <div class="cr-corpo">
+        <div class="cr-meter" id="ctx-meter" role="img" aria-label="Occupazione della finestra">
+          <span class="cr-meter-cache" id="cr-ctx-cache"></span><span class="cr-meter-nuovi" id="ctx-bar"></span>
+        </div>
+        <div class="cr-riga-kv">
+          <span id="ctx-pct">—</span>
+          <span id="cr-ctx-dettaglio"></span>
+        </div>
+        <div class="cr-draft" id="cr-draft" hidden>
+          <div class="cr-riga-kv"><span class="cr-sottolabel">Draft MTP</span><span id="cr-draft-v">—</span></div>
+          <div class="cr-meter cr-meter-draft"><span id="cr-draft-fill"></span></div>
+          <div class="cr-draft-passi" id="cr-draft-passi" role="img" aria-label="Accettazione del draft per passo"></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Il piano: "a che punto e'". Nascosto finche' non c'e' un piano: su
+         una richiesta semplice sarebbe una scatola vuota. -->
     <div class="card" id="plan-card" style="display:none">
       <h4>Piano <span class="plan-count" id="plan-count">—</span></h4>
-      <!-- A che punto è, prima di leggere una riga. Il conteggio accanto al
-           titolo c'era già, ma è la cosa meno visibile della scheda: la barra
-           risponde da lontano, e con un piano da dieci punti risponde anche
-           quando i punti chiusi sono scorsi fuori dalla vista. Due segmenti,
-           perché "saltato" non è "fatto" e non deve contarci dentro. -->
+      <!-- Due segmenti, perché "saltato" non è "fatto" e non deve contarci
+           dentro. -->
       <div class="plan-bar" id="plan-bar" role="img" aria-label="avanzamento del piano">
         <span class="plan-bar-done" id="plan-bar-done"></span>
         <span class="plan-bar-skipped" id="plan-bar-skipped"></span>
@@ -365,55 +437,31 @@ try {
       <div id="plan"></div>
     </div>
 
-    <!-- Le note stanno sotto il piano perché rispondono all'altra domanda:
-         non "a che punto è" ma "cosa ha capito". Le scrive il modello mentre
-         lavora, e sono ciò che sopravvive quando la cronologia viene
-         compattata — quindi vederle serve anche a sapere cosa NON verrà
-         perso. Nascoste finché il foglio è vuoto. -->
+    <!-- Velocita' contro contesto, passo per passo e turno per turno: quanto
+         rallenta il modello man mano che il prompt cresce. I punti dei turni
+         vecchi sono grigi, quelli dell'ultimo colorati, il passo in corso
+         pulsa. La retta e' la tendenza, e il titolo la dice in parole. -->
+    <section class="card cr-card" id="cr-dispersione" aria-label="Velocità e contesto">
+      <button class="cr-head" type="button" data-cr-chiudi="dispersione" aria-expanded="true">
+        <span class="cr-label">Velocità e contesto</span>
+        <span class="cr-meta" id="cr-tendenza">—</span>
+      </button>
+      <div class="cr-corpo">
+        <svg class="cr-grafico" id="cr-grafico" role="img" aria-label="Token al secondo rispetto ai token del prompt"></svg>
+        <div class="cr-didascalia" id="cr-didascalia"></div>
+      </div>
+    </section>
+
+    <!-- Le note: "cosa ha capito". Sono ciò che sopravvive alla
+         compattazione. Nascoste finché il foglio è vuoto. -->
     <div class="card" id="notes-card" style="display:none">
       <h4>Note <span class="plan-count" id="notes-count">—</span></h4>
       <div id="notes"></div>
     </div>
 
-    <!-- Contesto e ultima esecuzione erano due riquadri con due intestazioni
-         per rispondere alla stessa domanda: quanto sta costando. Uniti, la
-         barra fa da titolo e i numeri del turno appena finito le stanno sotto,
-         separati da una riga invece che da un bordo, un'ombra e 19px di aria. -->
-    <div class="card">
-      <h4>Consumo</h4>
-      <div class="meter" id="ctx-meter"><div id="ctx-bar" style="width:0%"></div></div>
-      <div class="kv"><span>Inviati al modello</span><span id="ctx-used">—</span></div>
-      <div class="kv"><span>Finestra</span><span id="ctx-window">—</span></div>
-      <div class="kv"><span>Occupazione</span><span id="ctx-pct">—</span></div>
-
-      <div id="usage-block" style="display:none">
-        <div class="card-split">Ultima esecuzione</div>
-        <div class="kv"><span>Prompt</span><span id="u-prompt">—</span></div>
-        <div class="kv"><span>Generati</span><span id="u-gen">—</span></div>
-        <div class="kv"><span>Velocità</span><span id="u-speed">—</span></div>
-        <div class="kv"><span>Totale</span><span id="u-total">—</span></div>
-        <!-- Quante volte l'harness ha dovuto correggere il modello. Compare solo
-             quando è successo: su un modello che non ne ha bisogno la riga non
-             c'è, ed è esattamente l'informazione che serve per decidere se le
-             reti di sicurezza si possono togliere. -->
-        <div class="kv" id="u-nudge-row" style="display:none">
-          <span title="Solleciti automatici che l'harness ha dovuto iniettare">Correzioni</span>
-          <span id="u-nudges">—</span>
-        </div>
-        <!-- Quanto rende il draft model. Compare solo se il server ne ha uno e
-             ne dichiara i contatori: senza speculative decoding la riga non
-             c'è, e non c'è nemmeno un numero inventato al suo posto. -->
-        <div class="kv" id="u-draft-row" style="display:none">
-          <span title="Token proposti dal draft model e accettati dal modello grande">Draft</span>
-          <span id="u-draft">—</span>
-        </div>
-      </div>
-    </div>
-
-    <!-- I file toccati erano righe di testo monospaziato: si leggevano e basta.
-         Sono le stesse gocce di fine turno, quindi hanno lo stesso aspetto e lo
-         stesso gesto — il nome apre l'anteprima, l'iconcina apre la cartella. -->
-    <div class="card">
+    <!-- I file toccati: le stesse gocce di fine turno, stesso gesto. Si
+         aggiornano a ogni tool che scrive, non a fine turno. -->
+    <div class="card" id="files-card">
       <h4 id="files-title">File toccati</h4>
       <div id="files"><div class="empty">Nessun file toccato.</div></div>
     </div>
@@ -469,6 +517,7 @@ try {
 <!-- Prima di app.js: definisce lo schema e le funzioni del menu, che usano
      quelle di app.js solo quando vengono chiamate. -->
 <script src="/static/impostazioni.js"></script>
+<script src="/static/cruscotto.js"></script>
 <script src="/static/app.js"></script>
 </body>
 </html>

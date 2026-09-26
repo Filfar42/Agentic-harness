@@ -72,12 +72,17 @@ def test_quello_che_il_client_sa_gia_non_lo_chiede_al_server():
 def test_il_riquadro_dell_ultima_esecuzione_si_spegne_cambiando_chat():
     """``renderUsage`` accendeva il blocco e non lo spegneva mai: erano numeri
     senza etichetta di provenienza, e letti nel posto sbagliato non sembrano
-    vecchi, sembrano sbagliati."""
+    vecchi, sembrano sbagliati.
+
+    Col cruscotto (26/09/2026) la regola resta e si precisa: cambiando chat si
+    azzera tutto; rileggendo la **stessa** chat (fine turno, riallineamento)
+    no, perche' la traccia dal vivo del turno appena finito esiste solo nella
+    pagina."""
     js = (WEB / "app.js").read_text(encoding="utf-8")
     assert "function resetUsage()" in js
     corpo = js[js.index("async function showSession(") :]
     corpo = corpo[: corpo.index("\n}\n")]
-    assert "resetUsage()" in corpo
+    assert "if (conversationChanged && typeof window !== 'undefined') window.Cruscotto?.reset();" in corpo
 
 
 def test_entrando_in_una_chat_si_atterra_sull_ultimo_messaggio():

@@ -1,0 +1,302 @@
+/* Il cruscotto della colonna di destra (web/cruscotto.js).
+ *
+ * Solo i token di style.css, piu' cinque colori di fase. I colori sono una
+ * palette categoriale validata per daltonismo (protan, deutan, tritan) sulle
+ * coppie adiacenti nell'ordine in cui compaiono -- pensiero, risposta,
+ * argomenti, tool -- e ognuno ha almeno 3:1 sulla superficie delle schede,
+ * in chiaro e in scuro. L'attesa e' grigia di proposito: e' il tempo in cui
+ * il modello non produce niente, e non deve competere con le altre. */
+
+:root {
+  --fase-attesa: #b3c1c4;
+  --fase-pensiero: #7b61c9;
+  --fase-risposta: #0b8f7f;
+  --fase-chiamate: #e0692e;
+  --fase-tool: #2a78d6;
+}
+html[data-theme="dark"] {
+  --fase-attesa: #4a6066;
+  --fase-pensiero: #9085e9;
+  --fase-risposta: #22a592;
+  --fase-chiamate: #e0702f;
+  --fase-tool: #4a90e2;
+}
+
+/* ``--c`` e' il colore della fase dell'elemento: lo decide ``data-fase``, e
+   chi lo usa ha comunque il grigio dell'attesa come ripiego. */
+[data-fase="attesa"], [data-fase="riposo"] {
+  --c: var(--fase-attesa);
+}
+[data-fase="pensiero"] {
+  --c: var(--fase-pensiero);
+}
+[data-fase="risposta"] {
+  --c: var(--fase-risposta);
+}
+[data-fase="chiamate"] {
+  --c: var(--fase-chiamate);
+}
+[data-fase="tool"] {
+  --c: var(--fase-tool);
+}
+
+/* ---------- la colonna ---------- */
+
+/* Schede piatte: il bordo basta a separarle, l'ombra era rumore. I titoli in
+   minuscolo e a colore pieno: le etichette maiuscole da 10px erano la cosa
+   piu' piccola e piu' grigia della colonna, cioe' quella che non si legge. */
+#panel { padding: 12px 12px 20px; }
+#panel .card {
+  border-radius: 14px; padding: 12px 14px 13px; margin-bottom: 10px;
+  box-shadow: none;
+}
+#panel .card h4 {
+  display: flex; align-items: baseline; justify-content: space-between; gap: 8px;
+  margin: 0 0 9px; font-size: 12.5px; font-weight: 600; letter-spacing: -0.005em;
+  text-transform: none; color: var(--text);
+}
+#panel .plan-count {
+  float: none; font-family: var(--mono); font-size: 11px; font-weight: 500;
+  color: var(--text-faint);
+}
+
+/* Testa di una scheda del cruscotto: e' un bottone, perche' la scheda si
+   chiude cliccandola (la scelta resta in localStorage). */
+.cr-head {
+  width: 100%; display: flex; align-items: center; justify-content: space-between;
+  gap: 8px; margin: 0 0 10px; text-align: left; border-radius: 6px;
+}
+.cr-head:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 3px; }
+.cr-label {
+  font-size: 12.5px; font-weight: 600; letter-spacing: -0.005em; color: var(--text);
+  display: inline-flex; align-items: center; gap: 6px; flex: none; white-space: nowrap;
+}
+.cr-label::before {
+  content: ""; width: 6px; height: 6px; flex: none;
+  border-right: 1.5px solid var(--text-faint); border-bottom: 1.5px solid var(--text-faint);
+  transform: rotate(45deg) translate(-1px, -1px);
+  transition: transform var(--motion-ui) var(--ease-out);
+}
+.cr-chiusa .cr-label::before { transform: rotate(-45deg); }
+.cr-meta {
+  font-family: var(--mono); font-size: 11px; color: var(--text-faint);
+  font-variant-numeric: tabular-nums; white-space: nowrap;
+  overflow: hidden; text-overflow: ellipsis; min-width: 0;
+}
+.cr-chiusa .cr-head { margin-bottom: 0; }
+.cr-chiusa .cr-corpo { display: none; }
+
+/* ---------- velocita' ---------- */
+
+.cr-fase {
+  display: inline-flex; align-items: center; gap: 6px; min-width: 0;
+  padding: 2px 9px 2px 7px; border-radius: 999px;
+  font-size: 11.5px; color: var(--text-muted);
+  background: var(--surface-alt); border: 1px solid var(--border);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.cr-fase i { width: 7px; height: 7px; border-radius: 50%; flex: none; background: var(--c, var(--fase-attesa)); }
+.cr-fase.vivo i { animation: cr-pulsa 1.4s ease-in-out infinite; }
+.cr-fase #cr-fase-testo { overflow: hidden; text-overflow: ellipsis; }
+@keyframes cr-pulsa {
+  0%, 100% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--c, var(--fase-attesa)) 55%, transparent); }
+  50% { box-shadow: 0 0 0 4px color-mix(in srgb, var(--c, var(--fase-attesa)) 0%, transparent); }
+}
+
+.cr-hero { display: flex; align-items: baseline; gap: 7px; margin: 0 0 3px; }
+/* Cifre tabellari anche se e' un numero solo: cambia quattro volte al
+   secondo, e con cifre proporzionali ballerebbe di larghezza. */
+.cr-num {
+  font-size: 46px; line-height: 1; font-weight: 600; letter-spacing: -0.035em;
+  font-variant-numeric: tabular-nums; color: var(--text);
+  transition: opacity var(--motion-ui) var(--ease-out);
+}
+.cr-hero.spento .cr-num { opacity: 0.4; }
+.cr-unit { font-size: 13px; font-weight: 500; color: var(--text-muted); }
+.cr-sub {
+  min-height: 18px; font-size: 12px; color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+.cr-prefill {
+  height: 3px; margin: 7px 0 0; border-radius: 2px; overflow: hidden;
+  background: var(--border);
+}
+.cr-prefill[hidden] { display: none; }
+.cr-prefill span {
+  display: block; height: 100%; width: 0; border-radius: 2px;
+  background: var(--text-faint); transition: width var(--motion-ui) var(--ease-out);
+}
+.cr-traccia { display: block; width: 100%; height: 46px; margin: 12px 0 11px; overflow: visible; }
+.cr-barretta { fill: var(--c, var(--fase-attesa)); }
+.cr-barretta:hover { opacity: 0.75; }
+.cr-asse { stroke: var(--border-strong); stroke-width: 1; }
+.cr-griglia { stroke: var(--border); stroke-width: 1; }
+.cr-scala { font-family: var(--mono); font-size: 9.5px; fill: var(--text-faint); }
+.cr-vuoto { font-size: 11.5px; fill: var(--text-faint); }
+
+.cr-mini {
+  display: grid; grid-template-columns: repeat(3, minmax(0, 1fr));
+  padding-top: 9px; border-top: 1px solid var(--border);
+}
+.cr-mini > div { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
+.cr-mini > div + div { padding-left: 10px; border-left: 1px solid var(--border); margin-left: -1px; }
+.cr-mini > div:not(:last-child) { padding-right: 6px; }
+.cr-mini-k { font-size: 10.5px; color: var(--text-faint); white-space: nowrap; }
+.cr-mini-v {
+  font-size: 13px; font-weight: 600; color: var(--text);
+  font-variant-numeric: tabular-nums; white-space: nowrap;
+  overflow: hidden; text-overflow: ellipsis;
+}
+
+/* ---------- turno ---------- */
+
+/* La somma: una barra al 100%, un pezzo per fase, 2px di superficie fra un
+   pezzo e l'altro al posto di un bordo. */
+.cr-somma { display: flex; gap: 2px; height: 8px; border-radius: 4px; overflow: hidden; }
+.cr-somma span { min-width: 2px; background: var(--c, var(--fase-attesa)); }
+.cr-somma:empty { display: none; }
+.cr-legenda {
+  display: flex; flex-wrap: wrap; gap: 3px 11px; margin: 7px 0 10px;
+  font-size: 11px; color: var(--text-muted);
+}
+.cr-legenda:empty { display: none; }
+.cr-voce { display: inline-flex; align-items: center; gap: 4px; cursor: default; }
+.cr-voce i { width: 8px; height: 8px; border-radius: 2px; background: var(--c, var(--fase-attesa)); }
+.cr-voce b { font-weight: 600; color: var(--text); font-variant-numeric: tabular-nums; }
+
+.cr-righe {
+  display: flex; flex-direction: column; gap: 3px;
+  max-height: 204px; overflow-y: auto;
+  padding-right: 4px; margin-right: -4px;
+}
+.cr-riga {
+  display: grid; grid-template-columns: 22px minmax(0, 1fr) 46px; align-items: center;
+  gap: 8px; min-height: 18px;
+}
+.cr-n {
+  font-family: var(--mono); font-size: 10.5px; color: var(--text-faint);
+  text-align: right; font-variant-numeric: tabular-nums;
+}
+/* Una compattazione prima del passo: il numero si tinge e prende un segno.
+   Il colore da solo non basterebbe. */
+.cr-riga.compattato .cr-n { color: var(--warn); }
+.cr-riga.compattato .cr-n::before { content: "\21BA\00A0"; }
+.cr-pista {
+  height: 10px; border-radius: 3px; background: var(--surface-alt);
+  overflow: hidden;
+}
+.cr-striscia {
+  display: flex; gap: 2px; height: 100%; min-width: 3px; width: 0;
+  border-radius: 3px; overflow: hidden;
+  transition: width 240ms var(--ease-out);
+}
+.cr-striscia span { height: 100%; min-width: 1px; background: var(--c, var(--fase-attesa)); }
+.cr-striscia span[hidden] { display: none; }
+.cr-dur {
+  font-family: var(--mono); font-size: 10.5px; color: var(--text-muted);
+  text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap;
+}
+.cr-riga:hover .cr-pista { box-shadow: 0 0 0 1px var(--border-strong); }
+.cr-riga.vivo .cr-n { color: var(--accent); font-weight: 700; }
+.cr-riga.vivo .cr-pista { background: var(--accent-soft); }
+.cr-riga.vivo .cr-striscia { animation: cr-respira 1.6s ease-in-out infinite; }
+@keyframes cr-respira { 50% { opacity: 0.72; } }
+
+.cr-piede {
+  display: flex; justify-content: space-between; gap: 8px;
+  margin-top: 10px; padding-top: 8px; border-top: 1px solid var(--border);
+  font-size: 11.5px; color: var(--text-muted); font-variant-numeric: tabular-nums;
+}
+.cr-piede[hidden] { display: none; }
+.cr-correzioni { color: var(--warn); cursor: help; white-space: nowrap; }
+
+/* ---------- contesto ---------- */
+
+/* Pieno = ripreso dalla cache, tratteggiato = ricalcolato: si distinguono
+   anche senza distinguere i colori. */
+.cr-meter {
+  display: flex; height: 8px; margin: 1px 0 8px; border-radius: 4px; overflow: hidden;
+  background: var(--accent-soft);
+  --m: var(--accent);
+  --m2: var(--accent-border);
+}
+.cr-meter.warn {
+  --m: var(--warn);
+  --m2: color-mix(in srgb, var(--warn) 45%, var(--surface));
+}
+.cr-meter.err {
+  --m: var(--err);
+  --m2: color-mix(in srgb, var(--err) 45%, var(--surface));
+}
+.cr-meter > span { height: 100%; width: 0; transition: width var(--motion-ui) var(--ease-out); }
+.cr-meter-cache { background: var(--m); }
+.cr-meter-nuovi {
+  background: repeating-linear-gradient(-45deg, var(--m) 0 2px, var(--m2) 2px 4.5px);
+  box-shadow: inset 2px 0 0 var(--surface);
+}
+.cr-meter-nuovi.solo { box-shadow: none; }
+.cr-riga-kv {
+  display: flex; justify-content: space-between; gap: 8px;
+  font-size: 11.5px; color: var(--text-muted); font-variant-numeric: tabular-nums;
+}
+.cr-draft { margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--border); }
+.cr-draft[hidden] { display: none; }
+.cr-draft .cr-riga-kv { margin-bottom: 6px; }
+.cr-sottolabel { font-size: 12px; font-weight: 600; color: var(--text); }
+#cr-draft-v { font-weight: 600; color: var(--text); cursor: help; }
+.cr-meter-draft { margin-bottom: 6px; }
+.cr-meter-draft span { background: var(--accent); }
+.cr-draft-passi { display: flex; align-items: flex-end; gap: 2px; height: 22px; }
+.cr-draft-passi span {
+  flex: 1 1 0; max-width: 9px; min-height: 2px;
+  border-radius: 2px 2px 0 0; background: var(--accent-border);
+}
+.cr-draft-passi span:last-child { background: var(--accent); }
+
+/* ---------- velocita' e contesto ---------- */
+
+.cr-grafico { display: block; width: 100%; height: 150px; overflow: visible; }
+.cr-didascalia {
+  margin-top: 6px; font-size: 11.5px; color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+.cr-didascalia b { color: var(--text); font-weight: 600; }
+.cr-didascalia:empty { display: none; }
+.cr-punto-vecchio { fill: var(--text-faint); opacity: 0.38; }
+.cr-punto-ultimo { fill: var(--accent); stroke: var(--surface); stroke-width: 1.5; }
+.cr-punto-vivo {
+  fill: var(--accent); stroke: var(--surface); stroke-width: 2;
+  animation: cr-lampeggia 1.4s ease-in-out infinite;
+}
+@keyframes cr-lampeggia { 50% { opacity: 0.55; } }
+.cr-tendenza { stroke: var(--accent); stroke-width: 1.5; stroke-linecap: round; opacity: 0.6; }
+.cr-bersaglio { fill: transparent; }
+
+/* ---------- suggerimento ---------- */
+
+.cr-tip {
+  position: fixed; z-index: 1000; pointer-events: none;
+  max-width: 250px; padding: 6px 9px 7px;
+  background: var(--surface); color: var(--text-muted);
+  border: 1px solid var(--border-strong); border-radius: 8px;
+  box-shadow: var(--shadow); font-size: 11.5px; line-height: 1.45;
+}
+.cr-tip[hidden] { display: none; }
+.cr-tip b { color: var(--text); font-weight: 600; font-variant-numeric: tabular-nums; }
+.cr-tip-testa b { font-size: 12.5px; }
+.cr-tip-chiave {
+  display: inline-block; width: 10px; height: 3px; border-radius: 2px;
+  margin-right: 6px; vertical-align: 2px; background: var(--c, var(--fase-attesa));
+}
+
+/* ---------- finestra stretta ---------- */
+
+@media (max-width: 1100px) {
+  .cr-num { font-size: 38px; }
+  .cr-mini-v { font-size: 12px; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .cr-fase.vivo i, .cr-riga.vivo .cr-striscia, .cr-punto-vivo { animation: none; }
+  .cr-striscia, .cr-meter > span, .cr-prefill span { transition: none; }
+}

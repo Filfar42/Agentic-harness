@@ -1315,9 +1315,17 @@ function handleEvent(event, turn, status, setStatus) {
   switch (event.type) {
     case 'start':
       setStatus(event.resume ? 'Riprendo…' : 'Il modello sta pensando…');
+      if (typeof window !== 'undefined') window.Cruscotto?.inizioTurno();
       break;
     case 'step':
       setStatus(`Passo ${event.step}/${event.total}`);
+      if (typeof window !== 'undefined') window.Cruscotto?.passo(event.step, event.total);
+      break;
+    case 'metriche':
+      // Il cruscotto della colonna di destra: velocita', fase, prefill,
+      // draft. Quattro al secondo durante la generazione, uno definitivo a
+      // fine passo. Non tocca il thread.
+      if (typeof window !== 'undefined') window.Cruscotto?.metriche(event);
       break;
     case 'note':
       // Avvisi dell'harness, non del modello: immagini entrate in contesto,
@@ -1342,12 +1350,19 @@ function handleEvent(event, turn, status, setStatus) {
       break;
     case 'tool_start':
       setStatus(`Eseguo ${event.name}…`);
+      if (typeof window !== 'undefined') window.Cruscotto?.toolInizio(event.name);
       break;
-    case 'tool_end':
+    case 'tool_end': {
       turn.addTool(toolDrawer(event.name, event.args, event.result, event.duration_s, event.ok));
       turn.noteFile(event.name, event.args, event.result, event.ok);
       forseRicarica(event.name, event.args, event.result, event.ok);
+      if (typeof window !== 'undefined') window.Cruscotto?.toolFine(event.name, event.duration_s);
+      // La scheda dei file toccati si aggiorna adesso, non a fine turno: la
+      // stessa regola delle gocce (``fileTocca``), un file per volta.
+      const toccato = fileTocca(event.name, event.args, event.result, event.ok);
+      if (toccato) aggiungiToccato(toccato.path);
       break;
+    }
     case 'plan':
       renderPlan(event.steps);
       break;
@@ -1356,6 +1371,7 @@ function handleEvent(event, turn, status, setStatus) {
       break;
     case 'compacted':
       turn.append(compactedNode(event));
+      if (typeof window !== 'undefined') window.Cruscotto?.compattato();
       break;
     case 'preview':
       renderPreview(event.payload);
@@ -1412,7 +1428,9 @@ function handleEvent(event, turn, status, setStatus) {
           'Scrivi "continua" per riprendere (le verifiche rimaste rosse restano aperte) o indica un\'altra strada.'));
       }
       if (rosse.length) turn.append(renderQualita(qualita));
-      if (event.usage) renderUsage(event.usage);
+      // Il riassunto del turno (media, token, correzioni) lo disegna il
+      // cruscotto, che ha gia' le righe di ogni passo.
+      if (typeof window !== 'undefined') window.Cruscotto?.fine(event);
       break;
     }
     case 'state':
@@ -1517,35 +1535,47 @@ async function submitAnswer(answer) {
 // Pannelli
 // ---------------------------------------------------------------------------
 
-function applyStats(stats) {
-  state.stats = stats;
-  const used = stats.context_used || 0;
-  const window = stats.context_window || 1;
-  const ratio = Math.min(1, used / window);
-
-  $('#ctx-meter').className = 'meter' + (ratio > 0.9 ? ' err' : ratio > 0.7 ? ' warn' : '');
-  $('#ctx-bar').style.width = (ratio * 100).toFixed(1) + '%';
-  $('#ctx-used').textContent = '~' + used.toLocaleString('it-IT') + ' tok';
-  $('#ctx-window').textContent = window.toLocaleString('it-IT') + ' tok';
-  $('#ctx-pct').textContent = Math.round(ratio * 100) + '%';
-
-  renderAttachments(stats.attachments || []);
-
-  const files = stats.touched_files || [];
+/** I file toccati della conversazione, nella scheda in fondo alla colonna.
+ *
+ *  Le stesse gocce di fine turno, impilate: il nome apre l'anteprima e
+ *  l'iconcina la cartella. Riusare ``fileChips`` e non una seconda lista di
+ *  righe e' cio' che tiene un gesto solo per lo stesso oggetto -- e cio' che
+ *  evita di doverlo correggere in due posti.
+ */
+function renderToccati(files) {
+  state.toccati = files.slice();
   $('#files-title').textContent = `File toccati (${files.length})`;
   const box = $('#files');
   box.innerHTML = '';
   if (!files.length) {
     box.innerHTML = '<div class="empty">Nessun file toccato.</div>';
-  } else {
-    // Le stesse gocce di fine turno, impilate: il nome apre l'anteprima e
-    // l'iconcina la cartella. Riusare ``fileChips`` e non una seconda lista di
-    // righe e' cio' che tiene un gesto solo per lo stesso oggetto -- e cio'
-    // che evita di doverlo correggere in due posti.
-    const chips = fileChips(files.slice(0, 40).map((path) => ({ path, action: 'toccato' })));
-    chips.classList.add('stacked');
-    box.appendChild(chips);
+    return;
   }
+  const chips = fileChips(files.slice(0, 40).map((path) => ({ path, action: 'toccato' })));
+  chips.classList.add('stacked');
+  box.appendChild(chips);
+}
+
+/** Un file appena scritto dal turno in corso: entra subito nella scheda.
+ *  Prima la scheda si aggiornava solo con le stats di fine turno, e durante
+ *  un turno da dieci minuti diceva "nessun file toccato" mentre l'agente ne
+ *  riscriveva sei. Le stats di fine turno restano la fonte: la rimettono in
+ *  ordine e ci aggiungono i file toccati da altre strade. */
+function aggiungiToccato(path) {
+  const attuali = state.toccati || [];
+  if (attuali.includes(path)) return;
+  renderToccati([...attuali, path].sort());
+}
+
+function applyStats(stats) {
+  state.stats = stats;
+  // Contesto, timeline dell'ultimo turno e punti velocita'/contesto: li
+  // disegna il cruscotto (web/cruscotto.js), che a turno vivo li tiene
+  // aggiornati dagli eventi e qui prende solo lo storico.
+  if (typeof window !== 'undefined') window.Cruscotto?.stats(stats);
+
+  renderAttachments(stats.attachments || []);
+  renderToccati(stats.touched_files || []);
 
   // La lista arriva gia' dentro le stats: chi apre una chat non deve fare
   // una seconda GET /api/sessions per riavere le stesse righe.
@@ -2354,72 +2384,15 @@ function closePreview() {
   $('#ov-body').innerHTML = '';
 }
 
-/** Nasconde i numeri dell'ultima esecuzione.
+/** Il messaggio e' partito: i numeri del cruscotto sono del turno di prima.
  *
- *  ``renderUsage`` accendeva il blocco e non lo spegneva mai: aprendo una chat
- *  nuova restavano in vista prompt, token generati e velocità **della chat
- *  precedente**, e sparivano solo quando il primo turno di quella nuova finiva.
- *  Sono numeri senza etichetta di provenienza: letti nel posto sbagliato non
- *  sembrano vecchi, sembrano sbagliati.
+ *  Fra l'invio e il primo evento del modello possono passare i secondi del
+ *  caricamento in VRAM, e i numeri vecchi -- senza etichetta di provenienza --
+ *  letti in quel momento non sembrano vecchi, sembrano sbagliati. Il
+ *  cruscotto lo dice ("invio…") finche' il turno non parte davvero.
  */
 function resetUsage() {
-  $('#usage-block').style.display = 'none';
-  $('#u-nudge-row').style.display = 'none';
-  $('#u-draft-row').style.display = 'none';
-  ['#u-prompt', '#u-gen', '#u-speed', '#u-total', '#u-nudges', '#u-draft'].forEach((id) => {
-    $(id).textContent = '—';
-  });
-}
-
-function renderUsage(usage) {
-  if (!usage || !Object.keys(usage).length) return;
-  const evalMs = usage.eval_ms || 0;
-  const tps = evalMs ? (usage.completion_tokens || 0) / (evalMs / 1000) : 0;
-  $('#usage-block').style.display = '';
-  $('#u-prompt').textContent = (usage.prompt_tokens || 0).toLocaleString('it-IT') + ' tok';
-  $('#u-gen').textContent = (usage.completion_tokens || 0).toLocaleString('it-IT') + ' tok';
-  $('#u-speed').textContent = tps.toFixed(1) + ' tok/s';
-  $('#u-total').textContent = ((usage.total_ms || 0) / 1000).toFixed(1) + ' s';
-
-  // I nomi interni dei nudge non dicono niente a chi guarda: si traducono.
-  const NUDGE_LABELS = {
-    tool: 'ha risposto a parole invece di agire',
-    ask: 'ha chiesto a parole invece di usare il tool',
-    verify: 'ha lasciato una verifica rossa',
-    loop: 'ha ripetuto lo stesso comando fallito',
-    coverage: 'ha verificato codice diverso da quello scritto',
-    summary: 'ha chiuso il turno senza scrivere',
-    summary_failed: 'ha chiuso in rosso senza dirlo',
-    json_leak: 'ha stampato la tool call come testo',
-  };
-  const nudges = usage.nudges && Object.entries(usage.nudges).filter(([, n]) => n > 0);
-  if (nudges && nudges.length) {
-    $('#u-nudge-row').style.display = '';
-    $('#u-nudges').textContent = nudges.reduce((sum, [, n]) => sum + n, 0);
-    $('#u-nudges').title = nudges
-      .map(([key, n]) => `${n}× ${NUDGE_LABELS[key] || key}`)
-      .join('\n');
-  } else {
-    $('#u-nudge-row').style.display = 'none';
-  }
-
-  // Speculative decoding: quanti token ha proposto il draft model e quanti ne
-  // ha tenuti il modello grande. È l'unico modo di sapere se sta rendendo —
-  // la velocità da sola non dice se il merito è del draft o del contesto
-  // corto. Senza draft i contatori non arrivano e la riga resta nascosta.
-  const draftN = usage.draft_n || 0;
-  if (draftN > 0) {
-    const accettati = usage.draft_accepted || 0;
-    const quota = Math.round((accettati / draftN) * 100);
-    $('#u-draft-row').style.display = '';
-    $('#u-draft').textContent =
-      quota + '% · ' + accettati.toLocaleString('it-IT') + '/' + draftN.toLocaleString('it-IT');
-    $('#u-draft').title =
-      accettati.toLocaleString('it-IT') + ' token accettati su ' + draftN.toLocaleString('it-IT') +
-      ' proposti dal draft model.\nQuota bassa = il draft sta costando calcolo senza far guadagnare tempo.';
-  } else {
-    $('#u-draft-row').style.display = 'none';
-  }
+  if (typeof window !== 'undefined') window.Cruscotto?.preparaTurno();
 }
 
 /** Evidenzia i termini cercati dentro un estratto gia' da scappare.
@@ -2655,9 +2628,11 @@ async function showSession(payload, { entrando = false } = {}) {
     // quando a spostarlo e' stato l'altro schermo.
     dopoIlCambio(payload, 'Ora si lavora in: ' + nomeCartella(payload.workspace_dir));
   }
-  // I numeri dell'ultima esecuzione sono di **quella** conversazione: cambiando
-  // chat vanno via subito, prima ancora di disegnare la nuova.
-  resetUsage();
+  // I numeri del cruscotto sono di **quella** conversazione: cambiando chat
+  // vanno via subito, prima ancora di disegnare la nuova. Rileggere la stessa
+  // chat (fine turno, riallineamento) invece non li tocca: la traccia dal
+  // vivo del turno appena finito esiste solo in questa pagina.
+  if (conversationChanged && typeof window !== 'undefined') window.Cruscotto?.reset();
   // Il piano arriva dal payload, non dagli eventi: riaprendo una chat vecchia
   // il pannello si ripopola anche se il turno che l'ha scritto e' finito ieri.
   renderPlan(payload.plan);

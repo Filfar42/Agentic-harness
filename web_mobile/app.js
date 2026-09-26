@@ -37,6 +37,158 @@ let contaSecondi = 0;
 let inizioTurno = 0;
 let tickAttivita = null;
 
+// ------------------------------------------- velocita', contesto, piano ----
+//
+// Le stesse misure del cruscotto del desktop, ridotte a tre segni: la goccia
+// con i token al secondo, la riga del contesto sotto la barra, la rotaia del
+// piano sul bordo destro. Dal vivo vengono dall'evento ``metriche`` e ``plan``
+// dello stream; a riposo dalla rilettura della conversazione.
+
+let misure = { tokS: null, viva: false, usato: 0, finestra: 0, esatto: false,
+  cache: null, draftN: null, draftOk: null };
+let pianoCorrente = [];
+
+function fmtUno(v) {
+  return v == null ? "—" : v.toLocaleString("it-IT", { minimumFractionDigits: 1, maximumFractionDigits: 1 });
+}
+
+function fmtMigliaia(v) {
+  if (v == null) return "—";
+  return v < 1000 ? String(Math.round(v)) : (v / 1000).toLocaleString("it-IT", { maximumFractionDigits: 1 }) + "k";
+}
+
+/** La goccia: il numero, e se il modello sta generando adesso. */
+function disegnaGoccia() {
+  const goccia = $("goccia-tok");
+  if (!goccia) return;
+  goccia.classList.toggle("hidden", misure.tokS == null);
+  goccia.classList.toggle("viva", misure.viva);
+  $("goccia-tok-v").textContent = fmtUno(misure.tokS);
+  goccia.title = misure.viva ? "Velocità adesso" : "Media dell'ultimo turno";
+}
+
+/** La riga del contesto: quanto della finestra occupa il prompt. */
+function disegnaContesto() {
+  const barra = $("barra-contesto");
+  if (!barra) return;
+  const quota = misure.finestra ? Math.min(1, misure.usato / misure.finestra) : 0;
+  $("barra-contesto-fill").style.width = (quota * 100).toFixed(1) + "%";
+  barra.classList.toggle("warn", quota > 0.7 && quota <= 0.9);
+  barra.classList.toggle("err", quota > 0.9);
+  barra.setAttribute("aria-label", misure.finestra
+    ? `Contesto: ${Math.round(quota * 100)}% della finestra` : "Contesto");
+}
+
+/** Un evento ``metriche`` dallo stream: aggiorna goccia e contesto. */
+function applicaMetriche(m) {
+  const generando = ["pensiero", "risposta", "chiamata"].includes(m.fase) && !m.definitivo;
+  const v = generando ? (m.tok_s ?? m.tok_s_passo) : m.tok_s_passo;
+  if (v != null) misure.tokS = v;
+  misure.viva = generando;
+  const prompt = m.prompt ?? m.prompt_stimato;
+  if (prompt) {
+    misure.usato = prompt;
+    misure.esatto = m.prompt != null;
+    misure.finestra = m.finestra || misure.finestra;
+    misure.cache = m.cache ?? misure.cache;
+  }
+  if (m.draft_n) { misure.draftN = m.draft_n; misure.draftOk = m.draft_accettati || 0; }
+  disegnaGoccia();
+  disegnaContesto();
+}
+
+/** A riposo: la media dell'ultimo turno e la stima del contesto dal server. */
+function applicaStats(stats) {
+  if (!stats) return;
+  misure.viva = false;
+  misure.usato = Number(stats.context_used) || 0;
+  misure.finestra = Number(stats.context_window) || misure.finestra;
+  misure.esatto = false;
+  const turni = (stats.cruscotto && stats.cruscotto.turni) || [];
+  const ultimo = turni[turni.length - 1];
+  if (ultimo && ultimo.tok_s != null) misure.tokS = ultimo.tok_s;
+  const righe = (stats.cruscotto && stats.cruscotto.ultimo && stats.cruscotto.ultimo.righe) || [];
+  const riga = righe[righe.length - 1];
+  if (riga) {
+    misure.cache = riga.cache;
+    const conDraft = righe.filter((r) => r.draft_n);
+    misure.draftN = conDraft.length ? conDraft.reduce((s, r) => s + r.draft_n, 0) : null;
+    misure.draftOk = conDraft.reduce((s, r) => s + (r.draft_accettati || 0), 0);
+  }
+  disegnaGoccia();
+  disegnaContesto();
+}
+
+/** Toccando la goccia: i numeri che non stanno in una goccia. */
+function dettaglioMisure() {
+  const pezzi = [`${fmtUno(misure.tokS)} tok/s ${misure.viva ? "adesso" : "(ultimo turno)"}`];
+  if (misure.finestra) {
+    pezzi.push(`contesto ${misure.esatto ? "" : "~"}${fmtMigliaia(misure.usato)}/${fmtMigliaia(misure.finestra)}`);
+  }
+  if (misure.cache != null && misure.usato) {
+    pezzi.push(`cache ${Math.round(100 * Math.min(1, misure.cache / misure.usato))}%`);
+  }
+  if (misure.draftN) pezzi.push(`MTP ${Math.round(100 * misure.draftOk / misure.draftN)}%`);
+  return pezzi.join(" · ");
+}
+
+const SEGNO_PUNTO = { done: "✓", doing: "●", skipped: "⤼", todo: "○" };
+
+/** La rotaia del piano: un pallino per punto, la linea piena fino
+ *  all'ultimo punto chiuso. Senza piano non c'e'. */
+function disegnaRotaia(steps) {
+  pianoCorrente = Array.isArray(steps) ? steps : [];
+  const rotaia = $("rotaia-piano");
+  if (!rotaia) return;
+  const ce = pianoCorrente.length > 0;
+  rotaia.classList.toggle("hidden", !ce);
+  $("messages-wrap").classList.toggle("con-rotaia", ce);
+  const punti = $("rotaia-punti");
+  punti.innerHTML = "";
+  if (!ce) { chiudiFoglioPiano(); return; }
+  let ultimoChiuso = -1;
+  pianoCorrente.forEach((step, i) => {
+    const pallino = document.createElement("span");
+    pallino.className = step.status || "todo";
+    pallino.title = `${step.id}. ${step.text || ""}`;
+    punti.appendChild(pallino);
+    if (step.status === "done" || step.status === "skipped") ultimoChiuso = i;
+  });
+  const n = pianoCorrente.length;
+  const quota = n > 1 ? Math.max(0, ultimoChiuso) / (n - 1) : (ultimoChiuso >= 0 ? 1 : 0);
+  $("rotaia-fatto").style.height = (ultimoChiuso < 0 ? 0 : quota * 100).toFixed(1) + "%";
+  const fatti = pianoCorrente.filter((s) => s.status === "done").length;
+  rotaia.setAttribute("aria-label", `Piano: ${fatti} punti fatti su ${n}`);
+  if (!$("piano-foglio").classList.contains("hidden")) riempiFoglioPiano();
+}
+
+function riempiFoglioPiano() {
+  const elenco = $("piano-elenco");
+  elenco.innerHTML = "";
+  pianoCorrente.forEach((step) => {
+    const li = document.createElement("li");
+    li.className = step.status || "todo";
+    const segno = document.createElement("span");
+    segno.textContent = SEGNO_PUNTO[step.status] || SEGNO_PUNTO.todo;
+    const testo = document.createElement("span");
+    testo.textContent = step.text || "";
+    li.append(segno, testo);
+    elenco.appendChild(li);
+  });
+  const fatti = pianoCorrente.filter((s) => s.status === "done").length;
+  $("piano-conto").textContent = `${fatti}/${pianoCorrente.length}`;
+}
+
+function apriFoglioPiano() {
+  riempiFoglioPiano();
+  $("piano-foglio").classList.remove("hidden");
+}
+
+function chiudiFoglioPiano() {
+  const foglio = $("piano-foglio");
+  if (foglio) foglio.classList.add("hidden");
+}
+
 // ---------------------------------------------------------------- toast ----
 
 function toast(text) {
@@ -351,6 +503,10 @@ async function refreshChat(attachQuestionCard) {
     }
     running = Boolean(payload.running);
     updateComposer();
+    // Rotaia del piano e misure: fuori dalla firma, perche' cambiano anche
+    // quando i messaggi no (un punto chiuso, le statistiche di fine turno).
+    disegnaRotaia(payload.plan || []);
+    if (!running) applicaStats(payload.stats);
     // Sottoriga della barra: modello e workspace di QUESTA chat. Solo
     // lettura: si aggiornano a ogni rilettura (il polling li tiene freschi
     // se un'apertura da desktop ha cambiato il modello), ma niente clic.
@@ -834,6 +990,12 @@ function handleEvent(data) {
       scrollBottom();
       break;
     }
+    case "metriche":
+      applicaMetriche(data);
+      break;
+    case "plan":
+      disegnaRotaia(data.steps || []);
+      break;
     case "question":
       // AwaitingUserInput arriva intero dallo stream: domanda, opzioni e
       // allow_multiple sono gia' nel frame, la card li usa tutti.
@@ -948,6 +1110,17 @@ $("btn-new").addEventListener("click", async () => {
 });
 
 $("btn-refresh").addEventListener("click", () => refreshChat(true));
+$("goccia-tok").addEventListener("click", () => toast(dettaglioMisure()));
+$("rotaia-piano").addEventListener("click", (ev) => {
+  ev.stopPropagation();
+  if ($("piano-foglio").classList.contains("hidden")) apriFoglioPiano();
+  else chiudiFoglioPiano();
+});
+// Un tocco fuori dal foglio del piano lo chiude.
+document.addEventListener("click", (ev) => {
+  const foglio = $("piano-foglio");
+  if (foglio && !foglio.classList.contains("hidden") && !foglio.contains(ev.target)) chiudiFoglioPiano();
+});
 
 $("btn-send").addEventListener("click", sendMessage);
 $("btn-answer").addEventListener("click", sendAnswer);

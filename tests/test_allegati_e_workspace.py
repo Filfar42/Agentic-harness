@@ -241,14 +241,17 @@ def test_la_colonna_di_destra_non_ha_piu_i_riquadri_traslocati():
     # workspace: il percorso e i due pulsanti non stanno piu' qui
     assert 'id="ws-path"' not in pannello
     assert 'id="ws-browse"' not in pannello
-    # contesto e consumo del turno in una scheda sola
-    assert 'id="usage-block"' in pannello
-    # Quattro schede a vista: piano, note, consumo, file toccati. Erano sette.
-    # Le due del vault -- identita' e memoria -- sono **alternative** alle
-    # altre: parlano del posto in cui si sta, non della conversazione, e
-    # quando compaiono le altre quattro sono nascoste. La colonna resta magra,
-    # che e' la regola.
-    assert pannello.count("<h4") == 6
+    # Il vecchio riquadro "Consumo" e' diventato il cruscotto (26/09/2026):
+    # velocita', turno, contesto, velocita' e contesto. Piano, note e file
+    # toccati restano; le due schede del vault -- identita' e memoria -- sono
+    # **alternative** alle altre: parlano del posto in cui si sta, non della
+    # conversazione, e quando compaiono le altre sono nascoste.
+    assert 'id="usage-block"' not in pannello
+    for scheda in ("cr-tachimetro", "cr-turno", "cr-contesto", "cr-dispersione",
+                   "plan-card", "notes-card", "files-card", "vault-card", "vault-mem-card"):
+        assert f'id="{scheda}"' in pannello, scheda
+    assert pannello.count("<h4") == 5            # vault, memoria, piano, note, file
+    assert pannello.count('class="card cr-card"') == 4
     assert 'id="vault-card" style="display:none"' in pannello
     assert 'id="vault-mem-card" style="display:none"' in pannello
 
@@ -317,9 +320,14 @@ def test_le_due_tendine_non_restano_aperte_insieme():
 
 def test_i_file_toccati_sono_gocce_che_aprono_l_anteprima():
     js = (WEB / "app.js").read_text(encoding="utf-8")
-    blocco = js[js.index("const files = stats.touched_files"):]
-    blocco = blocco[: blocco.index("\n  // La lista arriva")]
+    blocco = js[js.index("function renderToccati("):]
+    blocco = blocco[: blocco.index("\n}\n")]
     assert "fileChips(" in blocco and "stacked" in blocco
+    # Una sola funzione disegna la scheda: le stats di fine turno e il file
+    # appena scritto dal turno in corso passano entrambi da li'.
+    assert "renderToccati(stats.touched_files || [])" in js
+    corpo = js[js.index("function aggiungiToccato("):]
+    assert "renderToccati(" in corpo[: corpo.index("\n}\n")]
     assert "file-row" not in js          # niente piu' righe di solo testo
 
     css = (WEB / "style.css").read_text(encoding="utf-8")
