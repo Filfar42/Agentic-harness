@@ -1407,11 +1407,25 @@ def tool_edit_file(
     tollerante: aggancio.Aggancio | None = None
     if occurrences and not replace_all and aggancio.dentro_il_rientro(text, old_string):
         # Trovato, ma a meta' degli spazi iniziali: e' un rientro sbagliato, non
-        # un frammento voluto. Se l'aggancio a righe intere e' unico vale quello.
+        # un frammento voluto. Se l'aggancio a righe intere e' unico vale quello;
+        # se no, niente modifica: la sostituzione come sottostringa lascerebbe
+        # davanti gli spazi non coperti e sbaglierebbe il rientro della riga
+        # (sui file non Python nessuna guardia di sintassi lo vedrebbe).
         agganci, modo = aggancio.cerca(text, old_string, new_string or "")
         if len(agganci) == 1 and modo == "rientro":
             tollerante = agganci[0]
             occurrences = 1
+        else:
+            return _err(
+                f"'old_string' in '{filepath}' comincia a meta' del rientro di una riga: "
+                "sostituirlo cosi' sbaglierebbe l'indentazione, e il rientro di new_string "
+                "non e' coerente ne' con old_string ne' con il file.",
+                hint=(
+                    "Copia le righe intere con il loro rientro, e rientra new_string come "
+                    "il file."
+                ),
+                righe=aggancio.righe_occorrenze(text, old_string),
+            )
     if occurrences == 0:
         agganci, _modo = aggancio.cerca(text, old_string, new_string or "")
         if len(agganci) > 1:

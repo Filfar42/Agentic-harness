@@ -93,7 +93,8 @@ def esegui(h: dict[str, Any], sc: Any, backend: Any, params: Any, pensiero: bool
             ok = False
         finale = next((m for m in reversed(ui) if m.get("role") == "assistant"
                        and not m.get("tool_calls")), None)
-        json_finale = bool(finale and '"arguments"' in str(finale.get("content")))
+        json_finale = bool(finale and '"arguments"' in str(finale.get("content"))
+                           and motivi and motivi[-1] == "completed")
         return {
             "riuscito": ok and not json_finale, "passi": passi, "chiamate_modello": passi,
             "chiamate_servizio": 0, "token_prompt": token, "chiamate_tool": chiamate,

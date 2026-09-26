@@ -157,3 +157,13 @@ def test_cerca_preferisce_il_grado_meno_tollerante():
 def test_righe_occorrenze():
     assert aggancio.righe_occorrenze("x\ny\nx\n", "x") == [1, 3]
     assert aggancio.righe_occorrenze("abc", "z") == []
+
+
+def test_rientro_incoerente_dentro_il_rientro_non_si_applica_come_sottostringa(tmp_path):
+    """Il caso trovato in verifica: il frammento sta dentro gli spazi iniziali,
+    e new_string non e' rientrato ne' come old_string ne' come il file. Prima
+    la sostituzione come sottostringa lasciava 6 spazi, senza dirlo."""
+    testo = "chiave:\n        value: 1\n"
+    esito, dopo = _edit(tmp_path, "    value: 1", "  value: 2", testo=testo, nome="c.yaml")
+    assert "error" in esito and dopo == testo
+    assert esito["righe"] == [2]

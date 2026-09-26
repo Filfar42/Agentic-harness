@@ -659,7 +659,11 @@ def esegui_scenario(h: dict[str, Any], sc: Scenario, seme: int) -> dict[str, Any
             ok = False
         risposta_finale = next((m for m in reversed(ui) if m.get("role") == "assistant"
                                 and not m.get("tool_calls")), None)
-        json_finale = bool(risposta_finale and '"arguments"' in str(risposta_finale.get("content")))
+        # Conta solo il JSON *accettato* come risposta: turno chiuso "completed"
+        # con una chiamata scritta come testo. Un turno chiuso con l'errore di
+        # protocollo (rete canale esaurita) non ha accettato niente.
+        json_finale = bool(risposta_finale and '"arguments"' in str(risposta_finale.get("content"))
+                           and motivi and motivi[-1] == "completed")
         return {
             # Riuscito = il criterio sul disco E una chiusura che non sia una
             # chiamata a tool scritta come testo e scambiata per risposta.
