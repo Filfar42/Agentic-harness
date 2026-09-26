@@ -495,6 +495,12 @@ DEFAULTS: dict[str, Any] = {
     # senza aver chiamato nessun tool. E' la difesa contro il modo di fallire
     # piu' costoso osservato: ottomila token di pensiero e zero azioni.
     "think_watchdog": True,
+    # Monitor di avanzamento (``core/ciclo/avanzamento.py``): conta i passi
+    # senza nessun effetto verificabile (una lettura nuova, una scrittura che
+    # cambia il file, un test che passa, un punto del piano chiuso). A 6 lo
+    # dice al modello e gli concede di chiudere spiegando cosa blocca; a 10
+    # chiude il turno con un riepilogo invece di arrivare al tetto dei passi.
+    "monitor_avanzamento": True,
     "strip_think_from_context": True,
     "compact_old_tool_results": True,
     # Quando il contesto si riempie, il tratto vecchio viene riassunto da una
@@ -502,6 +508,18 @@ DEFAULTS: dict[str, Any] = {
     # Costa una generazione e un ricalcolo del KV cache, per questo la soglia
     # e' alta: sotto non succede niente.
     "compact_history": True,
+    # Prima del riassunto, la compattazione selettiva (``core/selezione.py``,
+    # l'idea di fast-jev-compaction): si tolgono o si accorciano le chiamate
+    # vecchie, il testo resta parola per parola, e se basta il riassunto non
+    # si fa. spenta | laya (un ``laya-serve`` locale a ``laya_url`` decide
+    # chiamata per chiamata; se non risponde, decidono le regole). "regole"
+    # resta accettato ma non e' nella UI: sul replay del 26/09 evitava 0-2
+    # riassunti su 24-27 tentativi -- da sole le regole non bastano.
+    "compattazione_selettiva": "spenta",
+    "laya_url": "http://127.0.0.1:8000/v1/systemone",
+    # "multilingual": la conversazione e' in italiano (il checkpoint inglese
+    # legge 512 token, questo 1024).
+    "laya_modello": "multilingual",
     "compact_threshold": HISTORY_COMPACT_THRESHOLD,
     # Tetto in token: si compatta al piu' tardi qui, anche se la percentuale
     # sopra non e' stata raggiunta. Serve perche' la finestra e' cresciuta piu'

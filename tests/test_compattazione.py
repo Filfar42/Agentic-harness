@@ -701,3 +701,144 @@ def test_un_errore_non_testuale_non_rompe_la_busta():
     errore = json.loads(out)["error"]
     assert errore["code"] == 12
     assert len(errore["msg"]) < 400
+
+
+# ---------------------------------------------------------------------------
+# Script inline potati (A7a del 25/09)
+# ---------------------------------------------------------------------------
+
+
+def _cronologia_comandi(esiti: list[str]) -> list[dict]:
+    """Script lunghi lanciati con run_command, uno per passo, con l'esito dato."""
+    script = "python3 - <<'EOF'\n" + "\n".join(f"print({i})" for i in range(120)) + "\nEOF"
+    msgs: list[dict] = [{"role": "user", "content": "analizza i dati"}]
+    for i, esito in enumerate(esiti):
+        msgs.append({"role": "assistant", "content": "", "tool_calls": [{
+            "id": f"c{i}", "type": "function",
+            "function": {"name": "run_command",
+                         "arguments": json.dumps({"command": script})},
+        }]})
+        msgs.append({"role": "tool", "tool_call_id": f"c{i}", "name": "run_command",
+                     "ok": True, "content": json.dumps({
+                         "esito": esito, "command": script,
+                         "returncode": 0 if esito == "ok" else 1, "stdout": "0\n1\n"})})
+    return msgs
+
+
+def test_gli_script_vecchi_riusciti_tengono_solo_la_prima_riga():
+    """B2: run_command.command era il 34,9% degli argomenti inviati."""
+    msgs = _cronologia_comandi(["ok"] * 6)
+    api = build_api_messages(msgs, system_prompt="", env_header=None,
+                             compact_old_tools=True, budgets=Budgets(tool_result_full_window=2))
+    comandi = [json.loads(c["function"]["arguments"])["command"]
+               for m in api for c in (m.get("tool_calls") or [])]
+    assert all(c.startswith("python3 - <<'EOF' <omesso: script di 122 righe") for c in comandi[:-2])
+    assert all("print(119)" in c for c in comandi[-2:]), "le recenti restano intere"
+
+
+def test_uno_script_fallito_resta_intero():
+    """E' la cosa da correggere: il modello deve poterlo rileggere."""
+    msgs = _cronologia_comandi(["FALLITO"] + ["ok"] * 5)
+    api = build_api_messages(msgs, system_prompt="", env_header=None,
+                             compact_old_tools=True, budgets=Budgets(tool_result_full_window=2))
+    comandi = [json.loads(c["function"]["arguments"])["command"]
+               for m in api for c in (m.get("tool_calls") or [])]
+    assert "print(119)" in comandi[0]
+    assert "<omesso" in comandi[1]
+
+
+def test_un_comando_corto_non_si_tocca():
+    msgs = _cronologia_comandi(["ok"] * 6)
+    for m in msgs:
+        for c in m.get("tool_calls") or []:
+            c["function"]["arguments"] = json.dumps({"command": "pytest -q"})
+    api = build_api_messages(msgs, system_prompt="", env_header=None,
+                             compact_old_tools=True, budgets=Budgets(tool_result_full_window=2))
+    comandi = [json.loads(c["function"]["arguments"])["command"]
+               for m in api for c in (m.get("tool_calls") or [])]
+    assert comandi == ["pytest -q"] * 6
+
+
+# ---------------------------------------------------------------------------
+# Copie superate, compattate allo scatto (A7b del 25/09)
+# ---------------------------------------------------------------------------
+
+
+def _letture(ordine: list[str], chars: int = 2_000) -> list[dict]:
+    """Letture intere in sequenza, ognuna con un contenuto diverso."""
+    msgs: list[dict] = [{"role": "user", "content": "studia"}]
+    for i, fp in enumerate(ordine):
+        cid = f"r{i}"
+        msgs.append({"role": "assistant", "content": "", "tool_calls": [{
+            "id": cid, "type": "function",
+            "function": {"name": "read_file", "arguments": json.dumps({"filepath": fp})},
+        }]})
+        msgs.append({"role": "tool", "tool_call_id": cid, "name": "read_file", "ok": True,
+                     "content": json.dumps({"filepath": fp, "content": f"v{i}\n" * (chars // 3)})})
+    return msgs
+
+
+def _contenuti(api: list[dict]) -> dict[str, str]:
+    return {m["tool_call_id"]: m["content"] for m in api if m.get("role") == "tool"}
+
+
+def test_senza_scatto_le_copie_superate_restano():
+    """Prima del primo scatto niente si tocca: il prefisso resta quello."""
+    from core.agent import copie_superate, zona_integrale
+
+    msgs = _letture(["a.py", "a.py"])
+    b = Budgets(tool_result_full_window=4, tool_result_full_tokens=100_000)
+    pos = [i for i, m in enumerate(msgs) if m["role"] == "tool"]
+    zona, scatto = zona_integrale(msgs, pos, b)
+    assert scatto == -1
+    assert copie_superate(msgs, zona, scatto) == set()
+
+
+def test_la_copia_superata_dentro_la_zona_viene_compattata():
+    """Otto letture, zona integrale di sei: r2 legge a.py, r4 lo rilegge prima
+    dello scatto. r2 e' superata ed esce dalla zona; r4 resta intera."""
+    from core.agent import copie_superate, zona_integrale
+
+    msgs = _letture(["x.py", "y.py", "a.py", "z.py", "a.py", "w.py", "k.py", "q.py"], chars=900)
+    b = Budgets(tool_result_full_window=6, tool_result_full_tokens=1_500)
+    pos = [i for i, m in enumerate(msgs) if m["role"] == "tool"]
+    zona, scatto = zona_integrale(msgs, pos, b)
+    assert scatto >= 0 and pos[2] in zona
+    assert copie_superate(msgs, zona, scatto) == {pos[2]}
+    api = build_api_messages(msgs, system_prompt="", env_header=None,
+                             compact_old_tools=True, budgets=b)
+    c = _contenuti(api)
+    assert len(c["r2"]) < len(c["r4"]) / 2, "la copia vecchia e' compattata"
+    assert c["r4"].count("v4") > 100, "l'ultima lettura resta intera"
+
+
+def test_una_lettura_parziale_non_supera_quella_intera():
+    from core.agent import copie_superate
+
+    msgs = _letture(["a.py", "a.py"], chars=300)
+    args = json.loads(msgs[3]["tool_calls"][0]["function"]["arguments"])
+    args["start_line"] = 1
+    msgs[3]["tool_calls"][0]["function"]["arguments"] = json.dumps(args)
+    pos = [i for i, m in enumerate(msgs) if m["role"] == "tool"]
+    assert copie_superate(msgs, set(pos), fino_a=pos[-1]) == set()
+
+
+def test_fra_due_scatti_la_vista_dei_vecchi_messaggi_non_cambia():
+    """La proprieta' che giustifica il "solo allo scatto": una rilettura
+    nuova non deve riscrivere un messaggio a meta' cronologia."""
+    b = Budgets(tool_result_full_window=4, tool_result_full_tokens=3_000)
+    base = ["a.py", "b.py", "c.py", "d.py", "e.py", "f.py"]
+    msgs = _letture(base, chars=600)
+    pos = [i for i, m in enumerate(msgs) if m["role"] == "tool"]
+    from core.agent import zona_integrale
+
+    _zona, scatto_prima = zona_integrale(msgs, pos, b)
+    prima = build_api_messages(msgs, system_prompt="", env_header=None,
+                               compact_old_tools=True, budgets=b)
+    dopo_msgs = _letture([*base, "b.py"], chars=600)
+    pos2 = [i for i, m in enumerate(dopo_msgs) if m["role"] == "tool"]
+    _zona2, scatto_dopo = zona_integrale(dopo_msgs, pos2, b)
+    dopo = build_api_messages(dopo_msgs, system_prompt="", env_header=None,
+                              compact_old_tools=True, budgets=b)
+    if scatto_dopo == scatto_prima:
+        assert dopo[: len(prima)] == prima

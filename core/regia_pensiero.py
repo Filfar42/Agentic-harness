@@ -378,11 +378,20 @@ class OsservatorePensiero:
 # perche' e' la lingua in cui Qwen pensa: una frase italiana in mezzo a un
 # ragionamento inglese e' un cambio di registro che il modello tende a
 # commentare, cioe' altro pensiero.
+#
+# ``budget`` e' la frase ufficiale di Qwen3 (Technical Report, sezione sul
+# thinking budget: "we manually halt the thinking process and insert the
+# stop-thinking instruction"). E' quella che il modello ha visto in
+# addestramento nel punto esatto in cui la usiamo noi -- il budget esaurito --
+# ed e' quindi la chiusura che ha imparato a seguire con una risposta invece
+# che con altro pensiero. La ``</think>`` la mette il backend in continuazione.
+# Le altre due non hanno un equivalente ufficiale e restano le nostre.
+FRASE_BUDGET_QWEN3 = (
+    "Considering the limited time by the user, I have to give the solution "
+    "based on the thinking directly now."
+)
 CHIUSURE = {
-    "budget": (
-        "\n\nI have spent my reasoning budget for this step. I already know enough "
-        "to make the next concrete move, so I stop deliberating and act now.\n"
-    ),
+    "budget": "\n\n" + FRASE_BUDGET_QWEN3 + "\n",
     "oscillazione": (
         "\n\nI keep going back and forth. Re-checking will not settle it: I pick the "
         "most reasonable option and let the tool result tell me if it was wrong.\n"

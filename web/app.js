@@ -839,6 +839,18 @@ function renderHistory(messages, opzioni = {}) {
       return;
     }
 
+    if (msg.role === 'selezione') {
+      // Compattazione selettiva: nessun riassunto, alcune chiamate vecchie
+      // tolte o accorciate nella vista del modello. Stesso cartello del
+      // riassunto, con la riga che dice cosa e' stato deciso.
+      closeTurn();
+      thread().appendChild(compactedNode({
+        messages: msg.candidati || 0,
+        summary: String(msg.descrizione || ''),
+      }));
+      return;
+    }
+
     if (msg.role === 'pending_question') {
       state.pending = msg;
       currentTurn().append(renderQuestion(msg, null));
@@ -1387,6 +1399,15 @@ function handleEvent(event, turn, status, setStatus) {
           `Limite di ${event.steps} passi raggiunto. Scrivi "continua" o alza il limite nelle impostazioni.`));
         const tb = $('#composer-toolbar');
         if (tb) tb.hidden = false;
+      }
+      // Il monitor di avanzamento (core/ciclo/avanzamento.py) ha chiuso il
+      // turno: troppi passi di fila senza nessun effetto nuovo. Non e' il
+      // tetto dei passi, e va detto diversamente: alzare il limite qui non
+      // servirebbe a niente.
+      if (event.reason === 'stallo') {
+        turn.append(el('div', 'notice',
+          `Turno fermato dopo ${event.steps} passi: gli ultimi non producevano più niente di nuovo. ` +
+          'Scrivi "continua" per riprendere (le verifiche rimaste rosse restano aperte) o indica un\'altra strada.'));
       }
       if (rosse.length) turn.append(renderQualita(qualita));
       if (event.usage) renderUsage(event.usage);
@@ -3649,6 +3670,9 @@ async function boot() {
   bindField('#s-compact', 'compact_old_tool_results');
   bindField('#s-plan-gate', 'plan_gate');
   bindField('#s-compact-history', 'compact_history');
+  bindField('#s-selezione', 'compattazione_selettiva');
+  bindField('#s-laya-url', 'laya_url');
+  bindField('#s-laya-modello', 'laya_modello');
   bindField('#s-compact-threshold', 'compact_threshold', Number);
   bindField('#s-compact-max-tokens', 'compact_max_tokens', Number);
   bindField('#s-libreria', 'libreria_concetti');
@@ -3678,6 +3702,7 @@ async function boot() {
     if (event.key === 'Escape') closePreview();
   });
   bindField('#s-require-plan', 'require_plan');
+  bindField('#s-monitor-avanzamento', 'monitor_avanzamento');
   bindField('#s-think-watchdog', 'think_watchdog');
   bindField('#s-danger', 'confirm_commands');
   bindField('#s-sandbox', 'sandbox');

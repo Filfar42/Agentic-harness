@@ -37,7 +37,7 @@ from typing import Any
 
 from .tools import platform_summary, workspace_snapshot
 
-from .system_prompt import SYSTEM_PROMPT, SYSTEM_PROMPT_LEAN
+from .system_prompt import PROMPT_DI_SERIE_PRECEDENTI, SYSTEM_PROMPT, SYSTEM_PROMPT_LEAN
 
 
 def pick_system_prompt(*, thinking: bool) -> str:
@@ -64,7 +64,12 @@ def is_stock_prompt(text: str) -> bool:
     testo = (text or "").strip()
     if not testo:
         return True
-    return testo in {SYSTEM_PROMPT.strip(), SYSTEM_PROMPT_LEAN.strip()}
+    # Anche le versioni di serie precedenti (``PROMPT_DI_SERIE_PRECEDENTI``):
+    # una loro copia salvata e' esattamente la trappola descritta sopra.
+    return testo in {
+        SYSTEM_PROMPT.strip(), SYSTEM_PROMPT_LEAN.strip(),
+        *(p.strip() for p in PROMPT_DI_SERIE_PRECEDENTI),
+    }
 
 
 # Clausola sul ragionamento, aggiunta SOLO quando il canale thinking nativo e'

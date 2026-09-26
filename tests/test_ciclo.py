@@ -6,12 +6,13 @@ Ogni gruppo di test risale a un guasto misurato sui log di agosto-settembre
 * F6 -- la chiamata scritta nel testo passava per risposta finale dal secondo
   passo in poi: ``rete_canale``;
 * F8 -- "Fatto." accettato senza nessuna scrittura: ``rete_senza_prova``;
-* F2/F3 -- turni finiti al tetto dei passi girando a vuoto con forme diverse:
+* F1/F7 -- turni finiti al tetto dei passi girando a vuoto con forme diverse:
   il monitor di avanzamento (``core/ciclo/avanzamento.py``);
-* F9 -- dopo un "continua" le verifiche rosse del turno prima sparivano:
+* F1 -- dopo un "continua" le verifiche rosse del turno prima sparivano:
   checkpoint e ``<ripresa>`` (``core/ciclo/ripresa.py``);
-* F10 -- una chiamata senza risultato (crash a meta' effetto) rompeva il
-  template al turno dopo: ``ripara_orfani`` e il diario degli effetti.
+* residuo "exactly-once" dell'audit del 6/09 -- una chiamata senza risultato
+  (crash a meta' effetto) faceva rifiutare la cronologia ai template severi:
+  ``ripara_orfani`` e il diario degli effetti.
 """
 
 from __future__ import annotations
@@ -391,8 +392,8 @@ def test_il_checkpoint_esce_dal_turno_e_la_ripresa_rimette_i_rossi(tmp_path):
 
 
 def test_il_monitor_chiude_un_turno_che_gira_a_vuoto(tmp_path):
-    """F2/F3: la stessa lettura variata di poco, all'infinito. Le reti di forma
-    non la vedono; il monitor di effetto si'."""
+    """F1/F7: la stessa lettura, all'infinito. Le reti di forma scattano una
+    volta e tacciono; il monitor di effetto no."""
     (tmp_path / "a.py").write_text("x = 1\n", encoding="utf-8")
     passi = [[_call("read_file", {"filepath": "a.py"}, f"r{i}")] for i in range(40)]
     eventi, messaggi, _ = _gira(tmp_path, passi, "trova il bug in a.py", max_steps=40,

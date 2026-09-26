@@ -89,6 +89,7 @@ from .tools import (
 # ``core.agent``.
 from .ciclo import reti as reti_mod
 from .ciclo import ripresa as ripresa_mod
+from . import selezione as selezione_mod
 from .ciclo.avanzamento import Chiamata, leggi_esito
 from .ciclo.reti import (  # noqa: F401 - ri-esportati
     LOOP_THRESHOLD,
@@ -385,7 +386,16 @@ def _compact_tool_result(
 _ARGOMENTI_PESANTI = {
     "write_file": ("content",),
     "edit_file": ("old_string", "new_string"),
+    # Gli script inline (``python3 - <<'EOF' ... EOF``): nei log del 25/09 il
+    # 34,9% degli argomenti inviati era ``run_command.command``, la voce piu'
+    # grossa dopo i corpi dei file -- e la potatura non la toccava. Si tiene la
+    # prima riga, che dice *cosa* e' stato lanciato; il resto e' gia' eseguito
+    # e il suo esito sta nel risultato.
+    "run_command": ("command",),
 }
+# Sotto questa lunghezza un corpo non si pota: il risparmio non ripaga la
+# riscrittura del messaggio, che fa divergere il prefisso.
+MIN_CORPO_DA_POTARE = 400
 
 
 def _prune_tool_call(call: dict[str, Any]) -> dict[str, Any]:
@@ -416,16 +426,23 @@ def _prune_tool_call(call: dict[str, Any]) -> dict[str, Any]:
     potato = False
     for chiave in chiavi:
         corpo = args.get(chiave)
-        if not isinstance(corpo, str) or len(corpo) < 400:
+        if not isinstance(corpo, str) or len(corpo) < MIN_CORPO_DA_POTARE:
             # Sotto la soglia il risparmio non ripaga la riscrittura del
             # messaggio, che fa divergere il prefisso e costa un prompt eval.
             continue
         righe = corpo.count("\n") + 1
-        args[chiave] = (
-            f"<omesso: {righe} righe, {len(corpo)} caratteri di una modifica "
-            "eseguita. read_file restituisce la versione attuale del file, "
-            "che puo' differire da questo contenuto storico.>"
-        )
+        if nome == "run_command":
+            prima = corpo.split("\n", 1)[0][:160]
+            args[chiave] = (
+                f"{prima} <omesso: script di {righe} righe, {len(corpo)} caratteri, "
+                "gia' eseguito: l'esito e' nel risultato di questa chiamata.>"
+            )
+        else:
+            args[chiave] = (
+                f"<omesso: {righe} righe, {len(corpo)} caratteri di una modifica "
+                "eseguita. read_file restituisce la versione attuale del file, "
+                "che puo' differire da questo contenuto storico.>"
+            )
         potato = True
 
     if not potato:
@@ -451,7 +468,7 @@ def _costo_argomenti_pesanti(call: dict[str, Any]) -> int:
     return sum(
         estimate_tokens(corpo)
         for corpo in (args.get(k) for k in chiavi)
-        if isinstance(corpo, str) and len(corpo) >= 400
+        if isinstance(corpo, str) and len(corpo) >= MIN_CORPO_DA_POTARE
     )
 
 
@@ -487,10 +504,27 @@ def risultati_integrali(
     Pura funzione della cronologia: ricostruita a ogni passo dal primo
     risultato, da' lo stesso confine che aveva dato al passo prima.
     """
+    return zona_integrale(ui_messages, tool_positions, budgets)[0]
+
+
+def zona_integrale(
+    ui_messages: Sequence[dict[str, Any]],
+    tool_positions: Sequence[int],
+    budgets: Budgets,
+) -> tuple[set[int], int]:
+    """``risultati_integrali`` piu' la posizione dell'ultimo scatto.
+
+    Lo scatto e' l'indice (in ``ui_messages``) del risultato che ha fatto
+    saltare il confine l'ultima volta, -1 se non e' mai saltato. Tutto cio' che
+    si decide "allo scatto" -- le copie superate, A7b -- si decide guardando
+    la cronologia fino a li': fra uno scatto e l'altro la vista non cambia.
+    """
     finestra = max(1, int(budgets.tool_result_full_window))
     quota = int(getattr(budgets, "tool_result_full_tokens", 0) or 0)
     if quota <= 0:
-        return set(tool_positions[-finestra:])
+        zona = tool_positions[-finestra:]
+        scatto = zona[0] if len(tool_positions) > finestra and zona else -1
+        return set(zona), scatto
     pesanti: dict[str, int] = {}
     for msg in ui_messages:
         if msg.get("role") == "assistant":
@@ -500,6 +534,7 @@ def risultati_integrali(
                     pesanti[str(call.get("id") or "")] = costo
     confine = 0
     zona = 0
+    scatto = -1
     costi: list[int] = []
     for j, pos in enumerate(tool_positions):
         msg = ui_messages[pos]
@@ -512,7 +547,67 @@ def risultati_integrali(
             nuovo = j - finestra + 1
             zona -= sum(costi[confine:nuovo])
             confine = nuovo
-    return set(tool_positions[confine:])
+            scatto = pos
+    return set(tool_positions[confine:]), scatto
+
+
+def copie_superate(
+    ui_messages: Sequence[dict[str, Any]],
+    zona: set[int],
+    fino_a: int,
+) -> set[int]:
+    """Le letture integrali rese vecchie da un evento successivo, fino allo scatto (A7b).
+
+    Una ``read_file`` nella zona integrale e' superata se, dopo di lei e non
+    oltre ``fino_a``, lo stesso file e' stato riletto per intero o scritto con
+    successo: il suo contenuto non e' piu' quello del disco, e tenerlo
+    integrale costa token e confonde (nel replay delle 54 sessioni erano il
+    5% dei token inviati). Solo fino allo scatto, e non a ogni passo: compattare
+    un messaggio a meta' cronologia fa ricalcolare il prefisso da li', e allo
+    scatto il prefisso diverge gia' al confine -- piu' indietro -- quindi la
+    compattazione e' gratis. Fra uno scatto e l'altro la vista resta ferma.
+    """
+    if fino_a < 0 or not zona:
+        return set()
+    esiti = {str(m.get("tool_call_id") or ""): (i, m) for i, m in enumerate(ui_messages)
+             if m.get("role") == "tool"}
+    letture: list[tuple[int, str, bool]] = []      # (pos esito, file, intera)
+    eventi: list[tuple[int, str, str, bool]] = []  # (pos esito, file, tool, intera)
+    for m in ui_messages:
+        if m.get("role") != "assistant":
+            continue
+        for call in m.get("tool_calls") or []:
+            fn = call.get("function") or {}
+            nome = str(fn.get("name") or "")
+            if nome not in ("read_file", "write_file", "edit_file"):
+                continue
+            trovato = esiti.get(str(call.get("id") or ""))
+            if trovato is None:
+                continue
+            pos, esito = trovato
+            if esito.get("ok") is False or not _esito_del_tool(str(esito.get("content") or "")):
+                continue
+            try:
+                args = json.loads(fn.get("arguments") or "{}")
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(args, dict) or not args.get("filepath"):
+                continue
+            fp = str(args["filepath"]).replace("\\", "/").lstrip("./")
+            intera = not (args.get("start_line") or args.get("end_line"))
+            eventi.append((pos, fp, nome, intera))
+            if nome == "read_file" and pos in zona:
+                letture.append((pos, fp, intera))
+    superate: set[int] = set()
+    for pos, fp, intera in letture:
+        for pos_e, fp_e, nome_e, intera_e in eventi:
+            if not (pos < pos_e <= fino_a) or fp_e != fp:
+                continue
+            # Una lettura parziale dopo non supera una lettura intera prima.
+            if nome_e != "read_file" or intera_e or not intera:
+                superate.add(pos)
+                break
+    return superate
 
 
 def build_api_messages(
@@ -572,14 +667,21 @@ def build_api_messages(
     # ricalcolato da li' in avanti. Su una finestra stretta il baratto conviene
     # lo stesso; su una larga si pagherebbe un prompt eval per risparmiare
     # token che non mancavano a nessuno.
+    # Compattazione selettiva (``core/selezione.py``): le decisioni fissate
+    # nello scatto valgono per id di chiamata. "elimina" toglie la coppia
+    # chiamata+risultato dalla vista (mai uno senza l'altro); "tronca" accorcia
+    # il risultato anche se sarebbe ancora nella finestra integrale.
+    decisioni_sel = selezione_mod.decisioni_attive(ui_messages)
     tool_positions = [
         i for i, m in enumerate(ui_messages) if m.get("role") == "tool"
+        and decisioni_sel.get(str(m.get("tool_call_id") or "")) != "elimina"
     ]
-    recent_tools = (
-        risultati_integrali(ui_messages, tool_positions, budgets)
-        if compact_old_tools
-        else set(tool_positions)
-    )
+    if compact_old_tools:
+        recent_tools, scatto = zona_integrale(ui_messages, tool_positions, budgets)
+        # A7b: le copie superate escono dalla zona integrale nello stesso scatto.
+        recent_tools -= copie_superate(ui_messages, recent_tools, scatto)
+    else:
+        recent_tools = set(tool_positions)
 
     # Gli id delle chiamate ancora "recenti". La potatura degli argomenti segue
     # la stessa finestra dei risultati, e non e' una comodita': se si potasse
@@ -594,6 +696,10 @@ def build_api_messages(
         for message in ui_messages
         if message.get("role") == "tool" and message.get("ok") is not False
         and _esito_del_tool(str(message.get("content") or ""))
+        # Uno script finito con exit != 0 non e' "eseguito e chiuso": e' la
+        # cosa da correggere, e il modello deve poterlo rileggere intero.
+        and not (message.get("name") == "run_command"
+                 and '"esito": "FALLITO"' in str(message.get("content") or ""))
     }
     invalid_json_ids: set[str] = set()
     for message in ui_messages:
@@ -625,14 +731,18 @@ def build_api_messages(
             if strip_thinking:
                 content = strip_think(content)
             entry: dict[str, Any] = {"role": "assistant", "content": content}
-            if msg.get("tool_calls"):
+            chiamate_vive = [
+                call for call in (msg.get("tool_calls") or [])
+                if decisioni_sel.get(str(call.get("id") or "")) != "elimina"
+            ]
+            if chiamate_vive:
                 entry["tool_calls"] = [
                     call
                     if not compact_old_tools
                     or str(call.get("id") or "") in recent_call_ids
                     or str(call.get("id") or "") not in successful_call_ids
                     else _prune_tool_call(call)
-                    for call in msg["tool_calls"]
+                    for call in chiamate_vive
                 ]
                 # Ollama requires decoded objects even in historical calls.
                 # An invalid attempt gets an inert placeholder only in this
@@ -648,6 +758,19 @@ def build_api_messages(
                 api.append(entry)
 
         elif role == "tool":
+            decisione = decisioni_sel.get(str(msg.get("tool_call_id") or ""))
+            if decisione == "elimina":
+                continue
+            if decisione == "tronca":
+                api.append({
+                    "role": "tool",
+                    "tool_call_id": msg.get("tool_call_id", ""),
+                    "name": msg.get("name", ""),
+                    "content": selezione_mod.testo_troncato(_compact_tool_result(
+                        str(msg.get("content", "")), full=False, budgets=budgets,
+                    )),
+                })
+                continue
             api.append(
                 {
                     "role": "tool",
@@ -1011,6 +1134,69 @@ def compatta_cronologia(
         riassunto=riassunto,
         richieste=richieste,
     )
+
+
+def proponi_selezione(
+    ui_messages: list[dict[str, Any]],
+    *,
+    budgets: Budgets,
+    strip_thinking: bool,
+    finestra: int,
+    valutatore: Any = None,
+    soglia_coda: float = CODA_DEFAULT,
+    piano: str = "",
+    pressione: Callable[[list[dict[str, Any]]], float] | None = None,
+) -> tuple[int, selezione_mod.Selezione] | None:
+    """Prepara una compattazione selettiva sullo stesso tratto del riassunto.
+
+    Il tratto e' quello che ``compatta_cronologia`` riassumerebbe (stesso
+    ``taglio``, stessa coda tenuta intera): le due strade si confrontano sullo
+    stesso materiale. Non tocca ``ui_messages``: torna il punto d'inserimento e
+    la selezione, e decide il chiamante se basta (``QUOTA_OBIETTIVO``).
+
+    ``pressione`` (la pressione della vista costruita su una cronologia data)
+    serve a non disturbare il valutatore quando e' inutile: prima si prova il
+    tetto -- tutte le chiamate candidate tolte, il massimo che qualunque
+    valutatore potrebbe fare -- e se nemmeno quello scende sotto la quota si
+    torna None subito. Nel replay delle 54 sessioni era il caso di meta' delle
+    compattazioni a 32k: domande a Laya che non avrebbero evitato niente.
+    """
+    if finestra <= 0:
+        return None
+
+    def costo(pezzo: Sequence[dict[str, Any]]) -> int:
+        return estimate_messages_tokens(
+            build_api_messages(
+                pezzo, system_prompt="", env_header=None, strip_thinking=strip_thinking,
+                compact_old_tools=False, budgets=budgets,
+            )
+        )
+
+    ultimo_riassunto = max(
+        (i for i, m in enumerate(ui_messages) if m.get("role") == "summary"), default=-1,
+    )
+    inizio = ultimo_riassunto + 1
+    delta = taglio(ui_messages[inizio:], costo=costo, budget_coda=int(finestra * soglia_coda))
+    if not delta:
+        return None
+    fine = inizio + delta
+    if pressione is not None:
+        tetto = selezione_mod.record_tutto_via(ui_messages, inizio, fine)
+        if not tetto["decisioni"]:
+            return None
+        prova = list(ui_messages)
+        prova.insert(fine, tetto)
+        if pressione(prova) > selezione_mod.QUOTA_OBIETTIVO:
+            return None
+    # fast-jev usa come obiettivo le ultime tre richieste dell'utente.
+    obiettivo = "\n".join(richieste_utente(ui_messages)[-3:])
+    sel = selezione_mod.seleziona(
+        ui_messages, inizio, fine, obiettivo=obiettivo, piano=piano, valutatore=valutatore,
+    )
+    if not sel.record["decisioni"]:
+        return None
+    sel.record["descrizione"] = selezione_mod.descrivi(sel)
+    return fine, sel
 
 
 # Di quanto scendere sotto la soglia quando si buttano turni: senza margine si
@@ -1622,6 +1808,11 @@ def run_turn(
     # checkpoint``, salvata dal server nella sessione). Serve alla ripresa dopo
     # un turno rimasto a meta': vedi ``core/ciclo/ripresa.py``.
     checkpoint_precedente: dict[str, Any] | None = None,
+    # Compattazione selettiva (``core/selezione.py``), tentata prima del
+    # riassunto: "spenta" | "regole" | "valutatore". Con "valutatore" serve
+    # ``valutatore_selezione`` (client /v1/systemone: Laya locale o Jev).
+    selezione: str = "spenta",
+    valutatore_selezione: Any = None,
 ) -> Iterator[AgentEvent]:
     """Esegue un turno completo. Muta ``ui_messages`` in-place via append.
 
@@ -1652,7 +1843,8 @@ def run_turn(
         skills_block=skills_block, abilita_delega=abilita_delega, should_stop=should_stop,
         images=images, allow_text_tool_calls=allow_text_tool_calls,
         initialize_workspace=initialize_workspace, monitor_avanzamento=monitor_avanzamento,
-        checkpoint_precedente=checkpoint_precedente,
+        checkpoint_precedente=checkpoint_precedente, selezione=selezione,
+        valutatore_selezione=valutatore_selezione,
     )
     yield from turno.esegui()
 
@@ -1924,10 +2116,11 @@ class _Turno:
             )
         )
 
-    def _costruisci(self, step: int, blocco_piano: str) -> list[dict[str, Any]]:
+    def _costruisci(self, step: int, blocco_piano: str,
+                    messaggi: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
         tool_ctx = self.tool_ctx
         return build_api_messages(
-            self.ui_messages,
+            self.ui_messages if messaggi is None else messaggi,
             system_prompt=self.system_prompt,
             env_header=self.env_header,
             strip_thinking=self.strip_thinking,
@@ -2102,7 +2295,12 @@ class _Turno:
             api_messages, finestra_compat, reserved_tokens=self.schema_tokens,
         ) > self.soglia:
             prima_tok = estimate_messages_tokens(api_messages)
-            esito = compatta_cronologia(
+            selezionata = None
+            if self.selezione in ("regole", "valutatore"):
+                selezionata, api_messages = yield from self._selezione(
+                    step, blocco_piano, api_messages, finestra_compat, prima_tok,
+                )
+            esito = None if selezionata is not None else compatta_cronologia(
                 self.ui_messages,
                 backend=self.backend.scope("compaction"),
                 params=params,
@@ -2112,7 +2310,7 @@ class _Turno:
                 schedario=self.schedario,
                 should_stop=self.stopped,
             )
-            if esito is None and not self.stopped():
+            if esito is None and selezionata is None and not self.stopped():
                 st.compattazione_ferma_fino_a = step + PAUSA_COMPATTAZIONE_FALLITA
                 self.conta("compattazione_rinviata")
             if esito is not None:
@@ -3034,6 +3232,57 @@ class _Turno:
             yield self.fine("stallo", step)
             return FINE
         return AVANTI
+
+    # ------------------------------------------------------------------
+    # COMPATTAZIONE SELETTIVA (``core/selezione.py``)
+    # ------------------------------------------------------------------
+    def _selezione(
+        self, step: int, blocco_piano: str, api_messages: list[dict[str, Any]],
+        finestra: int, prima_tok: int,
+    ) -> Iterator[AgentEvent]:
+        """Prova a liberare contesto togliendo chiamate vecchie; None se non basta.
+
+        Generatore con valore di ritorno (``yield from``): emette l'evento di
+        compattazione solo se la selezione resta, e torna la selezione (o
+        None) con la vista da usare.
+        """
+        piano = "; ".join(
+            f"{p.id}. {p.text}" for p in (self.tool_ctx.plan.open_steps if self.tool_ctx.plan else [])
+        )
+        valutatore = self.valutatore_selezione if self.selezione == "valutatore" else None
+
+        def pressione(messaggi: list[dict[str, Any]]) -> float:
+            return context_pressure(self._costruisci(step, blocco_piano, messaggi), finestra,
+                                    reserved_tokens=self.schema_tokens)
+
+        proposta = proponi_selezione(
+            self.ui_messages, budgets=self.budgets, strip_thinking=self.strip_thinking,
+            finestra=finestra, valutatore=valutatore, piano=piano, pressione=pressione,
+        )
+        if proposta is None:
+            self.conta("selezione_impossibile")
+            return None, api_messages
+        fine, sel = proposta
+        self.ui_messages.insert(fine, sel.record)
+        prova = self._costruisci(step, blocco_piano)
+        if context_pressure(prova, finestra, reserved_tokens=self.schema_tokens) > (
+            selezione_mod.QUOTA_OBIETTIVO
+        ):
+            # Non basta: si toglie e si riassume come prima. Stessa regola di
+            # fast-jev (``minReductionRatio``): meglio un riassunto che una
+            # selezione che riscatta al passo dopo.
+            del self.ui_messages[fine]
+            self.conta("selezione_insufficiente")
+            return None, api_messages
+        self.conta("compattazione_selettiva")
+        if sel.errore:
+            self.conta("valutatore_giu")
+        yield HistoryCompacted(
+            messages=sel.candidati, tokens_before=prima_tok,
+            tokens_after=estimate_messages_tokens(prova),
+            summary=sel.record["descrizione"],
+        )
+        return sel, prova
 
     # ------------------------------------------------------------------
     # CHIUSURA A PASSI FINITI

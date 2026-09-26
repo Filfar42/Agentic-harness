@@ -663,6 +663,27 @@ try {
             <div class="help">Quando il contesto si riempie, la parte vecchia viene riassunta da una chiamata dedicata e tolta alla vista del modello. In chat resta leggibile. Costa una generazione e un ricalcolo del KV cache: per questo la soglia è alta.</div></div>
         </div>
         <div class="field" style="margin-left:30px">
+          <label for="s-selezione">Prima del riassunto: compattazione selettiva</label>
+          <select id="s-selezione">
+            <option value="spenta">spenta</option>
+            <option value="laya">laya (locale)</option>
+          </select>
+          <div class="help">Sperimentale. Invece di riassumere, un <code>laya-serve</code> in locale decide chiamata per chiamata quali risultati vecchi togliere o accorciare; il testo tuo e del modello resta parola per parola, e nessun dato esce dalla macchina. Se togliere non basta, o Laya non risponde, si riassume come prima. Prima di accenderla misurala sulle tue conversazioni con <code>scripts/valuta_laya.py</code>: sul replay delle sessioni di agosto e settembre anche un valutatore perfetto evitava fra il 15% e il 38% dei riassunti.</div>
+        </div>
+        <div class="field" style="margin-left:30px">
+          <label for="s-laya-url">Indirizzo di laya-serve</label>
+          <input type="text" id="s-laya-url" spellcheck="false">
+          <div class="help">Il protocollo è quello di Jev (<code>/v1/systemone</code>). Checkpoint: <code>multilingual</code> per le conversazioni in italiano.</div>
+        </div>
+        <div class="field" style="margin-left:30px">
+          <label for="s-laya-modello">Checkpoint di Laya</label>
+          <select id="s-laya-modello">
+            <option value="multilingual">multilingual</option>
+            <option value="english">english</option>
+            <option value="typed-decisions">typed-decisions</option>
+          </select>
+        </div>
+        <div class="field" style="margin-left:30px">
           <label for="s-compact-threshold">Soglia di compattazione</label>
           <input type="number" id="s-compact-threshold" min="0.4" max="0.95" step="0.05">
           <div class="help">Frazione della finestra oltre la quale scatta. A 0.75 resta un quarto di contesto libero per il passo successivo.</div>
@@ -744,6 +765,11 @@ try {
           <input type="checkbox" id="s-require-plan">
           <div><label for="s-require-plan" style="margin:0">Pretendi un piano sulle richieste con più obiettivi</label>
             <div class="help">Se la richiesta ha step numerati o più verbi all'imperativo e il modello lavora senza piano, l'harness glielo chiede una volta.</div></div>
+        </div>
+        <div class="switch">
+          <input type="checkbox" id="s-monitor-avanzamento">
+          <div><label for="s-monitor-avanzamento" style="margin:0">Ferma i turni che girano a vuoto</label>
+            <div class="help">Conta i passi senza nessun effetto verificabile: una lettura nuova, una scrittura che cambia il file, un test che passa, un punto del piano chiuso. Dopo 6 lo dice al modello e gli permette di chiudere spiegando cosa blocca; dopo 10 chiude il turno con un riepilogo, invece di consumare tutti i passi.</div></div>
         </div>
         <div class="switch">
           <input type="checkbox" id="s-think-watchdog">

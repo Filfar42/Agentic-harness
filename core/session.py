@@ -99,6 +99,8 @@ def _read_metadata(path: Path) -> dict[str, Any] | None:
                 raise JsonBoundaryError(f"Invalid storage field: {key}")
         if data.get("preview") is not None and not isinstance(data["preview"], dict):
             raise JsonBoundaryError("Invalid preview")
+        if data.get("checkpoint") is not None and not isinstance(data["checkpoint"], dict):
+            raise JsonBoundaryError("Invalid checkpoint")
         if "n_messages" in data and (type(data["n_messages"]) is not int or data["n_messages"] < 0):
             raise JsonBoundaryError("Invalid message count")
         return data
@@ -353,8 +355,9 @@ def _scrivi_messaggi(
 
 # Ruoli che stanno nella cronologia salvata ma non sono messaggi per nessuno:
 # l'``intento`` e' il diario degli effetti (``core/ciclo/ripresa.py``), scritto
-# prima di un'azione perche' un crash lasci traccia che l'azione era partita.
-RUOLI_DI_SERVIZIO = frozenset({"intento"})
+# prima di un'azione perche' un crash lasci traccia che l'azione era partita;
+# la ``selezione`` e' la compattazione selettiva (``core/selezione.py``).
+RUOLI_DI_SERVIZIO = frozenset({"intento", "selezione"})
 
 
 def conta_visibili(messages: list[dict]) -> int:
@@ -443,6 +446,11 @@ def save_session(state: Any, *, force: bool = False, riscrivi: bool = False) -> 
         # torna com'era. Le anteprime di applicazioni si ricontrollano al
         # momento -- un processo del turno di ieri non e' piu' vivo.
         "preview": state.get("preview") or None,
+        # L'istantanea dell'ultimo turno (``TurnFinished.checkpoint``): perche'
+        # si e' fermato, le verifiche rimaste rosse, i file scritti. Un
+        # "continua" dopo un turno rimasto a meta' riparte da qui
+        # (``core/ciclo/ripresa.py``), anche dopo un riavvio.
+        "checkpoint": state.get("checkpoint") or None,
         # Allegati della conversazione: solo i metadati, i file veri stanno
         # nella cartella 'allegati/' del workspace.
         "attachments": list(state.get("attachments", [])),
@@ -824,6 +832,7 @@ def load_session(state: Any, session_id: str) -> bool:
     if sidecar is not None and not isinstance(inline, list):
         state["_telemetry_saved"] = _telemetry_marker(session_id, sidecar)
     state["preview"] = data.get("preview") or None
+    state["checkpoint"] = data.get("checkpoint") or None
     state["attachments"] = list(data.get("attachments", []))
     if data.get("workspace_dir"):
         state["workspace_dir"] = data["workspace_dir"]
@@ -857,6 +866,7 @@ def new_session(state: Any) -> str:
     state["plan"] = []
     state["notes"] = []
     state["preview"] = None
+    state["checkpoint"] = None
     state["attachments"] = []
     state["last_usage"] = {}
     state["turn_telemetry"] = []

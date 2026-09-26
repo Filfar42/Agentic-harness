@@ -48,12 +48,14 @@ from starlette.datastructures import MutableHeaders
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from core import agent as agent_mod
+from core.ciclo import ripresa as ripresa_mod
 from core import memory as memory_mod
 from core import notes as notes_mod
 from core import skills as skills_mod
 from core import plan as plan_mod
 from core import profiles
 from core import sandbox as sandbox_mod
+from core import selezione as selezione_mod
 from core import session as session_mod
 from core import settings as settings_mod
 from core import vault as vault_mod
@@ -1256,6 +1258,24 @@ def ultima_richiesta(messages: list[dict[str, Any]]) -> str:
     return ""
 
 
+def _selezione_da_impostazioni(settings: dict[str, Any]) -> tuple[str, Any]:
+    """La compattazione selettiva scelta nelle impostazioni, per ``run_turn``.
+
+    "laya" vuol dire un ``laya-serve`` raggiungibile a ``laya_url`` (protocollo
+    ``/v1/systemone`` di Jev): la conversazione resta sulla macchina. Se il
+    servizio non risponde decidono le regole e il turno non si ferma.
+    """
+    scelta = str(settings.get("compattazione_selettiva") or "spenta")
+    if scelta == "regole":
+        return "regole", None
+    if scelta == "laya":
+        return "valutatore", selezione_mod.ValutatoreSystemOne(
+            str(settings.get("laya_url") or ""),
+            str(settings.get("laya_modello") or "multilingual"),
+        )
+    return "spenta", None
+
+
 def start_turn(
     session_id: str,
     web_search: bool = False,
@@ -1320,11 +1340,21 @@ def start_turn(
                 # il system prompt deve descriverlo, altrimenti dice al
                 # modello di non usarlo mentre il backend lo chiede.
                 pensiero_forzato = True
+            tool_ctx_turno = turn_state.tool_ctx(session_id, web_search)
+            # Chiamate rimaste senza risultato (crash o riavvio a meta' di un
+            # effetto): si ripara prima, e si riscrive la coda, perche'
+            # l'esito sintetico va *in mezzo* alla cronologia, accanto alla sua
+            # chiamata. Vedi ``core/ciclo/ripresa.py``.
+            if ripresa_mod.ripara_orfani(
+                messages, str(getattr(tool_ctx_turno, "workspace", "") or "")
+            ):
+                STATE.save(session_id, riscrivi=True)
+            selezione_turno, valutatore_turno = _selezione_da_impostazioni(turn_state.settings)
             events = agent_mod.run_turn(
                 backend=turn_state.backend(),
                 params=params_turno,
                 tools_schema=turn_state.tools_schema(web_search),
-                tool_ctx=turn_state.tool_ctx(session_id, web_search),
+                tool_ctx=tool_ctx_turno,
                 ui_messages=messages,
                 system_prompt=turn_state.system_prompt(web_search, pensiero=pensiero_forzato),
                 # Il turno rilegge il disco: e' qui che l'agente deve vedere
@@ -1353,10 +1383,23 @@ def start_turn(
                 spec_delega=bool(turn_state.settings["spec_delega"]),
                 auto_preview=bool(turn_state.settings["preview_enabled"]),
                 think_watchdog=bool(turn_state.settings["think_watchdog"]),
+                monitor_avanzamento=bool(turn_state.settings["monitor_avanzamento"]),
+                checkpoint_precedente=STATE.session(session_id).get("checkpoint"),
+                selezione=selezione_turno,
+                valutatore_selezione=valutatore_turno,
             )
             for event in events:
+                # Diario degli effetti: l'``intento`` e' gia' in coda quando
+                # arriva ToolStarted di un tool con effetti, e il tool parte
+                # solo quando il generatore riprende. Salvare qui vuol dire
+                # che un crash durante l'effetto lascia su disco la traccia.
+                if isinstance(event, agent_mod.ToolStarted) and event.name in ripresa_mod.EFFETTI:
+                    STATE.save(session_id)
                 # A terminal result is acknowledged only after persistence.
                 if isinstance(event, agent_mod.TurnFinished):
+                    STATE.session(session_id)["checkpoint"] = (
+                        getattr(event, "checkpoint", None) or None
+                    )
                     session_mod.record_turn_telemetry(
                         STATE.session(session_id), getattr(event, "telemetry", {}),
                         reason=event.reason, steps=event.steps,

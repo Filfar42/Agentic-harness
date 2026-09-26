@@ -125,12 +125,26 @@ def test_una_copia_vecchia_nel_campo_blocca_le_modifiche_al_prompt():
     """
     from core.prompts import SYSTEM_PROMPT, is_stock_prompt
 
-    copia_vecchia = SYSTEM_PROMPT.replace("Coding Agent", "Senior Software Engineer")
+    copia_vecchia = SYSTEM_PROMPT.replace("agente di programmazione", "Senior Software Engineer")
     assert copia_vecchia != SYSTEM_PROMPT
     assert not is_stock_prompt(copia_vecchia), (
         "una copia di un nostro prompt vecchio passa per personalizzata: "
         "e' voluto, ma per questo il campo deve poter tornare vuoto"
     )
+
+
+def test_le_versioni_di_serie_precedenti_restano_di_serie():
+    """Il 25/09 il prompt e' diventato a moduli. Chi aveva salvato la versione
+    2.38 identica non l'ha personalizzata: deve continuare a ricevere quella
+    nuova, non restare inchiodato alla vecchia."""
+    from core.prompts import SYSTEM_PROMPT, is_stock_prompt
+    from core.system_prompt import PROMPT_DI_SERIE_PRECEDENTI
+
+    assert PROMPT_DI_SERIE_PRECEDENTI
+    for vecchio in PROMPT_DI_SERIE_PRECEDENTI:
+        assert vecchio != SYSTEM_PROMPT
+        assert is_stock_prompt(vecchio)
+        assert is_stock_prompt(vecchio + "\n\n")
 
 
 def test_ogni_campo_numerico_converte_prima_di_salvare():
