@@ -228,7 +228,8 @@ def _richiesto_dopo(futuro: list[dict[str, Any]], nome: str, args: dict[str, Any
 
 def rigioca(messaggi: list[dict[str, Any]], *, num_ctx: int, tetto: int,
             soglia: float = 0.75, selezione: str = "spenta",
-            valutatore_esterno: Any = None) -> dict[str, Any]:
+            valutatore_esterno: Any = None,
+            max_caratteri_stato: int | None = None) -> dict[str, Any]:
     budgets = budgets_for(num_ctx, tetto)
     params = GenParams(num_ctx=num_ctx, max_tokens=8192)
     finestra = finestra_efficace(num_ctx, tetto)
@@ -277,7 +278,7 @@ def rigioca(messaggi: list[dict[str, Any]], *, num_ctx: int, tetto: int,
 
                     prop = agent_mod.proponi_selezione(
                         storia, budgets=budgets, strip_thinking=True, finestra=finestra,
-                        valutatore=valutatore,
+                        valutatore=valutatore, max_caratteri_stato=max_caratteri_stato,
                         **({"pressione": pressione} if selezione != "limite" else {}),
                     )
                     if prop is not None:

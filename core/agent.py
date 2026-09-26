@@ -1146,6 +1146,7 @@ def proponi_selezione(
     soglia_coda: float = CODA_DEFAULT,
     piano: str = "",
     pressione: Callable[[list[dict[str, Any]]], float] | None = None,
+    max_caratteri_stato: int | None = None,
 ) -> tuple[int, selezione_mod.Selezione] | None:
     """Prepara una compattazione selettiva sullo stesso tratto del riassunto.
 
@@ -1192,6 +1193,7 @@ def proponi_selezione(
     obiettivo = "\n".join(richieste_utente(ui_messages)[-3:])
     sel = selezione_mod.seleziona(
         ui_messages, inizio, fine, obiettivo=obiettivo, piano=piano, valutatore=valutatore,
+        max_caratteri_stato=max_caratteri_stato or selezione_mod.MAX_CARATTERI_STATO,
     )
     if not sel.record["decisioni"]:
         return None

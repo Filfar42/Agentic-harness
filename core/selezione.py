@@ -20,12 +20,18 @@ Cosa cambia rispetto all'originale, e perche'
 ---------------------------------------------
 1. **Stato per chiamata, non la conversazione intera.** fast-jev manda a Jev
    tutta la cronologia (fino a 25k token, sotto il limite di 32k di Jev) e
-   chiede di ogni chiamata. Laya legge 512 token (inglese), 1024 (multilingue,
-   fino a 8192 con accuratezza che cala oltre ~4000) e **tronca in silenzio**
-   uno stato-stringa piu' lungo tenendone l'inizio: puntato sulla conversazione
-   intera risponderebbe su un pezzo che non contiene la chiamata chiesta.
-   Qui ogni chiamata ha il suo stato breve (obiettivo, chiamata, inizio
-   dell'esito, fatti successivi), sotto ``MAX_CARATTERI_STATO``.
+   chiede di ogni chiamata. Laya di serie legge 1.024 token sul multilingue
+   (~768 per lo stato: il resto va a domanda e opzioni, ``head_max_len``) e
+   512 sull'inglese; il multilingue arriva a 8.192 con ``max_len``, ma
+   ``laya-serve`` chiama il modello **senza** ``max_len`` (``laya/serve.py``),
+   quindi via HTTP vale il default. Uno stato piu' lungo viene **troncato in
+   silenzio** tenendone l'inizio. E conta il costo: Laya codifica lo stato
+   insieme a ogni domanda (``[CLS] domanda [SEP] opzioni [SEP] stato``), quindi
+   uno stato lungo si paga una volta per domanda -- con 80-120 domande a
+   compattazione, la conversazione intera anche a 8k costerebbe minuti. Qui
+   ogni chiamata ha il suo stato breve (fatti successivi, chiamata, obiettivo,
+   inizio dell'esito), sotto ``MAX_CARATTERI_STATO``, con i fatti **in testa**:
+   se lo stato sfora, Laya taglia la coda, cioe' l'inizio dell'esito.
 2. **I fatti successivi li calcola l'harness.** Uno stato locale non vede il
    futuro della conversazione; e il segnale piu' forte ("questo file e' stato
    riletto o riscritto dopo", "questo comando e' stato rilanciato") e' un
@@ -71,7 +77,9 @@ QUOTA_OBIETTIVO = 0.55
 # ancora valutate si decidono con le regole: il turno non aspetta un modello
 # di decisione lento (Laya su CPU: ~0,2-0,6 s a domanda).
 TEMPO_MASSIMO_S = 20.0
-# ~700 token: con le due domande sta nei 1024 di laya-multilingual.
+# Lo stato di serie: ~600-800 token, nei ~768 che laya-serve lascia allo stato
+# di serie (1.024 meno la testa della domanda). Piu' grande solo con un
+# servizio che passi ``max_len`` (vedi ``ValutatoreSystemOne``).
 MAX_CARATTERI_STATO = 2_400
 MAX_OBIETTIVO = 600
 MAX_ARGOMENTI = 300
@@ -291,23 +299,33 @@ def _breve(testo: str, n: int) -> str:
     return testo if len(testo) <= n else testo[: n - 1] + "…"
 
 
-def stato_locale(c: Candidato, obiettivo: str, piano: str = "") -> dict[str, Any]:
-    """Lo stato di una chiamata, dentro la finestra di Laya."""
+def stato_locale(c: Candidato, obiettivo: str, piano: str = "",
+                 max_caratteri: int = MAX_CARATTERI_STATO) -> dict[str, Any]:
+    """Lo stato di una chiamata, dentro la finestra di Laya.
+
+    L'ordine delle chiavi e' voluto: Laya serializza lo stato cosi' com'e' e,
+    se sfora la finestra, ne taglia la **coda**. In testa vanno i fatti certi
+    e la chiamata; in fondo l'inizio dell'esito e la descrizione del compito,
+    che sono le parti che si possono perdere. ``max_caratteri`` oltre il
+    default ha senso solo con un servizio che passa ``max_len`` a Laya: il
+    margine in piu' va all'inizio dell'esito.
+    """
     args = {k: (_breve(v, 160) if isinstance(v, str) else v) for k, v in c.args.items()}
+    testa_esito = max(MAX_TESTA_ESITO, max_caratteri - (MAX_CARATTERI_STATO - MAX_TESTA_ESITO))
     stato: dict[str, Any] = {
-        "context": CONTESTO_STATO,
-        "goal": _breve(obiettivo, MAX_OBIETTIVO),
+        "later": c.fatti or ["nothing related happened later"],
         "call": {"tool": c.nome, "input": _breve(json.dumps(args, ensure_ascii=False),
                                                   MAX_ARGOMENTI)},
-        "result_head": _breve(c.esito, MAX_TESTA_ESITO),
-        "result_chars": len(c.esito),
         "result_ok": c.ok,
-        "later": c.fatti or ["nothing related happened later"],
+        "result_chars": len(c.esito),
+        "goal": _breve(obiettivo, MAX_OBIETTIVO),
     }
     if piano:
         stato["open_plan"] = _breve(piano, 300)
+    stato["result_head"] = _breve(c.esito, testa_esito)
+    stato["context"] = CONTESTO_STATO
     # Garanzia sulla misura: si accorcia l'esito, poi l'obiettivo.
-    while len(json.dumps(stato, ensure_ascii=False)) > MAX_CARATTERI_STATO:
+    while len(json.dumps(stato, ensure_ascii=False)) > max_caratteri:
         if len(stato["result_head"]) > 120:
             stato["result_head"] = _breve(stato["result_head"], len(stato["result_head"]) // 2)
         elif len(stato["goal"]) > 150:
@@ -411,9 +429,13 @@ class ValutatoreSystemOne:
     """
 
     def __init__(self, url: str, modello: str = "multilingual", *, chiave: str = "",
-                 timeout_s: float = 10.0, client: Any = None) -> None:
+                 timeout_s: float = 10.0, client: Any = None, max_len: int = 0) -> None:
         self.url = url
         self.modello = modello
+        # ``max_len`` di Laya (fino a 8.192 sul multilingue). ``laya-serve`` non
+        # lo legge -- chiama il modello con il default -- quindi serve solo con
+        # un servizio che lo passa a ``Router.predict``. 0: non si manda.
+        self.max_len = int(max_len or 0)
         # Mai nelle impostazioni: solo dall'ambiente, e solo verso l'host di
         # TypeSafe -- per nome di host, non per sottostringa dell'indirizzo
         # ("http://altro.host/typesafe.ai" non deve ricevere la chiave).
@@ -429,7 +451,9 @@ class ValutatoreSystemOne:
         intestazioni = {"content-type": "application/json"}
         if self.chiave:
             intestazioni["authorization"] = f"Bearer {self.chiave}"
-        corpo = {"model": self.modello, "state": stato, "questions": domande}
+        corpo: dict[str, Any] = {"model": self.modello, "state": stato, "questions": domande}
+        if self.max_len > 0:
+            corpo["max_len"] = self.max_len
         client = self._client or httpx
         risposta = client.post(self.url, json=corpo, headers=intestazioni,
                                timeout=self.timeout_s)
@@ -487,6 +511,7 @@ def seleziona(
     valutatore: Valutatore | None = None,
     tempo_massimo_s: float = TEMPO_MASSIMO_S,
     orologio: Callable[[], float] = time.monotonic,
+    max_caratteri_stato: int = MAX_CARATTERI_STATO,
 ) -> Selezione:
     """Decide ogni candidato in ``[inizio, fine)``; non modifica ``ui_messages``."""
     partenza = orologio()
@@ -502,7 +527,8 @@ def seleziona(
         if valutatore is not None and not errore and orologio() - partenza < tempo_massimo_s:
             q = domande(c)
             try:
-                risposte = valutatore.valuta(stato_locale(c, obiettivo, piano), q)
+                risposte = valutatore.valuta(
+                    stato_locale(c, obiettivo, piano, max_caratteri_stato), q)
                 p_chiamata, p_esito = risposte["keep_call"], risposte["keep_result"]
                 dal_valutatore += 1
                 n_domande += len(q)

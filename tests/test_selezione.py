@@ -370,3 +370,85 @@ def test_letto_e_mai_ripreso_e_il_vicolo_cieco():
     sel = selezione.seleziona(msgs, 0, len(msgs), obiettivo="sistema il parser")
     assert sel.record["decisioni"].get("r1") != "elimina"
     assert "r2" not in sel.record["decisioni"]
+
+
+# ---------------------------------------------------------------------------
+# La finestra di Laya: 1.024 di serie, fino a 8.192 con max_len (26/09)
+# ---------------------------------------------------------------------------
+
+
+def test_i_fatti_stanno_in_testa_e_sopravvivono_al_taglio():
+    """Laya serializza lo stato cosi' com'e' e, se sfora, ne taglia la coda.
+    I fatti certi devono stare prima dell'inizio dell'esito."""
+    msgs = _storia()
+    cand = selezione.candidati(msgs, 0, len(msgs))
+    selezione.annota_fatti(msgs, cand)
+    c = cand[0]
+    stato = selezione.stato_locale(c, "correggi il bug in stats.py")
+    chiavi = list(stato)
+    assert chiavi[0] == "later" and chiavi[-2:] == ["result_head", "context"]
+    testo = json.dumps(stato, ensure_ascii=False)
+    tagliato = testo[: len(testo) // 2]       # un taglio brutale a meta'
+    assert all(f in tagliato for f in c.fatti)
+
+
+def test_uno_stato_piu_grande_allarga_l_inizio_dell_esito():
+    msgs = _storia()
+    c = selezione.candidati(msgs, 0, len(msgs))[0]
+    c.esito = "riga\n" * 5_000
+    piccolo = selezione.stato_locale(c, "x")
+    grande = selezione.stato_locale(c, "x", max_caratteri=12_000)
+    assert len(json.dumps(grande, ensure_ascii=False)) <= 12_000
+    assert len(grande["result_head"]) > 4 * len(piccolo["result_head"])
+
+
+def test_max_len_si_manda_solo_se_chiesto():
+    client = _ClientFinto([_Risposta(200, {"answers": {
+        "keep_call": {"noul": 0.5}, "keep_result": {"noul": 0.5}}})] * 2)
+    di_serie = selezione.ValutatoreSystemOne("http://x/v1/systemone", client=client)
+    di_serie.valuta({}, {"keep_call": {}, "keep_result": {}})
+    assert "max_len" not in client.corpi[-1]["json"]
+    lungo = selezione.ValutatoreSystemOne("http://x/v1/systemone", client=client, max_len=4096)
+    lungo.valuta({}, {"keep_call": {}, "keep_result": {}})
+    assert client.corpi[-1]["json"]["max_len"] == 4096
+
+
+def test_la_dimensione_dello_stato_arriva_fino_al_valutatore():
+    msgs = _storia()
+    visti: list[int] = []
+
+    class Misura:
+        nome = "laya"
+
+        def valuta(self, stato: Any, domande: dict[str, Any]) -> dict[str, float]:
+            visti.append(len(json.dumps(stato, ensure_ascii=False)))
+            return dict.fromkeys(domande, 0.9)
+
+    for m in msgs:
+        if m.get("role") == "tool":
+            m["content"] = json.dumps({"content": "z" * 20_000})
+    selezione.seleziona(msgs, 0, len(msgs), obiettivo="x", valutatore=Misura(),
+                        max_caratteri_stato=9_000)
+    assert visti and max(visti) > selezione.MAX_CARATTERI_STATO and max(visti) <= 9_000
+
+
+def test_laya_in_processo_passa_max_len_al_router(monkeypatch):
+    """valuta_laya --in-processo: senza laya-serve, per poter passare max_len."""
+    import sys
+    import types
+
+    chiamate: list[dict[str, Any]] = []
+
+    class RouterFinto:
+        def predict(self, stato: Any, domande: dict[str, Any], **kw: Any) -> dict[str, Any]:
+            chiamate.append(kw)
+            return {"answers": {k: {"noul": 0.25} for k in domande}}
+
+    monkeypatch.setitem(sys.modules, "laya", types.SimpleNamespace(Router=RouterFinto))
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+    import valuta_laya
+
+    v = valuta_laya.LayaInProcesso("multilingual", max_len=8192)
+    assert v.valuta({"a": 1}, {"keep_call": {}, "keep_result": {}}) == {
+        "keep_call": 0.25, "keep_result": 0.25}
+    assert chiamate[-1] == {"model": "multilingual", "max_len": 8192}

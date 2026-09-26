@@ -517,8 +517,9 @@ DEFAULTS: dict[str, Any] = {
     # riassunti su 24-27 tentativi -- da sole le regole non bastano.
     "compattazione_selettiva": "spenta",
     "laya_url": "http://127.0.0.1:8000/v1/systemone",
-    # "multilingual": la conversazione e' in italiano (il checkpoint inglese
-    # legge 512 token, questo 1024).
+    # "multilingual": la conversazione e' in italiano. Di serie il checkpoint
+    # inglese legge 512 token e questo 1.024 (fino a 8.192 con ``max_len``,
+    # che pero' ``laya-serve`` non passa: vedi ``core/selezione.py``).
     "laya_modello": "multilingual",
     "compact_threshold": HISTORY_COMPACT_THRESHOLD,
     # Tetto in token: si compatta al piu' tardi qui, anche se la percentuale

@@ -32,6 +32,24 @@ locale. Per Jev: ``--url https://api.typesafe.ai/v1/systemone --modello
 jev-latest`` con ``TYPESAFE_API_KEY`` nell'ambiente -- in quel caso gli stati
 (obiettivo, chiamata, inizio dell'esito) vanno a TypeSafe.
 
+Stati piu' lunghi (fino a 8.192 token)
+--------------------------------------
+Il multilingue di serie legge 1.024 token, ma con ``max_len`` arriva a 8.192.
+``laya-serve`` pero' non passa ``max_len`` (chiama ``Router.predict`` senza),
+quindi per provarlo lo script puo' usare Laya **nella stessa macchina senza
+server**::
+
+    pip install laya
+    python scripts/valuta_laya.py chat_sessions --in-processo --max-len 4096 \
+        --caratteri-stato 12000 --json laya_4k.json
+
+``--caratteri-stato`` allarga lo stato di ogni chiamata (il margine va
+all'inizio dell'esito); ``--max-len`` e' la finestra di Laya. Attenzione al
+costo: Laya codifica lo stato insieme a *ogni* domanda, quindi uno stato
+quattro volte piu' lungo costa circa quattro volte di piu' a domanda, e le
+domande sono 80-120 a compattazione. Confronta accordo, AUC e secondi con la
+corsa di serie prima di decidere.
+
 Cosa stampa
 -----------
 * accordo con l'oracolo sulla decisione "togli / tieni" del risultato
@@ -59,6 +77,27 @@ from analisi_sessioni import carica
 from replay_contesto import ValutatoreOracolo, rigioca
 
 from core import selezione
+
+
+class LayaInProcesso:
+    """Laya chiamata direttamente, senza ``laya-serve``: l'unico modo di passare
+    ``max_len`` con la libreria com'e'. Stesse domande e stessi stati del turno."""
+
+    nome = "laya"
+
+    def __init__(self, modello: str = "multilingual", max_len: int = 0) -> None:
+        from laya import Router  # pip install laya
+
+        self.router = Router()
+        self.modello = modello
+        self.max_len = max_len
+
+    def valuta(self, stato: Any, domande: dict[str, Any]) -> dict[str, float]:
+        opzioni: dict[str, Any] = {"model": self.modello}
+        if self.max_len:
+            opzioni["max_len"] = self.max_len
+        risposte = self.router.predict(stato, domande, **opzioni)["answers"]
+        return {nome: float(risposte[nome]["noul"]) for nome in domande}
 
 
 class Registratore(ValutatoreOracolo):
@@ -141,8 +180,20 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--min-passi", type=int, default=3)
     ap.add_argument("--max-sessioni", type=int, default=0, help="0 = tutte")
     ap.add_argument("--json", type=Path, default=None)
+    ap.add_argument("--max-len", type=int, default=0,
+                    help="finestra di Laya in token (0 = quella di serie, 1.024 sul multilingue)")
+    ap.add_argument("--caratteri-stato", type=int, default=selezione.MAX_CARATTERI_STATO,
+                    help="caratteri massimi dello stato di ogni chiamata")
+    ap.add_argument("--in-processo", action="store_true",
+                    help="usa la libreria laya qui, senza laya-serve (serve per --max-len)")
     a = ap.parse_args(argv)
-    vero = selezione.ValutatoreSystemOne(a.url, a.modello, timeout_s=30.0)
+    if a.max_len and not a.in_processo:
+        # laya-serve accetta il campo ma non lo usa: la corsa girerebbe con la
+        # finestra di serie e il rapporto direbbe 'max_len 4096'. Meglio fermarsi.
+        ap.error("laya-serve ignora max_len: per provarlo usa --in-processo")
+    vero: Any = (LayaInProcesso(a.modello, a.max_len) if a.in_processo
+                 else selezione.ValutatoreSystemOne(a.url, a.modello, timeout_s=30.0,
+                                                    max_len=a.max_len))
     registratore = Registratore(vero)
     per_sessione: dict[str, Any] = {}
     sessioni = [s for s in carica(a.cartella)
@@ -152,7 +203,8 @@ def main(argv: list[str] | None = None) -> int:
     for s in sessioni:
         prima = len(registratore.righe)
         esito = rigioca(s["messaggi"], num_ctx=a.num_ctx, tetto=a.tetto, selezione="oracolo",
-                        valutatore_esterno=registratore)
+                        valutatore_esterno=registratore,
+                        max_caratteri_stato=a.caratteri_stato)
         per_sessione[s["id"]] = {"compattazioni": esito["selezioni_riuscite"]
                                  + esito["selezioni_insufficienti"],
                                  "candidati": len(registratore.righe) - prima,
@@ -162,8 +214,10 @@ def main(argv: list[str] | None = None) -> int:
     if eventi and "ms_per_domanda_mediana" in totale:
         totale["secondi_per_compattazione_stimati"] = round(
             statistics.median(eventi) * 2 * totale["ms_per_domanda_mediana"] / 1000, 1)
-    rapporto = {"parametri": {"url": a.url, "modello": a.modello, "num_ctx": a.num_ctx,
-                              "tetto": a.tetto, "valutatore": vero.nome},
+    rapporto = {"parametri": {"url": "(in processo)" if a.in_processo else a.url,
+                              "modello": a.modello, "num_ctx": a.num_ctx, "tetto": a.tetto,
+                              "valutatore": vero.nome, "max_len": a.max_len or "di serie",
+                              "caratteri_stato": a.caratteri_stato},
                 "totale": totale}
     print(json.dumps(rapporto, ensure_ascii=False, indent=1))
     if a.json:
