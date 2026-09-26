@@ -185,11 +185,32 @@ def test_reattaching_replays_the_whole_turn(client):
     session_id = current_session(client)
     first = run_and_collect(client, session_id, "cosa c'e' nel progetto?")
 
-    # una seconda connessione allo stesso turno rivede tutto dall'inizio
+    # una seconda connessione allo stesso turno rivede tutto dall'inizio --
+    # tranne le metriche dal vivo del cruscotto, che sono volatili: di quelle
+    # l'arretrato tiene solo l'ultima (``TurnRunner.emit(volatile=...)``).
+    # Le definitive, una per passo, ci sono tutte.
+    def durevoli(eventi):
+        return [e["type"] for e in eventi
+                if not (e["type"] == "metriche" and not e.get("definitivo"))]
+
     again = read_sse(client.get(f"/api/stream/{session_id}"))
-    assert [e["type"] for e in again] == [e["type"] for e in first]
+    assert durevoli(again) == durevoli(first)
+    assert sum(e["type"] == "metriche" and not e["definitivo"] for e in again) <= 1
+    assert any(e["type"] == "metriche" and e["definitivo"] for e in again)
     assert any(e["type"] == "tool_end" for e in again)
     assert any(e["type"] == "reasoning" for e in again)
+
+
+def test_le_stats_portano_il_cruscotto(client):
+    """Riaprendo una chat il pannello ritrova la timeline dell'ultimo turno."""
+    session_id = current_session(client)
+    run_and_collect(client, session_id, "cosa c'e' nel progetto?")
+    assert wait_until(lambda: not client.get(f"/api/sessions/{session_id}").json()["running"])
+    payload = client.get(f"/api/sessions/{session_id}").json()
+    ultimo = payload["stats"]["cruscotto"]["ultimo"]
+    assert ultimo and ultimo["righe"]
+    assert ultimo["righe"][0]["passo"] == 1
+    assert {"attesa_ms", "generazione_ms", "tool_ms", "tok_s", "prompt"} <= set(ultimo["righe"][0])
 
 
 def test_turn_survives_switching_conversation(client):

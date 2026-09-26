@@ -18,6 +18,7 @@ from typing import Any
 from collections.abc import Callable, Iterator, Sequence
 
 from .backend import PREFISSO_NOTA_HARNESS, StreamEvent
+from .cruscotto import Metriche, Tachimetro
 
 from .context import compact_result, deposit_references
 from .inference import service_text
@@ -363,6 +364,7 @@ AgentEvent = (
     | PreviewUpdated
     | TurnFinished
     | AgentError
+    | Metriche
 )
 
 
@@ -1912,6 +1914,9 @@ class _Turno:
         self.backend = backend
         self.telemetry_offset = backend.collector.offset()
         self.turn_started = time.monotonic()
+        # Lo stesso istante sull'orologio di parete: viaggia nelle metriche del
+        # cruscotto per chi si riattacca a turno in corso.
+        self.turn_started_epoch = time.time()
         self.allowed_tools = {schema["function"]["name"] for schema in self.tools_schema}
         self.schema_tokens = (
             estimate_tokens(json.dumps(self.tools_schema, ensure_ascii=False))
@@ -2458,15 +2463,36 @@ class _Turno:
         messaggi_stream = prep.api_messages
         params_stream = prep.params_passo
         tetto_passo = prep.tetto_passo
+        # Il cruscotto del passo: velocita', fase, prefill, draft. Vede gli
+        # stessi eventi del ciclo e non ne cambia nessuno (``core/cruscotto``).
+        tachimetro = Tachimetro(
+            step,
+            prompt_stimato=prep.stima_passo,
+            finestra=int(getattr(prep.params_passo, "num_ctx", 0) or 0),
+            un_token_per_chunk=getattr(backend, "un_token_per_chunk", False) is True,
+            prompt_intero=getattr(backend, "prompt_tokens_is_total", False) is True,
+            turno_inizio=round(self.turn_started_epoch, 3),
+        )
+        # Il primo frame parte subito: dice "attesa" e quanto e' grosso il
+        # prompt, che durante il prefill e' l'unica cosa che si sa.
+        yield tachimetro.aggiorna(forza=True)
+        prima_richiesta = True
         try:
             stream_options = {"should_stop": stopped} if getattr(
                 backend, "supports_cancellation", False
             ) else {}
             while True:
+                if not prima_richiesta:
+                    tachimetro.nuova_richiesta()
+                prima_richiesta = False
                 events = backend.stream(messaggi_stream, self.tools_schema, params_stream,
                                         **stream_options)
                 taglio: str | None = None
                 for ev in events:
+                    tachimetro.evento(ev)
+                    metriche = tachimetro.aggiorna()
+                    if metriche is not None:
+                        yield metriche
                     if stopped():
                         # Chiudere il generatore fa cadere la connessione HTTP:
                         # senza, la generazione continuerebbe a occupare la GPU.
@@ -2475,6 +2501,8 @@ class _Turno:
                         if callable(close):
                             close()
                         break
+                    if ev.kind == "battito":
+                        continue
                     if ev.kind == "reasoning":
                         pensiero_nativo = True
                         if parser.feed_reasoning(ev.text):
@@ -2608,6 +2636,9 @@ class _Turno:
             self.conta("continuazione_rifiutata")
 
         parser.finish()
+        # Il frame definitivo del passo, anche se il passo e' finito male: e'
+        # proprio li' che serve sapere quanto aveva generato e in quanto.
+        yield tachimetro.chiudi()
 
         # La calibrazione vale solo se la richiesta misurata e' quella stimata
         # e se il server dichiara il prompt intero (``prompt_tokens_is_total``).

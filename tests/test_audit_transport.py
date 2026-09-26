@@ -78,13 +78,27 @@ def run(kind: str, **kwargs) -> list[StreamEvent]:
     return list(backend(kind).stream([], None, GenParams(model="test"), **kwargs))
 
 
+def output(events: list[StreamEvent]) -> list[StreamEvent]:
+    """Gli eventi con un effetto: senza i battiti del cruscotto.
+
+    Un battito dice solo che il modello sta scrivendo gli argomenti di una
+    chiamata (quanti caratteri): non porta testo ne' tool, e le garanzie di
+    questi test -- niente tool prima della fine, niente tool parziali -- sono
+    sugli eventi che portano qualcosa.
+    """
+    for event in events:
+        if event.kind == "battito":
+            assert not event.text and event.tool_call is None
+    return [event for event in events if event.kind != "battito"]
+
+
 @pytest.mark.parametrize("kind", ["ollama", "openai"])
 def test_tool_is_withheld_until_explicit_completion_and_wire_closes(kind, wire_client):
     raw = (ndjson(OLLAMA_CALL, {"done": True, "done_reason": "stop"}) if kind == "ollama"
            else sse(OPENAI_CALL, choice(finish="tool_calls")))
     wire = Wire([raw[i:i + 3] for i in range(0, len(raw), 3)])
     wire_client(lambda request: httpx.Response(200, stream=wire))
-    events = run(kind)
+    events = output(run(kind))
     assert [event.kind for event in events] == ["usage", "tool_call"]
     assert events[-1].tool_call["name"] == "read_file"
     assert wire.closed
@@ -254,7 +268,7 @@ def test_length_termination_never_releases_partial_tools(kind, wire_client):
     raw = (ndjson(OLLAMA_CALL, {"done": True, "done_reason": "length"}) if kind == "ollama"
            else sse(OPENAI_CALL, choice(finish="length")))
     wire_client(lambda request: httpx.Response(200, content=raw))
-    events = run(kind)
+    events = output(run(kind))
     assert [event.kind for event in events] == ["usage"]
     assert events[0].usage["done_reason"] == "length"
 
@@ -339,7 +353,7 @@ def test_huge_json_integer_never_escapes_as_overflow_error(kind, wire_client):
 def test_entire_tool_batch_is_validated_before_first_tool_event(second, wire_client):
     raw = sse(OPENAI_CALL, choice({"tool_calls": [second]}), choice(finish="tool_calls"))
     wire_client(lambda request: httpx.Response(200, content=raw))
-    events = run("openai")
+    events = output(run("openai"))
     assert len(events) == 1 and events[0].kind == "error"
 
 

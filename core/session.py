@@ -138,7 +138,7 @@ def bounded_turn_telemetry(value: Any) -> list[dict[str, Any]]:
                 entry = {
                     key: entry[key] for key in (
                         "version", "totals", "since_offset", "end_offset", "turn_reason",
-                        "steps", "recorded_at",
+                        "steps", "recorded_at", "turn_wall_ms", "cruscotto",
                     ) if key in entry
                 }
                 entry.update(calls=[], calls_truncated=(len(calls) if isinstance(calls, list) else 0)
@@ -157,7 +157,7 @@ def bounded_turn_telemetry(value: Any) -> list[dict[str, Any]]:
 
 
 def record_turn_telemetry(state: Any, telemetry: Any, *, reason: str, steps: int,
-                          qualita: Any = None) -> None:
+                          qualita: Any = None, cruscotto: Any = None) -> None:
     """Attach a completed turn snapshot before the final session save.
 
     ``qualita`` e' lo stato delle verifiche alla fine del turno. Sta qui e non
@@ -175,6 +175,10 @@ def record_turn_telemetry(state: Any, telemetry: Any, *, reason: str, steps: int
     }
     if isinstance(qualita, dict) and qualita:
         entry["qualita"] = qualita
+    # Le righe della timeline del cruscotto (``core/cruscotto.Registro``):
+    # come il turno e' stato visto dal vivo, per chi riapre la conversazione.
+    if isinstance(cruscotto, list) and cruscotto:
+        entry["cruscotto"] = cruscotto
     previous = state.get("turn_telemetry")
     state["turn_telemetry"] = bounded_turn_telemetry(
         [*(previous if isinstance(previous, list) else []), entry]

@@ -49,6 +49,7 @@ from starlette.datastructures import MutableHeaders
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from core import agent as agent_mod
+from core import cruscotto as cruscotto_mod
 from core.ciclo import ripresa as ripresa_mod
 from core import memory as memory_mod
 from core import notes as notes_mod
@@ -968,6 +969,7 @@ _EVENT_NAMES = {
     agent_mod.PreviewUpdated: "preview",
     agent_mod.TurnFinished: "done",
     agent_mod.AgentError: "error",
+    agent_mod.Metriche: "metriche",
 }
 
 
@@ -1196,12 +1198,16 @@ def session_stats(session_id: str) -> dict[str, Any]:
         contesto = contesto_usato(session_id)
         toccati = sorted(STATE.touched(session_id))
         allegati = pending_attachments(session_id)
+        # Timeline dell'ultimo turno e punti velocita'/contesto, ricavati
+        # dalla telemetria salvata (memorizzati: vedi ``storico_della_sessione``).
+        cruscotto = cruscotto_mod.storico_della_sessione(STATE.session(session_id))
     except HTTPException:
-        contesto, toccati, allegati = 0, [], []
+        contesto, toccati, allegati, cruscotto = 0, [], [], None
     return {
         "context_used": contesto,
         "context_window": int(STATE.settings["num_ctx"]),
         "touched_files": toccati,
+        "cruscotto": cruscotto,
         # Solo quelli ancora in attesa di partire: gli altri stanno gia'
         # disegnati sotto il messaggio con cui sono stati inviati, e ripeterli
         # nella barra del composer li farebbe sembrare in coda una seconda
@@ -1390,7 +1396,18 @@ def start_turn(
                 selezione=selezione_turno,
                 valutatore_selezione=valutatore_turno,
             )
+            # Le righe della timeline, dagli stessi eventi che vanno al
+            # browser: a fine turno si salvano con la telemetria, e chi
+            # riapre la chat ritrova il cruscotto com'era.
+            registro = cruscotto_mod.Registro()
             for event in events:
+                registro.osserva(event)
+                # Le metriche dal vivo sono volatili: all'arretrato basta
+                # l'ultima. Quella definitiva di fine passo resta, come ogni
+                # altro evento.
+                if isinstance(event, agent_mod.Metriche) and not event.definitivo:
+                    runner.emit(event_to_sse(event), volatile="metriche")
+                    continue
                 # Diario degli effetti: l'``intento`` e' gia' in coda quando
                 # arriva ToolStarted di un tool con effetti, e il tool parte
                 # solo quando il generatore riprende. Salvare qui vuol dire
@@ -1406,6 +1423,7 @@ def start_turn(
                         STATE.session(session_id), getattr(event, "telemetry", {}),
                         reason=event.reason, steps=event.steps,
                         qualita=getattr(event, "qualita", None),
+                        cruscotto=registro.chiudi(),
                     )
                     terminal_frame = event_to_sse(event)
                     continue
@@ -1583,7 +1601,11 @@ def index() -> Response:
     resta apribile a mano durante lo sviluppo.
     """
     html = (WEB_DIR / "index.html").read_text(encoding="utf-8")
-    for nome in ("app.js", "style.css", "companion.js", "companion.css"):
+    # Tutti i file che la pagina carica, non una parte: ``impostazioni.*``
+    # erano rimasti fuori, e un menu appena cambiato poteva girare nella
+    # versione di prima con niente che lo facesse sospettare.
+    for nome in ("app.js", "style.css", "companion.js", "companion.css",
+                 "impostazioni.js", "impostazioni.css", "cruscotto.js", "cruscotto.css"):
         html = html.replace(f"/static/{nome}", f"/static/{nome}?v={_impronta(nome)}")
     return Response(
         html,

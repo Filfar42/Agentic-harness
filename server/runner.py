@@ -144,6 +144,14 @@ class TurnRunner:
         # ridisegna questa e poi riapplica i frame, senza duplicati.
         self.snapshot = snapshot
         self.frames: list[str] = []
+        # Frame **volatili**: di ogni specie conta solo l'ultimo. Sono le
+        # metriche dal vivo del cruscotto, quattro al secondo: tenerle tutte
+        # nell'arretrato vorrebbe dire, su un turno da un'ora, quindicimila
+        # frame che nessuno rileggera' -- e ``_MAX_REPLAY_FRAMES`` che scatta
+        # e ferma il turno per aver misurato troppo. Chi si riattacca riceve
+        # l'ultimo, al posto in cui era stato emesso. Specie -> (posizione in
+        # ``frames``, frame).
+        self._volatili: dict[str, tuple[int, str]] = {}
         self._replay_bytes = 0
         self._overflowed = False
         self.finished = threading.Event()
@@ -160,9 +168,24 @@ class TurnRunner:
 
     # -- produzione --------------------------------------------------------
 
-    def emit(self, frame: str) -> None:
+    def emit(self, frame: str, *, volatile: str | None = None) -> None:
+        """Un frame per chi guarda adesso e per chi si riattacchera' dopo.
+
+        ``volatile``: la specie del frame, se ne conta solo l'ultimo (vedi
+        ``_volatili``). Un frame volatile non entra nel conto dei limiti, e un
+        abbonato troppo lento lo perde invece di essere staccato: il prossimo
+        arriva fra un quarto di secondo e dice la stessa cosa aggiornata.
+        """
         with self._lock:
             if self.finished.is_set() or self._overflowed:
+                return
+            if volatile is not None:
+                self._volatili[volatile] = (len(self.frames), frame)
+                for sub in list(self._subscribers):
+                    try:
+                        sub.put_nowait(frame)
+                    except queue.Full:
+                        pass
                 return
             size = len(frame.encode("utf-8"))
             if self._replay_bytes + size > _MAX_REPLAY_BYTES or len(self.frames) >= _MAX_REPLAY_FRAMES:
@@ -207,6 +230,11 @@ class TurnRunner:
     def subscribe(self) -> tuple[list[str], queue.Queue[str | None]]:
         with self._lock:
             backlog = list(self.frames)
+            # L'ultimo volatile di ogni specie, dove era stato emesso: dopo di
+            # lui possono esserci frame piu' nuovi (la fine del passo), e
+            # rimetterlo in coda li contraddirebbe.
+            for posizione, frame in sorted(self._volatili.values(), key=lambda v: -v[0]):
+                backlog.insert(posizione, frame)
             sub = SubscriberQueue(_SUBSCRIBER_QUEUE_MAX)
             self._subscribers.append(sub)
         return backlog, sub

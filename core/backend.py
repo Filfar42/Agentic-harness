@@ -33,7 +33,12 @@ import httpx
 from .config import GenParams
 from .jsonsafe import JsonBoundaryError, loads_object
 
-EventKind = Literal["content", "reasoning", "tool_call", "usage", "error"]
+# ``battito``: il server sta generando (o sta leggendo il prompt) e questo e'
+# quanto ne sappiamo adesso -- i ``timings`` di llama.cpp token per token, il
+# progresso del prefill, i caratteri degli argomenti di una tool call che si
+# sta scrivendo. Non porta testo e non e' output osservabile: serve al
+# cruscotto (``core/cruscotto.py``) e chi non lo conosce lo ignora.
+EventKind = Literal["content", "reasoning", "tool_call", "usage", "error", "battito"]
 
 MAX_FRAME_BYTES = 1_048_576
 MAX_STREAM_BYTES = 16_777_216
@@ -185,7 +190,12 @@ def _stream_with_retries(
                 try:
                     for event in yield_from:
                         _checkpoint(should_stop, deadline)
-                        emitted = True
+                        # Un battito non e' output: dopo un battito si puo'
+                        # ancora riprovare senza duplicare niente -- gli
+                        # argomenti di una tool call restano nel buffer finche'
+                        # la generazione non e' completa.
+                        if event.kind != "battito":
+                            emitted = True
                         yield event
                 finally:
                     yield_from.close()
@@ -762,6 +772,10 @@ class OllamaBackend:
     name = "ollama"
     supports_cancellation = True
     manages_retries = True
+    # Ollama spedisce un token per riga dello stream: contare i pezzi e'
+    # contare i token. Il cruscotto lo usa per la velocita' dal vivo, che
+    # Ollama dichiara solo a generazione finita (``eval_count``).
+    un_token_per_chunk = True
     # ``prompt_eval_count`` di Ollama, con la cache del prefisso attiva, non e'
     # garantito essere il prompt intero: puo' contare solo i token ricalcolati.
     # Il ciclo non ci calibra sopra la stima (``agent.calibra_stima``).
@@ -1274,6 +1288,9 @@ class OpenAICompatBackend:
     # ``id_slot`` e' un campo di llama-server: solo ``LlamaCppBackend`` lo
     # manda (vedi ``slot_per``).
     supports_id_slot = False
+    # Un endpoint compatibile generico (vLLM, OpenRouter) puo' mettere piu'
+    # token in un pezzo: il cruscotto li stima dai caratteri.
+    un_token_per_chunk = False
 
 
     def __init__(self, base_url: str, api_key: str, timeout_s: float = 180.0) -> None:
@@ -1426,6 +1443,10 @@ class OpenAICompatBackend:
         """Numeri fuori standard letti dal chunk. Qui non ce ne sono."""
         return {}
 
+    def _battito(self, chunk: Any) -> dict[str, Any]:  # noqa: ARG002
+        """Misure dal vivo del chunk (``StreamEvent("battito")``). Qui nessuna."""
+        return {}
+
     def _openai_attempt(
         self,
         payload: dict[str, Any],
@@ -1471,6 +1492,9 @@ class OpenAICompatBackend:
                 if chunk.get("error"):
                     raise TransportProtocolError("Il backend ha restituito un errore nello stream.")
                 extra_usage.update(self._extra_usage(chunk))
+                # Il battito si legge prima delle ``choices``: i pezzi del
+                # progresso del prefill possono non averne.
+                battito = self._battito(chunk)
                 raw_usage = chunk.get("usage")
                 if raw_usage is not None:
                     if not isinstance(raw_usage, dict):
@@ -1491,6 +1515,8 @@ class OpenAICompatBackend:
                 if not isinstance(choices, list) or len(choices) > 1:
                     raise TransportProtocolError("Attesa una sola choice nello stream.")
                 if not choices:
+                    if battito:
+                        yield StreamEvent("battito", usage=battito)
                     continue
                 choice = choices[0]
                 if not isinstance(choice, dict) or choice.get("index", 0) != 0:
@@ -1513,6 +1539,7 @@ class OpenAICompatBackend:
                     calls = []
                 if not isinstance(calls, list) or len(calls) > MAX_TOOL_CALLS:
                     raise TransportProtocolError("tool_calls deve essere una lista limitata.")
+                argomenti_nuovi = 0
                 for call in calls:
                     if not isinstance(call, dict):
                         raise TransportProtocolError("Envelope tool_call non valido.")
@@ -1531,9 +1558,20 @@ class OpenAICompatBackend:
                     if not isinstance(function, dict):
                         raise TransportProtocolError("function deve essere un oggetto.")
                     for field, limit in (("name", 256), ("arguments", MAX_FRAME_BYTES)):
-                        slot[field] += _text_field(function.get(field), field, limit=limit)
+                        pezzo = _text_field(function.get(field), field, limit=limit)
+                        slot[field] += pezzo
+                        if field == "arguments":
+                            argomenti_nuovi += len(pezzo)
                         if len(slot[field]) > limit:
                             raise TransportProtocolError(f"Buffer tool {field} oltre il limite.")
+                # Gli argomenti di una tool call restano nel buffer fino alla
+                # fine (vedi sopra), ma il modello li sta generando adesso: un
+                # ``write_file`` da trecento righe sono minuti di token che,
+                # senza questo, dall'esterno sembrano silenzio.
+                if argomenti_nuovi:
+                    battito = {**battito, "chiamata": argomenti_nuovi}
+                if battito:
+                    yield StreamEvent("battito", usage=battito)
                 if finish:
                     done_reason = finish
             raise TransportProtocolError("Stream OpenAI incompleto: manca [DONE].")
@@ -1634,6 +1672,9 @@ class LlamaCppBackend(OpenAICompatBackend):
 
     name = "llamacpp"
     supports_id_slot = True
+    # llama-server spedisce un pezzo per token, anche con lo speculative
+    # decoding (i token accettati escono uno alla volta).
+    un_token_per_chunk = True
     # Lo slot delle chiamate di servizio (impostazione ``slot_servizio``);
     # -1 = spento. Lo assegna il server a ogni turno.
     slot_servizio: int = -1
@@ -1957,6 +1998,11 @@ class LlamaCppBackend(OpenAICompatBackend):
             # Fa arrivare i timings -- e con essi i contatori del draft --
             # dentro lo stream, invece di doverli chiedere a /slots dopo.
             "timings_per_token": True,
+            # Il progresso del prefill (``prompt_progress``) nello stream: su
+            # un contesto lungo il prefill sono secondi di silenzio, e questo
+            # e' l'unico modo di sapere a che punto e'. Un server che non lo
+            # conosce ignora il campo, come ogni campo in piu'.
+            "return_progress": True,
             # llama-server tiene le chiamate multiple **spente** se non glielo
             # si chiede (docs/function-calling.md: "disabled by default"),
             # mentre il prompt e il ciclo le trattano come il comportamento
@@ -2034,6 +2080,58 @@ class LlamaCppBackend(OpenAICompatBackend):
                     fuori[chiave] = int(_counter(valore, f"timings.{nome}"))
                     break
         return fuori
+
+
+    def _battito(self, chunk: Any) -> dict[str, Any]:
+        """Tempi del passo **mentre** genera, e progresso del prefill.
+
+        Con ``timings_per_token`` ogni pezzo porta i contatori del passo fino a
+        quel token: quanti ne ha generati e in quanti millisecondi, quanti del
+        prompt ha calcolato e quanti ha preso dalla cache, quanti ne ha
+        proposti il draft e quanti ne sono stati accettati. Sono gli stessi
+        numeri che ``_extra_usage`` legge a fine passo, solo prima.
+
+        ``prompt_progress`` arriva durante il prefill, se il server lo sa
+        mandare (``return_progress``): totale, dalla cache, calcolati finora,
+        millisecondi. Numeri non validi si scartano in silenzio: qui si
+        disegna un cruscotto, non si decide niente.
+        """
+        fuori: dict[str, Any] = {}
+        t = self._timings(chunk)
+        for chiave, nomi in (
+            ("generati", ("predicted_n",)),
+            ("generazione_ms", ("predicted_ms",)),
+            ("prompt_calcolati", ("prompt_n",)),
+            ("prefill_ms", ("prompt_ms",)),
+            ("cache", ("cache_n",)),
+            ("draft_n", self.ALIAS_DRAFT_N),
+            ("draft_accepted", self.ALIAS_DRAFT_OK),
+        ):
+            for nome in nomi:
+                valore = _numero_vivo(t.get(nome))
+                if valore is not None:
+                    fuori[chiave] = valore
+                    break
+        progresso = chunk.get("prompt_progress") if isinstance(chunk, dict) else None
+        if isinstance(progresso, dict):
+            for chiave, nome in (("prefill_totale", "total"), ("prefill_cache", "cache"),
+                                 ("prefill_fatti", "processed"),
+                                 ("prefill_trascorsi_ms", "time_ms")):
+                valore = _numero_vivo(progresso.get(nome))
+                if valore is not None:
+                    fuori[chiave] = valore
+        return fuori
+
+
+def _numero_vivo(valore: Any) -> int | float | None:
+    """Un contatore del battito, o None se non e' un numero sensato."""
+    if isinstance(valore, bool) or not isinstance(valore, (int, float)):
+        return None
+    if isinstance(valore, float) and not math.isfinite(valore):
+        return None
+    if valore < 0 or valore > 2**53:
+        return None
+    return valore
 
 
 _STREAM_TOOLS_MODES = {"auto": None, "sempre": True, "mai": False}
