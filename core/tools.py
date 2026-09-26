@@ -37,7 +37,7 @@ from collections.abc import Callable
 
 from . import sandbox as sandbox_mod
 from . import atomic
-from . import sintassi
+from . import aggancio, sintassi
 from . import vault as vault_mod
 from .config import Budgets
 from .memory import add_memory, remove_memory
@@ -1015,6 +1015,21 @@ def _read_text_bounded(path: Path, *, errors: str = "replace") -> str:
     return data.decode("utf-8", errors=errors).replace("\r\n", "\n").replace("\r", "\n")
 
 
+def _stile_a_capo(path: Path) -> str:
+    """CRLF se ogni a capo del file e' CRLF, altrimenti LF."""
+    try:
+        with path.open("rb") as stream:
+            data = stream.read(MAX_TEXT_FILE_BYTES + 1)
+    except OSError:
+        return "\n"
+    crlf = data.count(b"\r\n")
+    return "\r\n" if crlf and crlf == data.count(b"\n") else "\n"
+
+
+def _con_a_capo(testo: str, a_capo: str) -> str:
+    return testo.replace("\n", a_capo) if a_capo != "\n" else testo
+
+
 def _is_probably_binary(path: Path) -> bool:
     if path.suffix.lower() in BINARY_SUFFIXES:
         return True
@@ -1031,10 +1046,12 @@ def _ok(payload: dict[str, Any]) -> str:
     return json.dumps(payload, ensure_ascii=False)
 
 
-def _err(message: str, *, hint: str = "") -> str:
+def _err(message: str, *, hint: str = "", **extra: Any) -> str:
     payload: dict[str, Any] = {"error": message}
     if hint:
         payload["hint"] = hint
+    # Campi diagnostici (``righe``, ``piu_vicino``...): solo se hanno un valore.
+    payload.update({k: v for k, v in extra.items() if v not in (None, "", [], {})})
     return json.dumps(payload, ensure_ascii=False)
 
 
@@ -1386,14 +1403,39 @@ def tool_edit_file(
         return _err(f"Impossibile leggere '{filepath}': {exc}")
 
     occurrences = text.count(old_string)
+    # Aggancio tollerante (``core/aggancio.py``): solo spazi, solo tratto unico.
+    tollerante: aggancio.Aggancio | None = None
+    if occurrences and not replace_all and aggancio.dentro_il_rientro(text, old_string):
+        # Trovato, ma a meta' degli spazi iniziali: e' un rientro sbagliato, non
+        # un frammento voluto. Se l'aggancio a righe intere e' unico vale quello.
+        agganci, modo = aggancio.cerca(text, old_string, new_string or "")
+        if len(agganci) == 1 and modo == "rientro":
+            tollerante = agganci[0]
+            occurrences = 1
     if occurrences == 0:
-        return _err(
-            f"'old_string' non trovato in '{filepath}'.",
-            hint=(
-                "Rileggi il file con read_file e copia il testo esatto, "
-                "inclusi indentazione e a capo."
-            ),
-        )
+        agganci, _modo = aggancio.cerca(text, old_string, new_string or "")
+        if len(agganci) > 1:
+            return _err(
+                f"'old_string' non c'e' alla lettera in '{filepath}', e a meno degli "
+                f"spazi compare {len(agganci)} volte: la modifica sarebbe ambigua.",
+                hint="Copia il testo esatto da uno dei punti indicati, con una riga di contesto in piu'.",
+                righe=[a.riga for a in agganci[:10]],
+            )
+        if not agganci:
+            vicino = aggancio.piu_vicino(text, old_string)
+            return _err(
+                f"'old_string' non trovato in '{filepath}'.",
+                hint=(
+                    "Il tratto piu' simile e' in 'piu_vicino': se e' quello giusto, copia "
+                    "old_string da li' ('-' e' il file, '+' e' il tuo testo), senza "
+                    "rileggere il file."
+                    if vicino else
+                    "Rileggi il file con read_file e copia il testo esatto, "
+                    "inclusi indentazione e a capo."
+                ),
+                piu_vicino=vicino,
+            )
+        tollerante = agganci[0]
     if occurrences > 1 and not replace_all:
         return _err(
             f"'old_string' compare {occurrences} volte in '{filepath}': la modifica "
@@ -1402,13 +1444,22 @@ def tool_edit_file(
                 "Allarga old_string con righe di contesto per renderlo unico, "
                 "oppure passa replace_all=true se le volevi cambiare tutte."
             ),
+            righe=aggancio.righe_occorrenze(text, old_string),
         )
 
     # Il confronto e' fra il file prima e il file dopo, non fra i due frammenti:
     # una edit chirurgica come old_string="== 3" / new_string="is not None"
     # indebolisce un assert senza che nessuno dei due frammenti *sia* un assert.
-    quante = occurrences if replace_all else 1
-    nuovo_testo = text.replace(old_string, new_string or "", quante)
+    if tollerante is not None:
+        quante = 1
+        nuovo_testo = text[:tollerante.inizio] + tollerante.sostituto + text[tollerante.fine:]
+        inizio_modifica = tollerante.inizio
+        sostituto_applicato = tollerante.sostituto
+    else:
+        quante = occurrences if replace_all else 1
+        nuovo_testo = text.replace(old_string, new_string or "", quante)
+        inizio_modifica = text.find(old_string)
+        sostituto_applicato = new_string or ""
     refusal = _refuse_test_edit(ctx, filepath, text, nuovo_testo)
     if refusal:
         return refusal
@@ -1417,7 +1468,11 @@ def tool_edit_file(
         return sintassi.rifiuto(filepath, verdetto.errore)
 
     try:
-        atomic.write_text(path, nuovo_testo)
+        # Gli a capo del file restano i suoi: la lettura li normalizza in "\n"
+        # per il confronto, e riscrivere cosi' trasformava un file CRLF intero
+        # in LF per una modifica di una riga -- su Windows, un diff di tutto il
+        # file. Solo se *tutti* gli a capo erano CRLF: un file misto resta LF.
+        atomic.write_text(path, _con_a_capo(nuovo_testo, _stile_a_capo(path)))
     except OSError as exc:
         return _err(f"Scrittura fallita su '{filepath}': {exc}")
 
@@ -1425,11 +1480,19 @@ def tool_edit_file(
     ctx.known_files.add(rel)
     record_new_symbols(ctx, rel, text, nuovo_testo)
     avviso = {"avviso_sintassi": verdetto.errore.come_dict()} if verdetto.errore else {}
+    if tollerante is not None:
+        # Detto nel risultato: il modello deve sapere che il suo old_string non
+        # era esatto, o ripetera' lo stesso scarto alla prossima modifica.
+        avviso["aggancio"] = tollerante.modo
+        avviso["nota_aggancio"] = (
+            f"old_string non era alla lettera: agganciato a riga {tollerante.riga} "
+            f"a meno di {'spazi a fine riga' if tollerante.modo != 'rientro' else 'rientro'}."
+        )
     return _ok(
         {
             **avviso,
             "dopo_la_modifica": finestra_modifica(
-                nuovo_testo, text.find(old_string), new_string or "", quante
+                nuovo_testo, inizio_modifica, sostituto_applicato, quante
             ),
             "status": "ok",
             "action": "modificato",
