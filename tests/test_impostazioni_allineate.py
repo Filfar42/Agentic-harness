@@ -23,6 +23,11 @@ def js() -> str:
     return (WEB / "app.js").read_text(encoding="utf-8")
 
 
+def menu_js() -> str:
+    """Il menu delle impostazioni: schema e controlli (dal 26/09/2026)."""
+    return (WEB / "impostazioni.js").read_text(encoding="utf-8")
+
+
 def blocco(sorgente: str, inizio: str, fine: str = "\n}") -> str:
     testo = sorgente[sorgente.index(inizio):]
     return testo[: testo.index(fine) + len(fine)]
@@ -52,16 +57,20 @@ def test_nessuno_riallinea_piu_i_campi_a_mano():
     """Le quattro copie: la riga dentro pickModel, la mappa dentro 'Applica i
     consigliati', l'immagine dentro il pulsante della build."""
     sorgente = js()
+    menu = menu_js()
     assert "select.value = nome" not in sorgente
-    profilo = blocco(sorgente, "$('#profile-apply').onclick")
-    assert "'#s-temp'" not in profilo and "num_ctx" not in profilo
+    # "Applica i consigliati" vive nel menu: i valori li rimette nei campi
+    # renderHeader, non una mappa scritta a mano dentro il pulsante.
+    profilo = blocco(menu, "async function impApplicaProfilo(")
+    assert "'#s-temp" not in profilo and "num_ctx" not in profilo
     assert "renderHeader();" in profilo
     # La terza copia era dentro il pulsante della build, che non esiste più:
     # l'immagine appena costruita la seleziona il **server** (``seleziona_
     # immagine``), quindi non c'è più nessun posto da cui il client possa
     # scriverla a mano e dimenticarsi di riallineare il resto.
-    assert "$('#sandbox-build')" not in sorgente
-    assert "$('#s-docker-image').value =" not in sorgente
+    for fonte in (sorgente, menu):
+        assert "$('#sandbox-build')" not in fonte
+        assert "$('#s-docker-image').value =" not in fonte
 
 
 def test_un_valore_fuori_elenco_non_sparisce_in_silenzio():
@@ -78,19 +87,28 @@ def test_il_campo_che_si_sta_scrivendo_non_viene_riscritto():
     il fuoco sposterebbe il cursore in fondo alla riga ad ogni lettera."""
     corpo = blocco(js(), "function syncSettingsWidgets(")
     assert "document.activeElement" in corpo
-    # ...ma il numero accanto al cursore deve continuare a muoversi
-    assert re.search(r"echo\.textContent = out", js())
+    # ...ma il numero accanto al cursore deve continuare a muoversi mentre si
+    # trascina, e da fermo mostrare il valore salvato, non quello che il passo
+    # del cursore ha arrotondato.
+    menu = menu_js()
+    cursore = menu[menu.index("case 'cursore': {"):]
+    cursore = cursore[: cursore.index("case 'modello': {")]
+    assert "input.addEventListener('input', () => mostra(input.value))" in cursore
+    assert "eco.textContent = testo" in cursore
+    assert "state.settings[campo.k]" in cursore
 
 
 def test_il_modello_scelto_dal_server_arriva_fino_ai_widget():
     """Se il modello configurato non c'e' piu' sull'endpoint, il server ne
     sceglie un altro e lo dichiara in /api/models. Ignorarlo lasciava scritto
     ovunque il nome di un modello che nessuno stava usando."""
-    sorgente = js()
-    corpo = sorgente[sorgente.index("const refreshModels = async ()"):]
-    corpo = corpo[: corpo.index("};")]
-    assert "state.settings.model_name = data.model_name" in corpo
+    # La sonda e' una sola: la chiama l'avvio, la chiama il menu dopo un
+    # cambio di indirizzo o di transport, la chiama "Verifica".
+    corpo = blocco(js(), "async function sondaBackend(")
+    assert "state.settings.model_name = info.model_name" in corpo
     assert "renderHeader();" in corpo
+    ricontrollo = blocco(menu_js(), "async function impRicontrollaServer(")
+    assert "await sondaBackend();" in ricontrollo
 
 
 # ---------------------------------------------------------------------------
@@ -161,20 +179,31 @@ def test_ogni_campo_numerico_converte_prima_di_salvare():
     cui mancava ``Number`` -- e il test che copriva questo file verificava il
     *meccanismo* BOUND_FIELDS, non la trasformazione.
     """
-    sorgente = js()
-    html = (WEB / "index.html").read_text(encoding="utf-8")
-    numerici = set(re.findall(r'<input[^>]*type="number"[^>]*id="([^"]+)"', html))
-    numerici |= set(re.findall(r'<input[^>]*type="range"[^>]*id="([^"]+)"', html))
-    assert numerici, "nessun campo numerico trovato: il regex e' da rivedere"
+    # Dal 26/09/2026 i campi li costruisce lo schema e li lega impLega: la
+    # conversione non e' piu' scritta campo per campo ma viene dal tipo del
+    # controllo, e il test la esegue davvero (vedi test_menu_impostazioni).
+    from core.config import DEFAULTS
+    from tests.test_menu_impostazioni import campi, contesto_js
+
+    ctx = contesto_js()
     scoperti = []
-    for campo in sorted(numerici):
-        riga = re.search(rf"bindField\('#{re.escape(campo)}',[^)]*\)", sorgente)
-        if riga and "Number" not in riga.group(0):
-            scoperti.append(campo)
+    for campo in campi(ctx):
+        if campo["tipo"] not in ("numero", "cursore") and not campo["numerico"]:
+            continue
+        # Il valore come arriva dal controllo: una stringa, dentro i limiti.
+        grezzo = str(DEFAULTS[campo["k"]])
+        out = ctx.eval(
+            f"(() => {{ const c = IMP_CAMPI.find((x) => x.k === '{campo['k']}');"
+            f" return typeof impTrasforma(c)('{grezzo}'); }})()"
+        )
+        if out != "number":
+            scoperti.append(campo["k"])
     assert not scoperti, (
         "questi campi numerici si salvano come stringa e torneranno al valore "
         f"di serie al prossimo riavvio, senza avvisare: {scoperti}"
     )
+    lega = blocco(menu_js(), "function impLega(")
+    assert "impTrasforma(campo)" in lega
 
 
 def test_la_palette_non_ha_variabili_fantasma():
@@ -185,7 +214,9 @@ def test_la_palette_non_ha_variabili_fantasma():
     righe dei vault nascevano gia' a colore pieno -- quindi :hover e .active,
     che portano a ``var(--text)``, non cambiavano niente di visibile.
     """
-    css = (WEB / "style.css").read_text(encoding="utf-8")
+    # Tutti i fogli: il menu delle impostazioni (impostazioni.css) usa i token
+    # definiti in style.css, e un nome sbagliato li' e' lo stesso difetto.
+    css = "\n".join(f.read_text(encoding="utf-8") for f in sorted(WEB.glob("*.css")))
     # Solo gli usi **senza ripiego**: `var(--preview-w, 50%)` e' il modo giusto
     # di leggere una variabile che scrive il JS, e non e' un difetto.
     senza_ripiego = set(re.findall(r"var\(\s*(--[a-z0-9-]+)\s*\)", css))

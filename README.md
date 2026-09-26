@@ -381,11 +381,19 @@ generazione, ed e' li' che il controllo scatta piu' spesso.
 
 ## Impostazioni che contano
 
+Il menu si apre dall'ingranaggio in fondo alla barra laterale o con
+**Ctrl+,** (⌘, su macOS). Ha una ricerca (`/`), segna le voci cambiate
+rispetto ai valori di serie e le rimette com'erano, e mostra le voci che
+valgono per un solo server solo quando si usa quel server. Le poche chiavi che
+non ha (`stream_tools`, `auto_env_header`, ...) si cambiano a mano nel file
+delle impostazioni, con l'harness spento: il percorso è in Informazioni.
+
 - **Transport `ollama`** — usa `POST /api/chat`. E' l'unico endpoint dove
   `num_ctx`, `num_gpu` e `keep_alive` hanno effetto: su `/v1/chat/completions`
   Ollama li ignora senza segnalarlo.
-- **`num_ctx >= 8192`** — system prompt e schemi dei tool occupano gia' ~2.400
-  token. Sotto questa soglia il tool calling degrada.
+- **`num_ctx`** — system prompt e schemi dei tool occupano gia' 5-7 mila token
+  (snello 1.604 + 3.702, esteso 1.863 + 4.943): sotto 16k resta poco per il
+  lavoro. Con llama.cpp vale il minore fra questo valore e il `-c` del server.
 - **`keep_alive`** — tenere il modello in VRAM elimina 4-15 s di ricarica ad
   ogni passo agentico. E' l'impostazione con l'effetto percepito maggiore.
 - **Canale thinking nativo** — su `auto` si accende da solo se il modello
@@ -419,6 +427,66 @@ del backend. La sandbox si prova con un finto `docker` messo sul PATH. Nessun
 modello richiesto.
 
 ## Storia delle revisioni
+
+**Menu delle impostazioni** (26/09/2026, ramo `impostazioni-2026-09-26`,
+versione non ancora numerata) — rifatto da capo.
+
+Erano cinque schede scritte a mano; una ("Efficienza") raccoglieva 25 voci che
+non c'entravano fra loro, e "Connessione" conteneva mezza sandbox. Ora e' una
+finestra con una barra laterale e dieci sezioni (Modello e server,
+Generazione, Comportamento, Contesto e memoria, Istruzioni, Memorie, Sandbox,
+Anteprime, Aspetto, Informazioni), costruita da uno schema in
+`web/impostazioni.js`: una voce per chiave di `DEFAULTS`, con etichetta, una
+riga su cosa cambia per chi usa l'harness, tipo di controllo e condizioni.
+`test_ogni_impostazione_ha_un_posto` pretende che ogni chiave stia nello schema
+o in `IMP_FUORI_MENU` con il motivo.
+
+- **Voci per server.** `keep_alive` e `num_gpu` si vedono solo con Ollama, lo
+  slot di servizio solo con llama.cpp, `top_k` e le penalita' non con un server
+  OpenAI-compatibile (che non le riceve). Cercando si vedono lo stesso,
+  sbiadite, con il perche'.
+- **Essenziali e Avanzate.** Ogni sezione mostra le voci che si cambiano; il
+  resto sta in "Avanzate", chiuso. Fuori dal menu: `stream_tools` (serve solo
+  con Ollama < 0.8), `auto_env_header` (spento peggiora sempre l'agente),
+  `expand_thoughts` (nessuno lo legge).
+- **Ricerca, pallino, ripristino.** La ricerca guarda l'inizio delle parole, non
+  i pezzi ("porta" non trova piu' "comportamento"), ignora gli accenti e la
+  vocale finale (porta/porte). Le voci diverse dal valore di serie hanno un
+  pallino e il ripristino, anche per sezione intera, con l'elenco di cosa
+  cambia prima di confermare. I valori di serie li da' `GET /api/settings/meta`.
+- **Salvataggio immediato, ma non a ogni tasto.** I campi di testo e numerici
+  salvano quando si smette di scrivere (`bindField(..., { ritardo })`) e subito
+  uscendo dal campo: prima ogni cifra dell'indirizzo del server ricostruiva il
+  backend. Un numero fuori dai limiti non si salva e, uscendo, si porta al
+  limite. Un salvataggio rifiutato dal server non resta piu' nello stato.
+  Spia "Salvato" in alto.
+- **Stati dentro le sezioni.** Server del modello (raggiungibile o no, con il
+  messaggio del server e "Verifica") e sandbox (Docker, immagine del progetto)
+  in testa alle loro sezioni, con un segno nella barra quando c'e' un problema.
+  "Apri le impostazioni" dalla schermata di prontezza va alla sezione giusta.
+- **Profilo consigliato con le differenze.** Dice cosa cambierebbe prima di
+  applicarlo. Il suggerimento sulla VRAM remota compare solo con Ollama: con
+  OpenRouter parlava di "Ollama su openrouter.ai".
+- **Istruzioni: di serie o tuo.** Il campo del prompt conteneva il prompt
+  esteso anche per chi riceveva quello snello. `GET /api/settings/prompt` dice
+  quale prompt e' in uso e restituisce quello effettivo, memorie comprese;
+  "Personalizzato" parte dal testo di serie in uso, e tornare indietro chiede
+  conferma.
+- **Esporta / importa.** `GET /api/settings/export` scrive un JSON
+  (`astra-impostazioni`) senza chiave API, chiave del telefono, cartelle,
+  vault e immagine Docker; `POST /api/settings/import` accetta quel file o un
+  `agent_settings.json`, con `prova: true` mostra le differenze prima di
+  applicare, e scarta con il motivo le chiavi sconosciute o di tipo sbagliato.
+  Menu e importazione passano da `_applica_impostazioni`, la stessa porta.
+- **Informazioni e diagnostica.** Versione, Python, sistema, dove stanno
+  impostazioni, conversazioni e memorie, e "Copia diagnostica" (le impostazioni
+  diverse dal default, con la chiave API coperta). `GET /api/diagnostics` non
+  interroga la rete.
+- **Tastiera.** Ctrl+, apre e chiude, `/` cerca, frecce fra le sezioni, Invio
+  dalla ricerca porta alla prima voce, Esc svuota la ricerca e poi chiude senza
+  chiudere anche l'anteprima sotto; il fuoco resta nella finestra.
+- **Corretto:** "Passi per turno" arrivava a 40 mentre il valore in uso era 100,
+  quindi il campo nasceva non valido.
 
 **v2.38.1** — i template severi: il GGUF ufficiale di Qwen3.8 non rifiuta piu'
 ogni messaggio.

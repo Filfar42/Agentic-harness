@@ -370,28 +370,31 @@ def test_la_riga_di_stato_del_turno_si_annuncia():
 
 
 def test_le_schede_delle_impostazioni_dicono_quale_e_aperta():
-    """Cinque bottoni che si distinguono per una classe CSS.
+    """Le sezioni del menu sono schede verticali, costruite dallo schema.
 
     Una classe uno screen reader non la legge: senza `aria-selected` chi non
     vede lo schermo non ha modo di sapere in quale sezione si trova.
     """
     html = (WEB / "index.html").read_text(encoding="utf-8")
-    schede = re.findall(r'<button class="tab[^"]*"[^>]*>', html, re.S)
-    assert len(schede) == 5, f"{len(schede)} schede trovate"
-    assert all('role="tab"' in s for s in schede), "manca role=tab"
-    assert sum('aria-selected="true"' in s for s in schede) == 1, (
-        "esattamente una scheda va marcata come aperta"
-    )
-    pannelli = re.findall(r'<section class="tab-panel[^"]*"[^>]*>', html)
-    assert len(pannelli) == 5
-    assert all('role="tabpanel"' in p and "aria-labelledby=" in p for p in pannelli)
+    elenco = re.search(r'<div class="imp-schede"[^>]*>', html).group(0)
+    assert 'role="tablist"' in elenco and 'aria-orientation="vertical"' in elenco
+    finestra = re.search(r'<div class="imp-finestra"[^>]*>', html).group(0)
+    assert 'role="dialog"' in finestra and 'aria-modal="true"' in finestra
+    assert "aria-labelledby=" in finestra
 
-    # E lo stato deve **muoversi**: se il click sposta solo la classe, l'HTML
+    js = (WEB / "impostazioni.js").read_text(encoding="utf-8")
+    monta = js[js.index("function impMonta("):]
+    monta = monta[: monta.index("\n}\n")]
+    assert "setAttribute('role', 'tab')" in monta and "aria-controls" in monta
+    assert "setAttribute('aria-selected', 'false')" in monta
+    assert "setAttribute('role', 'tabpanel')" in monta and "aria-labelledby" in monta
+
+    # E lo stato deve **muoversi**: se il clic sposta solo la classe, l'HTML
     # è a posto e la UI mente dal secondo clic in poi.
-    js = (WEB / "app.js").read_text(encoding="utf-8")
-    gestore = js[js.index("$$('.tab').forEach(") :]
-    gestore = gestore[: gestore.index("\n  });")]
-    assert "aria-selected" in gestore
+    seleziona = js[js.index("function impSeleziona("):]
+    seleziona = seleziona[: seleziona.index("\n}\n")]
+    assert "setAttribute('aria-selected', String(scelta))" in seleziona
+    assert "tabIndex = scelta ? 0 : -1" in seleziona
 
 
 def test_la_chiave_api_e_mascherata_anche_senza_webkit():
@@ -401,9 +404,9 @@ def test_la_chiave_api_e_mascherata_anche_senza_webkit():
     peggio di un campo dichiaratamente visibile: nessuno pensa di coprire uno
     schermo che sembra già coperto.
     """
-    css = (WEB / "style.css").read_text(encoding="utf-8")
+    css = (WEB / "impostazioni.css").read_text(encoding="utf-8")
     assert "-webkit-text-security" in css, "la mascheratura CSS è sparita"
-    js = (WEB / "app.js").read_text(encoding="utf-8")
+    js = (WEB / "impostazioni.js").read_text(encoding="utf-8")
     assert "CSS.supports('-webkit-text-security'" in js, (
         "nessun ripiego per i browser che non conoscono -webkit-text-security"
     )

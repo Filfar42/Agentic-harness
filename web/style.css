@@ -1069,41 +1069,8 @@ body.turn-live .att-del { display: none; }
   background: var(--surface); font-size: 12.5px; transition: border-color var(--motion-ui) var(--ease-out), color var(--motion-ui) var(--ease-out), background var(--motion-ui) var(--ease-out);
 }
 .mini-btn:hover { border-color: var(--accent); color: var(--accent); background: var(--accent-soft); }
-.btn-row { display: flex; gap: 6px; margin-bottom: 9px; }
-.btn-row .mini-btn { flex: 1; }
 
-/* ---------- overlay impostazioni ---------- */
-
-#overlay {
-  position: fixed; inset: 0; background: rgba(10, 22, 27, 0.48);
-  display: none; align-items: flex-start; justify-content: center;
-  padding: 46px 20px; z-index: 50; backdrop-filter: blur(2px);
-}
-#overlay.open { display: flex; }
-.modal {
-  background: var(--bg); border: 1px solid var(--border); border-radius: 15px;
-  box-shadow: 0 18px 48px rgba(0, 0, 0, 0.24);
-  width: min(880px, 100%); max-height: 100%; overflow-y: auto;
-}
-.modal-head {
-  display: flex; align-items: center; gap: 10px;
-  padding: 14px 20px; border-bottom: 1px solid var(--border);
-  position: sticky; top: 0; background: var(--bg); z-index: 1;
-}
-.modal-head h2 { margin: 0; font-size: 16px; font-weight: 600; flex: 1; }
-.modal-body { padding: 16px 20px 22px; }
-
-.tabs { display: flex; gap: 3px; border-bottom: 1px solid var(--border); margin-bottom: 15px; }
-.tab {
-  padding: 6px 13px; font-size: 13.5px; font-weight: 500; color: var(--text-muted);
-  border-radius: 8px 8px 0 0; border-bottom: 2px solid transparent; margin-bottom: -1px;
-}
-.tab.active { color: var(--accent); border-bottom-color: var(--accent); }
-.tab-panel { display: none; }
-.tab-panel.active { display: block; }
-
-.grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 15px 22px; }
-@media (max-width: 720px) { .grid2 { grid-template-columns: 1fr; } }
+/* Il menu delle impostazioni ha il suo foglio: impostazioni.css. */
 
 /* Finestra stretta: le colonne laterali si **stringono**, non spariscono.
    Erano fisse a 252px e 288px a qualunque larghezza, e su una finestra da 900
@@ -1120,22 +1087,6 @@ body.turn-live .att-del { display: none; }
   #app #panel, #app #panel-grip { display: none; }
 }
 
-.field { margin-bottom: 12px; }
-.field label { display: block; font-size: 12.5px; font-weight: 500; color: var(--text-muted); margin-bottom: 4px; }
-.field .help { font-size: 11.5px; color: var(--text-faint); margin-top: 3px; line-height: 1.45; }
-.field input[type="text"], .field input[type="password"], .field input[type="number"],
-.field select, .field textarea {
-  width: 100%; padding: 7px 10px; border-radius: 9px;
-  border: 1px solid var(--border-strong); background: var(--surface);
-}
-.field input:focus, .field select:focus, .field textarea:focus {
-  outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft);
-}
-.field textarea { font-family: var(--mono); font-size: 12.5px; line-height: 1.55; resize: vertical; }
-.field input[type="range"] { width: 100%; accent-color: var(--accent); }
-/* Mascheratura visiva senza type="password" (vedi commento in index.html). */
-.field input.masked { -webkit-text-security: disc; text-security: disc; font-family: var(--mono); }
-.field input.masked:placeholder-shown { -webkit-text-security: none; text-security: none; }
 .switch { display: flex; align-items: flex-start; gap: 8px; margin-bottom: 11px; font-size: 13.5px; }
 .switch input { margin-top: 3px; accent-color: var(--accent); flex: none; }
 .switch .help { font-size: 11.5px; color: var(--text-faint); margin-top: 2px; }
@@ -1158,13 +1109,6 @@ table.grid th, table.grid td { text-align: left; padding: 6px 9px; border-bottom
 table.grid th { font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--text-faint); font-weight: 600; }
 table.grid td.yes { color: var(--ok); font-weight: 500; }
 table.grid td.no { color: var(--text-faint); }
-
-.mem-row {
-  display: flex; align-items: flex-start; gap: 9px;
-  padding: 8px 11px; border: 1px solid var(--border); border-radius: 9px;
-  background: var(--surface); margin-bottom: 6px; font-size: 13.5px;
-}
-.mem-row .id { font-family: var(--mono); font-size: 10.5px; color: var(--text-faint); }
 
 #toast {
   position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%) translateY(3px);
@@ -1411,9 +1355,7 @@ input, textarea { caret-color: var(--accent); }
 input::placeholder, textarea::placeholder { color: var(--text-faint); opacity: 1; }
 .hint-inline { opacity: 1; }
 details.drawer > summary .chev { opacity: 1; }
-.search-box, #composer,
-.field input[type="text"], .field input[type="password"], .field input[type="number"],
-.field select, .field textarea, .q-free input, #vault-card input[type="text"],
+.search-box, #composer, .q-free input, #vault-card input[type="text"],
 #vault-card textarea, .vault-composer, .new-chat, .btn, .quick-chip, .goccia-web {
   border-color: var(--control-border);
 }
@@ -1421,7 +1363,6 @@ details.drawer > summary .chev { opacity: 1; }
   border-color: var(--focus-ring);
   box-shadow: 0 0 0 2px var(--focus-ring), var(--shadow-sm);
 }
-.field :is(input, select, textarea):focus-visible,
 .q-free input:focus-visible, #vault-card :is(input, textarea):focus-visible {
   border-color: var(--focus-ring);
   box-shadow: none;
@@ -1438,7 +1379,7 @@ details.drawer > summary .chev { opacity: 1; }
 @media (hover: none) {
   .session-del, .att-del, .vmem-del { opacity: 1; }
 }
-#overlay.open .modal, .tab-panel.active, .model-menu:not([hidden]), .ws-menu:not([hidden]) {
+.model-menu:not([hidden]), .ws-menu:not([hidden]) {
   animation: surface-enter var(--motion-ui) var(--ease-out) both;
 }
 @keyframes surface-enter {

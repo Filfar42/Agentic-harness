@@ -752,12 +752,19 @@ def test_no_password_inputs_in_the_ui():
 
 
 def test_the_api_key_field_is_masked_but_not_a_credential():
-    html = _ui_html()
-    css = (Path(__file__).resolve().parents[1] / "web" / "style.css").read_text(
-        encoding="utf-8"
-    )
-    field = next(line for line in html.splitlines() if 'id="s-api-key"' in line)
-    assert 'class="masked"' in field and 'autocomplete="off"' in field
+    """Il campo della chiave si costruisce in impostazioni.js (ramo ``segreto``)
+    dal 26/09/2026: e' li' che deve restare un testo mascherato, non una
+    password, e fuori dai gestori di credenziali."""
+    web = Path(__file__).resolve().parents[1] / "web"
+    js = (web / "impostazioni.js").read_text(encoding="utf-8")
+    css = (web / "impostazioni.css").read_text(encoding="utf-8")
+    assert re.search(r"k: 'api_key', tipo: 'segreto'", js)
+    ramo = js[js.index("case 'segreto': {"):]
+    ramo = ramo[: ramo.index("default: {")]
+    assert "input.type = 'text';" in ramo and "masked" in ramo
+    assert "input.autocomplete = 'off';" in ramo
+    for gestore in ("data-lpignore", "data-1p-ignore", "data-bwignore"):
+        assert gestore in ramo, gestore
     assert "-webkit-text-security" in css
 
 

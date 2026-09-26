@@ -29,6 +29,7 @@ try {
 </script>
 <link rel="stylesheet" href="/static/style.css">
 <link rel="stylesheet" href="/static/companion.css">
+<link rel="stylesheet" href="/static/impostazioni.css">
 <!-- Raster fallbacks and an adaptive vector mark for modern browsers. -->
 <link rel="icon" type="image/png" sizes="64x64" href="/static/favicon-64.png">
 <link rel="icon" type="image/png" sizes="32x32" href="/static/favicon-32.png">
@@ -421,399 +422,53 @@ try {
 </div>
 
 <!-- ------------------------------ impostazioni ---------------------------- -->
-<div id="overlay">
-  <div class="modal">
-    <div class="modal-head">
-      <h2>Impostazioni</h2>
-      <button class="btn" id="close-settings">Chiudi</button>
-    </div>
-    <div class="modal-body">
-      <!-- role/aria-selected: cinque <button> con una classe CSS diversa non
-           dicono niente a uno screen reader su quale scheda è aperta. Il
-           gestore in app.js sposta `aria-selected` insieme alla classe. -->
-      <div class="tabs" role="tablist" aria-label="Sezioni delle impostazioni">
-        <button class="tab active" data-tab="conn" role="tab" id="tabbtn-conn"
-                aria-controls="tab-conn" aria-selected="true">Connessione</button>
-        <button class="tab" data-tab="gen" role="tab" id="tabbtn-gen"
-                aria-controls="tab-gen" aria-selected="false">Generazione</button>
-        <button class="tab" data-tab="eff" role="tab" id="tabbtn-eff"
-                aria-controls="tab-eff" aria-selected="false">Efficienza</button>
-        <button class="tab" data-tab="prompt" role="tab" id="tabbtn-prompt"
-                aria-controls="tab-prompt" aria-selected="false">System prompt</button>
-        <button class="tab" data-tab="mem" role="tab" id="tabbtn-mem"
-                aria-controls="tab-mem" aria-selected="false">Memoria</button>
-      </div>
-
-      <!-- connessione -->
-      <section class="tab-panel active" id="tab-conn" role="tabpanel" aria-labelledby="tabbtn-conn">
-        <div class="grid2">
-          <div>
-            <div class="field">
-              <label for="s-api-base">Endpoint API (api_base)</label>
-              <input type="text" id="s-api-base" placeholder="http://localhost:11434 o https://openrouter.ai/api/v1">
-              <div class="help">URL dell'endpoint LLM (chiave <code>api_base</code>). Es. <code>http://localhost:11434</code> per Ollama oppure <code>https://openrouter.ai/api/v1</code> per OpenRouter.</div>
-            </div>
-            <div class="field">
-              <label for="s-gpu-vram">VRAM della scheda remota (MB)</label>
-              <input type="number" id="s-gpu-vram" min="0" step="1024">
-              <div class="help">Serve solo con Ollama su un'altra macchina: da lì <code>nvidia-smi</code> non è raggiungibile e l'API dice quanto è <em>occupato</em>, non quanto è <em>grande</em> la scheda. 0 = endpoint locale. Es. 32768 per una scheda da 32 GB.</div>
-            </div>
-            <div class="field">
-              <label for="s-transport">Transport</label>
-              <select id="s-transport">
-                <option value="auto">auto</option>
-                <option value="ollama">ollama</option>
-                <option value="openai">openai</option>
-                <option value="llamacpp">llamacpp</option>
-              </select>
-              <div class="help">Solo <code>/api/chat</code> di Ollama applica davvero num_ctx, num_gpu e keep_alive. Con <code>llamacpp</code> il contesto lo comanda <code>-c</code> al lancio del server: l'harness lo <em>legge</em> da <code>/props</code> e ci si adegua. <code>auto</code> riconosce da solo quale dei due sta rispondendo.</div>
-            </div>
-            <div class="field">
-              <label for="s-stream-tools">Tool in streaming</label>
-              <select id="s-stream-tools">
-                <option value="auto">auto</option>
-                <option value="sempre">sempre</option>
-                <option value="mai">mai</option>
-              </select>
-              <div class="help">Ollama &lt; 0.8.0 non emette tool call con stream=true. "auto" legge la versione del server.</div>
-            </div>
-            <div class="field">
-              <label for="s-model">Modello</label>
-              <input type="text" id="s-model" list="s-model-list" placeholder="Es. Qwen3.8:27B-Q6_K o qwen/qwen-2.5-72b-instruct" autocomplete="off" spellcheck="false">
-              <datalist id="s-model-list"></datalist>
-              <div class="help">Digita il nome di qualsiasi modello (es. per OpenRouter/OpenAI) oppure sceglilo dai suggerimenti trovati sull'endpoint.</div>
-            </div>
-            <!-- La cartella di lavoro NON sta qui. Stava qui e in alto a
-                 sinistra, e le due copie facevano lo stesso identico gesto:
-                 scegliere una cartella e aprirla in Esplora risorse. È rimasta
-                 quella in alto, che è dove si legge dove si sta lavorando —
-                 cercare una cosa dentro le impostazioni per cambiarla è un
-                 passaggio in più per una scelta che si fa mentre si lavora. -->
-            <div class="field">
-              <label for="s-api-key">API key</label>
-              <!-- NON usare type="password": il gestore password di Chrome
-                   tratterebbe il campo come una credenziale, offrirebbe di
-                   salvarlo, lo autocompilerebbe con password salvate e
-                   mostrerebbe l'avviso "password compromessa". Mascheriamo
-                   il testo via CSS: stesso aspetto, zero password manager. -->
-              <input type="text" id="s-api-key" class="masked" autocomplete="off"
-                     spellcheck="false" autocapitalize="off" data-lpignore="true"
-                     data-1p-ignore data-bwignore data-form-type="other">
-              <div class="help">Serve solo con transport <code>openai</code>. Con Ollama lascia vuoto.</div>
-            </div>
-            <div class="field">
-              <label for="s-timeout">Timeout di inattività (s)</label>
-              <input type="number" id="s-timeout" min="10" max="1800" step="10">
-              <div class="help">Quanto aspettare un server muto, prefill compreso. Non limita la durata di una generazione.</div>
-            </div>
-            <div class="field">
-              <label for="s-slot-servizio">Slot di servizio (llama-server)</label>
-              <input type="number" id="s-slot-servizio" min="-1" max="15" step="1">
-              <div class="help">Con <code>-np 2</code>: lo slot per riassunti, estratti e deleghe, così non spostano la cache della conversazione. -1 = spento.</div>
-            </div>
-
-          </div>
-
-          <!-- Seconda colonna: tutto quello che riguarda il recinto in cui
-               girano i comandi. Prima stava di seguito ai campi di
-               connessione, con la diagnostica del tool calling a destra; tolta
-               quella, la sandbox si prende la colonna che si era liberata. -->
-          <div>
-            <div class="field">
-              <label for="s-sandbox">Sandbox dei comandi</label>
-              <select id="s-sandbox">
-                <option value="docker">docker (isolato)</option>
-                <option value="host">host (nessun recinto)</option>
-              </select>
-              <div class="help" id="sandbox-help">—</div>
-            </div>
-            <div class="field">
-              <label for="s-docker-image">Immagine del container</label>
-              <input type="text" id="s-docker-image">
-              <div class="help">Deve contenere gli strumenti che l'agente usa (python, git, pytest).</div>
-            </div>
-            <div class="switch">
-              <input type="checkbox" id="s-sandbox-network">
-              <div><label for="s-sandbox-network" style="margin:0">Rete nel container</label>
-                <div class="help">Spenta, l'agente non puo' scaricare nulla ne' mandare dati fuori.</div></div>
-            </div>
-            <!-- I due tasti "Costruisci l'immagine" e "Ricrea il container"
-                 non stanno più qui. Immagine e container si preparano da soli
-                 quando si cambia cartella; farli a mano è un rimedio, e i
-                 rimedi stanno accanto alla cosa da rimediare — nella tendina
-                 della cartella in alto a sinistra, sotto "Impostazioni". -->
-
-            <div class="switch">
-              <input type="checkbox" id="s-danger">
-              <div><label for="s-danger" style="margin:0">Consenti comandi distruttivi</label>
-                <div class="help">Disattivato, un guard-rail blocca rm -rf, format e simili.</div></div>
-            </div>
-          </div>
-
+<!-- Qui c'e' solo lo scheletro: sezioni, voci e controlli li costruisce
+     web/impostazioni.js da uno schema, cosi' ricerca, ripristino ai valori di
+     serie e voci che dipendono dal server leggono tutti la stessa fonte.
+     Erano cinquanta campi scritti a mano in cinque schede, una delle quali
+     ("Efficienza") raccoglieva tutto quello che non aveva un posto. -->
+<div id="impostazioni" class="imp-velo" hidden>
+  <div class="imp-finestra" role="dialog" aria-modal="true" aria-labelledby="imp-titolo">
+    <nav class="imp-nav" aria-label="Sezioni delle impostazioni">
+      <div class="imp-nav-testa"><h2 id="imp-titolo">Impostazioni</h2></div>
+      <label class="imp-cerca">
+        <svg class="imp-icona" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+             stroke-linecap="round" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6"/><path d="m15 15 5 5"/></svg>
+        <input type="search" id="imp-cerca" placeholder="Cerca un'impostazione" autocomplete="off"
+               spellcheck="false" aria-label="Cerca fra le impostazioni" aria-controls="imp-corpo">
+        <kbd class="imp-kbd" aria-hidden="true">/</kbd>
+        <button type="button" class="imp-cerca-svuota" id="imp-cerca-svuota" hidden
+                title="Svuota la ricerca (Esc)" aria-label="Svuota la ricerca">
+          <svg class="imp-icona" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+               stroke-linecap="round" aria-hidden="true"><path d="M7 7l10 10M17 7 7 17"/></svg>
+        </button>
+      </label>
+      <div class="imp-schede" id="imp-schede" role="tablist" aria-orientation="vertical"
+           aria-label="Sezioni"></div>
+      <div class="imp-nav-piede" id="imp-nav-piede"></div>
+    </nav>
+    <section class="imp-contenuto" aria-labelledby="imp-sezione-titolo">
+      <header class="imp-testa">
+        <div class="imp-testa-testo">
+          <h3 id="imp-sezione-titolo"></h3>
+          <p id="imp-sezione-descr"></p>
         </div>
-      </section>
-
-      <!-- generazione -->
-      <section class="tab-panel" id="tab-gen" role="tabpanel" aria-labelledby="tabbtn-gen">
-        <div class="grid2">
-          <div>
-            <div class="field">
-              <label for="s-numctx">Finestra di contesto — <span id="s-numctx-val"></span></label>
-              <select id="s-numctx">
-                <option>2048</option><option>4096</option><option>8192</option>
-                <option>16384</option><option>24576</option><option>32768</option>
-                <option>49152</option><option>65536</option><option>98304</option>
-                <option>131072</option>
-              </select>
-              <div class="help">Sotto 8192 il tool calling degrada: system prompt e schemi occupano già ~2.400 token. I limiti di troncamento dei tool scalano con questo valore, quindi alzarlo allarga anche quanto file entra in un <code>read_file</code>.</div>
-            </div>
-            <div class="field">
-              <label for="s-numgpu">Layer su GPU (num_gpu)</label>
-              <input type="number" id="s-numgpu" min="0" max="999">
-              <div class="help">999 = tutti. Abbassalo solo in caso di OOM di VRAM.</div>
-            </div>
-            <div class="field">
-              <label for="s-keepalive">keep_alive</label>
-              <select id="s-keepalive">
-                <option value="0">0 (scarica subito)</option>
-                <option value="5m">5m</option><option value="30m">30m</option>
-                <option value="2h">2h</option><option value="-1">-1 (per sempre)</option>
-              </select>
-              <div class="help">Tenere il modello in VRAM elimina 4–15 s di ricarica ad ogni passo agentico.</div>
-            </div>
-            <div class="field">
-              <label for="s-think">Canale thinking nativo</label>
-              <select id="s-think">
-                <option value="auto">auto (rileva dal modello)</option>
-                <option value="si">sempre</option>
-                <option value="no">mai</option>
-                <option value="low">livello: low</option>
-                <option value="medium">livello: medium</option>
-                <option value="high">livello: high</option>
-                <option value="max">livello: max</option>
-              </select>
-              <div class="help">Su "auto" si accende solo se il modello dichiara la capability <code>thinking</code>. I livelli valgono sui modelli che li supportano: <code>max</code> per progettare, <code>low</code> per le modifiche meccaniche, dove il pensiero lungo è solo tempo di GPU.</div>
-            </div>
-          </div>
-          <div>
-            <div class="field">
-              <label for="s-temp">Temperature — <span id="s-temp-val"></span></label>
-              <input type="range" id="s-temp" min="0" max="1.5" step="0.05">
-              <div class="help">Sopra 0.4 il modello inizia a inventare nomi di parametri nei tool.</div>
-            </div>
-            <div class="field">
-              <label for="s-topp">top_p — <span id="s-topp-val"></span></label>
-              <input type="range" id="s-topp" min="0.1" max="1" step="0.05">
-            </div>
-            <div class="field">
-              <label for="s-topk">top_k — <span id="s-topk-val"></span></label>
-              <input type="range" id="s-topk" min="1" max="100" step="1">
-              <div class="help">Qwen 3.x raccomanda 20. Non inviarlo lascia il 40 di Ollama.</div>
-            </div>
-            <div class="field">
-              <label for="s-presence">presence_penalty — <span id="s-presence-val"></span></label>
-              <input type="range" id="s-presence" min="0" max="2" step="0.1">
-              <div class="help">Aiuta i modelli di pensiero a non girare in tondo. Sul codice tienila a 0: penalizza gli identificatori ripetuti, che devono restare uguali.</div>
-            </div>
-            <div class="field">
-              <label for="s-repetition">repetition_penalty — <span id="s-repetition-val"></span></label>
-              <input type="range" id="s-repetition" min="1" max="2" step="0.05">
-              <div class="help">Penalizza ogni ripetizione di un token già visto: 1 non fa niente (senza di lei Ollama lascerebbe il suo default 1.1), sopra 1.05 rischia di tagliare le parole comuni nel mezzo delle frasi.</div>
-            </div>
-            <div class="field">
-              <label for="s-maxtok">Max token generati — <span id="s-maxtok-val"></span></label>
-              <input type="range" id="s-maxtok" min="256" max="16384" step="256">
-            </div>
-            <div class="field">
-              <label for="s-loops">Max passi agentici</label>
-              <input type="number" id="s-loops" min="1" max="40">
-            </div>
-            <div class="card" style="margin-top:14px">
-              <h4>Profilo consigliato</h4>
-              <div class="help" id="profile-note">—</div>
-              <div class="btn-row" style="margin-top:8px">
-                <button class="mini-btn" id="profile-apply">Applica i consigliati</button>
-              </div>
-            </div>
-          </div>
-        </div>
-      </section>
-
-      <!-- efficienza -->
-      <section class="tab-panel" id="tab-eff" role="tabpanel" aria-labelledby="tabbtn-eff">
-        <p class="help" style="margin-bottom:14px">Ogni interruttore qui sotto scambia qualcosa: contesto contro round-trip, oppure token contro riuso del KV cache.</p>
-        <div class="switch">
-          <input type="checkbox" id="s-strip">
-          <div><label for="s-strip" style="margin:0">Rimuovi i blocchi &lt;think&gt; dal contesto</label>
-            <div class="help">Il ragionamento resta visibile in chat ma non torna al modello.</div></div>
-        </div>
-        <div class="switch">
-          <input type="checkbox" id="s-compact">
-          <div><label for="s-compact" style="margin:0">Compatta i risultati dei tool più vecchi di 3 passi</label>
-            <div class="help">Un read_file già consumato costa token in ogni richiesta successiva.</div></div>
-        </div>
-        <div class="switch">
-          <input type="checkbox" id="s-plan-gate">
-          <div><label for="s-plan-gate" style="margin:0">Fammi leggere i piani lunghi prima di partire</label>
-            <div class="help">Oltre sei punti il turno si ferma e ti mostra il piano, con "procedi" o "correggi". Correggere un piano costa dieci secondi; valutare trenta passi fatti male, no. Sui compiti corti non si fa vedere.</div></div>
-        </div>
-        <div class="switch">
-          <input type="checkbox" id="s-compact-history">
-          <div><label for="s-compact-history" style="margin:0">Riassumi la cronologia oltre soglia</label>
-            <div class="help">Quando il contesto si riempie, la parte vecchia viene riassunta da una chiamata dedicata e tolta alla vista del modello. In chat resta leggibile. Costa una generazione e un ricalcolo del KV cache: per questo la soglia è alta.</div></div>
-        </div>
-        <div class="field" style="margin-left:30px">
-          <label for="s-selezione">Prima del riassunto: compattazione selettiva</label>
-          <select id="s-selezione">
-            <option value="spenta">spenta</option>
-            <option value="laya">laya (locale)</option>
-          </select>
-          <div class="help">Sperimentale. Invece di riassumere, un <code>laya-serve</code> in locale decide chiamata per chiamata quali risultati vecchi togliere o accorciare; il testo tuo e del modello resta parola per parola, e nessun dato esce dalla macchina. Se togliere non basta, o Laya non risponde, si riassume come prima. Prima di accenderla misurala sulle tue conversazioni con <code>scripts/valuta_laya.py</code>: sul replay delle sessioni di agosto e settembre anche un valutatore perfetto evitava fra il 15% e il 38% dei riassunti.</div>
-        </div>
-        <div class="field" style="margin-left:30px">
-          <label for="s-laya-url">Indirizzo di laya-serve</label>
-          <input type="text" id="s-laya-url" spellcheck="false">
-          <div class="help">Il protocollo è quello di Jev (<code>/v1/systemone</code>). Checkpoint: <code>multilingual</code> per le conversazioni in italiano.</div>
-        </div>
-        <div class="field" style="margin-left:30px">
-          <label for="s-laya-modello">Checkpoint di Laya</label>
-          <select id="s-laya-modello">
-            <option value="multilingual">multilingual</option>
-            <option value="english">english</option>
-            <option value="typed-decisions">typed-decisions</option>
-          </select>
-        </div>
-        <div class="field" style="margin-left:30px">
-          <label for="s-compact-threshold">Soglia di compattazione</label>
-          <input type="number" id="s-compact-threshold" min="0.4" max="0.95" step="0.05">
-          <div class="help">Frazione della finestra oltre la quale scatta. A 0.75 resta un quarto di contesto libero per il passo successivo.</div>
-        </div>
-        <div class="field" style="margin-left:30px">
-          <label for="s-compact-max-tokens">…e comunque non oltre (token)</label>
-          <input type="number" id="s-compact-max-tokens" min="0" max="200000" step="4096">
-          <div class="help">Il costo del contesto è un numero assoluto, non una frazione: su endpoint remoto sono token pagati ad ogni passo, e l'attenzione del modello cala molto prima che la finestra si riempia. Con finestre grandi la sola percentuale non scatta mai. 0 = nessun tetto.</div>
-        </div>
-        <div class="switch" style="margin-left:30px">
-          <input type="checkbox" id="s-libreria">
-          <div><label for="s-libreria" style="margin:0">Salva i tratti compattati in <code>.memoria/</code></label>
-            <div class="help">Ogni riassunto finisce anche su disco, così com'è e per sempre. Serve a due cose: non viene riassunto una seconda volta alla compattazione dopo — che è il modo in cui un riassunto diventa la fotocopia di una fotocopia — e in contesto ne resta una riga di indice invece del testo. Il modello li rilegge con read_file, e quelli che riguardano il punto aperto glieli rimette davanti l'harness.</div></div>
-        </div>
-        <div class="switch" style="margin-left:30px">
-          <input type="checkbox" id="s-estratto-pensiero">
-          <div><label for="s-estratto-pensiero" style="margin:0">Distilla il ragionamento quando un punto di piano si chiude</label>
-            <div class="help">Il ragionamento vale 22 volte le risposte e viene buttato a ogni turno, ma non è scarto: dentro ci sono errori veri, versioni, percorsi e comandi che funzionano, scritti da nessun'altra parte. Alla chiusura (o al salto) di un punto, una chiamata sola ne tiene solo <code>SCOPERTO</code> e <code>SCARTATO</code> e li archivia in <code>.memoria/</code>. Costa una chiamata per punto chiuso, e richiede l'impostazione qui sopra: senza indice, l'estratto verrebbe scritto e mai riletto.</div></div>
-        </div>
-        <div class="switch">
-          <input type="checkbox" id="s-spec-delega">
-          <div><label for="s-spec-delega" style="margin:0">Impara dagli esiti delle esplorazioni</label>
-            <div class="help">Su 17 esplorazioni misurate, 8 finivano i sei passi senza rispondere: il figlio non sa quanto tempo gli resta. Con questa attiva se lo vede a ogni passo, e l'esito di ogni delega resta scritto in <code>.memoria/.deleghe.json</code>. Da quei fatti si ricavano al volo due frasi — un avviso al figlio quando qui le esplorazioni sfondano spesso, e un esempio vero di domanda ben posta in coda al sollecito. I fatti non si riscrivono mai; le frasi si rifanno da capo ogni volta, così se l'evidenza cambia cambiano anche loro.</div></div>
-        </div>
-        <div class="switch">
-          <input type="checkbox" id="s-deposito">
-          <div><label for="s-deposito" style="margin:0">Deposita i risultati troppo lunghi in <code>.deposito/</code></label>
-            <div class="help">Oggi un risultato che sfora il budget viene <em>troncato</em>: per un file la coda si rilegge a righe, ma per lo stdout di un comando quel testo non esiste più da nessuna parte e l'unica strada è rilanciarlo. Col deposito il testo intero finisce su disco <em>prima</em> del taglio e il risultato ne porta il percorso: in contesto entrano gli stessi token di prima, ma la coda smette di essere perduta. Vale per <code>run_command</code> e <code>search_files</code>.</div></div>
-        </div>
-        <div class="field" style="margin-left:30px">
-          <label for="s-deposito-max-mb">Tetto del deposito (MB)</label>
-          <input type="number" id="s-deposito-max-mb" min="0" max="4096" step="16">
-          <div class="help">Sopra il tetto escono i file più vecchi. Le conversazioni non si chiudono mai da sole, quindi legare la vita del deposito alla sessione vorrebbe dire non potarlo mai. 0 = nessun tetto.</div>
-        </div>
-        <div class="switch">
-          <input type="checkbox" id="s-envhdr">
-          <div><label for="s-envhdr" style="margin:0">Inietta l'environment header</label>
-            <div class="help">cwd, OS e albero del workspace: è la leva principale sull'uso spontaneo dei tool.</div></div>
-        </div>
-        <div class="switch">
-          <input type="checkbox" id="s-docker-autostart">
-          <div><label for="s-docker-autostart" style="margin:0">Avvia Docker all'apertura dell'harness</label>
-            <div class="help">Docker Desktop ci mette 20-60 secondi: avviandolo subito è pronto prima che tu abbia finito di scrivere il primo messaggio. Se è già acceso non fa nulla.</div></div>
-        </div>
-        <div class="switch">
-          <input type="checkbox" id="s-image-autobuild">
-          <div><label for="s-image-autobuild" style="margin:0">Costruisci l'immagine quando scegli una cartella</label>
-            <div class="help">Solo se non esiste già e se non hai scelto tu un'immagine tua. La build parte in background e l'immagine viene selezionata da sola quando è pronta.</div></div>
-        </div>
-        <div class="switch">
-          <input type="checkbox" id="s-preview">
-          <div><label for="s-preview" style="margin:0">Apri l'anteprima da sola sui file visuali</label>
-            <div class="help">Quando l'agente scrive un .md, .html, .svg, un'immagine o un PDF il pannello si apre senza che debba chiederlo. Sui file di codice no, sarebbero dieci anteprime per un refactoring.</div></div>
-        </div>
-        <div class="switch">
-          <input type="checkbox" id="s-preview-ports">
-          <div><label for="s-preview-ports" style="margin:0">Pubblica le porte per le anteprime di applicazioni</label>
-            <div class="help">Il container espone <code id="preview-ports-echo">8200-8203</code> su 127.0.0.1, così un server avviato dall'agente si vede nel browser. È una concessione sulla tenuta della sandbox: solo questa macchina, solo queste porte. Cambiarla ricrea il container.</div></div>
-        </div>
-        <div class="field">
-          <label for="s-preview-port-base">Prima porta per le anteprime</label>
-          <input type="number" id="s-preview-port-base" min="1024" max="65500">
-        </div>
-        <div class="field">
-          <label for="s-preview-port-count">Quante porte</label>
-          <input type="number" id="s-preview-port-count" min="1" max="20">
-        </div>
-        <div class="switch">
-          <input type="checkbox" id="s-preview-autobackend">
-          <div><label for="s-preview-autobackend" style="margin:0">Avvia da solo il backend del progetto</label>
-            <div class="help">Prima di mostrare una pagina, se la sua cartella dichiara un backend (Flask, FastAPI, Django, Vite, <code>package.json</code>) l'harness lo avvia. Se non risponde, la pagina si vede lo stesso come file statico e il modello legge il log.</div></div>
-        </div>
-        <div class="field">
-          <label for="s-preview-host-port">Porta del server delle anteprime</label>
-          <input type="number" id="s-preview-host-port" min="0" max="65500">
-          <div class="help">Le pagine si servono da qui, non dalla porta dell'harness: è un'origine diversa, ed è quello che permette loro di avere <code>localStorage</code>, moduli ES e <code>fetch</code> senza poter leggere le risposte delle rotte dell'harness. Si accende alla prima anteprima. 0 = spento.</div>
-        </div>
-        <div class="switch">
-          <input type="checkbox" id="s-require-plan">
-          <div><label for="s-require-plan" style="margin:0">Pretendi un piano sulle richieste con più obiettivi</label>
-            <div class="help">Se la richiesta ha step numerati o più verbi all'imperativo e il modello lavora senza piano, l'harness glielo chiede una volta.</div></div>
-        </div>
-        <div class="switch">
-          <input type="checkbox" id="s-monitor-avanzamento">
-          <div><label for="s-monitor-avanzamento" style="margin:0">Ferma i turni che girano a vuoto</label>
-            <div class="help">Conta i passi senza nessun effetto verificabile: una lettura nuova, una scrittura che cambia il file, un test che passa, un punto del piano chiuso. Dopo 6 lo dice al modello e gli permette di chiudere spiegando cosa blocca; dopo 10 chiude il turno con un riepilogo, invece di consumare tutti i passi.</div></div>
-        </div>
-        <div class="switch">
-          <input type="checkbox" id="s-think-watchdog">
-          <div><label for="s-think-watchdog" style="margin:0">Interrompi i ragionamenti che non portano ad azioni</label>
-            <div class="help">Oltre il 55% del budget di generazione senza nessuna tool call, la generazione viene chiusa e il modello riportato al piano. È la difesa contro gli 8.000 token di pensiero che finiscono in un turno vuoto.</div></div>
-        </div>
-      </section>
-
-      <!-- system prompt -->
-      <section class="tab-panel" id="tab-prompt" role="tabpanel" aria-labelledby="tabbtn-prompt">
-        <div class="field">
-          <label for="s-prompt">System prompt</label>
-          <textarea id="s-prompt" rows="22" placeholder="Vuoto: lo sceglie l'harness in base al modello."></textarea>
-          <!-- Il testo qui dentro vince SEMPRE su quello del codice, e una
-               copia vecchia rimasta nel campo e' il modo silenzioso di non
-               ricevere piu' nessuna modifica al prompt: succede da solo,
-               perche' basta che il testo di riferimento cambi perche' la copia
-               smetta di combaciare e passi per "personalizzato". -->
-          <div class="help">
-            Quello che scrivi qui vince sempre e blocca la scelta automatica fra
-            prompt esteso (modelli senza canale di pensiero) e snello. Svuota il
-            campo per tornare automatico:
-            <button type="button" class="btn" id="s-prompt-reset">Ripristina</button>
-          </div>
-        </div>
-      </section>
-
-      <!-- memoria -->
-      <section class="tab-panel" id="tab-mem" role="tabpanel" aria-labelledby="tabbtn-mem">
-        <div class="field" style="display:flex;gap:8px;align-items:flex-end">
-          <div style="flex:1">
-            <label for="mem-input">Nuova memoria</label>
-            <input type="text" id="mem-input" placeholder="I test si lanciano con: uv run pytest -q">
-          </div>
-          <button class="btn primary" id="mem-add">Salva</button>
-        </div>
-        <div id="mem-list"></div>
-      </section>
-    </div>
+        <span class="imp-salvataggio" id="imp-salvataggio" role="status" aria-live="polite"></span>
+        <button type="button" class="imp-chiudi" id="imp-chiudi" title="Chiudi (Esc)" aria-label="Chiudi le impostazioni">
+          <svg class="imp-icona" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+               stroke-linecap="round" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"/></svg>
+        </button>
+      </header>
+      <div class="imp-corpo" id="imp-corpo"></div>
+    </section>
   </div>
 </div>
 
 <div id="toast"></div>
 <script src="/static/companion.js"></script>
+<!-- Prima di app.js: definisce lo schema e le funzioni del menu, che usano
+     quelle di app.js solo quando vengono chiamate. -->
+<script src="/static/impostazioni.js"></script>
 <script src="/static/app.js"></script>
 </body>
 </html>

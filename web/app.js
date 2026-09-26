@@ -686,7 +686,9 @@ const CHECK_ICON = { ok: '\u25cf', warn: '\u25d0', error: '\u25cf' };
 const CHECK_ACTIONS = {
   docker: { label: 'Avvia Docker', run: () => runPrep('/api/prep/docker', 'Avvio Docker…') },
   image: { label: 'Costruisci l\'immagine', run: () => runPrep('/api/prep/image', 'Costruisco l\'immagine…') },
-  settings: { label: 'Apri le impostazioni', run: () => $('#open-settings').click() },
+  // La sezione giusta, non la prima: dal server spento si arriva a
+  // "Modello e server", dai comandi senza recinto a "Sandbox".
+  settings: { label: 'Apri le impostazioni', run: (check) => impApri(check === 'docker' ? 'sandbox' : 'server') },
   workspace: { label: 'Scegli la cartella', run: () => browseWorkspace() },
 };
 
@@ -712,7 +714,7 @@ function welcomeHtml() {
     return `<div class="check ${c.state}">`
       + `<span class="check-dot">${CHECK_ICON[c.state]}</span>`
       + `<span class="check-text"><b>${esc(c.label)}</b>${esc(c.detail) ? ' — ' + esc(c.detail) : ''}</span>`
-      + (azione ? `<button class="mini-btn check-btn" data-action="${esc(c.action)}">${esc(azione.label)}</button>` : '')
+      + (azione ? `<button class="mini-btn check-btn" data-action="${esc(c.action)}" data-check="${esc(c.id)}">${esc(azione.label)}</button>` : '')
       + '</div>';
   }).join('');
 
@@ -724,7 +726,7 @@ function welcomeHtml() {
 
 function bindWelcome() {
   $$('.check-btn').forEach((btn) => {
-    btn.onclick = () => CHECK_ACTIONS[btn.dataset.action]?.run();
+    btn.onclick = () => CHECK_ACTIONS[btn.dataset.action]?.run(btn.dataset.check);
   });
 }
 
@@ -1688,6 +1690,7 @@ function renderStatusPill(online, detail) {
   // da un indirizzo sbagliato o da una chiave che manca. Prima quel testo
   // arrivava solo dentro un toast, cioe' spariva dopo tre secondi.
   pill.title = detail ? base + '\n' + detail : base;
+  if (typeof impDisegnaStati === 'function') impDisegnaStati();
 }
 
 /** Chiede al server del modello chi e' e cosa ha, a pagina gia' disegnata.
@@ -1763,71 +1766,31 @@ function avviaPollingEndpoint() {
 function renderSandbox(info) {
   state.sandbox = info;
   const pill = $('#pill-sandbox');
-  const help = $('#sandbox-help');
-  // L'intervallo mostrato è quello che il server pubblicherebbe davvero, non
-  // quello scritto nei campi: con la sandbox su "host" o la rete spenta non
-  // c'è nessuna porta, e leggerlo qui evita di cercare per mezz'ora perché
-  // l'anteprima non si connette.
-  const echo = $('#preview-ports-echo');
-  if (echo) {
-    echo.textContent = info.preview_ports
-      ? `${info.preview_ports[0]}-${info.preview_ports[1]}`
-      : 'nessuna porta';
-  }
-
   if (info.mode !== 'docker') {
     pill.textContent = 'nessun recinto';
     pill.className = 'pill warn';
     pill.title = 'I comandi girano direttamente sulla macchina: l\'agente vede tutto il disco.';
-    help.textContent = 'Con "host" i comandi girano sulla tua macchina e la cartella '
-      + 'di lavoro non e\' un recinto: cd .. e l\'agente e\' fuori.';
-    return;
-  }
-  if (!info.available) {
+  } else if (!info.available) {
     pill.textContent = 'docker assente';
     pill.className = 'pill err';
     pill.title = info.detail + ' — i comandi non partiranno.';
-    help.textContent = 'Docker non raggiungibile: ' + info.detail
-      + '. Finche\' non riparte, run_command rifiuta di eseguire (non ripiega sull\'host).';
-    return;
+  } else {
+    pill.textContent = info.running ? 'sandbox attiva' : 'sandbox pronta';
+    pill.className = 'pill ok';
+    pill.title = `${info.detail} · workspace montato su ${info.workdir}`;
   }
-  pill.textContent = info.running ? 'sandbox attiva' : 'sandbox pronta';
-  pill.className = 'pill ok';
-  pill.title = `${info.detail} · workspace montato su ${info.workdir}`;
-
-  // L'immagine di serie ha solo Python: senza un'immagine del progetto, il
-  // primo `pytest -q` dell'agente risponde "not found" e sembra un bug nostro.
-  const suaImmagine = state.settings.docker_image === info.project_image;
-  help.textContent = suaImmagine
-    ? `Immagine del progetto in uso. I comandi girano in un container che monta `
-      + `solo la cartella di lavoro su ${info.workdir}.`
-    : `Attenzione: l'immagine "${state.settings.docker_image}" ha Python ma non `
-      + `pytest, ruff o git. Premi "Costruisci l'immagine" per averli anche `
-      + `dentro la sandbox.`;
+  // Il racconto per esteso -- e le porte che il server pubblicherebbe davvero
+  // -- sta nel menu, sezioni Sandbox e Anteprime (``impTestoSandbox``).
+  if (typeof impDisegnaStati === 'function') impDisegnaStati();
 }
 
 async function refreshProfile() {
   try {
-    const info = await api('/api/profile');
-    const kv = info.kv_mb_per_token
-      ? ` KV cache ${info.kv_mb_per_token.toFixed(3)} MB/token (dai metadati del modello).`
-      : '';
-    // Tre casi ben distinti, perché suggeriscono tre azioni diverse. Il vecchio
-    // testo li schiacciava tutti su "contesto proposto prudente", che davanti a
-    // un endpoint remoto era fuorviante: non c'era nessuna prudenza, c'era una
-    // misura mancante.
-    let vram;
-    if (info.free_vram_mb) {
-      vram = ` VRAM libera ${(info.free_vram_mb / 1024).toFixed(1)} GB, contesto proposto ${info.values.num_ctx}.${kv}`;
-    } else if (info.vram && info.vram.remote) {
-      vram = ` Ollama gira su ${info.vram.host}: dichiara la VRAM della scheda in Connessione per avere un contesto calcolato invece che confermato.${kv}`;
-    } else {
-      vram = ` VRAM non rilevabile: il contesto proposto è quello attuale, non una misura.${kv}`;
-    }
-    const caps = [info.thinking ? 'pensiero' : null, info.vision ? 'vision' : null]
-      .filter(Boolean).join(' + ');
-    $('#profile-note').textContent =
-      `${info.profile}${caps ? ' — capability: ' + caps : ''}. ${info.note}${vram}`;
+    // Il profilo consigliato vive nella sezione Generazione del menu, che lo
+    // disegna con le differenze rispetto ai valori di adesso.
+    state.profilo = await api('/api/profile');
+    if (typeof impDisegnaStati === 'function') impDisegnaStati();
+    if (typeof impRiallinea === 'function') impRiallinea();
   } catch { /* non critico */ }
 }
 
@@ -2799,9 +2762,11 @@ function renderHeader() {
 }
 
 async function saveSettings(patch) {
+  const prima = {};
+  Object.keys(patch).forEach((k) => { prima[k] = state.settings[k]; });
   Object.assign(state.settings, patch);
   // Ottimistico: l'intestazione segue il campo appena toccato, senza aspettare
-  // il giro sul server. Se il salvataggio fallisce, il catch la riallinea.
+  // il giro sul server.
   renderHeader();
   try {
     const data = await api('/api/settings', {
@@ -2810,6 +2775,15 @@ async function saveSettings(patch) {
     });
     state.settings = data.settings;
     if (data.stats) applyStats(data.stats);
+  } catch (error) {
+    // Il valore ottimistico non e' mai arrivato sul server: tenerlo vorrebbe
+    // dire mostrare una scelta che al prossimo avvio non c'e'. Si torna a
+    // quello di prima, ma solo dove nessun salvataggio piu' recente l'ha gia'
+    // cambiato di nuovo.
+    Object.keys(prima).forEach((k) => {
+      if (state.settings[k] === patch[k]) state.settings[k] = prima[k];
+    });
+    throw error;
   } finally {
     renderHeader();
   }
@@ -2849,8 +2823,9 @@ function applyField({ id, key }) {
     const testo = value == null ? '' : String(value);
     if (node.value !== testo) node.value = testo;
   }
-  const echo = $(id + '-val');
-  if (echo) echo.textContent = value;
+  // Riallineato al valore salvato: se era segnato come non valido, non lo e'
+  // piu'.
+  node.removeAttribute('aria-invalid');
 }
 
 /** Riallinea tutti i campi delle impostazioni a ``state.settings``.
@@ -2864,23 +2839,56 @@ function syncSettingsWidgets() {
   BOUND_FIELDS.forEach((campo) => {
     if ($(campo.id) !== attivo) applyField(campo);
   });
+  // I controlli disegnati sopra i campi (segmenti, cursori, stati) e le voci
+  // che compaiono solo con certe scelte seguono lo stesso giro: e' il motivo
+  // per cui il menu non resta indietro quando si cambia qualcosa da fuori.
+  if (typeof impRiallinea === 'function') impRiallinea();
 }
 
-function bindField(id, key, transform = (v) => v) {
+/**
+ * Lega un campo a un'impostazione: valore iniziale, salvataggio, riallineamento.
+ *
+ * ``transform`` converte il valore grezzo del controllo. Se restituisce
+ * ``undefined`` il valore non e' valido -- un numero fuori dai limiti, un campo
+ * vuoto -- e non si salva: il campo resta segnato con ``aria-invalid`` finche'
+ * non torna valido.
+ *
+ * ``ritardo`` (ms) e' per i campi che si scrivono: si salva quando si smette
+ * di scrivere, e subito al ``change`` (uscita dal campo, Invio). Salvare a ogni
+ * tasto voleva dire, sull'indirizzo del server, ricostruire il backend e
+ * rifare i controlli di prontezza per ogni cifra di un IP.
+ */
+function bindField(id, key, transform = (v) => v, { ritardo = 0 } = {}) {
   const node = $(id);
   if (!node) return;
   BOUND_FIELDS.push({ id, key });
   applyField({ id, key });
-  const handler = () => {
+  let attesa = null;
+  const salva = () => {
+    clearTimeout(attesa);
+    attesa = null;
     const raw = node.type === 'checkbox' ? node.checked : node.value;
     const out = transform(raw);
-    saveSettings({ [key]: out }).catch((e) => toast(e.message));
-    // Il numero accanto al cursore si aggiorna qui e non dal riallineamento:
-    // mentre si trascina, il campo ha il fuoco e il riallineamento lo salta.
-    const echo = $(id + '-val');
-    if (echo) echo.textContent = out;
+    if (out === undefined) {
+      node.setAttribute('aria-invalid', 'true');
+      return;
+    }
+    node.removeAttribute('aria-invalid');
+    if (state.settings[key] === out) return;
+    const salvataggio = saveSettings({ [key]: out });
+    // Chi mostra lo stato del salvataggio (la spia del menu) lo sa da qui.
+    document.dispatchEvent(new CustomEvent('impostazioni:salvataggio', {
+      detail: { key, salvataggio },
+    }));
+    salvataggio.catch((e) => toast(e.message));
   };
-  node.addEventListener(node.tagName === 'SELECT' || node.type === 'checkbox' ? 'change' : 'input', handler);
+  const evento = node.tagName === 'SELECT' || node.type === 'checkbox' ? 'change' : 'input';
+  node.addEventListener(evento, () => {
+    if (!ritardo) { salva(); return; }
+    clearTimeout(attesa);
+    attesa = setTimeout(salva, ritardo);
+  });
+  if (ritardo) node.addEventListener('change', salva);
 }
 
 function fillModels(models) {
@@ -2893,7 +2901,7 @@ function fillModels(models) {
       datalist.appendChild(option);
     });
   }
-  const input = $('#s-model');
+  const input = $('#s-model-name');
   if (input && state.settings.model_name && input.value !== state.settings.model_name && document.activeElement !== input) {
     input.value = state.settings.model_name;
   }
@@ -3108,26 +3116,6 @@ async function browseWorkspace() {
   browseWorkspace._aperto = false;
 }
 
-function renderMemories() {
-  const root = $('#mem-list');
-  root.innerHTML = state.memories.length
-    ? ''
-    : '<div class="empty">Nessuna memoria salvata. L\'agente puo\' aggiungerne da solo.</div>';
-  state.memories.forEach((mem) => {
-    const row = el('div', 'mem-row');
-    row.innerHTML = `<div style="flex:1">${esc(mem.text)}<div class="id">${esc(mem.id)} · ${esc(mem.created_at || '—')}</div></div>`;
-    const del = el('button', 'icon-btn', '×');
-    del.onclick = async () => {
-      const data = await api(`/api/memories/${mem.id}`, { method: 'DELETE' });
-      state.memories = data.memories;
-      renderMemories();
-    };
-    row.appendChild(del);
-    root.appendChild(row);
-  });
-}
-
-
 // ---------------------------------------------------------------------------
 // Tema e layout
 // ---------------------------------------------------------------------------
@@ -3137,6 +3125,23 @@ function applyTheme(mode) {
   state.settings.theme_mode = mode;
   $('#theme-toggle').textContent = mode === 'dark' ? '☾' : '☀';
   try { localStorage.setItem('ah-theme', mode); } catch { /* modalita' privata */ }
+}
+
+/** Colonne laterali visibili o no, dalle impostazioni.
+ *
+ * Una funzione sola per i tre posti che le cambiano -- i due ☰ in alto, il
+ * menu Aspetto, un'importazione -- e per l'avvio. Il titolo dei pulsanti dice
+ * cosa succede al prossimo clic, non come si chiama la cosa: "Pannello
+ * destro" su un pulsante che lo nasconde non aiuta nessuno.
+ */
+function applicaColonne() {
+  const app = $('#app');
+  const senzaBarra = state.settings.show_left_sidebar === false;
+  const senzaPannello = state.settings.show_right_panel === false;
+  app.classList.toggle('no-sidebar', senzaBarra);
+  app.classList.toggle('no-panel', senzaPannello);
+  $('#toggle-sidebar').title = senzaBarra ? 'Mostra la barra laterale' : 'Nascondi la barra laterale';
+  $('#toggle-panel').title = senzaPannello ? 'Mostra il pannello destro' : 'Nascondi il pannello destro';
 }
 
 // ---------------------------------------------------------------------------
@@ -3551,6 +3556,7 @@ async function boot() {
   state.settings = data.settings;
   state.memories = data.memories;
   state.backend = data.backend;
+  state.app = data.app;
 
   // Il server e' la fonte di verita'; localStorage e' solo una scorciatoia per
   // non far lampeggiare il tema sbagliato prima che /api/bootstrap risponda.
@@ -3558,8 +3564,7 @@ async function boot() {
   try { theme = localStorage.getItem('ah-theme') || theme; } catch { /* ignora */ }
   applyTheme(theme);
 
-  $('#app').classList.toggle('no-sidebar', state.settings.show_left_sidebar === false);
-  $('#app').classList.toggle('no-panel', state.settings.show_right_panel === false);
+  applicaColonne();
 
   $('#brand-name').textContent = data.app.name;
   $('#brand-sub').textContent = 'v' + data.app.version;
@@ -3601,97 +3606,15 @@ async function boot() {
   api('/api/preload', { method: 'POST' }).catch(() => {});
   // La goccia si ricontrolla da sola da qui in avanti.
   avviaPollingEndpoint();
-  renderMemories();
   // Anche questa senza await: e' l'unica cosa dell'avvio che dipende da
   // un'altra macchina, ed e' esattamente quella che non deve tenere ferma la
   // pagina. Vedi ``/api/bootstrap``.
   sondaBackend();
 
-  bindField('#s-api-base', 'api_base');
-  bindField('#s-gpu-vram', 'gpu_total_vram_mb', Number);
-  bindField('#s-api-key', 'api_key');
-  // La mascheratura del campo API key è in CSS (`-webkit-text-security`) per
-  // non far entrare in ballo il gestore password di Chrome — il commento in
-  // index.html spiega perché. Ma quella proprietà in Firefox non esiste: lì il
-  // campo *sembrava* mascherato e mostrava la chiave in chiaro, che è peggio di
-  // un campo dichiaratamente visibile, perché nessuno pensa di coprire lo
-  // schermo. Dove la proprietà manca si torna a `type="password"`, che maschera
-  // davvero: l'unico motivo per evitarlo è il gestore password di Chrome, e in
-  // Chrome questo ramo non gira.
-  if (!(window.CSS && CSS.supports && CSS.supports('-webkit-text-security', 'disc'))) {
-    $('#s-api-key').type = 'password';
-  }
-  bindField('#s-transport', 'transport');
-  bindField('#s-stream-tools', 'stream_tools');
-
-  // La tendina dei modelli veniva riempita una volta sola, al bootstrap: dopo
-  // aver cambiato endpoint continuava a elencare i modelli della macchina
-  // precedente, e il modello nuovo sembrava non esistere. Il server il backend
-  // lo ha già ricostruito — mancava solo che qualcuno glielo richiedesse.
-  const refreshModels = async () => {
-    try {
-      const data = await api('/api/models');
-      // Il modello configurato puo' non esistere piu' sull'endpoint: in quel
-      // caso il server ne sceglie un altro e lo dice qui. Ignorarlo lasciava
-      // in alto e nelle impostazioni il nome di un modello che nessuno sta
-      // usando -- il caso peggiore, perche' non sembra un errore.
-      if (data.model_name) state.settings.model_name = data.model_name;
-      fillModels(data.models);
-      renderHeader();
-      renderStatusPill(data.online, data.detail);
-      if (!data.online) toast('Endpoint non raggiungibile: ' + data.detail);
-      else if (!data.models.length) toast('Endpoint raggiungibile ma senza modelli installati.');
-      refreshProfile();
-    } catch (error) { toast(error.message); }
-  };
-  // Sul 'change' e non sull''input': il campo è di testo, e interrogare il
-  // server ad ogni carattere digitato in un indirizzo IP significa una raffica
-  // di richieste verso host che non esistono ancora.
-  ['#s-api-base', '#s-transport'].forEach((id) =>
-    $(id).addEventListener('change', () => setTimeout(refreshModels, 120)),
-  );
-  bindField('#s-model', 'model_name');
-  $('#s-model').addEventListener('change', () => setTimeout(refreshProfile, 120));
-  bindField('#s-timeout', 'timeout_seconds', Number);
-  bindField('#s-slot-servizio', 'slot_servizio', Number);
-
-  bindField('#s-numctx', 'num_ctx', Number);
-  bindField('#s-numgpu', 'num_gpu', Number);
-  bindField('#s-keepalive', 'keep_alive');
-  bindField('#s-think', 'native_think');
-  bindField('#s-temp', 'temperature', Number);
-  bindField('#s-topp', 'top_p', Number);
-  bindField('#s-topk', 'top_k', Number);
-  bindField('#s-presence', 'presence_penalty', Number);
-  bindField('#s-repetition', 'repetition_penalty', Number);
-  bindField('#s-maxtok', 'max_tokens', Number);
-  bindField('#s-loops', 'max_agent_loops', Number);
-  bindField('#s-strip', 'strip_think_from_context');
-  bindField('#s-compact', 'compact_old_tool_results');
-  bindField('#s-plan-gate', 'plan_gate');
-  bindField('#s-compact-history', 'compact_history');
-  bindField('#s-selezione', 'compattazione_selettiva');
-  bindField('#s-laya-url', 'laya_url');
-  bindField('#s-laya-modello', 'laya_modello');
-  bindField('#s-compact-threshold', 'compact_threshold', Number);
-  bindField('#s-compact-max-tokens', 'compact_max_tokens', Number);
-  bindField('#s-libreria', 'libreria_concetti');
-  bindField('#s-estratto-pensiero', 'estratto_pensiero');
-  bindField('#s-spec-delega', 'spec_delega');
-  bindField('#s-deposito', 'deposito_risultati');
-  bindField('#s-deposito-max-mb', 'deposito_max_mb', Number);
-  bindField('#s-envhdr', 'auto_env_header');
-  bindField('#s-docker-autostart', 'docker_autostart');
-  bindField('#s-image-autobuild', 'image_autobuild');
-  bindField('#s-preview', 'preview_enabled');
-  bindField('#s-preview-ports', 'preview_ports_enabled');
-  bindField('#s-preview-port-base', 'preview_port_base', Number);
-  bindField('#s-preview-port-count', 'preview_port_count', Number);
-  bindField('#s-preview-autobackend', 'preview_autostart_backend');
-  bindField('#s-preview-host-port', 'preview_host_port', Number);
-  ['#s-preview-ports', '#s-preview-port-base', '#s-preview-port-count'].forEach((id) =>
-    $(id).addEventListener('change', () => setTimeout(refreshSandbox, 60)),
-  );
+  // Il menu delle impostazioni si costruisce dal suo schema (impostazioni.js)
+  // e lega ogni campo con bindField: una volta, adesso che le impostazioni
+  // ci sono.
+  impMonta();
   bindPreviewResize();
   bindColumnResize();
   bindVaultsResize();
@@ -3701,52 +3624,7 @@ async function boot() {
   document.addEventListener('keydown', (event) => {
     if (event.key === 'Escape') closePreview();
   });
-  bindField('#s-require-plan', 'require_plan');
-  bindField('#s-monitor-avanzamento', 'monitor_avanzamento');
-  bindField('#s-think-watchdog', 'think_watchdog');
-  bindField('#s-danger', 'confirm_commands');
-  bindField('#s-sandbox', 'sandbox');
-  bindField('#s-docker-image', 'docker_image');
-  bindField('#s-sandbox-network', 'sandbox_network');
-  ['#s-sandbox', '#s-docker-image', '#s-sandbox-network'].forEach((id) =>
-    $(id).addEventListener('change', () => setTimeout(() => {
-      refreshSandbox();
-      refreshReadiness();
-    }, 60)),
-  );
-  ['#s-api-base', '#s-model', '#s-transport'].forEach((id) =>
-    $(id).addEventListener('change', () => setTimeout(refreshReadiness, 200)),
-  );
   refreshProfile();
-  $('#profile-apply').onclick = async () => {
-    try {
-      const data = await api('/api/profile/apply', { method: 'POST' });
-      state.settings = data.settings;
-      // I valori sono cambiati sul server: renderHeader li rimette in tutti i
-      // campi. Prima qui c'era una mappa id -> chiave scritta a mano, che
-      // copriva sei campi su sei -- finche' il profilo non ne ha toccato un
-      // settimo.
-      renderHeader();
-      toast('Profilo applicato: ' + data.applied.profile);
-    } catch (error) { toast(error.message); }
-  };
-
-  bindField('#s-prompt', 'system_prompt');
-  // Svuotare il campo e' il gesto che rimette la scelta automatica: il server
-  // legge il vuoto come "scegli tu". Il bottone esiste perche' cancellare a
-  // mano ventidue righe di testo non sembra una funzione, sembra un incidente.
-  const resetPrompt = $('#s-prompt-reset');
-  if (resetPrompt) {
-    resetPrompt.onclick = async () => {
-      const campo = $('#s-prompt');
-      campo.value = '';
-      try {
-        await saveSettings({ system_prompt: '' });
-        state.settings.system_prompt = '';
-        toast('Prompt automatico: lo sceglie l\'harness in base al modello.');
-      } catch (error) { toast(error.message); }
-    };
-  }
 }
 
 function wireUi() {
@@ -3760,48 +3638,18 @@ function wireUi() {
     applyTheme(mode);
     saveSettings({ theme_mode: mode }).catch(() => { /* il tema e' gia' applicato */ });
   };
-  // Il titolo dice cosa succede al prossimo clic, non come si chiama la cosa:
-  // "Pannello destro" su un pulsante che lo nasconde non aiuta nessuno.
-  const titoloColonne = () => {
-    const app = $('#app');
-    $('#toggle-sidebar').title = app.classList.contains('no-sidebar')
-      ? 'Mostra la barra laterale' : 'Nascondi la barra laterale';
-    $('#toggle-panel').title = app.classList.contains('no-panel')
-      ? 'Mostra il pannello destro' : 'Nascondi il pannello destro';
-  };
   $('#toggle-sidebar').onclick = () => {
-    const chiusa = $('#app').classList.toggle('no-sidebar');
-    titoloColonne();
-    saveSettings({ show_left_sidebar: !chiusa }).catch(() => {});
+    saveSettings({ show_left_sidebar: state.settings.show_left_sidebar === false }).catch(() => {});
+    applicaColonne();
   };
   $('#toggle-panel').onclick = () => {
-    const chiuso = $('#app').classList.toggle('no-panel');
-    titoloColonne();
-    saveSettings({ show_right_panel: !chiuso }).catch(() => {});
+    saveSettings({ show_right_panel: state.settings.show_right_panel === false }).catch(() => {});
+    applicaColonne();
   };
-  titoloColonne();
-  $('#open-settings').onclick = () => $('#overlay').classList.add('open');
-  $('#close-settings').onclick = () => $('#overlay').classList.remove('open');
-  $('#overlay').onclick = (event) => {
-    if (event.target === $('#overlay')) $('#overlay').classList.remove('open');
-  };
-
-  $$('.tab').forEach((tab) => {
-    tab.onclick = () => {
-      $$('.tab').forEach((t) => {
-        t.classList.remove('active');
-        // `aria-selected` va spostato insieme alla classe: era la classe da
-        // sola a dire quale scheda è aperta, e una classe CSS uno screen
-        // reader non la legge. Con cinque bottoni tutti uguali, chi non vede
-        // lo schermo non aveva modo di sapere dove si trovava.
-        t.setAttribute('aria-selected', 'false');
-      });
-      $$('.tab-panel').forEach((p) => p.classList.remove('active'));
-      tab.classList.add('active');
-      tab.setAttribute('aria-selected', 'true');
-      $('#tab-' + tab.dataset.tab).classList.add('active');
-    };
-  });
+  applicaColonne();
+  // Apertura, chiusura e scorciatoie del menu delle impostazioni: la finestra
+  // si costruisce dopo, al boot, quando le impostazioni sono arrivate.
+  impCollega();
 
   $('#send').onclick = send;
   // Goccia "Ricerca online": toggle puro lato client. Lo stato vero vive nel
@@ -3951,22 +3799,6 @@ function wireUi() {
     toggleModelMenu(false);
     toggleWsMenu();
   };
-
-  $('#mem-add').onclick = async () => {
-    const input = $('#mem-input');
-    if (!input.value.trim()) return;
-    const data = await api('/api/memories', {
-      method: 'POST', body: JSON.stringify({ text: input.value.trim() }),
-    });
-    state.memories = data.memories;
-    input.value = '';
-    if (!data.ok) toast(data.message);
-    renderMemories();
-  };
-
-  document.addEventListener('keydown', (event) => {
-    if (event.key === 'Escape') $('#overlay').classList.remove('open');
-  });
 }
 
 wireUi();

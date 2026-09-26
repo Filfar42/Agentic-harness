@@ -183,3 +183,101 @@ def pick_available_model(settings: dict[str, Any], models: list[str]) -> str | N
         if simile:
             return simile
     return models[0]
+
+
+# ---------------------------------------------------------------------------
+# Valori di serie e scambio fra macchine
+# ---------------------------------------------------------------------------
+#
+# Il menu delle impostazioni mostra cosa hai cambiato rispetto ai valori di
+# fabbrica e sa rimetterli: per farlo li deve conoscere, e la fonte e' una sola,
+# ``DEFAULTS``. Esportazione e importazione servono a portare le preferenze da
+# una macchina all'altra: quello che non ha senso portare -- segreti e percorsi
+# di questa macchina -- non esce e non entra, e il motivo viaggia con la chiave
+# perche' la UI lo possa dire invece di far sparire una voce in silenzio.
+
+#: Chiavi che non hanno un valore "di serie" da proporre: dipendono dalla
+#: macchina (``workspace_dir`` vale ``os.getcwd()`` al momento dell'import) o
+#: sono stato che l'utente non sceglie da un menu.
+SENZA_VALORE_DI_SERIE = VOLATILE_KEYS | frozenset(
+    {"workspace_dir", "recent_workspaces", "vaults", "mobile_token"}
+)
+
+#: Chiavi che un'esportazione non scrive e un'importazione non applica.
+FUORI_DALLO_SCAMBIO: dict[str, str] = {
+    "api_key": "la chiave del server è un segreto e resta su questa macchina",
+    "mobile_token": "la chiave del telefono vale solo per questa macchina",
+    "workspace_dir": "è un percorso di questa macchina",
+    "recent_workspaces": "sono percorsi di questa macchina",
+    "vaults": "sono percorsi di questa macchina",
+    "docker_image": "il nome dell'immagine dipende dal percorso del progetto",
+}
+
+FORMATO_SCAMBIO = "astra-impostazioni"
+VERSIONE_SCAMBIO = 1
+
+
+def valori_di_serie() -> dict[str, Any]:
+    """I valori di fabbrica delle chiavi che si possono cambiare dal menu."""
+    return {
+        key: value for key, value in _defaults().items()
+        if key not in SENZA_VALORE_DI_SERIE
+    }
+
+
+def esporta(settings: dict[str, Any], *, versione_app: str, adesso: str) -> dict[str, Any]:
+    """Le preferenze in un involucro che si riconosce al ritorno.
+
+    Parte da ``persistable``: e' cio' che finisce nel file delle preferenze,
+    quindi il system prompt c'e' solo se e' stato riscritto -- esportare quello
+    di serie vorrebbe dire congelarlo sull'altra macchina, la trappola
+    descritta in testa al modulo.
+    """
+    valori = {
+        key: value for key, value in persistable(settings).items()
+        if key not in FUORI_DALLO_SCAMBIO
+    }
+    return {
+        "formato": FORMATO_SCAMBIO,
+        "versione": VERSIONE_SCAMBIO,
+        "app": versione_app,
+        "esportate_il": adesso,
+        "impostazioni": valori,
+    }
+
+
+def da_importare(dati: Any) -> tuple[dict[str, Any], list[dict[str, str]]]:
+    """Cosa di un file importato si puo' applicare, e cosa no con il motivo.
+
+    Accetta l'involucro di ``esporta`` e anche un ``agent_settings.json``
+    copiato cosi' com'e': e' lo stesso dizionario senza la busta. La regola sui
+    tipi e' ``tipo_compatibile``, la stessa della rilettura all'avvio e di
+    ``/api/settings``: tre porte, una serratura.
+    """
+    if isinstance(dati, dict) and dati.get("formato") == FORMATO_SCAMBIO:
+        valori = dati.get("impostazioni")
+    else:
+        valori = dati
+    if not isinstance(valori, dict):
+        raise ValueError("Il file non contiene impostazioni: serve un oggetto JSON.")
+
+    applicabili: dict[str, Any] = {}
+    ignorate: list[dict[str, str]] = []
+    for key, value in valori.items():
+        if key in FUORI_DALLO_SCAMBIO:
+            ignorate.append({"chiave": key, "motivo": FUORI_DALLO_SCAMBIO[key]})
+        elif key == "system_prompt":
+            if isinstance(value, str):
+                applicabili[key] = value
+            else:
+                ignorate.append({"chiave": key, "motivo": "non è un testo"})
+        elif key not in DEFAULTS or key in VOLATILE_KEYS:
+            ignorate.append({"chiave": key, "motivo": "questa versione non la conosce"})
+        elif not tipo_compatibile(value, DEFAULTS[key]):
+            ignorate.append({
+                "chiave": key,
+                "motivo": f"atteso {type(DEFAULTS[key]).__name__}, trovato {type(value).__name__}",
+            })
+        else:
+            applicabili[key] = value
+    return applicabili, ignorate

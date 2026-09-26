@@ -33,6 +33,7 @@ import time
 from collections.abc import AsyncIterator, Callable, Iterator
 from contextlib import asynccontextmanager
 from dataclasses import asdict, is_dataclass, replace
+from datetime import datetime
 from pathlib import Path
 from functools import wraps
 from typing import Any, Literal
@@ -79,6 +80,7 @@ from core.config import (
 )
 from core.prompts import (
     SYSTEM_PROMPT,
+    SYSTEM_PROMPT_LEAN,
     TAG_AGGIORNAMENTO,
     aggiornamento_albero,
     build_attachments_block,
@@ -2855,7 +2857,7 @@ def global_events() -> StreamingResponse:
 @app.post("/api/settings")
 @serialized_admission
 def update_settings(request: SettingsRequest) -> dict[str, Any]:
-    touched = set()
+    accettate: dict[str, Any] = {}
     rifiutate: list[str] = []
     for key, value in request.values.items():
         if key not in STATE.settings and key != "system_prompt":
@@ -2875,11 +2877,24 @@ def update_settings(request: SettingsRequest) -> dict[str, Any]:
                 f"{type(value).__name__}"
             )
             continue
-        if STATE.settings.get(key) != value:
-            touched.add(key)
+        accettate[key] = value
     if rifiutate:
         raise HTTPException(400, "Valori non validi -- " + "; ".join(rifiutate))
-    STATE.settings.update({key: request.values[key] for key in touched})
+    _applica_impostazioni(accettate)
+    return {"settings": STATE.settings, "stats": session_stats(STATE.last_opened)}
+
+
+def _applica_impostazioni(valori: dict[str, Any]) -> set[str]:
+    """Scrive valori gia' validati e ne tira le conseguenze.
+
+    Una strada sola per il menu e per l'importazione da file: le conseguenze
+    di un cambio -- backend da ricostruire, container da buttare, prontezza da
+    rifare, cartella da rilegare alla chat -- stanno qui, e una seconda porta
+    che le copiasse se ne dimenticherebbe una. Restituisce le chiavi che sono
+    cambiate davvero.
+    """
+    touched = {key for key, value in valori.items() if STATE.settings.get(key) != value}
+    STATE.settings.update({key: valori[key] for key in touched})
     # Le cache dei derivati valgono finche' non si cambia a cosa puntano.
     if touched & {"transport", "api_base", "api_key", "timeout_seconds",
                   "stream_tools", "model_name"}:
@@ -2902,7 +2917,133 @@ def update_settings(request: SettingsRequest) -> dict[str, Any]:
     # di legare la cartella alla conversazione aperta.
     if "workspace_dir" in touched:
         applica_workspace(Path(str(STATE.settings["workspace_dir"])).expanduser())
-    return {"settings": STATE.settings, "stats": session_stats(STATE.last_opened)}
+    return touched
+
+
+@app.get("/api/settings/meta")
+def settings_meta() -> dict[str, Any]:
+    """Quello che il menu deve sapere oltre ai valori: i valori di serie.
+
+    Servono a segnare cosa e' stato cambiato e a rimetterlo com'era. Non stanno
+    in ``/api/bootstrap`` perche' il bootstrap e' la risposta che tiene ferma
+    la prima pagina, e questi al primo disegno non servono.
+    """
+    return {
+        "defaults": settings_mod.valori_di_serie(),
+        "fuori_dallo_scambio": settings_mod.FUORI_DALLO_SCAMBIO,
+    }
+
+
+@app.get("/api/settings/prompt")
+def settings_prompt() -> dict[str, Any]:
+    """Quale prompt di sistema riceve il modello, e se e' quello di serie.
+
+    Il campo delle impostazioni da solo non lo dice: finche' nessuno l'ha
+    riscritto contiene il prompt esteso (``setdefault`` in ``AppState``), mentre
+    a un modello che ragiona l'harness manda quello snello. Il menu mostrava il
+    testo sbagliato proprio a chi non l'aveva mai toccato.
+    """
+    testo = str(STATE.settings.get("system_prompt") or "")
+    di_serie = is_stock_prompt(testo)
+    if not di_serie:
+        attivo = "personalizzato"
+    elif vault_mod.is_modalita_vault(STATE.settings["workspace_dir"]):
+        attivo = "vault"
+    else:
+        attivo = "snello" if STATE.thinking_enabled() else "esteso"
+    effettivo = STATE.system_prompt()
+    base_attiva = {
+        "personalizzato": testo,
+        "vault": vault_mod.VAULT_SYSTEM_PROMPT,
+        "snello": SYSTEM_PROMPT_LEAN,
+        "esteso": SYSTEM_PROMPT,
+    }[attivo]
+    return {
+        "di_serie": di_serie,
+        "attivo": attivo,
+        "base": {"esteso": SYSTEM_PROMPT, "snello": SYSTEM_PROMPT_LEAN},
+        # Il testo da cui parte chi decide di personalizzare: quello che il
+        # modello riceve adesso, senza moduli e memorie che l'harness aggiunge
+        # comunque in coda (copiarli nel campo li farebbe comparire due volte).
+        "base_attiva": base_attiva,
+        "effettivo": effettivo,
+        "token_effettivo": estimate_tokens(effettivo),
+    }
+
+
+@app.get("/api/settings/export")
+def export_settings() -> dict[str, Any]:
+    """Le preferenze da portare su un'altra macchina, senza segreti ne' percorsi."""
+    adesso = datetime.now().astimezone().isoformat(timespec="seconds")
+    return settings_mod.esporta(STATE.settings, versione_app=APP_VERSION, adesso=adesso)
+
+
+class ImportRequest(BaseModel):
+    impostazioni: Any = None
+    # ``True`` = dimmi cosa cambierebbe, senza toccare niente. E' il passo che
+    # permette alla UI di chiedere conferma mostrando le differenze.
+    prova: bool = False
+
+
+@app.post("/api/settings/import")
+@serialized_admission
+def import_settings(request: ImportRequest) -> dict[str, Any]:
+    """Applica un file esportato (o un ``agent_settings.json``), dopo averlo filtrato.
+
+    Quello che non si puo' portare fra due macchine resta com'e' qui, e la
+    risposta dice quali chiavi sono state lasciate fuori e perche'.
+    """
+    try:
+        applicabili, ignorate = settings_mod.da_importare(request.impostazioni)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    diverse = sorted(k for k, v in applicabili.items() if STATE.settings.get(k) != v)
+    valori = {key: applicabili[key] for key in diverse}
+    if request.prova:
+        return {"diverse": diverse, "valori": valori, "ignorate": ignorate,
+                "riconosciute": len(applicabili)}
+    _applica_impostazioni(valori)
+    return {
+        "settings": STATE.settings,
+        "stats": session_stats(STATE.last_opened),
+        "diverse": diverse,
+        "ignorate": ignorate,
+    }
+
+
+@app.get("/api/diagnostics")
+def diagnostics() -> dict[str, Any]:
+    """Com'e' fatta questa installazione, senza chiedere niente alla rete.
+
+    Serve al pannello Informazioni e a "Copia diagnostica". Lo stato del server
+    del modello e della sandbox il client ce l'ha gia' (``/api/backend``,
+    ``/api/sandbox``): rifare qui quelle sonde vorrebbe dire far aspettare il
+    pannello i secondi di timeout di una macchina spenta.
+    """
+    di_serie = settings_mod.valori_di_serie()
+    diverse: dict[str, Any] = {}
+    for key, value in STATE.settings.items():
+        if key in di_serie and value != di_serie[key]:
+            # I segreti non finiscono in un testo fatto per essere incollato.
+            diverse[key] = "(impostata)" if key in _SEGRETI else value
+    return {
+        "app": {"nome": APP_NAME, "versione": APP_VERSION},
+        "python": platform.python_version(),
+        "sistema": f"{platform.system()} {platform.release()}".strip(),
+        "percorsi": {
+            "impostazioni": str(Path(settings_mod.SETTINGS_FILE).resolve()),
+            "memorie": str(Path(memory_mod.MEMORY_FILE).resolve()),
+            "conversazioni": str(Path(session_mod.DATA_DIR).resolve()),
+        },
+        "conversazioni": len(session_mod.list_sessions(limit=1_000_000)),
+        "memorie": len(STATE.memories),
+        "prompt_personalizzato": not is_stock_prompt(str(STATE.settings.get("system_prompt") or "")),
+        "diverse_dal_default": diverse,
+    }
+
+
+# Valori che non si mostrano mai per intero fuori dal loro campo.
+_SEGRETI = frozenset({"api_key", "mobile_token"})
 
 
 @app.get("/api/memories")
