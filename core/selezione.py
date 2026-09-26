@@ -406,7 +406,7 @@ def probabilita_regole(c: Candidato, obiettivo: str) -> tuple[float, float]:
         return 0.55, 0.35
     if c.nome == "manage_plan":
         return 0.2, 0.1            # il piano vive nel blocco di coda
-    if c.nome in ("esplora", "web_search", "vault_search"):
+    if c.nome in ("esplora", "web_search", "wiki_search"):
         return 0.7, 0.6            # referti e fonti esterne: costano da rifare
     return 0.6, 0.5
 

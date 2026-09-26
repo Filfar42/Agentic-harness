@@ -197,15 +197,15 @@ def test_reusing_collector_excludes_previous_turn_usage(tmp_path):
     assert tracked.collector.totals()["prompt_tokens"] == 40
 
 
-@pytest.mark.parametrize("tool_name", ["esplora", "vault_search"])
+@pytest.mark.parametrize("tool_name", ["esplora", "wiki_search"])
 def test_reused_tool_context_binds_auxiliary_calls_to_current_turn_backend(tmp_path, monkeypatch, tool_name):
     def service(*args, **kwargs):
         output = list(kwargs["backend"].stream([], None, kwargs["params"]))
         return {"referto": next(event.text for event in output if event.kind == "content")}
     monkeypatch.setattr(agent.delega_mod, "esegui", service)
-    monkeypatch.setattr(agent.vault_search_mod, "cerca_nel_vault", service)
+    monkeypatch.setattr(agent.wiki_search_mod, "cerca_nella_wiki", service)
     arguments = ({"compito": "Trova la funzione nel workspace"} if tool_name == "esplora"
-                 else {"vault": "documenti", "query": "Trova la funzione nel vault"})
+                 else {"progetto": "documenti", "query": "Trova la funzione nella wiki"})
     ctx = ToolContext(workspace=str(tmp_path), sandbox="host")
     messages = [{"role": "user", "content": "procedi con la ricerca"}]
     backends, finished = [], []
@@ -221,7 +221,7 @@ def test_reused_tool_context_binds_auxiliary_calls_to_current_turn_backend(tmp_p
         )))[-1])
         messages.append({"role": "user", "content": "ripeti la ricerca con il nuovo modello"})
     assert [len(backend.requests) for backend in backends] == [3, 3]
-    purpose = "delegate" if tool_name == "esplora" else "vault_search"
+    purpose = "delegate" if tool_name == "esplora" else "wiki_search"
     assert [turn.telemetry["totals"]["calls"] for turn in finished] == [3, 3]
     assert [turn.usage["prompt_tokens"] for turn in finished] == [60, 120]
     assert [turn.telemetry["totals"]["by_purpose"][purpose]["prompt_tokens"]

@@ -38,7 +38,7 @@ from collections.abc import Callable
 from . import sandbox as sandbox_mod
 from . import atomic
 from . import aggancio, sintassi
-from . import vault as vault_mod
+from . import progetto as progetto_mod
 from .config import Budgets
 from .memory import add_memory, remove_memory
 from .notes import NoteError, Notes
@@ -262,22 +262,29 @@ class ToolContext:
     # backend e parametri: tenerli qui vorrebbe dire far conoscere il modello a
     # un modulo che si occupa di file.
     on_delega: Callable[[str], dict[str, Any]] | None = None
-    # Come si interroga un vault LLM Wiki senza cambiare workspace. La monta
-    # il ciclo agentico, come per ``on_delega``: anche qui servono backend e
+    # Come si interroga la wiki di un progetto senza aprirlo. La monta il
+    # ciclo agentico, come per ``on_delega``: anche qui servono backend e
     # parametri del turno per far girare il sotto-turno del cercatore.
-    on_vault_search: Callable[..., dict[str, Any]] | None = None
-    # I vault noti (la chiave "vaults" delle impostazioni): servono al
-    # sotto-turno di vault_search per risolvere il nome in percorso.
-    registri_vault: list[dict[str, Any]] = field(default_factory=list)
-    # Il vault in cui si sta lavorando, se il workspace ne e' uno. Vuoto
-    # altrove: e' quello che rende ``manage_notes ambito='vault'`` possibile
+    on_wiki_search: Callable[..., dict[str, Any]] | None = None
+    # I progetti noti (la chiave "progetti" delle impostazioni): servono al
+    # sotto-turno di wiki_search per risolvere il nome in percorso.
+    registri_progetti: list[dict[str, Any]] = field(default_factory=list)
+    # Il progetto in cui si sta lavorando, se il workspace ne e' uno. Vuoto
+    # altrove: e' quello che rende ``manage_notes ambito='progetto'`` possibile
     # qui e un errore pulito altrove.
-    vault_dir: str = ""
-    # La memoria del vault, caricata all'inizio del turno. Sta nel contesto e
-    # non si rilegge da disco ad ogni passo: cambia solo quando la cambia il
-    # modello, e in quel caso la riscrive il tool.
-    vault_notes: list[str] = field(default_factory=list)
-    on_vault_notes_changed: Callable[[list[str]], None] | None = None
+    progetto_dir: str = ""
+    # Il nome del progetto, per il blocco in coda (``<memoria_del_progetto
+    # nome=...>``): e' quello scelto dall'utente, non quello della cartella.
+    progetto_nome: str = ""
+    # La memoria del progetto, caricata all'inizio del turno. Sta nel contesto
+    # e non si rilegge da disco ad ogni passo: cambia quando la cambia il
+    # modello (il tool la riscrive qui) o l'harness a fine turno.
+    progetto_memoria: tuple[Any, ...] = ()
+    on_progetto_memoria_changed: Callable[[tuple[Any, ...]], None] | None = None
+    # La conversazione in cui gira il turno: id e titolo. Servono a dire da
+    # dove viene una voce della memoria del progetto.
+    chat_id: str = ""
+    chat_titolo: str = ""
     allow_dangerous_commands: bool = False
     # "docker" = i comandi girano in un container che monta solo il workspace.
     # "host" = esecuzione diretta sulla macchina, come prima: l'agente vede
@@ -342,7 +349,7 @@ class ToolContext:
     # Punti di piano chiusi in questo passo, in attesa che ``agent`` ne
     # distilli il ragionamento. E' una **casella postale, non una callback**:
     # l'estrazione e' una chiamata al modello, e il modello qui dentro non si
-    # conosce (stessa ragione per cui ``on_delega`` e ``on_vault_search``
+    # conosce (stessa ragione per cui ``on_delega`` e ``on_wiki_search``
     # esistono). Farla dentro il tool bloccherebbe il passo a meta' e non
     # comparirebbe in nessun evento; ``agent`` la svuota a tool finiti, quando
     # ha backend, parametri e cronologia sotto mano.
@@ -358,7 +365,7 @@ class ToolContext:
     verification: Any = None
     # I tool che questo turno puo' eseguire. ``None`` = tutti (il turno
     # normale); un insieme = solo quelli, ed e' cosi' che i sotto-turni --
-    # l'esploratore della delega e il cercatore del vault -- restano di sola
+    # l'esploratore della delega e il cercatore della wiki -- restano di sola
     # lettura.
     #
     # Prima il perimetro esisteva solo nello **schema** passato al modello, e
@@ -475,9 +482,9 @@ class ToolContext:
         if self.on_notes_changed:
             self.on_notes_changed(self.notes)
 
-    def vault_notes_changed(self) -> None:
-        if self.on_vault_notes_changed:
-            self.on_vault_notes_changed(self.vault_notes)
+    def progetto_memoria_changed(self) -> None:
+        if self.on_progetto_memoria_changed:
+            self.on_progetto_memoria_changed(self.progetto_memoria)
 
 
 # ---------------------------------------------------------------------------
@@ -1067,7 +1074,7 @@ def _da_saltare(nome: str) -> bool:
     quattro seguivano tre politiche diverse: ``list_files`` aveva
     ``nome in IGNORED_DIRS or nome.startswith(".") and entry.is_dir()``, che per
     la precedenza di ``and`` su ``or`` significa "salta i dot-file solo se sono
-    anche cartelle" -- cioe' mai. I ``.env`` e i ``.vault.json`` finivano
+    anche cartelle" -- cioe' mai. I ``.env`` e i ``.progetto.json`` finivano
     nell'elenco mentre l'header d'ambiente li nascondeva: due risposte diverse
     alla stessa domanda, date allo stesso modello nello stesso turno.
     """
@@ -3005,30 +3012,30 @@ def tool_esplora(ctx: ToolContext, compito: str = "") -> str:
     return _ok(ctx.on_delega(compito))
 
 
-VAULT_SEARCH_TOOL = "vault_search"
+WIKI_SEARCH_TOOL = "wiki_search"
 
 
-def tool_vault_search(
+def tool_wiki_search(
     ctx: ToolContext,
-    vault: str = "",
+    progetto: str = "",
     query: str = "",
 ) -> str:
-    """Interroga la wiki di un vault tramite l'agente manutentore.
+    """Interroga la wiki di un progetto tramite l'agente manutentore.
 
-    Il cercatore gira nel workspace del vault, non in quello corrente: legge
-    l'indice e le pagine, e torna solo il referto con i link alle pagine.
-    Non puo' scrivere -- una chat normale consulta il vault, non lo modifica;
-    la manutenzione si fa aprendo il vault come workspace.
+    Il cercatore gira nella cartella di quel progetto, non in quella corrente:
+    legge l'indice e le pagine, e torna solo il referto con i link alle pagine.
+    Non puo' scrivere -- una chat consulta la wiki, non la modifica; la
+    manutenzione si fa aprendo il progetto.
     """
-    if ctx.on_vault_search is None:
+    if ctx.on_wiki_search is None:
         return _err(
-            "La ricerca nel vault non e' disponibile in questa sessione.",
-            hint="Nessun vault registrato: registralo dalla sezione Vault.",
+            "La ricerca nelle wiki non e' disponibile in questa sessione.",
+            hint="Nessun progetto con la wiki: accendila nelle impostazioni di un progetto.",
         )
-    if not str(vault or "").strip():
+    if not str(progetto or "").strip():
         return _err(
-            "Manca il nome del vault.",
-            hint="Passa 'vault' col nome di uno dei vault registrati.",
+            "Manca il nome del progetto.",
+            hint="Passa 'progetto' col nome di uno dei progetti con la wiki.",
         )
     if len(str(query or "").strip()) < 8:
         return _err(
@@ -3038,7 +3045,7 @@ def tool_vault_search(
                 "non vede la conversazione, vede solo questa frase."
             ),
         )
-    return _ok(ctx.on_vault_search(vault=vault.strip(), query=query.strip()))
+    return _ok(ctx.on_wiki_search(progetto=progetto.strip(), query=query.strip()))
 
 
 NOTES_TOOL = "manage_notes"
@@ -3047,23 +3054,25 @@ NOTES_TOOL = "manage_notes"
 def tool_manage_notes(
     ctx: ToolContext, action: str, text: str = "", ambito: str = "chat"
 ) -> str:
-    """Foglio di note del compito in corso, o memoria del vault.
+    """Foglio di note del compito in corso, o memoria del progetto.
 
     Separato da ``manage_plan`` di proposito: il piano dice a che punto sei,
     le note dicono cosa hai capito. Mescolarli riempirebbe il piano di scoperte
     e lo renderebbe illeggibile proprio quando serve di piu'.
 
-    Separato anche da ``manage_memory``: quella vale per il progetto e
-    sopravvive a tutte le sessioni, questa muore con il compito.
+    Separato anche da ``manage_memory``: quella vale ovunque e sopravvive a
+    tutte le sessioni, questa muore con il compito.
 
-    ``ambito='vault'`` scrive invece nella memoria del vault: stesso gesto,
-    altra durata. Non e' un terzo tool perche' la differenza fra i tre fogli
-    e' **quanto vivono**, non cosa ci si scrive -- e uno schema in piu' si
-    paga in finestra ad ogni passo di ogni turno.
+    ``ambito='progetto'`` scrive invece nella memoria del progetto: stesso
+    gesto, altra durata. Non e' un terzo tool perche' la differenza fra i fogli
+    e' **quanto vivono**, non cosa ci si scrive -- e uno schema in piu' si paga
+    in finestra ad ogni passo di ogni turno. A un modello che scrive ancora
+    ``'vault'`` (il nome di prima) risponde gia' la validazione dello schema
+    con i valori ammessi; qui l'alias copre chi chiama la funzione direttamente.
     """
     action = (action or "").strip().lower()
-    if (ambito or "chat").strip().lower() == "vault":
-        return _note_del_vault(ctx, action, text)
+    if (ambito or "chat").strip().lower() in ("progetto", "vault", "project"):
+        return _note_del_progetto(ctx, action, text)
     try:
         if action == "add":
             nota = ctx.notes.add(text)
@@ -3089,55 +3098,79 @@ def tool_manage_notes(
     return _ok({**esito, "action": action, "count": len(ctx.notes)})
 
 
-def _note_del_vault(ctx: ToolContext, action: str, text: str) -> str:
-    """La memoria del vault: quello che si e' capito **del posto**.
+def _tipo_dal_testo(testo: str) -> tuple[str, str]:
+    """``"decisione: usiamo SQLite"`` -> ``("decisione", "usiamo SQLite")``.
 
-    Vale per tutte le conversazioni della cartella e non muore con nessuna di
-    esse. Vive in ``.vault.json``, cioe' dentro il vault: la memoria segue la
-    cartella, come il suo nome.
+    Il tipo della voce viaggia come prefisso del testo e non come parametro:
+    un parametro in piu' nello schema si paga a ogni passo, e il prefisso e'
+    la forma che un modello scrive comunque quando elenca.
     """
-    if not ctx.vault_dir:
+    testo = str(testo or "").strip()
+    testa, sep, resto = testo.partition(":")
+    if sep and 0 < len(testa) <= 20:
+        tipo = progetto_mod._tipo(testa)
+        if tipo != progetto_mod.TIPO_DI_SERIE or testa.strip().lower() in ("fatto", "fatti"):
+            return tipo, resto.strip()
+    return progetto_mod.TIPO_DI_SERIE, testo
+
+
+def _note_del_progetto(ctx: ToolContext, action: str, text: str) -> str:
+    """La memoria del progetto: quello che si e' stabilito **in questo posto**.
+
+    Vale per tutte le conversazioni del progetto e non muore con nessuna di
+    esse. Vive in ``.progetto.json``, cioe' dentro la cartella: la memoria
+    segue la cartella, come il suo nome.
+    """
+    if not ctx.progetto_dir:
         return _err(
-            "Qui non c'e' nessun vault: questa cartella non ne fa parte.",
-            hint="Senza ambito='vault' la nota va nel foglio di questa chat.",
+            "Qui non c'e' nessun progetto: questa cartella non ne fa parte.",
+            hint="Senza ambito='progetto' la nota va nel foglio di questa chat.",
         )
     try:
         if action == "add":
-            config = vault_mod.aggiungi_nota(ctx.vault_dir, text)
-            esito: dict[str, Any] = {"status": "ok", "added": text}
+            tipo, testo = _tipo_dal_testo(text)
+            config, voce = progetto_mod.aggiungi_voce(
+                ctx.progetto_dir, testo, tipo=tipo, autore="modello",
+                chat=ctx.chat_id, titolo_chat=ctx.chat_titolo,
+            )
+            esito: dict[str, Any] = {"status": "ok", "added": {
+                "id": voce.id, "tipo": voce.tipo, "testo": voce.testo}}
         elif action == "remove":
-            config = vault_mod.togli_nota(ctx.vault_dir, text)
-            esito = {"status": "ok", "removed": text}
+            config, voce = progetto_mod.togli_voce(ctx.progetto_dir, text, autore="modello")
+            esito = {"status": "ok", "removed": {"id": voce.id, "testo": voce.testo}}
         elif action == "show":
-            return _ok({"notes": list(vault_mod.leggi_config(ctx.vault_dir).note)})
+            memoria = progetto_mod.leggi_config(ctx.progetto_dir).memoria
+            return _ok({"memoria": [
+                {"id": v.id, "tipo": v.tipo, "testo": v.testo, "autore": v.autore}
+                for v in memoria
+            ]})
         elif action == "clear":
-            # Niente svuotamento in blocco della memoria del vault. Il foglio
-            # di una chat si butta perche' muore con lei comunque; questa e'
-            # il lavoro di mesi, e una `clear` per sbaglio non ha un annulla.
+            # Niente svuotamento in blocco. Il foglio di una chat si butta
+            # perche' muore con lei comunque; questa e' il lavoro di mesi, e
+            # una `clear` per sbaglio non ha un annulla.
             return _err(
-                "La memoria del vault non si svuota in blocco.",
-                hint="Togli le note superate una per una con action='remove'.",
+                "La memoria del progetto non si svuota in blocco.",
+                hint="Togli le voci superate una per una con action='remove'.",
             )
         else:
             return _err(
                 f"Azione '{action}' non supportata.",
-                hint="Valori ammessi con ambito='vault': add, remove, show.",
+                hint="Valori ammessi con ambito='progetto': add, remove, show.",
             )
-    except vault_mod.NotaVaultError as exc:
+    except progetto_mod.MemoriaError as exc:
         return _err(str(exc))
-    except vault_mod.VaultScritturaError as exc:
-        # La nota non e' finita sul disco. Va detto: prima ``scrivi_config``
-        # ritornava la configurazione nuova comunque, e il modello riceveva
-        # "registrata" su una nota che non c'era.
+    except progetto_mod.ScritturaError as exc:
+        # La voce non e' finita sul disco. Va detto: il modello che legge
+        # "registrata" ci costruisce sopra il resto del turno.
         return _err(
-            f"Non ho potuto salvare la memoria del vault: {exc}",
-            hint="La nota NON e' stata registrata. Controlla i permessi della "
-            "cartella del vault, o riprova.",
+            f"Non ho potuto salvare la memoria del progetto: {exc}",
+            hint="La voce NON e' stata registrata. Controlla i permessi della "
+            "cartella del progetto, o riprova.",
         )
 
-    ctx.vault_notes = list(config.note)
-    ctx.vault_notes_changed()
-    return _ok({**esito, "action": action, "ambito": "vault", "count": len(config.note)})
+    ctx.progetto_memoria = tuple(config.memoria)
+    ctx.progetto_memoria_changed()
+    return _ok({**esito, "action": action, "ambito": "progetto", "count": len(config.memoria)})
 
 
 # ---------------------------------------------------------------------------
@@ -3409,7 +3442,7 @@ TOOL_IMPLS: dict[str, Callable[..., str]] = {
     PLAN_TOOL: tool_manage_plan,
     NOTES_TOOL: tool_manage_notes,
     DELEGA_TOOL: tool_esplora,
-    VAULT_SEARCH_TOOL: tool_vault_search,
+    WIKI_SEARCH_TOOL: tool_wiki_search,
     PREVIEW_TOOL: tool_preview,
 }
 
@@ -3426,7 +3459,7 @@ _ALLOWED_ARGS: dict[str, set[str]] = {
     PLAN_TOOL: {"action", "steps", "step_id", "note", "ignore_red"},
     NOTES_TOOL: {"action", "text", "ambito"},
     DELEGA_TOOL: {"compito"},
-    VAULT_SEARCH_TOOL: {"vault", "query"},
+    WIKI_SEARCH_TOOL: {"progetto", "query"},
     PREVIEW_TOOL: {"action", "path", "command", "port", "url_path", "wait_s"},
     ASK_USER_TOOL: {"question", "options", "allow_multiple"},
     WEB_SEARCH_TOOL: {"query", "max_results"},
@@ -3986,24 +4019,24 @@ TOOLS_SCHEMA: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
-            "name": VAULT_SEARCH_TOOL,
+            "name": WIKI_SEARCH_TOOL,
             "description": (
-                "Interroga un vault LLM Wiki registrato: l'agente manutentore "
-                "della wiki cerca nelle sue pagine e ti torna solo la risposta "
+                "Interroga la wiki (LLM Wiki) di un altro progetto: l'agente "
+                "manutentore cerca nelle sue pagine e ti torna solo la risposta "
                 "con i link alle pagine usate. USALO quando la domanda riguarda "
-                "il contenuto di un vault e tu non hai il vault aperto come "
-                "workspace. Il cercatore non vede questa conversazione e non "
+                "il contenuto di quella wiki e non stai lavorando in quel "
+                "progetto. Il cercatore non vede questa conversazione e non "
                 "puo' scrivere: la manutenzione della wiki si fa aprendo il "
-                "vault come workspace."
+                "progetto."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "vault": {
+                    "progetto": {
                         "type": "string",
                         "description": (
-                            "Nome del vault in cui cercare, cosi' come compare "
-                            "nella sezione Vault."
+                            "Nome del progetto in cui cercare, cosi' come "
+                            "compare nella sezione Progetti."
                         ),
                     },
                     "query": {
@@ -4015,7 +4048,7 @@ TOOLS_SCHEMA: list[dict[str, Any]] = [
                         ),
                     },
                 },
-                "required": ["vault", "query"],
+                "required": ["progetto", "query"],
             },
         },
     },
@@ -4055,16 +4088,16 @@ TOOLS_SCHEMA: list[dict[str, Any]] = [
                     },
                     "ambito": {
                         "type": "string",
-                        "enum": ["chat", "vault"],
+                        "enum": ["chat", "progetto"],
                         "description": (
                             "Dove scrivere. 'chat' (di serie) e' il foglio di "
-                            "questa conversazione: muore con lei. 'vault' e' la "
-                            "memoria della cartella: vale in TUTTE le chat di "
-                            "questo vault e non muore mai. Usa 'vault' per "
-                            "quello che varra' ancora fra un mese -- una "
-                            "convenzione concordata, dove stanno le cose, una "
-                            "strada scartata e perche'. Fuori da un vault non "
-                            "esiste e torna errore."
+                            "questa conversazione: muore con lei. 'progetto' e' "
+                            "la memoria del progetto: vale in TUTTE le sue chat "
+                            "e non muore mai. Usala per quello che varra' "
+                            "ancora fra un mese; comincia il testo con "
+                            "'decisione:', 'convenzione:', 'scartato:' o "
+                            "'aperto:' per dirne il tipo. Fuori da un progetto "
+                            "torna errore."
                         ),
                     },
                 },
@@ -4230,8 +4263,8 @@ LEAN_TOOL_DESCRIPTIONS: dict[str, str] = {
         "Cerca sul web e torna titolo, URL e snippet dei primi risultati. "
         "Per fatti attuali o esterni al workspace."
     ),
-    VAULT_SEARCH_TOOL: (
-        "Interroga un vault LLM Wiki registrato: torna solo la risposta "
+    WIKI_SEARCH_TOOL: (
+        "Interroga la wiki di un altro progetto: torna solo la risposta "
         "dell'agente cercatore, coi link alle pagine usate."
     ),
     "list_files": "Elenca file e cartelle di una sottocartella del workspace.",

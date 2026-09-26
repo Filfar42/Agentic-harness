@@ -128,6 +128,18 @@ def _file_sicuro(cart: Path, nome: str) -> Path | None:
         return None
 
 
+def file_della_voce(base: Path, nome: str) -> Path | None:
+    """Il file di una voce, solo se sta davvero dentro la libreria.
+
+    Per chi legge una voce da fuori (la schermata del progetto): le stesse
+    guardie di ``voci`` -- niente collegamenti, niente percorsi che escono.
+    """
+    cart = _cartella_sicura(Path(base))
+    if cart is None or not cart.is_dir():
+        return None
+    return _file_sicuro(cart, nome)
+
+
 def _slug(testo: str) -> str:
     piatto = unicodedata.normalize("NFKD", testo or "")
     piatto = piatto.encode("ascii", "ignore").decode("ascii").lower()

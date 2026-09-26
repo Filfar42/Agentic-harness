@@ -66,6 +66,7 @@ from typing import Any
 from .config import DATA_DIR
 from .atomic import write_text as atomic_write_text
 from .jsonsafe import JsonBoundaryError, loads_object
+from .textutils import strip_think
 
 logger = logging.getLogger(__name__)
 # Fixed striped locks avoid unbounded lock allocation from supplied ids.
@@ -361,7 +362,9 @@ def _scrivi_messaggi(
 # l'``intento`` e' il diario degli effetti (``core/ciclo/ripresa.py``), scritto
 # prima di un'azione perche' un crash lasci traccia che l'azione era partita;
 # la ``selezione`` e' la compattazione selettiva (``core/selezione.py``).
-RUOLI_DI_SERVIZIO = frozenset({"intento", "selezione"})
+# ``memoria`` e' la goccia della memoria del progetto a fine turno: si vede
+# nel thread, ma non e' un messaggio di nessuno.
+RUOLI_DI_SERVIZIO = frozenset({"intento", "selezione", "memoria"})
 
 
 def conta_visibili(messages: list[dict]) -> int:
@@ -370,6 +373,86 @@ def conta_visibili(messages: list[dict]) -> int:
         1 for m in messages
         if not m.get("hidden") and m.get("role") not in RUOLI_DI_SERVIZIO
     )
+
+
+MAX_TITOLO_CHARS = 120
+
+
+def _pulisci_titolo(valore: object) -> str:
+    return " ".join(str(valore or "").split())[:MAX_TITOLO_CHARS]
+
+
+@_session_locked
+def aggiorna_metadati(session_id: str, **campi: Any) -> bool:
+    """Cambia campi dei metadati sul disco **senza** toccare ``updated_at``.
+
+    Rinominare o archiviare una conversazione non e' averci lavorato: se la
+    data cambiasse, la chat rinominata salirebbe in cima all'elenco come se
+    fosse appena successo qualcosa. Torna False se il file non c'e' (una chat
+    nuova mai salvata) o non si scrive: chi chiama salva per la strada normale.
+    """
+    if not _valid_id(session_id):
+        return False
+    path = DATA_DIR / f"{session_id}.json"
+    data = _read_metadata(path) if path.exists() else None
+    if data is None:
+        return False
+    if "titolo_utente" in campi:
+        titolo = _pulisci_titolo(campi["titolo_utente"])
+        data["titolo_utente"] = titolo or None
+        if titolo:
+            data["title"] = titolo
+        elif campi.get("titolo_ricavato"):
+            data["title"] = campi["titolo_ricavato"]
+    if "archiviata" in campi:
+        data["archiviata"] = bool(campi["archiviata"])
+    if "workspace_dir" in campi:
+        data["workspace_dir"] = str(campi["workspace_dir"] or "")
+    try:
+        _atomic_write_json(path, data)
+    except (OSError, UnicodeError, ValueError):
+        logger.exception("Cannot update metadata of session %s", session_id)
+        return False
+    return True
+
+
+def leggi_metadati(session_id: str) -> dict[str, Any] | None:
+    """I metadati di una conversazione (piano, checkpoint, ...), senza messaggi."""
+    if not _valid_id(session_id):
+        return None
+    path = DATA_DIR / f"{session_id}.json"
+    return _read_metadata(path) if path.exists() else None
+
+
+def ultima_risposta_salvata(session_id: str, max_chars: int = 400) -> str:
+    """Il testo dell'ultima risposta dell'agente, letto dalla coda del file.
+
+    Serve alla scheda "Riprendi da qui" del progetto, che mostra dove si era
+    arrivati. Si legge solo la **fine** della cronologia (gli ultimi 256 KB):
+    una conversazione lunga sono megabyte, e la risposta che interessa e'
+    sempre fra gli ultimi messaggi.
+    """
+    if not _valid_id(session_id):
+        return ""
+    path = messages_path(session_id)
+    try:
+        with path.open("rb") as stream:
+            stream.seek(0, os.SEEK_END)
+            stream.seek(max(0, stream.tell() - 262_144))
+            righe = stream.read().decode("utf-8", errors="replace").splitlines()
+    except OSError:
+        return ""
+    for riga in reversed(righe):
+        try:
+            msg = json.loads(riga)
+        except ValueError:
+            continue
+        if not isinstance(msg, dict) or msg.get("role") != "assistant":
+            continue
+        testo = " ".join(strip_think(str(msg.get("content") or "")).split())
+        if testo:
+            return testo if len(testo) <= max_chars else testo[: max_chars - 1].rstrip() + "…"
+    return ""
 
 
 def derive_title(messages: list[dict]) -> str:
@@ -424,9 +507,16 @@ def save_session(state: Any, *, force: bool = False, riscrivi: bool = False) -> 
         # marker non avanza, quindi il salvataggio successivo ritenta.
         logger.exception("Cannot persist telemetry for session %s", session_id)
         telemetry_error = str(exc)
+    titolo_utente = _pulisci_titolo(state.get("titolo_utente"))
     payload = {
         "id": session_id,
-        "title": derive_title(messages),
+        # Il titolo scelto dall'utente vince su quello ricavato dalla prima
+        # riga; ``titolo_utente`` resta a parte per sapere che e' stato scelto.
+        "title": titolo_utente or derive_title(messages),
+        "titolo_utente": titolo_utente or None,
+        # Archiviata: fuori dagli elenchi, non cancellata. Si ritrova fra le
+        # archiviate e con la ricerca.
+        "archiviata": bool(state.get("archiviata")),
         "updated_at": datetime.now().isoformat(timespec="seconds"),
         # I messaggi stanno nella coda accanto. Qui restano i due numeri che
         # servono alla sidebar: senza, l'indice dovrebbe aprire la cronologia
@@ -557,6 +647,7 @@ def _session_summary(path: Path) -> dict[str, Any] | None:
         # vault: nessun campo nuovo da scrivere e nessuna migrazione, il legame
         # era gia' salvato e non veniva letto da nessuno.
         "workspace_dir": str(data.get("workspace_dir") or ""),
+        "archiviata": bool(data.get("archiviata")),
     }
     with _cache_lock:
         _index_cache[path.name] = (stat.st_mtime, stat.st_size, summary)
@@ -581,6 +672,7 @@ def list_sessions(
     *,
     cartella: str = "",
     escludi: Iterable[str] = (),
+    archiviate: bool | None = False,
 ) -> list[dict[str, Any]]:
     """Indice leggero delle sessioni: metadati, senza rileggere i messaggi.
 
@@ -605,6 +697,10 @@ def list_sessions(
         if voluta and casa != voluta:
             continue
         if fuori and casa in fuori:
+            continue
+        # ``archiviate``: False = solo quelle in uso (l'elenco normale), True =
+        # solo le archiviate, None = tutte (il telefono, la ricerca).
+        if archiviate is not None and bool(summary.get("archiviata")) != archiviate:
             continue
         out.append(summary)
     with _cache_lock:
@@ -838,6 +934,8 @@ def load_session(state: Any, session_id: str) -> bool:
     state["preview"] = data.get("preview") or None
     state["checkpoint"] = data.get("checkpoint") or None
     state["attachments"] = list(data.get("attachments", []))
+    state["titolo_utente"] = _pulisci_titolo(data.get("titolo_utente"))
+    state["archiviata"] = bool(data.get("archiviata"))
     if data.get("workspace_dir"):
         state["workspace_dir"] = data["workspace_dir"]
     return True
@@ -872,6 +970,8 @@ def new_session(state: Any) -> str:
     state["preview"] = None
     state["checkpoint"] = None
     state["attachments"] = []
+    state["titolo_utente"] = ""
+    state["archiviata"] = False
     state["last_usage"] = {}
     state["turn_telemetry"] = []
     state.pop("_telemetry_saved", None)

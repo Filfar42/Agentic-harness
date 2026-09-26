@@ -14,6 +14,7 @@ def service_text(
     params: Any,
     *,
     should_stop: Callable[[], bool] | None = None,
+    tools: list[dict[str, Any]] | None = None,
 ) -> str:
     """Collect a tool-free generation, discarding partial or failed output.
 
@@ -21,6 +22,11 @@ def service_text(
     of native support, cancellation is checked before and between events and
     after closing the stream. Passing a telemetry wrapper through unchanged
     preserves its usage collection and close/finalization hooks.
+
+    ``tools`` si passa solo quando la richiesta **continua** una conversazione
+    (la memoria del progetto a fine turno): gli schemi fanno parte del
+    prefisso che il template rende, e toglierli invaliderebbe la cache dal
+    primo token. La risposta resta senza tool: una tool call invalida l'esito.
     """
     stream = None
     pieces: list[str] = []
@@ -31,7 +37,7 @@ def service_text(
         kwargs = {}
         if should_stop is not None and getattr(backend, "supports_cancellation", False):
             kwargs["should_stop"] = should_stop
-        stream = backend.stream(messages, None, params, **kwargs)
+        stream = backend.stream(messages, tools or None, params, **kwargs)
         for event in stream:
             if should_stop is not None and should_stop():
                 failed = True

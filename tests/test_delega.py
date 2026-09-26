@@ -505,7 +505,7 @@ def test_un_esploratore_non_genera_esploratori(tmp_path):
         workspace=str(tmp_path),
         sandbox="host",
         on_delega=lambda compito: {"referto": "x"},
-        on_vault_search=lambda **kw: {"referto": "y"},
+        on_wiki_search=lambda **kw: {"referto": "y"},
     )
     esegui(
         "dove sta budgets_for?",
@@ -518,7 +518,7 @@ def test_un_esploratore_non_genera_esploratori(tmp_path):
         registra_esiti=False,
     )
     assert visto["ctx"].on_delega is None
-    assert visto["ctx"].on_vault_search is None
+    assert visto["ctx"].on_wiki_search is None
 
 
 def test_dispatch_rifiuta_un_tool_fuori_perimetro(tmp_path):

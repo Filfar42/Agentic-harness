@@ -256,15 +256,24 @@ def test_la_goccia_sopravvive_a_una_domanda_dell_agente(client):
     assert stato.web_search_di(spento) is False
 
 
-def test_senza_vault_registrati_il_tool_del_vault_non_compare(client):
+def test_senza_progetti_con_la_wiki_il_tool_delle_wiki_non_compare(client, tmp_path):
     """Stessa regola della ricerca online: un tool che puo' solo fallire non
-    si descrive ad ogni passo."""
+    si descrive ad ogni passo. E un progetto di codice non basta: senza wiki
+    il cercatore partirebbe da un indice che non c'e'."""
     stato = client.server.STATE
-    stato.settings["vaults"] = []
-    assert "vault_search" not in [t["function"]["name"] for t in stato.tools_schema()]
+    stato.settings["progetti"] = []
+    assert "wiki_search" not in [t["function"]["name"] for t in stato.tools_schema()]
 
-    stato.settings["vaults"] = [{"path": "/tmp/vault", "nome": "appunti"}]
-    assert "vault_search" in [t["function"]["name"] for t in stato.tools_schema()]
+    codice = tmp_path / "codice"
+    codice.mkdir()
+    stato.settings["progetti"] = [{"path": str(codice), "nome": "codice"}]
+    assert "wiki_search" not in [t["function"]["name"] for t in stato.tools_schema()]
+
+    appunti = tmp_path / "appunti"
+    (appunti / "raw").mkdir(parents=True)
+    (appunti / "wiki").mkdir()
+    stato.settings["progetti"].append({"path": str(appunti), "nome": "appunti"})
+    assert "wiki_search" in [t["function"]["name"] for t in stato.tools_schema()]
 
 
 # ---------------------------------------------------------------------------

@@ -175,7 +175,7 @@ class Avanzamento:
                 self.piani.add(chiave)
                 return nuovo
             return False
-        if nome in ("esplora", "web_search", "vault_search", "preview"):
+        if nome in ("esplora", "web_search", "wiki_search", "preview"):
             chiave = nome + json.dumps(args, sort_keys=True, ensure_ascii=False)
             nuovo = chiave not in self.esterni
             self.esterni.add(chiave)

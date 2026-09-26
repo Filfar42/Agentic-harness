@@ -1643,6 +1643,14 @@ class OpenAICompatBackend:
                 raise
 
 
+# Gli scopi che **continuano** la conversazione invece di parlarle accanto: la
+# loro richiesta e' la cronologia della chat piu' qualcosa in fondo, quindi
+# devono andare nello slot della conversazione, dove quel prefisso e' gia' in
+# cache. Mandata nello slot di servizio, la scrittura della memoria del
+# progetto ricalcolerebbe l'intera chat da zero. Vedi ``core/memoria_progetto.py``.
+SCOPI_DELLA_CONVERSAZIONE = frozenset({"main", "memoria_progetto"})
+
+
 class LlamaCppBackend(OpenAICompatBackend):
     """``llama-server`` di llama.cpp: OpenAI-compatibile, ma con ``/props``.
 
@@ -1896,7 +1904,7 @@ class LlamaCppBackend(OpenAICompatBackend):
         totali = self.props().get("total_slots")
         if type(totali) is not int or totali < 2 or servizio >= totali:
             return None
-        if scopo == "main":
+        if scopo in SCOPI_DELLA_CONVERSAZIONE:
             return 0 if servizio != 0 else 1
         return servizio
 

@@ -412,7 +412,7 @@ def test_i_valori_di_serie_non_contengono_stato_ne_percorsi(client):
     dati = client.get("/api/settings/meta").json()
     defaults = dati["defaults"]
     assert defaults["num_ctx"] == DEFAULTS["num_ctx"]
-    for chiave in ("workspace_dir", "recent_workspaces", "vaults", "mobile_token",
+    for chiave in ("workspace_dir", "recent_workspaces", "progetti", "mobile_token",
                    "agent_running", "pending_prompt", "last_usage"):
         assert chiave not in defaults, chiave
     assert "api_key" in dati["fuori_dallo_scambio"]
@@ -425,7 +425,7 @@ def test_l_esportazione_non_porta_segreti_ne_percorsi(client):
     valori = dati["impostazioni"]
     assert valori["temperature"] == 0.4
     for chiave in ("api_key", "mobile_token", "workspace_dir", "recent_workspaces",
-                   "vaults", "docker_image", "agent_running", "last_usage"):
+                   "progetti", "docker_image", "agent_running", "last_usage"):
         assert chiave not in valori, chiave
     assert "sk-segreta" not in json.dumps(dati)
     # il prompt di serie non si esporta: congelarlo sull'altra macchina e' la

@@ -26,6 +26,7 @@ import mimetypes
 import os
 import platform
 import queue
+import re
 import subprocess
 import sys
 import threading
@@ -60,7 +61,8 @@ from core import sandbox as sandbox_mod
 from core import selezione as selezione_mod
 from core import session as session_mod
 from core import settings as settings_mod
-from core import vault as vault_mod
+from core import libreria as libreria_mod
+from core import progetto as progetto_mod
 from server import previewhost
 from core.backend import (
     build_backend,
@@ -99,7 +101,7 @@ from core.tools import (
     MAX_IMAGES_IN_CONTEXT,
     TOOLS_SCHEMA,
     TOOLS_SCHEMA_LEAN,
-    VAULT_SEARCH_TOOL,
+    WIKI_SEARCH_TOOL,
     ToolContext,
     WEB_SEARCH_TOOLS,
     WEB_SEARCH_TOOLS_LEAN,
@@ -694,32 +696,32 @@ class AppState:
         thinking = self.thinking_enabled() if pensiero is None else pensiero
         base = self.settings["system_prompt"]
         if is_stock_prompt(base):
-            if vault_mod.is_modalita_vault(self.settings["workspace_dir"]):
-                # Il workspace e' un vault LLM Wiki: qui l'agente non e' un
+            if progetto_mod.is_modalita_wiki(self.settings["workspace_dir"]):
+                # Il progetto e' una wiki LLM: qui l'agente non e' un
                 # ingegnere generico, e' il manutentore della wiki. Il testo
                 # personalizzato dell'utente, se c'e', vince sempre.
-                base = vault_mod.VAULT_SYSTEM_PROMPT
+                base = progetto_mod.WIKI_SYSTEM_PROMPT
             else:
                 base = pick_system_prompt(thinking=thinking)
         prompt = append_web_search_clause(
             build_system_prompt(base, native_think=thinking),
             enabled=web_search,
         )
-        if vault_mod.is_modalita_vault(self.settings["workspace_dir"]):
+        if progetto_mod.is_modalita_wiki(self.settings["workspace_dir"]):
             # Solo la **struttura**: percorsi e nomi di cartella, che due
             # ingest di fila producono identici. Lo stato della wiki -- indice
             # e coda del log -- va in coda con ruolo 'user', come il piano e
             # le note, e per la stessa ragione: qui invalidava il prefisso a
             # ogni ingest, cioe' proprio nell'operazione per cui la modalita'
-            # wiki esiste. Vedi ``core/vault.blocco_stato``.
-            prompt += vault_mod.blocco_struttura(self.settings["workspace_dir"])
-        # Le istruzioni del vault valgono anche fuori dalla modalita' wiki: e'
-        # il senso di averle separate dalla descrizione. Vanno dopo il blocco
-        # del manutentore perche' sono dell'utente, e l'ultima parola su come
-        # si lavora in una cartella e' di chi ci lavora.
-        if vault_mod.is_registrato(self.settings["workspace_dir"]):
-            prompt += vault_mod.blocco_istruzioni(
-                vault_mod.leggi_config(self.settings["workspace_dir"])
+            # wiki esiste. Vedi ``core/progetto.blocco_stato``.
+            prompt += progetto_mod.blocco_struttura(self.settings["workspace_dir"])
+        # Le istruzioni del progetto valgono anche fuori dalla modalita' wiki:
+        # e' il senso di averle separate dalla descrizione. Vanno dopo il
+        # blocco del manutentore perche' sono dell'utente, e l'ultima parola su
+        # come si lavora in una cartella e' di chi ci lavora.
+        if progetto_mod.is_registrato(self.settings["workspace_dir"]):
+            prompt += progetto_mod.blocco_istruzioni(
+                progetto_mod.leggi_config(self.settings["workspace_dir"])
             )
         return prompt + memory_mod.format_for_prompt(self.memories)
 
@@ -820,13 +822,15 @@ class AppState:
         """
         snello = self.thinking_enabled()
         base = TOOLS_SCHEMA_LEAN if snello else TOOLS_SCHEMA
-        if not self.settings.get("vaults"):
-            # Stessa regola della ricerca online, applicata al vault: senza
-            # nessun vault registrato, ``vault_search`` e' un tool che puo'
+        if not self.progetti_con_wiki():
+            # Stessa regola della ricerca online, applicata alle wiki: senza
+            # nessun progetto con la wiki, ``wiki_search`` e' un tool che puo'
             # solo fallire. Descriverlo ad ogni passo costa token per far
-            # sapere al modello che esiste una porta chiusa a chiave.
+            # sapere al modello che esiste una porta chiusa a chiave. Prima
+            # bastava un vault registrato qualsiasi -- anche uno di codice, dove
+            # il cercatore partiva da un indice che non c'e'.
             base = [
-                t for t in base if t["function"]["name"] != VAULT_SEARCH_TOOL
+                t for t in base if t["function"]["name"] != WIKI_SEARCH_TOOL
             ]
         if not web_search:
             # Goccia "Ricerca online" spenta -> web_search non esiste per il
@@ -834,6 +838,18 @@ class AppState:
             # potrebbe usare.
             return base
         return base + (WEB_SEARCH_TOOLS_LEAN if snello else WEB_SEARCH_TOOLS)
+
+    def progetti_con_wiki(self) -> list[dict[str, Any]]:
+        """Le voci del registro dei progetti che hanno la wiki accesa.
+
+        Si rilegge il ``.progetto.json`` di ognuno: sono pochi file piccoli, e
+        un flag in cache resterebbe acceso dopo che l'utente ha spento la wiki.
+        """
+        return [
+            v for v in (self.settings.get("progetti") or [])
+            if str(v.get("path") or "").strip() and os.path.isdir(str(v["path"]))
+            and progetto_mod.is_modalita_wiki(str(v["path"]))
+        ]
 
     def tool_schema_tokens(self) -> int:
         return (
@@ -905,11 +921,19 @@ class AppState:
         def persist_notes(notes: notes_mod.Notes) -> None:
             self.store_notes(session_id, notes)
 
-        # Il vault in cui si sta lavorando, se il workspace ne e' uno. Vuoto
-        # altrove: e' cio' che rende ``manage_notes ambito='vault'`` possibile
-        # qui e un errore pulito da tutte le altre parti.
+        # Il progetto in cui si sta lavorando, se il workspace ne e' uno. Vuoto
+        # altrove: e' cio' che rende possibili la memoria del progetto e
+        # ``manage_notes ambito='progetto'`` qui, e un errore pulito altrove.
         workspace = str(self.settings["workspace_dir"])
-        vault_corrente = workspace if vault_mod.is_registrato(workspace) else ""
+        progetto_corrente = workspace if progetto_mod.is_registrato(workspace) else ""
+        config_progetto = (
+            progetto_mod.leggi_config(progetto_corrente) if progetto_corrente else None
+        )
+        try:
+            titolo_chat = session_mod.derive_title(self.messages(session_id))
+            titolo_chat = self.session(session_id).get("titolo_utente") or titolo_chat
+        except HTTPException:
+            titolo_chat = ""
 
         return ToolContext(
             workspace=self.settings["workspace_dir"],
@@ -932,14 +956,15 @@ class AppState:
             on_plan_changed=persist_plan,
             on_notes_changed=persist_notes,
             allow_dangerous_commands=bool(self.settings["confirm_commands"]),
-            registri_vault=list(self.settings.get("vaults") or []),
-            # La memoria del vault si carica una volta per turno e vive nel
-            # contesto: cambia solo quando la cambia il modello, e in quel caso
-            # e' il tool a riscrivere sia il file sia questa lista.
-            vault_dir=vault_corrente,
-            vault_notes=(
-                list(vault_mod.leggi_config(vault_corrente).note) if vault_corrente else []
-            ),
+            registri_progetti=self.progetti_con_wiki(),
+            # La memoria del progetto si carica una volta per turno e vive nel
+            # contesto: cambia quando la cambia il modello (e il tool riscrive
+            # file e lista insieme) o l'harness a fine turno.
+            progetto_dir=progetto_corrente,
+            progetto_nome=config_progetto.nome if config_progetto else "",
+            progetto_memoria=config_progetto.memoria if config_progetto else (),
+            chat_id=session_id,
+            chat_titolo=titolo_chat,
             sandbox=str(self.settings["sandbox"]),
             docker_image=str(self.settings["docker_image"]),
             sandbox_network=bool(self.settings["sandbox_network"]),
@@ -970,6 +995,7 @@ _EVENT_NAMES = {
     agent_mod.TurnFinished: "done",
     agent_mod.AgentError: "error",
     agent_mod.Metriche: "metriche",
+    agent_mod.MemoriaProgetto: "memoria",
 }
 
 
@@ -1221,18 +1247,23 @@ def session_stats(session_id: str) -> dict[str, Any]:
     }
 
 
-def session_list(*, cartella: str = "", solo_libere: bool = False) -> list[dict[str, Any]]:
+def session_list(
+    *, cartella: str = "", solo_libere: bool = False, archiviate: bool | None = False,
+    limit: int = 60,
+) -> list[dict[str, Any]]:
     """Elenco di conversazioni, con lo stato "sta girando" gia' dentro.
 
-    ``cartella`` -> le chat di quel vault. ``solo_libere`` -> l'elenco
-    generale, da cui le chat dei vault sono escluse: si arriva a quelle
-    aprendo il vault, e vederle anche qui vorrebbe dire lo stesso posto in due
-    elenchi diversi.
+    ``cartella`` -> le chat di quel progetto. ``solo_libere`` -> l'elenco
+    generale, da cui le chat dei progetti sono escluse: si arriva a quelle
+    aprendo il progetto, e vederle anche qui vorrebbe dire lo stesso posto in
+    due elenchi diversi. ``archiviate`` come in ``session.list_sessions``.
     """
     running = RUNNERS.running_ids()
     sessions = session_mod.list_sessions(
+        limit,
         cartella=cartella,
-        escludi=[v["path"] for v in _registro_vault()] if solo_libere else (),
+        escludi=[v["path"] for v in _registro_progetti()] if solo_libere else (),
+        archiviate=archiviate,
     )
     for item in sessions:
         item["running"] = item["id"] in running
@@ -1242,13 +1273,12 @@ def session_list(*, cartella: str = "", solo_libere: bool = False) -> list[dict[
 def elenco_corrente() -> list[dict[str, Any]]:
     """L'elenco che va nella colonna di sinistra: le conversazioni **libere**.
 
-    Prima cambiava sotto i piedi -- dentro un vault diventava l'elenco di quel
-    vault -- e le conversazioni recenti sparivano finche' non si usciva. Ma
-    aprire un vault non e' andarsene: si apre un posto di lavoro, e le chat di
-    quel posto ora stanno **sotto di lui**, annidate nella sezione Vault (vedi
-    ``/api/vaults/home``). Cosi' i due elenchi sono visibili insieme e nessuno
-    dei due copre l'altro; l'unico posto in cui una chat compare due volte non
-    esiste, perche' qui i vault restano esclusi come sempre.
+    Prima cambiava sotto i piedi -- dentro un progetto diventava l'elenco di
+    quel progetto -- e le conversazioni recenti sparivano finche' non si
+    usciva. Ma aprire un progetto non e' andarsene: le chat di quel posto stanno
+    **sotto di lui**, annidate nella sezione Progetti (vedi
+    ``/api/progetti/home``). Cosi' i due elenchi sono visibili insieme e
+    nessuno dei due copre l'altro.
     """
     return session_list(solo_libere=True)
 
@@ -1395,6 +1425,7 @@ def start_turn(
                 checkpoint_precedente=STATE.session(session_id).get("checkpoint"),
                 selezione=selezione_turno,
                 valutatore_selezione=valutatore_turno,
+                memoria_progetto=bool(turn_state.settings["memoria_progetto"]),
             )
             # Le righe della timeline, dagli stessi eventi che vanno al
             # browser: a fine turno si salvano con la telemetria, e chi
@@ -1434,6 +1465,12 @@ def start_turn(
                 if isinstance(event, agent_mod.PreviewUpdated):
                     STATE.store_preview(session_id, event.payload)
                 runner.emit(event_to_sse(event))
+                if isinstance(event, agent_mod.MemoriaProgetto) and event.fase == "fine":
+                    # La goccia e' gia' nella cronologia: si salva adesso, e
+                    # chi ha aperta la schermata del progetto (qui o sul
+                    # telefono) ridisegna la memoria senza aspettare.
+                    STATE.save(session_id)
+                    EVENTS.publish("progetto", path=event.progetto, session_id=session_id)
                 if isinstance(
                     event,
                     (
@@ -1799,6 +1836,23 @@ def open_payload(session_id: str) -> dict[str, Any]:
         # ha spostato altrove il container.
         "model": STATE.settings["model_name"],
         "session_workspace": STATE.workspace_di(session_id),
+        # Il progetto di questa conversazione, se ne ha uno: la goccia in alto
+        # e il telefono lo mostrano, e riporta alla sua schermata.
+        "progetto": _progetto_della_chat(session_id),
+        "titolo_utente": STATE.session(session_id).get("titolo_utente") or "",
+        "archiviata": bool(STATE.session(session_id).get("archiviata")),
+    }
+
+
+def _progetto_della_chat(session_id: str) -> dict[str, Any] | None:
+    cartella = STATE.workspace_di(session_id)
+    voce = _nel_registro(cartella) if cartella else None
+    if voce is None:
+        return None
+    return {
+        "path": voce["path"],
+        "nome": progetto_mod.leggi_config(voce["path"]).nome
+        if os.path.isdir(voce["path"]) else str(voce.get("nome") or ""),
     }
 
 
@@ -1808,16 +1862,125 @@ def open_payload(session_id: str) -> dict[str, Any]:
 
 
 @app.get("/api/sessions")
-def list_sessions(tutte: bool = False) -> dict[str, Any]:
+def list_sessions(tutte: bool = False, archiviate: bool = False) -> dict[str, Any]:
     """Conversazioni per la colonna di sinistra.
 
-    ``tutte=1`` le da' invece **tutte**, chat dei vault comprese. Lo usa il
-    telefono, che di vault non sa niente: li' un elenco solo e' l'unico
-    elenco che c'e', e togliergli le chat dei vault vorrebbe dire renderle
-    irraggiungibili da fuori casa.
+    ``tutte=1`` le da' invece **tutte**, chat dei progetti comprese: il
+    telefono le raggruppa da se' per progetto (``progetto`` su ogni riga), e
+    togliergli quelle dei progetti vorrebbe dire renderle irraggiungibili da
+    fuori casa. ``archiviate=1`` da' le conversazioni libere archiviate.
     """
-    sessions = session_list() if tutte else elenco_corrente()
-    return {"sessions": sessions, "current": STATE.last_opened}
+    if tutte:
+        sessions = session_list(limit=200)
+        _segna_progetto(sessions)
+    elif archiviate:
+        sessions = session_list(solo_libere=True, archiviate=True, limit=200)
+    else:
+        sessions = elenco_corrente()
+    return {
+        "sessions": sessions,
+        "current": STATE.last_opened,
+        # Quante sono le libere archiviate: la colonna dice che ci sono senza
+        # doverle leggere tutte.
+        "archiviate": len(session_mod.list_sessions(
+            999, escludi=[v["path"] for v in _registro_progetti()], archiviate=True)),
+    }
+
+
+def _segna_progetto(sessions: list[dict[str, Any]]) -> None:
+    """Mette su ogni riga il progetto a cui appartiene (percorso e nome)."""
+    progetti = {
+        session_mod.chiave_cartella(v["path"]): v for v in _registro_progetti()
+    }
+    for riga in sessions:
+        voce = progetti.get(session_mod.chiave_cartella(riga.get("workspace_dir", "")))
+        riga["progetto"] = (
+            {"path": voce["path"], "nome": str(voce.get("nome") or Path(voce["path"]).name)}
+            if voce else None
+        )
+
+
+class SessionePatch(BaseModel):
+    titolo: str | None = None
+    archiviata: bool | None = None
+
+
+@app.patch("/api/sessions/{session_id}")
+def modifica_sessione(session_id: str, request: SessionePatch) -> dict[str, Any]:
+    """Rinomina o archivia una conversazione, senza farla salire in cima.
+
+    Il titolo vuoto torna a quello ricavato dalla prima riga. Archiviare non
+    cancella niente: la chat esce dagli elenchi e si ritrova fra le archiviate.
+    """
+    sessione = STATE.session(session_id)
+    campi: dict[str, Any] = {}
+    if request.titolo is not None:
+        sessione["titolo_utente"] = " ".join(request.titolo.split())[:120]
+        campi["titolo_utente"] = sessione["titolo_utente"]
+        campi["titolo_ricavato"] = session_mod.derive_title(STATE.messages(session_id))
+    if request.archiviata is not None:
+        if request.archiviata and RUNNERS.is_running(session_id):
+            raise HTTPException(409, "Un turno e' in corso in questa conversazione.")
+        sessione["archiviata"] = bool(request.archiviata)
+        campi["archiviata"] = sessione["archiviata"]
+    if campi and not session_mod.aggiorna_metadati(session_id, **campi):
+        # Mai salvata (una chat nuova): si salva per la strada normale.
+        STATE.save(session_id)
+    EVENTS.publish("sessions", reason="updated", session_id=session_id)
+    return {"ok": True, "session_id": session_id}
+
+
+class SpostaRequest(BaseModel):
+    # La cartella del progetto di destinazione. Vuota = fuori da ogni
+    # progetto, nella ``cartella`` data o, senza, nell'ultima cartella libera.
+    progetto: str = ""
+    cartella: str = ""
+
+
+@app.post("/api/sessions/{session_id}/sposta")
+def sposta_sessione(session_id: str, request: SpostaRequest) -> dict[str, Any]:
+    """Porta una conversazione dentro un progetto, o fuori.
+
+    Una chat appartiene al progetto della cartella su cui lavora: spostarla
+    vuol dire cambiarle cartella. Da qui in poi i suoi turni lavorano nella
+    cartella nuova, con la memoria e le istruzioni di quel progetto; i file
+    creati finora restano dove sono -- lo dice anche la finestra che chiede
+    conferma.
+    """
+    if RUNNERS.is_running(session_id):
+        raise HTTPException(409, "Un turno e' in corso in questa conversazione.")
+    sessione = STATE.session(session_id)
+    if request.progetto:
+        destinazione = _cartella_del_progetto(request.progetto)
+        if _nel_registro(str(destinazione)) is None:
+            raise HTTPException(400, "Quella cartella non e' un progetto registrato.")
+    else:
+        progetti = {session_mod.chiave_cartella(v["path"]) for v in _registro_progetti()}
+        candidata = request.cartella or next(
+            (p for p in STATE.settings.get("recent_workspaces") or []
+             if session_mod.chiave_cartella(p) not in progetti and os.path.isdir(p)),
+            "",
+        )
+        if not candidata:
+            raise HTTPException(400, "Scegli la cartella in cui portare la conversazione.")
+        destinazione = Path(candidata).expanduser()
+        if not destinazione.is_dir():
+            raise HTTPException(400, f"'{candidata}' non e' una cartella esistente.")
+        if session_mod.chiave_cartella(str(destinazione)) in progetti:
+            raise HTTPException(400, "Quella cartella e' un progetto: scegli il progetto.")
+    destinazione = destinazione.resolve()
+    sessione["workspace_dir"] = str(destinazione)
+    # L'albero dell'environment era quello della cartella di prima.
+    sessione.pop("albero_base", None)
+    if not session_mod.aggiorna_metadati(session_id, workspace_dir=str(destinazione)):
+        STATE.save(session_id)
+    # Se e' la chat aperta, l'harness la segue: e' la stessa regola di
+    # quando si riapre una chat di ieri (``ripristina_workspace``).
+    if session_id == STATE.last_opened and not RUNNERS.running_ids():
+        smonta_se_serve(session_id)
+        ripristina_workspace(session_id)
+    EVENTS.publish("sessions", reason="moved", session_id=session_id)
+    return {"ok": True, "workspace_dir": str(destinazione), **open_payload(session_id)}
 
 
 @app.get("/api/sessions/search")
@@ -2969,14 +3132,14 @@ def settings_prompt() -> dict[str, Any]:
     di_serie = is_stock_prompt(testo)
     if not di_serie:
         attivo = "personalizzato"
-    elif vault_mod.is_modalita_vault(STATE.settings["workspace_dir"]):
-        attivo = "vault"
+    elif progetto_mod.is_modalita_wiki(STATE.settings["workspace_dir"]):
+        attivo = "wiki"
     else:
         attivo = "snello" if STATE.thinking_enabled() else "esteso"
     effettivo = STATE.system_prompt()
     base_attiva = {
         "personalizzato": testo,
-        "vault": vault_mod.VAULT_SYSTEM_PROMPT,
+        "wiki": progetto_mod.WIKI_SYSTEM_PROMPT,
         "snello": SYSTEM_PROMPT_LEAN,
         "esteso": SYSTEM_PROMPT,
     }[attivo]
@@ -3098,7 +3261,7 @@ def applica_workspace(path: Path) -> str:
     """Sposta l'harness su una cartella e prepara quello che va preparato.
 
     Un solo posto per il cambio: lo usano la scelta a mano, l'apertura di un
-    vault e il ripristino della cartella di una conversazione riaperta. Tre
+    progetto e il ripristino della cartella di una conversazione riaperta. Tre
     gesti diversi che devono avere lo stesso effetto, senno' uno dei tre si
     dimentica di ricostruire l'immagine o di aggiornare i recenti.
     """
@@ -3238,48 +3401,89 @@ def pick_workspace() -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# Rotte: vault LLM Wiki
+# Rotte: progetti
 # ---------------------------------------------------------------------------
+#
+# Un progetto e' una cartella registrata: nome, descrizione, istruzioni per il
+# modello, la sua memoria e le chat fatte li' dentro (``core/progetto.py``).
+# Fino al 26/09/2026 si chiamavano vault e le rotte stavano sotto
+# ``/api/vaults``; l'interfaccia e' l'unica cliente, quindi le rotte vecchie
+# non restano.
 
 
-class VaultRequest(BaseModel):
-    # ``path`` e' la cartella del vault. Registrarla scrive ``.vault.json``;
-    # la struttura LLM Wiki si crea **solo** se il vault e' una wiki.
+class ProgettoRequest(BaseModel):
+    """Crea (o registra) un progetto.
+
+    ``path`` e' la cartella del progetto; con ``crea_cartella`` e' invece la
+    cartella **in cui** crearne una nuova con quel nome. Se la cartella e' gia'
+    un progetto, la sua identita' vince sui campi passati: si registra e basta.
+    """
+
     path: str
-    # Nome breve mostrato nella colonna di sinistra. Se il vault ha gia' un
-    # ``.vault.json``, quello vince: l'identita' sta nella cartella.
     nome: str = ""
+    descrizione: str = ""
+    istruzioni: str = ""
+    wiki: bool = False
+    crea_cartella: str = ""
 
 
-class VaultOpenRequest(BaseModel):
+class ProgettoRiferimento(BaseModel):
     # Si apre per nome (quello del registro) o, in mancanza, per percorso.
     nome: str = ""
     path: str = ""
 
 
-class VaultPatchRequest(BaseModel):
-    """Modifica dell'identita' di un vault. Solo i campi passati cambiano."""
+class ProgettoPatch(BaseModel):
+    """Modifica dell'identita' di un progetto. Solo i campi passati cambiano."""
 
     path: str
     nome: str | None = None
     descrizione: str | None = None
-    # Le sole che arrivano al modello: vedi ``core/vault.py``.
+    # Le sole che arrivano al modello: vedi ``core/progetto.py``.
     istruzioni: str | None = None
     wiki: bool | None = None
-    # La memoria del vault. Dall'interfaccia si puo' solo **togliere**: la
-    # scrive il modello mentre lavora, e un campo libero in cui riscriverla a
-    # mano sarebbe un secondo posto da cui puo' divergere.
-    note: list[str] | None = None
 
 
-def _registro_vault() -> list[dict[str, Any]]:
-    return [v for v in (STATE.settings.get("vaults") or []) if str(v.get("path", "")).strip()]
+class VoceRequest(BaseModel):
+    path: str
+    testo: str
+    tipo: str = progetto_mod.TIPO_DI_SERIE
 
 
-def _voce_vault(path: str, nome: str = "") -> dict[str, Any]:
-    """Una riga d'elenco completa: identita', conteggi, chat, se e' aperto."""
+class VocePatch(BaseModel):
+    path: str
+    id: str
+    testo: str | None = None
+    tipo: str | None = None
+
+
+def _registro_progetti() -> list[dict[str, Any]]:
+    return [
+        dict(v) for v in (STATE.settings.get("progetti") or [])
+        if isinstance(v, dict) and str(v.get("path", "")).strip()
+    ]
+
+
+def _nel_registro(path: str) -> dict[str, Any] | None:
+    chiave = session_mod.chiave_cartella(path)
+    return next(
+        (v for v in _registro_progetti() if session_mod.chiave_cartella(v["path"]) == chiave),
+        None,
+    )
+
+
+def _cartella_del_progetto(path: str) -> Path:
+    """La cartella di un progetto, o 404 se non c'e' piu'."""
+    base = Path(str(path or "")).expanduser()
+    if not str(path or "").strip() or not base.is_dir():
+        raise HTTPException(404, f"'{path}' non e' una cartella esistente.")
+    return base
+
+
+def _scheda_progetto(path: str, nome: str = "") -> dict[str, Any]:
+    """Una riga d'elenco completa: identita', memoria, conteggi, se e' aperto."""
     corrente = session_mod.chiave_cartella(str(STATE.settings["workspace_dir"]))
-    info = vault_mod.info_vault(
+    info = progetto_mod.info_progetto(
         path, nome, chat=len(session_mod.list_sessions(limit=999, cartella=path))
     )
     voce = info.as_dict()
@@ -3287,168 +3491,345 @@ def _voce_vault(path: str, nome: str = "") -> dict[str, Any]:
     return voce
 
 
-@app.get("/api/vaults")
-def lista_vault() -> dict[str, Any]:
-    """Elenco dei vault registrati, con identita' e conteggi."""
-    voci: list[dict[str, Any]] = []
-    for v in _registro_vault():
-        path = str(v.get("path"))
-        if not os.path.isdir(path):
-            # Come per i recent_workspaces: un vault cancellato non deve
-            # restare nella tendina a suggerire errori.
-            continue
-        voci.append(_voce_vault(path, str(v.get("nome") or "")))
-    return {"vaults": voci}
+def _riprendi(sessioni: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """La scheda "Riprendi da qui": dov'era arrivata l'ultima chat del progetto.
 
-
-@app.get("/api/vaults/home")
-def home_vault(path: str) -> dict[str, Any]:
-    """Tutto quello che serve alla schermata iniziale di un vault.
-
-    Una chiamata sola e non tre: identita', conteggi ed elenco delle chat si
-    guardano insieme, e chiederli separatamente vorrebbe dire disegnare la
-    schermata a pezzi mentre le risposte arrivano.
+    Tutto dato, niente generato: il piano e il checkpoint salvati, l'ultima
+    risposta dell'agente. Un riassunto scritto dal modello sarebbe un'altra
+    cosa da tenere allineata, e la scelta dell'utente e' stata di affidare la
+    continuita' alla memoria (26/09/2026).
     """
-    if not os.path.isdir(path):
-        raise HTTPException(404, f"'{path}' non e' una cartella esistente.")
+    if not sessioni:
+        return None
+    ultima = sessioni[0]
+    meta = session_mod.leggi_metadati(ultima["id"]) or {}
+    piano = [s for s in (meta.get("plan") or []) if isinstance(s, dict)]
+    aperti = [
+        {"id": s.get("id"), "text": str(s.get("text") or ""), "status": s.get("status")}
+        for s in piano if s.get("status") in ("todo", "doing")
+    ]
+    checkpoint = meta.get("checkpoint") if isinstance(meta.get("checkpoint"), dict) else {}
+    if ultima.get("running"):
+        stato = "in_corso"
+    elif ultima.get("pending"):
+        stato = "in_attesa"
+    else:
+        stato = str((checkpoint or {}).get("motivo") or "completed")
     return {
-        "vault": _voce_vault(path),
-        "sessions": session_list(cartella=path),
+        "session": ultima,
+        "stato": stato,
+        "piano": {
+            "totale": len(piano),
+            "fatti": sum(1 for s in piano if s.get("status") == "done"),
+            "aperti": aperti[:5],
+        },
+        "ultima_risposta": session_mod.ultima_risposta_salvata(ultima["id"]),
     }
 
 
-@app.patch("/api/vaults")
-def modifica_vault(request: VaultPatchRequest) -> dict[str, Any]:
-    """Cambia nome, descrizione, istruzioni o modalita' wiki di un vault.
+def _libreria_del_progetto(base: Path) -> list[dict[str, Any]]:
+    """Le voci di ``.memoria/`` (riassunti delle compattazioni, estratti del
+    pensiero): la continuita' che l'harness scrive gia' da sola, da agosto."""
+    return [
+        {"numero": v.numero, "nome": v.nome, "titolo": v.titolo}
+        for v in reversed(libreria_mod.voci(base))
+    ]
 
-    Scrive in ``.vault.json``, cioe' **dentro la cartella**: il vault resta
-    quello che dice di essere anche se lo si sposta o lo si apre da un'altra
-    macchina, e il registro nelle preferenze torna a essere solo un elenco di
-    percorsi conosciuti.
+
+def _dati_home(path: str) -> dict[str, Any]:
+    base = _cartella_del_progetto(path)
+    sessioni = session_list(cartella=path)
+    return {
+        "progetto": _scheda_progetto(path),
+        "sessions": sessioni,
+        "archiviate": session_list(cartella=path, archiviate=True),
+        "riprendi": _riprendi(sessioni),
+        "libreria": _libreria_del_progetto(base),
+        "memoria_automatica": bool(STATE.settings.get("memoria_progetto")),
+    }
+
+
+def _annuncia(path: str) -> None:
+    """Il progetto e' cambiato: chi lo sta guardando (anche il telefono) rilegge."""
+    EVENTS.publish("progetto", path=path)
+
+
+@app.get("/api/progetti")
+def lista_progetti() -> dict[str, Any]:
+    """Elenco dei progetti registrati, con identita' e conteggi.
+
+    Un progetto la cui cartella non c'e' piu' (disco scollegato, cartella
+    spostata) resta in elenco con ``esiste: false``: farlo sparire in silenzio
+    vorrebbe dire non poterlo nemmeno togliere, e ricomparirebbe da solo
+    riattaccando il disco senza che nessuno capisca da dove.
     """
+    voci: list[dict[str, Any]] = []
+    for v in _registro_progetti():
+        path = str(v.get("path"))
+        if os.path.isdir(path):
+            voci.append(_scheda_progetto(path, str(v.get("nome") or "")))
+        else:
+            voci.append({
+                "path": path, "nome": str(v.get("nome") or Path(path).name),
+                "esiste": False, "attivo": False, "chat": 0, "memoria": [],
+                "wiki": False, "descrizione": "", "istruzioni": "",
+            })
+    return {"progetti": voci}
+
+
+@app.get("/api/progetti/home")
+def home_progetto(path: str) -> dict[str, Any]:
+    """Tutto quello che serve alla schermata del progetto, in una chiamata.
+
+    Identita', memoria, chat (in uso e archiviate), la scheda "Riprendi da
+    qui" e la libreria: si guardano insieme, e chiederli separatamente vorrebbe
+    dire disegnare la schermata a pezzi mentre le risposte arrivano.
+    """
+    return _dati_home(path)
+
+
+def _nome_cartella_valido(nome: str) -> str:
+    """Il nome di una cartella nuova, reso valido anche per Windows."""
+    pulito = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "", " ".join(str(nome or "").split()))
+    pulito = pulito.strip().rstrip(". ")
+    if pulito.upper() in {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)),
+                          *(f"LPT{i}" for i in range(1, 10))}:
+        pulito = ""
+    return pulito[:120]
+
+
+@app.post("/api/progetti")
+def crea_progetto(request: ProgettoRequest) -> dict[str, Any]:
+    """Crea un progetto (anche la cartella, se chiesto) e lo mette nel registro."""
     base = Path(request.path).expanduser()
     if not base.is_dir():
         raise HTTPException(400, f"'{request.path}' non e' una cartella esistente.")
-    if request.wiki:
-        # Accendere la wiki senza la sua struttura darebbe un manutentore che
-        # fallisce alla prima ingest: le due cose si fanno insieme.
-        vault_mod.abilita_wiki(base)
-    vault_mod.aggiorna_config(
-        base,
-        nome=request.nome,
-        descrizione=request.descrizione,
-        istruzioni=request.istruzioni,
-        wiki=request.wiki,
-        note=tuple(request.note) if request.note is not None else None,
-    )
+    if request.crea_cartella.strip():
+        nome_cartella = _nome_cartella_valido(request.crea_cartella)
+        if not nome_cartella:
+            raise HTTPException(400, "Il nome della cartella nuova non e' valido.")
+        nuova = base / nome_cartella
+        if nuova.exists() and not nuova.is_dir():
+            raise HTTPException(400, f"'{nuova}' esiste gia' e non e' una cartella.")
+        try:
+            nuova.mkdir(exist_ok=True)
+        except OSError as exc:
+            raise HTTPException(400, f"Non ho potuto creare '{nuova}': {exc}") from exc
+        base = nuova
+    base = base.resolve()
+    gia = progetto_mod.is_registrato(base)
+    try:
+        progetto_mod.ensure_progetto(
+            base,
+            nome=request.nome,
+            descrizione=request.descrizione,
+            istruzioni=request.istruzioni,
+            wiki=request.wiki or None,
+        )
+    except progetto_mod.ScritturaError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    nome = progetto_mod.leggi_config(base).nome
+    registro = _registro_progetti()
+    if _nel_registro(str(base)) is None:
+        registro.append({"path": str(base), "nome": nome})
+        STATE.settings["progetti"] = registro
+        STATE.persist()
+    return {"progetto": _scheda_progetto(str(base), nome), "esisteva": gia}
+
+
+@app.patch("/api/progetti")
+def modifica_progetto(request: ProgettoPatch) -> dict[str, Any]:
+    """Cambia nome, descrizione, istruzioni o modalita' wiki di un progetto.
+
+    Scrive in ``.progetto.json``, cioe' **dentro la cartella**: il progetto
+    resta quello che dice di essere anche se lo si sposta o lo si apre da
+    un'altra macchina.
+    """
+    base = _cartella_del_progetto(request.path)
+    try:
+        if request.wiki:
+            # Accendere la wiki senza la sua struttura darebbe un manutentore
+            # che fallisce alla prima ingest: le due cose si fanno insieme.
+            progetto_mod.abilita_wiki(base)
+        progetto_mod.aggiorna_config(
+            base,
+            nome=request.nome,
+            descrizione=request.descrizione,
+            istruzioni=request.istruzioni,
+            wiki=request.wiki,
+        )
+    except progetto_mod.ScritturaError as exc:
+        raise HTTPException(400, str(exc)) from exc
     # Il nome nel registro e' solo un ripiego per quando il file non c'e':
     # tenerlo allineato evita che l'elenco mostri il vecchio nome finche' la
     # cartella non e' raggiungibile.
-    registro = _registro_vault()
+    registro = _registro_progetti()
     chiave = session_mod.chiave_cartella(str(base))
     for v in registro:
         if session_mod.chiave_cartella(v["path"]) == chiave:
-            v["nome"] = vault_mod.leggi_config(base).nome
-    STATE.settings["vaults"] = registro
+            v["nome"] = progetto_mod.leggi_config(base).nome
+    STATE.settings["progetti"] = registro
     STATE.persist()
-    return {"vault": _voce_vault(str(base))}
+    _annuncia(str(base))
+    return {"progetto": _scheda_progetto(str(base))}
 
 
-@app.post("/api/vaults")
-def registra_vault(request: VaultRequest) -> dict[str, Any]:
-    """Registra un vault: scrive la sua identita' e lo mette nel registro."""
-    path = Path(request.path).expanduser()
-    if not path.is_dir():
-        raise HTTPException(400, f"'{request.path}' non e' una cartella esistente.")
-    path = path.resolve()
-    # Qui la cartella diventa un vault: ``.vault.json`` con il nome, e la
-    # struttura wiki solo se e' una wiki (una cartella qualsiasi non deve
-    # ritrovarsi raw/ e wiki/ che non ha chiesto).
-    vault_mod.ensure_vault(path, nome=request.nome.strip())
-    nome = vault_mod.leggi_config(path).nome
-    registro = _registro_vault()
-    chiave = session_mod.chiave_cartella(str(path))
-    if not any(session_mod.chiave_cartella(v["path"]) == chiave for v in registro):
-        registro.append({"path": str(path), "nome": nome})
-        STATE.settings["vaults"] = registro
-        STATE.persist()
-    return {"vault": _voce_vault(str(path), nome)}
+@app.post("/api/progetti/pick")
+def scegli_cartella_progetto() -> dict[str, Any]:
+    """Apre il selettore nativo di cartelle per la finestra "Nuovo progetto".
 
-
-@app.post("/api/vaults/pick")
-def scegli_vault_con_dialogo() -> dict[str, Any]:
-    """Apre il selettore nativo di cartelle e registra il vault scelto.
-
-    Stampa di ``/api/workspace/pick``: su Windows e' Esplora risorse, la
-    chiamata resta appesa finche' l'utente non sceglie o annulla (richiesta
-    sincrona servita dal threadpool, quindi senza bloccare il resto).
-    La registrazione riusa ``registra_vault``, cosi' validazione, dedupe e
-    creazione della struttura LLM Wiki hanno una sola implementazione.
+    Non registra niente: la scelta finisce nel campo della finestra, e il
+    progetto nasce quando l'utente preme "Crea" -- con il nome, le istruzioni
+    e la wiki che ha deciso lui, non con i valori di serie.
     """
     try:
         scelto = pick_folder(STATE.settings["workspace_dir"])
     except DialogUnavailable as exc:
         raise HTTPException(
             501,
-            f"Selettore di sistema non disponibile: {exc}. "
-            "Registra il percorso da Impostazioni.",
+            f"Selettore di sistema non disponibile: {exc}. Scrivi il percorso a mano.",
         ) from exc
-
     if not scelto:
         return {"cancelled": True}
+    path = Path(scelto).expanduser()
+    if not path.is_dir():
+        raise HTTPException(400, f"'{scelto}' non e' una cartella.")
+    gia = progetto_mod.is_registrato(path)
+    return {
+        "cancelled": False,
+        "path": str(path.resolve()),
+        "gia_progetto": gia,
+        "nome": progetto_mod.leggi_config(path).nome if gia else path.name,
+        "wiki": progetto_mod.ha_struttura_wiki(path),
+    }
 
-    voce = registra_vault(VaultRequest(path=scelto))
-    return {"cancelled": False, "vault": voce["vault"]}
 
+@app.post("/api/progetti/remove")
+def togli_progetto(request: ProgettoRiferimento) -> dict[str, Any]:
+    """Toglie un progetto dal registro: la cartella su disco non si tocca.
 
-@app.post("/api/vaults/remove")
-def rimuovi_vault(request: VaultOpenRequest) -> dict[str, Any]:
-    """Toglie un vault dal registro: la cartella su disco non si tocca."""
-    registro = _registro_vault()
+    Nemmeno ``.progetto.json``: registrandola di nuovo, la cartella ritrova
+    nome, istruzioni e memoria.
+    """
+    registro = _registro_progetti()
     chiave = ""
     if request.path:
-        chiave = os.path.normcase(os.path.normpath(request.path))
+        chiave = session_mod.chiave_cartella(request.path)
     elif request.nome:
         match = [v for v in registro if v.get("nome") == request.nome]
         if match:
-            chiave = os.path.normcase(os.path.normpath(match[0]["path"]))
+            chiave = session_mod.chiave_cartella(match[0]["path"])
     tenuti = [
-        v for v in registro
-        if os.path.normcase(os.path.normpath(v["path"])) != chiave
+        v for v in registro if session_mod.chiave_cartella(v["path"]) != chiave
     ] if chiave else registro
-    STATE.settings["vaults"] = tenuti
+    STATE.settings["progetti"] = tenuti
     STATE.persist()
-    return {"rimossi": len(registro) - len(tenuti), "vaults": tenuti}
+    return {"rimossi": len(registro) - len(tenuti), "progetti": tenuti}
 
 
-@app.post("/api/vaults/open")
-def apri_vault(request: VaultOpenRequest) -> dict[str, Any]:
-    """Apre un vault come workspace corrente, creandolo se non esiste ancora."""
+@app.post("/api/progetti/open")
+def apri_progetto(request: ProgettoRiferimento) -> dict[str, Any]:
+    """Apre un progetto: diventa la cartella di lavoro, e arriva la sua home.
+
+    Un vault di prima riceve qui il suo ``.progetto.json`` (``ensure_progetto``).
+    """
     bersaglio = ""
     if request.nome:
         match = [
-            v for v in _registro_vault()
+            v for v in _registro_progetti()
             if v.get("nome") == request.nome and os.path.isdir(v["path"])
         ]
         if match:
             bersaglio = match[0]["path"]
     if not bersaglio and request.path:
         bersaglio = request.path
-    if not bersaglio or not Path(bersaglio).is_dir():
-        raise HTTPException(400, f"Vault '{request.nome or request.path}' non trovato.")
-
-    radice = vault_mod.ensure_vault(Path(bersaglio).expanduser())
+    if not bersaglio or not Path(bersaglio).expanduser().is_dir():
+        raise HTTPException(400, f"Progetto '{request.nome or request.path}' non trovato.")
+    try:
+        radice = progetto_mod.ensure_progetto(Path(bersaglio).expanduser())
+    except progetto_mod.ScritturaError as exc:
+        raise HTTPException(400, str(exc)) from exc
     applica_workspace(radice)
     return {
         "workspace_dir": STATE.settings["workspace_dir"],
         "recent_workspaces": STATE.settings["recent_workspaces"],
         "stats": session_stats(STATE.last_opened),
         "jobs": PREP.snapshot(),
-        # La schermata iniziale del vault si disegna con questi due, che
-        # arrivano nella stessa risposta dell'apertura: aprire un vault e'
-        # un gesto solo, e non deve costare tre richieste in fila.
-        "vault": _voce_vault(str(radice)),
-        "sessions": session_list(cartella=str(radice)),
+        # La schermata si disegna con questi, che arrivano nella stessa
+        # risposta dell'apertura: aprire un progetto e' un gesto solo.
+        **_dati_home(str(radice)),
+    }
+
+
+@app.post("/api/progetti/memoria")
+def aggiungi_alla_memoria(request: VoceRequest) -> dict[str, Any]:
+    """Una voce scritta a mano: e' dell'utente, e l'harness non la tocca."""
+    base = _cartella_del_progetto(request.path)
+    try:
+        progetto_mod.aggiungi_voce(
+            base, request.testo, tipo=request.tipo, autore=progetto_mod.AUTORE_PROTETTO
+        )
+    except progetto_mod.MemoriaError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except progetto_mod.ScritturaError as exc:
+        raise HTTPException(500, str(exc)) from exc
+    _annuncia(str(base))
+    return {"progetto": _scheda_progetto(str(base))}
+
+
+@app.patch("/api/progetti/memoria")
+def correggi_memoria(request: VocePatch) -> dict[str, Any]:
+    """Corregge una voce. Da qui in poi e' dell'utente."""
+    base = _cartella_del_progetto(request.path)
+    try:
+        progetto_mod.modifica_voce(
+            base, request.id, testo=request.testo, tipo=request.tipo,
+            autore=progetto_mod.AUTORE_PROTETTO,
+        )
+    except progetto_mod.MemoriaError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except progetto_mod.ScritturaError as exc:
+        raise HTTPException(500, str(exc)) from exc
+    _annuncia(str(base))
+    return {"progetto": _scheda_progetto(str(base))}
+
+
+@app.delete("/api/progetti/memoria")
+def togli_dalla_memoria(path: str, id: str) -> dict[str, Any]:
+    """Toglie una voce, qualunque sia l'autore: l'ultima parola e' dell'utente."""
+    base = _cartella_del_progetto(path)
+    try:
+        progetto_mod.togli_voce(base, id, autore=progetto_mod.AUTORE_PROTETTO)
+    except progetto_mod.MemoriaError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except progetto_mod.ScritturaError as exc:
+        raise HTTPException(500, str(exc)) from exc
+    _annuncia(str(base))
+    return {"progetto": _scheda_progetto(str(base))}
+
+
+MAX_VOCE_LIBRERIA_CHARS = 60_000
+
+
+@app.get("/api/progetti/libreria")
+def leggi_voce_libreria(path: str, nome: str) -> dict[str, Any]:
+    """Il testo di una voce di ``.memoria/``, per leggerla dalla schermata."""
+    base = _cartella_del_progetto(path)
+    voce = next((v for v in libreria_mod.voci(base) if v.nome == nome), None)
+    file = libreria_mod.file_della_voce(base, nome) if voce else None
+    if voce is None or file is None:
+        raise HTTPException(404, "Voce della libreria non trovata.")
+    try:
+        with file.open(encoding="utf-8", errors="replace") as stream:
+            testo = stream.read(MAX_VOCE_LIBRERIA_CHARS + 1)
+    except OSError as exc:
+        raise HTTPException(500, str(exc)) from exc
+    troncato = len(testo) > MAX_VOCE_LIBRERIA_CHARS
+    return {
+        "nome": voce.nome,
+        "titolo": voce.titolo,
+        "testo": testo[:MAX_VOCE_LIBRERIA_CHARS],
+        "troncato": troncato,
     }
 
 

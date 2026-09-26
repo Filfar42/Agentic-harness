@@ -404,6 +404,20 @@ const IMP_SEZIONI = [
         ],
       },
       {
+        titolo: 'Memoria del progetto',
+        campi: [
+          {
+            k: 'memoria_progetto', tipo: 'interruttore',
+            etichetta: 'Aggiorna la memoria del progetto a fine turno',
+            descr: 'Nei progetti, dopo un turno che ha scritto file, lanciato comandi o chiuso punti del '
+              + 'piano, l\'harness chiede al modello cosa deve restare per le prossime chat: decisioni, '
+              + 'convenzioni, strade scartate, lavori aperti. Un passo in più, senza pensiero, che riusa '
+              + 'la cache. Le voci che scrivi o correggi tu non le tocca.',
+            cerca: 'memoria_progetto memoria progetto continuita chat automatica',
+          },
+        ],
+      },
+      {
         titolo: 'Memoria su disco',
         campi: [
           {
@@ -610,7 +624,7 @@ const IMP_SEZIONI = [
           },
           {
             k: 'show_left_sidebar', tipo: 'interruttore', etichetta: 'Barra laterale',
-            descr: 'Conversazioni e vault. Si nasconde anche con <b>☰</b> in alto a sinistra.',
+            descr: 'Conversazioni e progetti. Si nasconde anche con <b>☰</b> in alto a sinistra.',
             alCambio: () => applicaColonne(),
             cerca: 'show_left_sidebar barra laterale sinistra colonna',
           },
@@ -642,7 +656,7 @@ const IMP_FUORI_MENU = {
   expand_thoughts: 'Nessuna parte del codice la legge.',
   workspace_dir: 'Si sceglie dal percorso in cima alla chat.',
   recent_workspaces: 'Si usano dal percorso in cima alla chat.',
-  vaults: 'Si gestiscono dalla colonna di sinistra.',
+  progetti: 'Si gestiscono dalla colonna di sinistra e dalla schermata di ogni progetto.',
   mobile_token: 'La crea l\'avvio con --mobile.',
   agent_running: 'Stato del turno, non una preferenza.',
   pending_prompt: 'Stato del turno, non una preferenza.',
@@ -1890,7 +1904,7 @@ async function impApplicaProfilo(bottone) {
 const IMP_NOMI_PROMPT = {
   snello: 'snello, per i modelli che ragionano',
   esteso: 'esteso, per i modelli senza canale di pensiero',
-  vault: 'del manutentore della wiki, perché la cartella è un vault',
+  wiki: 'del manutentore della wiki, perché il progetto ha la wiki accesa',
   personalizzato: 'personalizzato',
 };
 
@@ -2171,7 +2185,7 @@ function impDisegnaInfo() {
     + '<section class="imp-gruppo"><h4 class="imp-gruppo-titolo">Backup e trasferimento</h4>'
     + '<div class="imp-carta imp-backup"><p class="imp-descr">Salva le impostazioni in un file JSON e '
     + 'riaprile sull\'altra macchina. Restano qui la chiave API, la chiave del telefono, le cartelle, i '
-    + 'vault e l\'immagine Docker: sono segreti o percorsi di questa macchina. Si può importare anche un '
+    + 'progetti e l\'immagine Docker: sono segreti o percorsi di questa macchina. Si può importare anche un '
     + '<code>agent_settings.json</code> così com\'è.</p><div class="imp-azioni">'
     + `<button type="button" class="btn" id="imp-esporta">${impIcona('scarica')}Esporta…</button>`
     + `<button type="button" class="btn" id="imp-importa">${impIcona('carica')}Importa…</button>`

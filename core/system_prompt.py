@@ -16,7 +16,7 @@ uso dei tool invece di indovinare, pianificazione) valgono da soli qualche
 punto di SWE-bench. Qui i moduli sono costanti con un nome, in ordine fisso,
 cosi' una regola ha un posto solo e il prefisso resta byte-identico fra un
 turno e l'altro (i moduli condizionali -- pensiero nel testo, ricerca online,
-vault, memorie -- li accoda ``server/main.py`` dopo, come prima).
+progetto, memorie -- li accoda ``server/main.py`` dopo, come prima).
 
 Corrispondenza con la missione: Role & Capabilities -> ``RUOLO``; Operational
 Constraints -> ``AUTORITA`` e ``CONTRATTO_TOOL``; Reasoning Protocol ->

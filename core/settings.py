@@ -82,6 +82,11 @@ def load_settings(path: Path | None = None) -> dict[str, Any]:
         return settings
     if not isinstance(saved, dict):
         return settings
+    # I vault sono diventati progetti (26/09/2026). La chiave si rinomina qui,
+    # alla lettura, e non con una migrazione del file: al primo salvataggio il
+    # file ha gia' il nome nuovo, e un file mai riscritto continua a funzionare.
+    if "vaults" in saved and "progetti" not in saved:
+        saved = {**saved, "progetti": saved["vaults"]}
 
     for key, value in saved.items():
         if key == "system_prompt":
@@ -200,7 +205,7 @@ def pick_available_model(settings: dict[str, Any], models: list[str]) -> str | N
 #: macchina (``workspace_dir`` vale ``os.getcwd()`` al momento dell'import) o
 #: sono stato che l'utente non sceglie da un menu.
 SENZA_VALORE_DI_SERIE = VOLATILE_KEYS | frozenset(
-    {"workspace_dir", "recent_workspaces", "vaults", "mobile_token"}
+    {"workspace_dir", "recent_workspaces", "progetti", "mobile_token"}
 )
 
 #: Chiavi che un'esportazione non scrive e un'importazione non applica.
@@ -209,7 +214,7 @@ FUORI_DALLO_SCAMBIO: dict[str, str] = {
     "mobile_token": "la chiave del telefono vale solo per questa macchina",
     "workspace_dir": "è un percorso di questa macchina",
     "recent_workspaces": "sono percorsi di questa macchina",
-    "vaults": "sono percorsi di questa macchina",
+    "progetti": "sono percorsi di questa macchina",
     "docker_image": "il nome dell'immagine dipende dal percorso del progetto",
 }
 

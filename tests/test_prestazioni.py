@@ -399,7 +399,7 @@ def test_gli_schemi_pesano_piu_del_prompt():
     """Dove conviene tagliare, se si vuole tagliare.
 
     Vale in entrambi i percorsi, ed e' il motivo per cui togliere dallo schema
-    i tool inutilizzabili (web_search spento, vault_search senza vault) rende
+    i tool inutilizzabili (web_search spento, wiki_search senza wiki) rende
     piu' che accorciare il prompt.
     """
     from core.prompts import costi_del_prefisso

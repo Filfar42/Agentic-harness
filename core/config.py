@@ -391,7 +391,7 @@ DEFAULTS: dict[str, Any] = {
     "timeout_seconds": 180,
     # Solo llama-server lanciato con ``-np 2`` o piu': lo slot riservato alle
     # chiamate di servizio (compattazione, estratto del pensiero, riepilogo,
-    # delega, ricerca nel vault). La conversazione usa un altro slot, e il suo
+    # delega, ricerca nella wiki). La conversazione usa un altro slot, e il suo
     # KV cache non viene spostato da quelle chiamate. -1 = spento.
     "slot_servizio": -1,
     # generazione
@@ -431,12 +431,13 @@ DEFAULTS: dict[str, Any] = {
     # indietro. Tenuta corta di proposito -- oltre la mezza dozzina non e' piu'
     # un elenco di scorciatoie ma una cronologia da leggere.
     "recent_workspaces": [],
-    # Vault LLM Wiki registrati: percorsi di workspace che contengono una wiki
-    # mantenuta dall'agente (raw/ + wiki/). La sezione "Vault" della colonna
-    # sinistra li elenca; il tool vault_search li interroga senza cambiare
-    # workspace. Lista di dict {path, nome}: il nome e' quello scelto
-    # dall'utente, non la basename, perche' i vault si riconoscono dal tema.
-    "vaults": [],
+    # Progetti registrati: cartelle con un nome, le loro chat e una memoria
+    # (``core/progetto.py``). La sezione "Progetti" della colonna sinistra li
+    # elenca. Lista di dict {path, nome}: l'identita' vera sta nel
+    # ``.progetto.json`` della cartella, qui solo i percorsi conosciuti -- che
+    # sono l'unica cosa che non si puo' ricavare. Fino al 26/09/2026 si
+    # chiamava ``vaults``: ``core/settings.py`` rinomina la chiave al caricamento.
+    "progetti": [],
     # Chiave d'accesso dell'interfaccia mobile. Vuota = non ancora generata:
     # al primo avvio con --mobile se ne fa una e si scrive qui.
     #
@@ -540,6 +541,12 @@ DEFAULTS: dict[str, Any] = {
     # verrebbe scritto e mai riletto -- percio' l'harness lo esegue solo con
     # entrambe attive. Vedi `core/pensiero.py`.
     "estratto_pensiero": True,
+    # A fine turno, nei progetti, l'harness aggiorna da solo la memoria del
+    # progetto: un passo in piu' in coda alla conversazione (senza pensiero,
+    # cache riusata) che torna aggiunte, correzioni e voci da togliere. Solo
+    # dopo i turni che hanno lavorato: scritto file, lanciato comandi o chiuso
+    # punti del piano. Vedi ``core/memoria_progetto.py``.
+    "memoria_progetto": True,
     # I risultati troppo lunghi (stdout/stderr di run_command, elenchi di
     # search_files) vengono scritti interi in `<workspace>/.deposito/` prima
     # di essere troncati, e il risultato ne porta il percorso. Il costo in

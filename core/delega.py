@@ -352,7 +352,7 @@ def esegui(
         # E un esploratore non genera esploratori: senza azzerarle, il figlio
         # ereditava le due porte da cui si aprono altri sotto-turni.
         on_delega=None,
-        on_vault_search=None,
+        on_wiki_search=None,
     )
 
     messaggi: list[dict[str, Any]] = [{"role": "user", "content": compito}]

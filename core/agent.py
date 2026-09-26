@@ -48,8 +48,9 @@ from . import libreria
 from . import pensiero
 from . import regia_pensiero as regia
 from . import spec_delega as spec_delega_mod
-from . import vault as vault_mod
-from . import vault_search as vault_search_mod
+from . import memoria_progetto as memoria_mod
+from . import progetto as progetto_mod
+from . import wiki_search as wiki_search_mod
 from . import verifiche as verifiche_mod
 from .notes import render_block as render_notes
 from .plan import render_block, render_summary
@@ -350,6 +351,22 @@ class AgentError:
 # contratto su cui il server scrive ``event_to_sse``, e un evento che non
 # compare qui e' un evento che chi legge non sa di dover gestire.
 # ``HistoryCompacted`` e ``NotesUpdated`` mancavano pur essendo emessi da anni.
+@dataclass(slots=True)
+class MemoriaProgetto:
+    """L'harness sta aggiornando la memoria del progetto, o ha finito.
+
+    ``fase`` e' "inizio" o "fine". Alla fine ``esito`` dice cosa e' cambiato
+    (``progetto.EsitoMemoria.as_dict``) e ``motivo`` perche' non e' cambiato
+    niente, quando e' cosi' per una ragione che l'utente deve sapere: la
+    finestra piena, una risposta illeggibile, un disco che ha detto di no.
+    """
+
+    fase: str
+    esito: dict[str, Any] = field(default_factory=dict)
+    motivo: str = ""
+    progetto: str = ""
+
+
 AgentEvent = (
     StepStarted
     | ReasoningDelta
@@ -365,6 +382,7 @@ AgentEvent = (
     | TurnFinished
     | AgentError
     | Metriche
+    | MemoriaProgetto
 )
 
 
@@ -626,11 +644,12 @@ def build_api_messages(
     notes_block: str = "",
     skills_block: str = "",
     libreria_block: str = "",
-    vault_notes_block: str = "",
-    vault_state_block: str = "",
+    progetto_block: str = "",
+    wiki_state_block: str = "",
     delega_block: str = "",
     verifiche_block: str = "",
     avanzamento_block: str = "",
+    nota_comunicazione: bool = True,
 ) -> list[dict[str, Any]]:
     """Costruisce l'array da inviare al modello a partire dal log della UI.
 
@@ -804,8 +823,11 @@ def build_api_messages(
     # da riassumere di nuovo. Questa nota non duplica il contenuto: rende
     # esplicito, nel punto piu' recente del prompt, che quelle risposte sono un
     # registro di comunicazione e non una bozza da parafrasare.
+    # ``nota_comunicazione=False`` la toglie a chi non chiede un altro passo di
+    # lavoro: la memoria del progetto a fine turno, dove "se chiudi, aggiungi
+    # solo i residui nuovi" parlerebbe di un'altra risposta.
     gia_comunicato = False
-    for msg in reversed(ui_messages):
+    for msg in reversed(ui_messages if nota_comunicazione else ()):
         if msg.get("role") == "user" and not msg.get("hidden"):
             break
         if msg.get("role") == "assistant" and strip_think(
@@ -824,7 +846,7 @@ def build_api_messages(
     # eval completo per aggiornare tre parole.
     coda = [
         blocco
-        # La memoria del vault sta **prima** del foglio della chat: dal piu'
+        # La memoria del progetto sta **prima** del foglio della chat: dal piu'
         # vecchio e stabile al piu' fresco, e il piu' fresco resta attaccato
         # al piano, che e' l'ultima cosa che il modello legge prima di agire.
         for blocco in (
@@ -834,9 +856,9 @@ def build_api_messages(
             # Lo stato della wiki -- indice e coda del log -- sta qui e non nel
             # prompt di sistema: cambia a ogni ingest, e in testa invalidava il
             # prefisso proprio nell'operazione per cui la modalita' wiki
-            # esiste. Prima della memoria del vault perche' e' piu' volatile.
-            vault_state_block,
-            vault_notes_block,
+            # esiste. Prima della memoria del progetto perche' e' piu' volatile.
+            wiki_state_block,
+            progetto_block,
             notes_block,
             # Le verifiche rosse subito prima del piano: e' il cammino critico,
             # e in coda -- l'ultima cosa letta -- non si perde in mezzo alla
@@ -1817,6 +1839,10 @@ def run_turn(
     # ``valutatore_selezione`` (client /v1/systemone: Laya locale o Jev).
     selezione: str = "spenta",
     valutatore_selezione: Any = None,
+    # La memoria del progetto scritta dall'harness a fine turno (vedi
+    # ``core/memoria_progetto.py``). Agisce solo se ``tool_ctx.progetto_dir``
+    # c'e', cioe' se la chat sta in un progetto.
+    memoria_progetto: bool = True,
 ) -> Iterator[AgentEvent]:
     """Esegue un turno completo. Muta ``ui_messages`` in-place via append.
 
@@ -1848,7 +1874,7 @@ def run_turn(
         images=images, allow_text_tool_calls=allow_text_tool_calls,
         initialize_workspace=initialize_workspace, monitor_avanzamento=monitor_avanzamento,
         checkpoint_precedente=checkpoint_precedente, selezione=selezione,
-        valutatore_selezione=valutatore_selezione,
+        valutatore_selezione=valutatore_selezione, memoria_progetto=memoria_progetto,
     )
     yield from turno.esegui()
 
@@ -2028,7 +2054,7 @@ class _Turno:
         ]
 
     # ------------------------------------------------------------------
-    # Servizi montati sul ToolContext (delega, ricerca nel vault)
+    # Servizi montati sul ToolContext (delega, ricerca nelle wiki)
     # ------------------------------------------------------------------
     def _monta_servizi(self) -> None:
         tool_ctx = self.tool_ctx
@@ -2057,27 +2083,27 @@ class _Turno:
             _delega._harness_owned = True
             tool_ctx.on_delega = _delega
 
-        # vault_search si monta come la delega. Il cercatore non riceve ne'
-        # delega ne' vault_search, quindi non c'e' ricorsione possibile.
-        if tool_ctx.on_vault_search is None or getattr(
-            tool_ctx.on_vault_search, "_harness_owned", False
+        # wiki_search si monta come la delega. Il cercatore non riceve ne'
+        # delega ne' wiki_search, quindi non c'e' ricorsione possibile.
+        if tool_ctx.on_wiki_search is None or getattr(
+            tool_ctx.on_wiki_search, "_harness_owned", False
         ):
-            def _vault_search(vault: str, query: str) -> dict[str, Any]:
-                return vault_search_mod.cerca_nel_vault(
-                    vault,
+            def _wiki_search(progetto: str, query: str) -> dict[str, Any]:
+                return wiki_search_mod.cerca_nella_wiki(
+                    progetto,
                     query,
-                    backend=backend.scope("vault_search"),
+                    backend=backend.scope("wiki_search"),
                     params=self.params,
                     tools_schema=self.tools_schema,
                     tool_ctx=tool_ctx,
                     env_header=self.env_header,
                     run_turn=run_turn,
-                    registri=getattr(tool_ctx, "registri_vault", None),
+                    registri=getattr(tool_ctx, "registri_progetti", None),
                     should_stop=self.should_stop,
                 )
 
-            _vault_search._harness_owned = True
-            tool_ctx.on_vault_search = _vault_search
+            _wiki_search._harness_owned = True
+            tool_ctx.on_wiki_search = _wiki_search
 
     # ------------------------------------------------------------------
     # Blocchi di coda
@@ -2101,27 +2127,32 @@ class _Turno:
         domanda = spec_delega_mod.esempio_riuscito(self.tool_ctx.base)
         return DELEGA_ESEMPIO.format(domanda=domanda) if domanda else ""
 
-    def _blocco_stato_vault(self) -> str:
-        """Indice e coda del log della wiki, per i vault in modalita' wiki.
+    def _blocco_stato_wiki(self) -> str:
+        """Indice e coda del log della wiki, per i progetti in modalita' wiki.
 
-        Il **workspace**, non ``vault_dir``: la modalita' wiki si accende anche
-        sui vault nati prima di ``.vault.json``, riconosciuti dalla struttura.
+        Il **workspace**, non ``progetto_dir``: la modalita' wiki si accende
+        anche sulle cartelle nate prima di ``.vault.json``, riconosciute dalla
+        struttura.
         """
         cartella = getattr(self.tool_ctx, "workspace", "") or ""
-        if not cartella or not vault_mod.is_modalita_vault(cartella):
+        if not cartella or not progetto_mod.is_modalita_wiki(cartella):
             return ""
-        return vault_mod.blocco_stato(cartella)
+        return progetto_mod.blocco_stato(cartella)
 
-    def _blocco_memoria_vault(self) -> str:
+    def _config_progetto(self) -> progetto_mod.ProgettoConfig | None:
         tool_ctx = self.tool_ctx
-        if not tool_ctx.vault_dir or not tool_ctx.vault_notes:
-            return ""
-        return vault_mod.blocco_note(
-            vault_mod.VaultConfig(
-                nome=PurePath(tool_ctx.vault_dir).name,
-                note=tuple(tool_ctx.vault_notes),
-            )
+        if not tool_ctx.progetto_dir:
+            return None
+        return progetto_mod.ProgettoConfig(
+            nome=getattr(tool_ctx, "progetto_nome", "") or PurePath(tool_ctx.progetto_dir).name,
+            memoria=tuple(tool_ctx.progetto_memoria),
         )
+
+    def _blocco_memoria_progetto(self) -> str:
+        config = self._config_progetto()
+        if config is None or not config.memoria:
+            return ""
+        return progetto_mod.blocco_memoria(config, automatica=bool(self.memoria_progetto))
 
     def _costruisci(self, step: int, blocco_piano: str,
                     messaggi: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
@@ -2142,8 +2173,8 @@ class _Turno:
             notes_block=render_notes(tool_ctx.notes),
             skills_block=self.skills_block,
             libreria_block=self.blocco_libreria,
-            vault_state_block=self._blocco_stato_vault(),
-            vault_notes_block=self._blocco_memoria_vault(),
+            wiki_state_block=self._blocco_stato_wiki(),
+            progetto_block=self._blocco_memoria_progetto(),
             verifiche_block=render_verifiche_aperte(self.verification.pendenti),
             avanzamento_block=(
                 render_promemoria_batch(self.st.letture_singole_di_fila)
@@ -2217,6 +2248,21 @@ class _Turno:
     # Il ciclo
     # ------------------------------------------------------------------
     def esegui(self) -> Iterator[AgentEvent]:
+        """Il turno, piu' la memoria del progetto prima della chiusura.
+
+        La memoria si scrive fra l'ultimo passo e ``TurnFinished``, non dopo:
+        cosi' la sua chiamata al modello entra nella telemetria del turno (e
+        nel cruscotto), e chi guarda vede il turno finire quando e' finito
+        davvero. ``fine()`` si rifa' per la stessa ragione.
+        """
+        for evento in self._ciclo():
+            if isinstance(evento, TurnFinished) and self._memoria_dovuta(evento):
+                yield from self._scrivi_memoria()
+                yield self.fine(evento.reason, evento.steps)
+                continue
+            yield evento
+
+    def _ciclo(self) -> Iterator[AgentEvent]:
         for step in range(1, self.max_steps + 1):
             if self.stopped():
                 yield from self.halt(step - 1)
@@ -3316,6 +3362,104 @@ class _Turno:
             summary=sel.record["descrizione"],
         )
         return sel, prova
+
+    # ------------------------------------------------------------------
+    # MEMORIA DEL PROGETTO (``core/memoria_progetto.py``)
+    # ------------------------------------------------------------------
+    def _memoria_dovuta(self, fine: TurnFinished) -> bool:
+        """Si scrive la memoria del progetto alla chiusura di questo turno?"""
+        return bool(
+            self.memoria_progetto
+            and getattr(self.tool_ctx, "progetto_dir", "")
+            and fine.reason in memoria_mod.MOTIVI_DI_CHIUSURA
+            and not self.stopped()
+            and memoria_mod.turno_ha_lavorato(self.ui_messages)
+        )
+
+    def _scrivi_memoria(self) -> Iterator[AgentEvent]:
+        """Un passo in piu', in coda alla conversazione, per la memoria.
+
+        La richiesta e' la stessa cronologia dei passi del turno (stesso prompt
+        di sistema, stesso environment, stessi schemi dei tool) piu' un
+        messaggio in fondo: il server riusa il prefisso in cache. Niente
+        pensiero, niente strumenti nella risposta, al massimo
+        ``MAX_TOKEN_MEMORIA`` token. Una risposta che non si legge o un disco
+        che dice di no non fanno fallire il turno, che e' gia' finito: si dice
+        cosa e' successo nella goccia, e basta.
+        """
+        tool_ctx = self.tool_ctx
+        cartella = str(tool_ctx.progetto_dir)
+        yield MemoriaProgetto(fase="inizio", progetto=cartella)
+        # Dal disco, non dal ToolContext: l'utente puo' averla corretta dalla
+        # schermata del progetto mentre il turno girava, e le sue correzioni
+        # sono proprio quelle che l'harness non deve scavalcare.
+        config = progetto_mod.leggi_config(cartella)
+        aperti = [
+            f"{p.id}. {p.text}" for p in (tool_ctx.plan.open_steps if tool_ctx.plan else [])
+        ]
+        api = build_api_messages(
+            self.ui_messages,
+            system_prompt=self.system_prompt,
+            env_header=self.env_header,
+            strip_thinking=self.strip_thinking,
+            compact_old_tools=self.compact_old_tools,
+            images=self.images,
+            budgets=self.budgets,
+            nota_comunicazione=False,
+        )
+        # Le note della chat vanno dentro la richiesta: sono "cosa ha capito"
+        # il modello in questa conversazione, cioe' la materia prima migliore
+        # per la memoria -- e muoiono con la chat.
+        richiesta = "\n\n".join(
+            b for b in (render_notes(tool_ctx.notes),
+                        memoria_mod.richiesta(config, piano_aperto=aperti)) if b
+        )
+        api.append({"role": "user", "content": richiesta})
+        tetto, _spazio = tetto_per_la_finestra(
+            api,
+            int(getattr(self.params, "num_ctx", 0) or 0),
+            min(int(getattr(self.params, "max_tokens", 2048) or 2048),
+                memoria_mod.MAX_TOKEN_MEMORIA),
+        )
+        if tetto < TETTO_INUTILE:
+            yield MemoriaProgetto(
+                fase="fine", progetto=cartella,
+                motivo="La finestra di contesto e' troppo piena per un passo in piu': "
+                "la memoria resta com'era.",
+            )
+            return
+        p = replace(self.params, think=False, temperature=0.1, max_tokens=tetto)
+        testo = service_text(
+            self.backend.scope("memoria_progetto"), api, p,
+            should_stop=self.stopped, tools=self.tools_schema,
+        )
+        if self.stopped():
+            yield MemoriaProgetto(fase="fine", progetto=cartella,
+                                  motivo="Interrotta: la memoria resta com'era.")
+            return
+        operazioni = memoria_mod.interpreta(testo)
+        if operazioni is None:
+            yield MemoriaProgetto(
+                fase="fine", progetto=cartella,
+                motivo="La risposta del modello non era leggibile: la memoria "
+                "resta com'era." if testo else "Il modello non ha risposto: la "
+                "memoria resta com'era.",
+            )
+            return
+        esito = progetto_mod.applica_operazioni(
+            cartella, operazioni, autore="harness",
+            chat=getattr(tool_ctx, "chat_id", ""), titolo_chat=getattr(tool_ctx, "chat_titolo", ""),
+        )
+        if esito.cambiata:
+            tool_ctx.progetto_memoria = tuple(progetto_mod.leggi_config(cartella).memoria)
+            tool_ctx.progetto_memoria_changed()
+        dati = esito.as_dict()
+        dati["riassunto"] = memoria_mod.riassunto_esito(dati)
+        # Nella cronologia, per la goccia che si ridisegna riaprendo la chat.
+        # Al modello non arriva: ``build_api_messages`` non conosce il ruolo.
+        self.ui_messages.append({"role": "memoria", "esito": dati, "ts": time.time()})
+        yield MemoriaProgetto(fase="fine", progetto=cartella, esito=dati,
+                              motivo=esito.errore)
 
     # ------------------------------------------------------------------
     # CHIUSURA A PASSI FINITI
