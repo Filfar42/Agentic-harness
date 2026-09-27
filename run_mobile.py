@@ -48,18 +48,6 @@ def ip_lan() -> str:
         s.close()
 
 
-def chiave() -> str:
-    """La chiave d'accesso del ponte, stabile fra un avvio e l'altro.
-
-    Una sola implementazione, e sta nel ponte: qui c'e' solo il rimando, cosi'
-    ``run.py`` e ``run_mobile.py`` non possono divergere da quello che il
-    server considera valido.
-    """
-    from server.mobile import token
-
-    return token()
-
-
 def main() -> None:
     parser = argparse.ArgumentParser(description="Interfaccia mobile dell'harness")
     parser.add_argument("--host", default="0.0.0.0", help="0.0.0.0 per la LAN")
@@ -73,13 +61,9 @@ def main() -> None:
 
     os.environ["MOBILE_PORT"] = str(args.port)
     os.environ["HARNESS_UPSTREAM"] = args.upstream
-    token = chiave()
-    os.environ["HARNESS_MOBILE_TOKEN"] = token
-    # L'indirizzo si stampa **con la chiave dentro**: e' l'unico gesto che si
-    # chiede all'utente, e va fatto una volta sola per telefono (poi resta un
-    # cookie). Senza, il ponte risponde 401 a chiunque -- compreso lui.
-    print(f"\n  Harness Mobile  ->  http://{ip_lan()}:{args.port}/?k={token}")
-    print("  (aprilo dal telefono: la chiave resta nel browser per 30 giorni)")
+    os.environ["HARNESS_MOBILE_PORT"] = str(args.port)
+    print(f"\n  Harness Mobile  ->  http://{ip_lan()}:{args.port}/")
+    print("  Associa il telefono da Impostazioni → Mobile nel desktop.")
     print(f"  upstream: {args.upstream}\n")
 
     uvicorn.run(

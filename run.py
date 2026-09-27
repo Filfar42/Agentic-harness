@@ -16,7 +16,6 @@ import argparse
 import asyncio
 import os
 import socket
-import threading
 import webbrowser
 from threading import Timer
 from types import FrameType
@@ -24,10 +23,8 @@ from types import FrameType
 import uvicorn
 from uvicorn.main import STARTUP_FAILURE
 
-# Una sola implementazione per l'indirizzo LAN e per la chiave: erano nate due
-# volte, qui e in run_mobile.py, e due copie della stessa funzione divergono
-# sempre -- di solito il giorno in cui una delle due viene corretta.
-from run_mobile import TIMEOUT_SPEGNIMENTO, chiave, ip_lan
+# Il limite di attesa allo spegnimento è condiviso con il launcher standalone.
+from run_mobile import TIMEOUT_SPEGNIMENTO
 
 
 class ServerCheSiFermaDavvero(uvicorn.Server):
@@ -92,15 +89,6 @@ class ServerCheSiFermaDavvero(uvicorn.Server):
                 pass
 
 
-def upstream_mobile(porta_principale: int) -> str:
-    """Dove il ponte deve trovare il principale.
-
-    Di norma la stessa porta del comando (``--port``); un ``HARNESS_UPSTREAM``
-    esplicito nell'ambiente vince sempre.
-    """
-    return os.environ.get("HARNESS_UPSTREAM") or f"http://127.0.0.1:{porta_principale}"
-
-
 def main() -> None:
     parser = argparse.ArgumentParser(description="Local Agent Harness")
     parser.add_argument("--host", default="127.0.0.1")
@@ -123,23 +111,11 @@ def main() -> None:
     url = f"http://{args.host}:{args.port}"
     print(f"\n  Local Agent Harness  ->  {url}")
 
-    ponte = None
+    os.environ["HARNESS_DESKTOP_URL"] = f"http://127.0.0.1:{args.port}"
+    os.environ["HARNESS_MOBILE_PORT"] = str(args.mobile_port)
+    os.environ["HARNESS_MOBILE_AUTOSTART"] = "1" if args.mobile else "0"
     if args.mobile:
-        # Il ponte vive in un thread: resta il processo principale a fare da
-        # riferimento (Ctrl+C chiude tutto). L'upstream segue la porta di
-        # questo comando, senno' con --port 8201 il telefono guarderebbe la
-        # 8123 e troverebbe il principale spento.
-        os.environ.setdefault("HARNESS_UPSTREAM", upstream_mobile(args.port))
-        # La chiave si decide **qui**, prima che il thread parta: cosi'
-        # l'indirizzo stampato la contiene gia' e non c'e' un momento in cui
-        # il ponte e' su e l'utente non sa come entrarci.
-        token = chiave()
-        os.environ["HARNESS_MOBILE_TOKEN"] = token
-        ponte = avvia_ponte_mobile(args.mobile_port)
-        print(
-            f"  Interfaccia mobile   ->  http://{ip_lan()}:{args.mobile_port}/?k={token}"
-        )
-        print("                           (dal telefono; la chiave resta nel browser)")
+        print("  Mobile: associa il telefono da Impostazioni → Mobile.")
 
     print()
     if not args.no_browser and not args.reload:
@@ -171,7 +147,6 @@ def main() -> None:
             timeout_graceful_shutdown=TIMEOUT_SPEGNIMENTO,
         )
     )
-    server.compagni = [ponte] if ponte is not None else []
     corri(server)
 
 
@@ -198,37 +173,6 @@ def corri(server: uvicorn.Server) -> None:
         pass
     if not server.started:
         raise SystemExit(STARTUP_FAILURE)
-
-
-def avvia_ponte_mobile(porta: int) -> uvicorn.Server:
-    """Solleva il ponte del telefono in un thread e ne ritorna il server.
-
-    Torna l'oggetto e non solo il thread perche' allo spegnimento gli si dice
-    ``should_exit``: un thread demone verrebbe ammazzato comunque all'uscita
-    dell'interprete, ma chiedere e' piu' pulito che tagliare.
-    """
-    server = uvicorn.Server(
-        uvicorn.Config(
-            "server.mobile:app",
-            host="0.0.0.0",
-            port=porta,
-            log_level="warning",
-            timeout_graceful_shutdown=TIMEOUT_SPEGNIMENTO,
-        )
-    )
-    # I gestori di segnale se li installa solo il thread principale (lo
-    # controlla uvicorn stesso): qui non ce ne sono, ed e' giusto cosi' --
-    # Ctrl+C lo raccoglie il server principale, che poi avvisa questo.
-    def in_silenzio() -> None:
-        # Un'eccezione in un thread demone stampa un traceback e basta: qui
-        # non c'e' niente da salvare, e a spegnimento in corso e' rumore.
-        try:
-            server.run()
-        except (KeyboardInterrupt, SystemExit):
-            pass
-
-    threading.Thread(target=in_silenzio, daemon=True, name="interfaccia-mobile").start()
-    return server
 
 
 if __name__ == "__main__":

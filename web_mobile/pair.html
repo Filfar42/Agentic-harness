@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html lang="it">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>Associa il telefono · Harness</title>
+<style>
+  :root { color-scheme: dark; font-family: system-ui, sans-serif; background: #11181b; color: #e8edeb; }
+  body { margin: 0; min-height: 100dvh; display: grid; place-items: center; }
+  main { max-width: 360px; padding: 32px; }
+  .mark { font-size: 32px; color: #86cbb6; }
+  h1 { font-size: 26px; letter-spacing: -.6px; }
+  p { line-height: 1.6; color: #afbfbb; }
+  button { width: 100%; margin-top: 16px; border: 0; border-radius: 12px; padding: 16px;
+    font: inherit; font-weight: 600; background: #a3dbc9; color: #10261f; cursor: pointer; }
+  button:disabled { opacity: .5; cursor: default; }
+</style>
+<main>
+  <div class="mark" aria-hidden="true">▣</div>
+  <h1>Il tuo desktop, sul telefono</h1>
+  <p>Associa questo browser per ritrovare le tue chat e continuare a lavorare dal telefono. Puoi associare un solo dispositivo alla volta.</p>
+  <button id="pair" type="button" disabled>Associa questo telefono</button>
+  <p id="status" role="status" aria-live="polite">Mantieni desktop e telefono sulla stessa rete Wi-Fi.</p>
+</main>
+<script>
+  // Il frammento non viaggia nelle richieste HTTP e sparisce subito dalla cronologia.
+  let code = location.hash.slice(1);
+  history.replaceState(null, '', '/pair');
+  const button = document.getElementById('pair');
+  const status = document.getElementById('status');
+  // Anche riaprendo il vecchio link del QR, un browser associato deve entrare
+  // nelle chat. Il codice monouso non viene riutilizzato per autenticarlo.
+  async function resumeExisting() {
+    try {
+      const response = await fetch('/api/mobile/session', {
+        method: 'POST', credentials: 'same-origin', cache: 'no-store',
+      });
+      if (response.ok) { location.replace('/'); return; }
+      if (response.status !== 401) {
+        status.textContent = 'Desktop non raggiungibile. Controlla la connessione e ricarica la pagina.';
+      } else if (!code) {
+        status.textContent = 'Scansiona un nuovo QR da Impostazioni → Mobile sul desktop.';
+      }
+    } catch {
+      status.textContent = 'Desktop non raggiungibile. Controlla la connessione e riprova.';
+    }
+    button.disabled = !code;
+  }
+  button.onclick = async () => {
+    button.disabled = true;
+    status.textContent = 'Associazione in corso…';
+    try {
+      const response = await fetch('/pair', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({code})});
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.detail || 'Associazione non riuscita.');
+      code = '';
+      location.replace('/');
+    } catch (error) {
+      status.textContent = error.message;
+      button.disabled = false;
+    }
+  };
+  resumeExisting();
+</script>
+</html>

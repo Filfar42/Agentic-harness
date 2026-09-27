@@ -73,6 +73,12 @@ Deployment with a reverse proxy must preserve this boundary at that proxy.
         except ValueError:
             peer_ip = None
         forbidden = not browser_request_allowed(scope, headers)
+        # Difesa anche dopo la normalizzazione URL di httpx: il proxy non può
+        # raggiungere il controllo dell'associazione attraverso percorsi con ../.
+        if headers.get("x-harness-mobile") and (
+            scope["path"] == "/api/mobile" or scope["path"].startswith("/api/mobile/")
+        ):
+            forbidden = True
         if peer_ip is not None and not authenticated:
             forbidden |= not peer_ip.is_loopback
             try:

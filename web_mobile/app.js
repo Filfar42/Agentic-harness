@@ -196,6 +196,12 @@ function toast(text) {
 
 async function api(path, options) {
   const res = await fetch(path, options);
+  if (res.status === 401) {
+    // La pagina di ingresso spiega come associare di nuovo il telefono e
+    // rimuove dalla vista le chat dopo una revoca dal desktop.
+    window.location.replace('/');
+    throw new Error('Associazione revocata o scaduta.');
+  }
   if (!res.ok) {
     let detail = `${res.status}`;
     try { detail = (await res.json()).detail || detail; } catch (_) {}

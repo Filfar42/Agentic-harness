@@ -44,7 +44,7 @@ server/main.py         API HTTP e streaming SSE degli eventi dell'agente
 server/runner.py       turni in background, slegati dalla connessione
 server/prep.py         lavori lunghi: avvio di Docker, build dell'immagine
 server/nativedialog.py selettore cartelle del sistema operativo
-server/mobile.py       ponte per il telefono: proxa /api/* sul principale, chiede la chiave
+server/mobile.py       ponte per il telefono: proxa /api/* sul principale, richiede l'associazione
 web/                   frontend: index.html, style.css, app.js, logo (nessuna CDN)
 web_mobile/            frontend del telefono: elenco, conversazione, risposta alle domande
 core/
@@ -88,6 +88,42 @@ generatore di eventi guidabile da una CLI, da un test o da un frontend.
 
 Tutti i percorsi sono confinati nel workspace da `resolve_path`, che usa
 `Path.is_relative_to` (non un confronto di stringhe).
+
+### Associazione del telefono
+
+Apri **Impostazioni → Applicazione → Mobile → Associa telefono**. Il desktop
+avvia il ponte mobile (porta 8200) e mostra un QR code, generato localmente,
+valido per cinque minuti. Scansionalo con la fotocamera e premi **Associa
+questo telefono** nel browser. Desktop e telefono devono essere sulla stessa
+rete; se il collegamento non si apre, verifica che il firewall consenta la
+porta mobile sulla rete privata. `--mobile-port` permette di cambiarla.
+
+È consentito **un solo browser associato**: il QR si consuma al primo utilizzo
+e non permette di associare un secondo dispositivo. La scheda mostra il
+telefono e permette di revocarlo o annullare un QR. Per sostituirlo, revoca
+l'associazione e genera un nuovo codice. La revoca blocca le nuove richieste
+e chiude anche gli stream già aperti al successivo controllo (circa un secondo,
+oltre al tempo di risposta del desktop).
+
+L'associazione sopravvive al riavvio; `run.py` riattiva il ponte per il telefono
+già associato. Il cookie HttpOnly dura un anno: cancellando i dati del browser,
+cambiando browser o usando un'app Home con archivio separato occorre associare
+di nuovo il dispositivo. Chiudere la scheda e riaprire lo shortcut nello stesso
+browser conserva invece l'accesso. La pagina iniziale recupera anche i cookie
+delle prime associazioni, senza richiedere un nuovo QR; gli shortcut che puntano
+a `/pair` aprono le chat se il browser è già associato. Samsung Internet e Chrome
+non condividono l'associazione: crea lo shortcut dal browser scelto.
+È un'associazione al browser, non un'identificazione
+hardware: chi copia il cookie può impersonarlo. Il ponte HTTP va usato sulla
+propria rete fidata; non fornisce cifratura del traffico sulla LAN.
+
+Le vecchie chiavi `?k=`, `HARNESS_MOBILE_TOKEN` e `X-Harness-Token` non danno
+più accesso. Il QR non contiene la credenziale permanente, e URL e manifest
+non la conservano. Il desktop salva solo l'impronta della credenziale nel file
+`agent_settings.mobile.json`, separato dalle preferenze e dai relativi backup.
+`run_mobile.py --upstream ...` resta disponibile per avviare il ponte in un
+processo separato sulla stessa macchina del desktop; si registra nella scheda
+Mobile del desktop a cui è collegato.
 
 ### Cartella di lavoro
 

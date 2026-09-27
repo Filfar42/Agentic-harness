@@ -39,93 +39,16 @@ def _run():
     return modulo
 
 
-def test_upstream_mobile_di_default_segue_la_porta_del_comando(monkeypatch):
-    monkeypatch.delenv("HARNESS_UPSTREAM", raising=False)
-    assert _run().upstream_mobile(8123) == "http://127.0.0.1:8123"
-    # Il caso che ha rotto l'anteprima: porta atipica -> upstream atipico.
-    assert _run().upstream_mobile(8201) == "http://127.0.0.1:8201"
-
-
-def test_harness_upstream_esplicito_vince_sulla_porta(monkeypatch):
+@pytest.mark.parametrize("port", [8123, 8201])
+def test_il_mobile_segue_il_desktop_corrente(monkeypatch, port):
+    run_harness = _run()
+    monkeypatch.setattr(sys, "argv", ["run.py", "--port", str(port), "--mobile", "--mobile-port", "8202", "--no-browser"])
     monkeypatch.setenv("HARNESS_UPSTREAM", "http://192.168.1.50:9000")
-    assert _run().upstream_mobile(8201) == "http://192.168.1.50:9000"
-
-
-def _intercetta_avvii(run_harness, avvii, ambiente=None):
-    """Sostituisce l'avvio vero con una nota su cosa sarebbe partito."""
-
-    def finto_run(self, *args, **kwargs):
-        avvii.append((self.config.app, self.config.port))
-        # ``started`` e' quello che distingue "il server e' partito" da "la
-        # porta era occupata": senza, ``corri`` uscirebbe con il codice di
-        # fallimento anche qui.
-        self.started = True
-        if ambiente is not None and self.config.app == "server.mobile:app":
-            ambiente["al_avvio_del_ponte"] = os.environ.get("HARNESS_UPSTREAM")
-
-    return patch.object(run_harness.uvicorn.Server, "run", finto_run)
-
-
-def test_main_imposta_harness_upstream_per_il_thread_del_ponte():
-    """main() deve fissare HARNESS_UPSTREAM PRIMA di aprire il thread del ponte.
-
-    Se non lo scrivesse, il ponte leggerebbe il default sbagliato.
-    """
-    run_harness = _run()
-    avvii: list[tuple[str, int]] = []
-    ambiente: dict[str, str | None] = {}
-
-    argv_prima = sys.argv
-    sys.argv = ["run.py", "--port", "8203", "--mobile", "--mobile-port", "8202", "--no-browser"]
-    with (
-        _intercetta_avvii(run_harness, avvii, ambiente),
-        patch.object(run_harness, "chiave", return_value="chiave-finta"),
-        patch.object(run_harness.webbrowser, "open"),
-        patch.dict(os.environ, {}, clear=False),
-    ):
-        os.environ.pop("HARNESS_UPSTREAM", None)
-        try:
-            run_harness.main()
-        finally:
-            sys.argv = argv_prima
-        # Il ponte parte in un thread: gli si da' un attimo per arrivare.
-        for _ in range(200):
-            if ("server.mobile:app", 8202) in avvii:
-                break
-            time.sleep(0.01)
-
-    assert ("server.main:app", 8203) in avvii
-    assert ("server.mobile:app", 8202) in avvii
-    # Valore atteso esplicito: quando il ponte si e' avviato, l'ambiente
-    # doveva gia' puntare alla porta DEL COMANDO.
-    assert ambiente["al_avvio_del_ponte"] == "http://127.0.0.1:8203"
-
-
-def test_main_non_sovrascrive_un_harness_upstream_gia_presente():
-    """Se l'utente ha scelto l'upstream a mano, main() non lo tocca."""
-    run_harness = _run()
-    avvii: list[tuple[str, int]] = []
-
-    argv_prima = sys.argv
-    sys.argv = ["run.py", "--port", "8123", "--mobile", "--no-browser"]
-    with (
-        _intercetta_avvii(run_harness, avvii),
-        patch.object(run_harness, "chiave", return_value="chiave-finta"),
-        patch.object(run_harness.webbrowser, "open"),
-        patch.dict(os.environ, {"HARNESS_UPSTREAM": "http://10.0.0.9:7777"}),
-    ):
-        try:
-            run_harness.main()
-        finally:
-            sys.argv = argv_prima
-        for _ in range(200):
-            if len(avvii) >= 2:
-                break
-            time.sleep(0.01)
-        # Valori attesi espliciti, letti DENTRO il contesto perche' patch.dict
-        # ripristina l'ambiente all'uscita.
-        assert sorted(app for app, _ in avvii) == ["server.main:app", "server.mobile:app"]
-        assert os.environ["HARNESS_UPSTREAM"] == "http://10.0.0.9:7777"
+    with patch.dict(os.environ, {}, clear=False), patch.object(run_harness, "corri"):
+        run_harness.main()
+        assert os.environ["HARNESS_DESKTOP_URL"] == f"http://127.0.0.1:{port}"
+        assert os.environ["HARNESS_MOBILE_PORT"] == "8202"
+        assert os.environ["HARNESS_MOBILE_AUTOSTART"] == "1"
 
 
 # --------------------------------------------------------------- spegnimento
@@ -169,7 +92,7 @@ def test_ctrl_c_avvisa_gli_stream_prima_di_mettersi_ad_aspettare():
         runner_mod.dimentica_spegnimento()
 
 
-def test_il_tetto_all_attesa_e_impostato_su_entrambi_i_server():
+def test_il_tetto_all_attesa_e_impostato_sul_desktop():
     """La cintura oltre alle bretelle: se un domani qualcuno aggiunge una
     risposta lunga e si scorda di ascoltare lo spegnimento, si aspetta questo
     e poi si chiude comunque."""
@@ -184,19 +107,14 @@ def test_il_tetto_all_attesa_e_impostato_su_entrambi_i_server():
     sys.argv = ["run.py", "--mobile", "--no-browser"]
     with (
         patch.object(run_harness.uvicorn.Server, "run", finto_run),
-        patch.object(run_harness, "chiave", return_value="chiave-finta"),
         patch.object(run_harness.webbrowser, "open"),
+        patch.dict(os.environ, {}, clear=False),
     ):
         try:
             run_harness.main()
         finally:
             sys.argv = argv_prima
-        for _ in range(200):
-            if len(configurazioni) >= 2:
-                break
-            time.sleep(0.01)
-
-    assert len(configurazioni) == 2
+    assert len(configurazioni) == 1
     for config in configurazioni:
         assert config.timeout_graceful_shutdown == run_harness.TIMEOUT_SPEGNIMENTO
 

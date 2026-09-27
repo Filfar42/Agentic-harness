@@ -13,6 +13,7 @@ dependencies = [
     "openai>=1.60",
     # Upload degli allegati: FastAPI ne ha bisogno per i form multipart.
     "python-multipart>=0.0.9",
+    "qrcode>=8.2,<9",
 ]
 
 [project.optional-dependencies]

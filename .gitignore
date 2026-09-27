@@ -6,6 +6,7 @@ dist/
 .pytest_cache/
 .ruff_cache/
 .venv
+.uv-cache/
 venv/
 
 # stato runtime dell'harness
@@ -14,6 +15,7 @@ agent_memories.json
 
 # preferenze utente
 agent_settings.json
+*.mobile.json
 
 # archivi e istantanee: pesano e si rigenerano
 *.zip

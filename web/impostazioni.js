@@ -39,6 +39,7 @@ const IMP_TRATTI = {
   sandbox: '<path d="m12 3 8.5 4.5v9L12 21l-8.5-4.5v-9z"/><path d="M3.5 7.5 12 12l8.5-4.5M12 12v9"/>',
   anteprime: '<path d="M2.5 12S6 5.5 12 5.5 21.5 12 21.5 12 18 18.5 12 18.5 2.5 12 2.5 12z"/><circle cx="12" cy="12" r="3"/>',
   aspetto: '<circle cx="12" cy="12" r="8.5"/><path d="M12 3.5v17a8.5 8.5 0 0 0 0-17z" fill="currentColor" stroke="none"/>',
+  mobile: '<rect x="6.5" y="2.5" width="11" height="19" rx="2.5"/><path d="M10 5h4M11 18.5h2"/>',
   info: '<circle cx="12" cy="12" r="8.5"/><path d="M12 11v5.5M12 7.8h.01"/>',
   cerca: '<circle cx="10.5" cy="10.5" r="6"/><path d="m15 15 5 5"/>',
   chiudi: '<path d="M6 6l12 12M18 6 6 18"/>',
@@ -639,6 +640,12 @@ const IMP_SEZIONI = [
     ],
   },
   {
+    id: 'mobile', gruppoNav: 'Applicazione', icona: 'mobile', titolo: 'Mobile',
+    descr: 'Associa il telefono a questo desktop e porta con te le tue chat.',
+    alMostrare: () => impCaricaMobile(),
+    blocchi: [{ speciale: 'mobile', cerca: 'telefono smartphone associa dispositivo QR code wifi rete revoca collegamento' }],
+  },
+  {
     id: 'info', gruppoNav: 'Applicazione', icona: 'info', titolo: 'Informazioni',
     descr: 'Versione, stato dell\'installazione, backup e scorciatoie.',
     alMostrare: () => impCaricaDiagnostica(),
@@ -657,7 +664,7 @@ const IMP_FUORI_MENU = {
   workspace_dir: 'Si sceglie dal percorso in cima alla chat.',
   recent_workspaces: 'Si usano dal percorso in cima alla chat.',
   progetti: 'Si gestiscono dalla colonna di sinistra e dalla schermata di ogni progetto.',
-  mobile_token: 'La crea l\'avvio con --mobile.',
+  mobile_token: 'Chiave delle versioni precedenti, non più accettata. L’associazione si gestisce in Mobile.',
   agent_running: 'Stato del turno, non una preferenza.',
   pending_prompt: 'Stato del turno, non una preferenza.',
   last_usage: 'Stato del turno, non una preferenza.',
@@ -701,6 +708,13 @@ const Imp = {
   modoPrompt: null,
   diagnostica: null,
   importazione: null,
+  mobile: null,
+  mobileQr: null,
+  mobileTimer: null,
+  mobileBusy: false,
+  mobileLoading: false,
+  mobileRequest: 0,
+  mobileError: '',
   // Chiavi con un salvataggio in volo: la spia in alto dice "Salvataggio…"
   // finche' non tornano tutte.
   inVolo: new Set(),
@@ -1444,6 +1458,8 @@ function impChiudi() {
     impCerca('');
   }
   Imp.importazione = null;
+  impFermaMobile();
+  Imp.mobileQr = null;
   const prima = Imp.apertaDa;
   Imp.apertaDa = null;
   if (prima && typeof prima.focus === 'function' && document.contains(prima)) prima.focus();
@@ -1452,6 +1468,7 @@ function impChiudi() {
 function impSeleziona(id, { svuotaRicerca = false, fuoco = false } = {}) {
   const sez = IMP_SEZIONI.find((s) => s.id === id);
   if (!sez) return;
+  if (id !== 'mobile') impFermaMobile();
   if (svuotaRicerca && $('#imp-cerca') && $('#imp-cerca').value) {
     $('#imp-cerca').value = '';
     impCerca('');
@@ -2118,6 +2135,129 @@ function impDisegnaMemorie() {
     lista.appendChild(riga);
   });
   impDisegnaStati();
+}
+
+// ---------------------------------------------------------------------------
+// Mobile
+// ---------------------------------------------------------------------------
+
+function impFermaMobile() {
+  clearTimeout(Imp.mobileTimer);
+  Imp.mobileTimer = null;
+}
+
+async function impCaricaMobile() {
+  impFermaMobile();
+  if (Imp.mobileLoading || Imp.mobileBusy) return;
+  Imp.mobileLoading = true;
+  const request = ++Imp.mobileRequest;
+  try {
+    const result = await api('/api/mobile');
+    if (request !== Imp.mobileRequest) return;
+    Imp.mobile = result;
+    Imp.mobileError = Imp.mobile.error || '';
+    if (Imp.mobile.device || !Imp.mobile.pending_expires_at
+      || (Imp.mobileQr && Imp.mobileQr.expires_at !== Imp.mobile.pending_expires_at)) Imp.mobileQr = null;
+  } catch (error) {
+    if (request !== Imp.mobileRequest) return;
+    Imp.mobileError = error.message;
+    Imp.mobileQr = null;
+  } finally {
+    if (request === Imp.mobileRequest) {
+      Imp.mobileLoading = false;
+      impDisegnaMobile();
+      if (impAperta() && Imp.sezione === 'mobile') Imp.mobileTimer = setTimeout(impCaricaMobile, 2000);
+    }
+  }
+}
+
+async function impAzioneMobile(azione) {
+  if (Imp.mobileBusy) return;
+  Imp.mobileBusy = true;
+  ++Imp.mobileRequest;
+  Imp.mobileLoading = false;
+  Imp.mobileError = '';
+  impFermaMobile();
+  impDisegnaMobile();
+  try {
+    if (azione === 'revoca') {
+      await api('/api/mobile/pairing', { method: 'DELETE' });
+      Imp.mobileQr = null;
+    } else {
+      Imp.mobileQr = await api('/api/mobile/pairing', { method: 'POST' });
+    }
+  } catch (error) {
+    Imp.mobileError = error.message;
+    Imp.mobileQr = null;
+  } finally {
+    Imp.mobileBusy = false;
+    // Conserva un errore dell'azione finché l'utente riprova.
+    if (Imp.mobileError) impDisegnaMobile();
+    else await impCaricaMobile();
+  }
+}
+
+function impDisegnaMobile() {
+  const nodo = $('#imp-mobile');
+  if (!nodo) return;
+  const d = Imp.mobile || {};
+  const qr = Imp.mobileQr;
+  const disabled = Imp.mobileBusy ? ' disabled' : '';
+  const data = (value) => new Date(value * 1000).toLocaleString('it-IT');
+  const intro = '<section class="imp-gruppo"><div class="imp-carta imp-mobile-intro">'
+    + `<div class="imp-mobile-simbolo">${impIcona('mobile')}</div>`
+    + '<div><h4>Continua dal telefono</h4><p class="imp-descr">Le stesse chat, lo stesso desktop. '
+    + 'Collega entrambi alla stessa rete Wi-Fi e mantieni aperta l’applicazione sul computer.</p></div></div></section>';
+  let corpo = '';
+  if (d.device) {
+    corpo = '<h4 class="imp-gruppo-titolo">Dispositivo associato</h4><div class="imp-carta imp-kv-lista">'
+      + impKv('Telefono', `${impIcona('spunta')} ${esc(d.device.name)}`)
+      + impKv('Desktop', esc(d.desktop || 'Questo computer'))
+      + impKv('Associato il', esc(data(d.device.paired_at)))
+      + impKv('Collegamento', d.running ? 'Attivo' : 'Da riattivare')
+      + '</div><p class="imp-descr">L’accesso è consentito solo al browser associato. '
+      + 'Per cambiare telefono o browser, revoca prima questa associazione.</p>'
+      + (d.url ? `<p class="imp-descr">Dal telefono associato: <span class="imp-mobile-url">${esc(d.url)}</span></p>` : '')
+      + '<div class="imp-azioni">'
+      + (!d.running ? `<button type="button" class="btn" id="imp-mobile-avvia"${disabled}>Riattiva collegamento</button>` : '')
+      + `<button type="button" class="btn" id="imp-mobile-revoca"${disabled}>Revoca associazione</button></div>`;
+  } else if (qr && qr.expires_at * 1000 > Date.now()) {
+    const secondi = Math.max(0, Math.ceil(qr.expires_at - Date.now() / 1000));
+    corpo = '<h4 class="imp-gruppo-titolo">Associa il tuo telefono</h4><div class="imp-carta imp-mobile-pair">'
+      + `<img class="imp-mobile-qr" src="${esc(qr.qr)}" alt="QR code per associare il telefono a questo desktop" width="224" height="224">`
+      + '<div><ol><li>Apri la fotocamera del telefono.</li><li>Inquadra il QR code.</li>'
+      + '<li>Tocca <b>Associa questo telefono</b>.</li></ol>'
+      + `<p class="imp-descr" role="status">Scade tra ${Math.floor(secondi / 60)}:${String(secondi % 60).padStart(2, '0')}. Utilizzabile una sola volta.</p>`
+      + '<p class="imp-descr">Il collegamento vale per questo browser: usa quello con cui vuoi accedere alle chat.</p></div></div>'
+      + `<div class="imp-azioni"><button type="button" class="btn" id="imp-mobile-genera"${disabled}>Genera nuovo QR</button>`
+      + `<button type="button" class="btn" id="imp-mobile-revoca"${disabled}>Annulla</button></div>`;
+  } else {
+    corpo = '<div class="imp-carta imp-mobile-vuoto"><h4>Nessun telefono associato</h4>'
+      + '<p class="imp-descr">Genera un QR code e scansionalo dal telefono. Il primo browser che completa '
+      + 'l’associazione sarà l’unico a poter accedere. Il codice scade dopo 5 minuti.</p>'
+      + `<button type="button" class="btn" id="imp-mobile-genera"${disabled}>${impIcona('mobile')}${Imp.mobileBusy ? 'Preparazione…' : 'Associa telefono'}</button></div>`;
+  }
+  // Conserva il fuoco della tastiera quando il poll aggiorna la scadenza.
+  const focusId = nodo.contains(document.activeElement) ? document.activeElement.id : null;
+  nodo.innerHTML = intro + '<section class="imp-gruppo">' + corpo + '</section>'
+    + (Imp.mobileError ? `<p class="imp-mobile-errore" role="alert">${esc(Imp.mobileError)}</p>`
+      + '<button type="button" class="btn" id="imp-mobile-riprova">Riprova</button>'
+      + (d.error ? '<button type="button" class="btn" id="imp-mobile-revoca">Reimposta associazione</button>' : '') : '');
+  if ($('#imp-mobile-genera')) $('#imp-mobile-genera').onclick = () => impAzioneMobile('genera');
+  if ($('#imp-mobile-revoca')) $('#imp-mobile-revoca').onclick = () => impAzioneMobile('revoca');
+  if ($('#imp-mobile-avvia')) $('#imp-mobile-avvia').onclick = () => impAvviaMobile();
+  if ($('#imp-mobile-riprova')) $('#imp-mobile-riprova').onclick = () => impCaricaMobile();
+  if (focusId) document.getElementById(focusId)?.focus();
+}
+
+async function impAvviaMobile() {
+  try {
+    await api('/api/mobile/start', { method: 'POST' });
+    await impCaricaMobile();
+  } catch (error) {
+    Imp.mobileError = error.message;
+    impDisegnaMobile();
+  }
 }
 
 // ---------------------------------------------------------------------------

@@ -15,27 +15,16 @@ Avvio: ``python run_mobile.py`` (ascolta su 0.0.0.0:8200, visibile in LAN).
 L'indirizzo del server principale si cambia con ``--upstream`` o con la
 variabile d'ambiente ``HARNESS_UPSTREAM``.
 
-## Perche' c'e' un token
-
-``0.0.0.0`` vuol dire "chiunque sia sulla rete". Dietro questo ponte c'e' un
-agente che esegue comandi sul computer dell'utente: senza una chiave, il
-telefono del vicino di casa -- o qualunque cosa parli sul Wi-Fi
-dell'aeroporto -- avrebbe la stessa autorita' del padrone di casa. Il token
-viaggia nell'URL (``?k=...``) e poi vive in un cookie: un gesto solo, la
-prima volta che si apre il link.
-
-E' **stabile**: si genera una volta e si salva nelle preferenze. Una chiave
-nuova ad ogni avvio renderebbe l'interfaccia non installabile -- l'icona sulla
-schermata home aprirebbe ogni giorno un indirizzo scaduto.
+L'accesso richiede il cookie del solo browser associato dal desktop.
+Il QR e' monouso; la credenziale non compare in URL, manifest o log.
 """
-
 from __future__ import annotations
 
 import hashlib
 import json
 import os
-import secrets
 import asyncio
+import time
 from pathlib import Path
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -43,8 +32,9 @@ from typing import Any
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request, Response
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
+from core.mobile_pairing import DEVICE_TTL
 from server.security import browser_request_allowed, API_TOKEN_ENV, API_TOKEN_HEADER, MAX_REQUEST_BYTES
 
 WEB_MOBILE_DIR = Path(__file__).resolve().parent.parent / "web_mobile"
@@ -108,108 +98,137 @@ async def close_client() -> None:
         _client = None
 
 
-TOKEN_ENV = "HARNESS_MOBILE_TOKEN"
-COOKIE = "harness_mobile"
-# Trenta giorni: il telefono si ricollega da solo per un mese, poi il link va
-# riaperto. Piu' corto sarebbe una seccatura quotidiana, piu' lungo un cookie
-# che nessuno ricorda di avere.
-COOKIE_MAX_AGE = 30 * 24 * 3600
+COOKIE = "harness_mobile_device"
+COOKIE_MAX_AGE = DEVICE_TTL
+PRIVATE_HEADERS = {
+    "Referrer-Policy": "no-referrer",
+    "Cache-Control": "no-store",
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+}
 
 
-def _uguale(presentato: str, atteso: str) -> bool:
-    """Confronto a tempo costante che non esplode su input arbitrario.
-
-    ``secrets.compare_digest`` su due ``str`` pretende che siano entrambe
-    ASCII: con un carattere accentato nel parametro ``?k=`` -- che chiunque
-    puo' mettere -- solleva ``TypeError``, e il ponte rispondeva 500 invece di
-    401. Confrontando i byte il problema non esiste, e la proprieta' di tempo
-    costante resta.
-    """
-    return secrets.compare_digest(
-        presentato.encode("utf-8", "surrogatepass"),
-        atteso.encode("utf-8", "surrogatepass"),
-    )
+def remember_device(response: Response, request: Request, credential: str) -> None:
+    # Strict omette il cookie quando il telefono rientra da un link esterno,
+    # pur conservandolo su disco. Lax consente la navigazione GET alla pagina;
+    # il controllo di origine resta obbligatorio per API e associazione POST.
+    response.set_cookie(COOKIE, credential, max_age=COOKIE_MAX_AGE,
+                        expires=COOKIE_MAX_AGE, path="/", httponly=True,
+                        samesite="lax", secure=request.url.scheme == "https")
 
 
-def token() -> str:
-    """La chiave d'accesso di questo ponte, la stessa ad ogni avvio.
-
-    Si legge **alla chiamata**, non all'import: ``run.py`` la imposta prima di
-    sollevare il thread, e i test la sostituiscono con una loro.
-
-    L'ordine e' ambiente, preferenze, e solo in ultimo una chiave nuova --
-    che viene subito **salvata**. Generarne una diversa ad ogni avvio
-    renderebbe impossibile installare l'interfaccia sul telefono: l'icona
-    sulla schermata home aprirebbe un indirizzo con la chiave di ieri.
-    """
-    esistente = os.environ.get(TOKEN_ENV)
-    if esistente:
-        return esistente
-
-    from core import settings as settings_mod
-
-    preferenze = settings_mod.load_settings()
-    salvata = str(preferenze.get("mobile_token") or "").strip()
-    if not salvata:
-        salvata = secrets.token_urlsafe(9)
-        preferenze["mobile_token"] = salvata
-        settings_mod.save_settings(preferenze)
-        print(f"  Chiave dell'interfaccia mobile: {salvata}  (ora e' salvata: non cambiera' piu')")
-    os.environ[TOKEN_ENV] = salvata
-    return salvata
+async def register_bridge() -> None:
+    """La scheda desktop vede anche il ponte avviato con run_mobile.py."""
+    while True:
+        try:
+            await get_client().post("api/mobile/bridge", json={
+                "port": int(os.environ.get("HARNESS_MOBILE_PORT", "8200"))}, timeout=5)
+        except httpx.HTTPError:
+            pass  # il desktop potrebbe essere ancora in avvio
+        await asyncio.sleep(10)
 
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    token()  # generata e stampata all'avvio, non alla prima richiesta
-    yield
-    await close_client()
+    task = asyncio.create_task(register_bridge())
+    try:
+        yield
+    finally:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        await close_client()
 
 
-app = FastAPI(title="Harness Mobile", docs_url=None, redoc_url=None, lifespan=lifespan)
+app = FastAPI(title="Harness Mobile", docs_url=None, redoc_url=None, openapi_url=None,
+              lifespan=lifespan)
+
+
+async def device_authorized(credential: str) -> bool:
+    if not credential or len(credential) > 128:
+        return False
+    try:
+        response = await get_client().post("api/mobile/authorize",
+                                           json={"credential": credential}, timeout=5)
+        response.raise_for_status()
+        data = response.json()
+        if not isinstance(data, dict):
+            raise ValueError("Risposta non valida")
+        return data.get("authorized") is True
+    except (httpx.HTTPError, ValueError) as exc:
+        raise HTTPException(503, "Desktop non raggiungibile. Riprova quando è acceso.") from exc
 
 
 @app.middleware("http")
-async def guardia_del_token(request: Request, call_next):
-    """Nessuna risposta senza chiave, nemmeno un file statico.
-
-    Tre modi per portarla, in ordine di comodita': la query ``?k=`` (il link
-    che si apre la prima volta), il cookie che quella query lascia, e
-    l'intestazione ``X-Harness-Token`` per chi chiama da uno script.
-    """
-    if not browser_request_allowed(request.scope, request.headers):
+async def guardia_dispositivo(request: Request, call_next):
+    # Link, preferiti e fotocamera possono navigare alla pagina iniziale.
+    # Nessuna eccezione per fetch, iframe, API o richieste che modificano dati.
+    public_navigation = (request.url.path in {"/", "/pair"} and request.method == "GET"
+                         and request.headers.get("sec-fetch-mode", "navigate") == "navigate"
+                         and request.headers.get("sec-fetch-dest", "document") == "document")
+    if not public_navigation and not browser_request_allowed(request.scope, request.headers):
         return JSONResponse({"detail": "Origine non autorizzata."}, status_code=403)
-    atteso = token()
-    dalla_query = request.query_params.get("k") or ""
-    presentate = (
-        dalla_query,
-        request.headers.get("x-harness-token") or "",
-        request.cookies.get(COOKIE) or "",
-    )
-    # Basta che UNA sia giusta, non la prima in ordine: un cookie valido non
-    # deve perdere contro un'intestazione vecchia rimasta appesa a un client.
-    # compare_digest e non ``==``: il confronto a tempo costante e' gratis.
-    if not any(_uguale(c, atteso) for c in presentate):
-        return JSONResponse(
-            {
-                "detail": (
-                    "Chiave mancante o sbagliata. Apri l'indirizzo completo "
-                    "stampato dal terminale, quello che finisce con ?k=..."
-                )
-            },
-            status_code=401,
-        )
-    risposta = await call_next(request)
-    risposta.headers["Referrer-Policy"] = "no-referrer"
-    risposta.headers["Cache-Control"] = "no-store"
-    if dalla_query:
-        # Arrivata dalla query: la si deposita, cosi' le richieste della
-        # pagina (fetch, EventSource, immagini) non devono portarsela dietro.
-        risposta.set_cookie(
-            COOKIE, atteso, max_age=COOKIE_MAX_AGE, httponly=True, samesite="lax",
-            secure=request.url.scheme == "https",
-        )
-    return risposta
+    credential = request.cookies.get(COOKIE, "")
+    try:
+        allowed = request.url.path == "/pair" or await device_authorized(credential)
+    except HTTPException as exc:
+        return JSONResponse({"detail": exc.detail}, status_code=exc.status_code,
+                            headers={"Cache-Control": "no-store"})
+    if not allowed:
+        detail = "Dispositivo non associato. Apri Impostazioni → Mobile sul desktop e scansiona il QR."
+        if request.url.path == "/":
+            # Un vecchio cookie Strict può mancare solo nella navigazione iniziale.
+            # La pagina riprova dalla propria origine; non crea nuove credenziali.
+            return HTMLResponse((WEB_MOBILE_DIR / "access.html").read_text(encoding="utf-8"),
+                                status_code=401, headers=PRIVATE_HEADERS)
+        return JSONResponse({"detail": detail}, status_code=401, headers={"Cache-Control": "no-store"})
+    response = await call_next(request)
+    response.headers.update(PRIVATE_HEADERS)
+    if request.url.path == "/" and request.method == "GET" and response.status_code == 200:
+        remember_device(response, request, credential)
+    return response
+
+
+@app.post("/api/mobile/session")
+async def resume_session(request: Request) -> JSONResponse:
+    """Conferma il cookie già autorizzato dalla guardia e migra i vecchi Strict."""
+    response = JSONResponse({"ok": True})
+    remember_device(response, request, request.cookies[COOKIE])
+    return response
+
+
+@app.get("/pair")
+def pairing_page() -> HTMLResponse:
+    return HTMLResponse((WEB_MOBILE_DIR / "pair.html").read_text(encoding="utf-8"))
+
+
+@app.post("/pair")
+async def pair(request: Request) -> JSONResponse:
+    try:
+        # Un codice QR e' corto: non accettiamo upload su questa rotta pubblica.
+        body = bytearray()
+        async with asyncio.timeout(5):
+            async for chunk in request.stream():
+                body.extend(chunk)
+                if len(body) > 1024:
+                    raise HTTPException(413, "Richiesta troppo grande.")
+        data = json.loads(body)
+        code = data.get("code") if isinstance(data, dict) else None
+        if not isinstance(code, str) or not 1 <= len(code) <= 128:
+            raise HTTPException(400, "Codice non valido.")
+        result = await get_client().post("api/mobile/claim", json={
+            "code": code, "user_agent": request.headers.get("user-agent", "")[:512]}, timeout=5)
+    except (ValueError, UnicodeError) as exc:
+        raise HTTPException(400, "Codice non valido.") from exc
+    except (httpx.HTTPError, TimeoutError) as exc:
+        raise HTTPException(503, "Desktop non raggiungibile. Riprova quando è acceso.") from exc
+    if result.status_code != 200:
+        return JSONResponse({"detail": "QR scaduto o già utilizzato. Generane uno nuovo dal desktop."}, status_code=401)
+    response = JSONResponse({"ok": True})
+    remember_device(response, request, result.json()["credential"])
+    return response
 
 
 # ---------------------------------------------------------------------------
@@ -253,6 +272,8 @@ def _filtered_headers(headers: Any) -> dict[str, str]:
     methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
 )
 async def proxy_api(path: str, request: Request) -> StreamingResponse:
+    if path == "mobile" or path.startswith("mobile/"):
+        raise HTTPException(403, "Gestisci l'associazione dal desktop.")
     async def read_body() -> bytes:
         body = bytearray()
         async for block in request.stream():
@@ -268,12 +289,14 @@ async def proxy_api(path: str, request: Request) -> StreamingResponse:
     headers = {
         k: v for k, v in _filtered_headers(request.headers).items()
         if k.lower() not in {"cookie", "authorization", "x-harness-token", API_TOKEN_HEADER,
-                             "origin", "referer", "sec-fetch-site", "forwarded", "x-forwarded-for"}
+                             "origin", "referer", "sec-fetch-site", "forwarded", "x-forwarded-for",
+                             "x-harness-mobile"}
     }
     headers["origin"] = str(client.base_url).rstrip("/")
     headers[API_TOKEN_HEADER] = os.environ.get(API_TOKEN_ENV, "")
-    # La chiave del ponte non deve proseguire verso il server principale: li'
-    # non significa niente e finirebbe nei log di un altro processo.
+    headers["x-harness-mobile"] = "1"
+    # Scarta anche il vecchio parametro di accesso: non autentica più e non
+    # deve finire nei log del desktop.
     parametri = {k: v for k, v in request.query_params.items() if k != "k"}
     try:
         # Il pattern cattura il percorso DOPO "/api": va rimesso il prefisso,
@@ -299,8 +322,33 @@ async def proxy_api(path: str, request: Request) -> StreamingResponse:
 
     async def flow() -> AsyncIterator[bytes]:
         try:
-            async for chunk in upstream_response.aiter_bytes():
-                yield chunk
+            # Anche una connessione SSE gia' aperta perde accesso dopo la revoca.
+            iterator = upstream_response.aiter_bytes().__aiter__()
+            pending = asyncio.create_task(anext(iterator, None))
+            checked_at = time.monotonic()
+            try:
+                while True:
+                    done, _ = await asyncio.wait({pending}, timeout=1)
+                    if time.monotonic() - checked_at >= 1:
+                        try:
+                            allowed = await device_authorized(request.cookies.get(COOKIE, ""))
+                        except HTTPException:
+                            allowed = False
+                        if not allowed:
+                            break
+                        checked_at = time.monotonic()
+                    if done:
+                        chunk = pending.result()
+                        if chunk is None:
+                            break
+                        yield chunk
+                        pending = asyncio.create_task(anext(iterator, None))
+            finally:
+                pending.cancel()
+                try:
+                    await pending
+                except asyncio.CancelledError:
+                    pass
         finally:
             await upstream_response.aclose()
 
@@ -361,25 +409,14 @@ def _asset_version() -> str:
 
 @app.get("/manifest.webmanifest")
 def manifest() -> Response:
-    """Il manifest, con la chiave dentro ``start_url``.
-
-    E' la riga che rende installabile l'interfaccia: quando si aggiunge alla
-    schermata home, il telefono si ricorda ``start_url``, e se li' non ci
-    fosse la chiave l'icona aprirebbe un 401 ogni volta che il cookie e'
-    scaduto o e' stato ripulito. Servito da qui e non come file statico
-    perche' la chiave si sa solo a processo avviato.
-    """
-    # Il file manca solo se l'installazione e' incompleta, e allora un 500 e'
-    # la risposta sbagliata: il telefono smette di installare l'app e non dice
-    # perche'. Un manifest minimo lo tiene installabile, e il nome che compare
-    # sotto l'icona dice gia' che qualcosa non e' a posto.
+    """Nessuna credenziale nel manifest: l'accesso resta nel cookie HttpOnly."""
     try:
         dati = json.loads(
             (WEB_MOBILE_DIR / "manifest.webmanifest").read_text(encoding="utf-8")
         )
     except (OSError, json.JSONDecodeError):
         dati = {"name": "Harness (manifest mancante)", "display": "standalone"}
-    dati["start_url"] = f"/?k={token()}"
+    dati["start_url"] = "/"
     return Response(
         json.dumps(dati, ensure_ascii=False, indent=2),
         media_type="application/manifest+json",

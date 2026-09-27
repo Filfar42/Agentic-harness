@@ -64,6 +64,7 @@ from core import settings as settings_mod
 from core import libreria as libreria_mod
 from core import progetto as progetto_mod
 from server import previewhost
+from server import mobile_control
 from core.backend import (
     build_backend,
     chiudi_client,
@@ -156,17 +157,31 @@ async def lifespan(_app: FastAPI):
     # andare a fermare un processo che non esiste piu'.
     sandbox_mod.dimentica_marchi_vivi()
     autostart_docker()
+    try:
+        mobile_paired = bool(mobile_control.pairing().status()["device"])
+    except mobile_control.PairingError:
+        mobile_paired = False
+    if os.environ.get("HARNESS_DESKTOP_URL") and (
+        os.environ.get("HARNESS_MOBILE_AUTOSTART") == "1" or mobile_paired
+    ):
+        try:
+            await run_in_threadpool(mobile_control.start_bridge,
+                                    os.environ["HARNESS_DESKTOP_URL"])
+        except HTTPException as exc:
+            logging.getLogger(__name__).warning("Mobile non avviato: %s", exc.detail)
     yield
     # Il server delle anteprime si e' acceso alla prima pagina mostrata, in un
     # thread demone: un demone morirebbe comunque all'uscita, ma chiedere e'
     # piu' pulito che tagliare -- e con --reload il processo non esce affatto.
     previewhost.shutdown()
+    await run_in_threadpool(mobile_control.shutdown)
     # Stessa ragione: il client condiviso verso il backend tiene connessioni
     # keep-alive aperte, e con --reload il processo sopravvive al ricaricamento.
     chiudi_client()
 
 
 app = FastAPI(title=APP_NAME, version=APP_VERSION, lifespan=lifespan)
+app.include_router(mobile_control.router)
 RUNNERS = RunnerRegistry()
 # Lavori di preparazione dell'ambiente (accendere Docker, costruire
 # l'immagine). Sono dell'applicazione, non di una conversazione.

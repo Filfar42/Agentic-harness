@@ -24,8 +24,7 @@ import tests.test_agent_loop as fake
 from core import config as config_mod
 
 
-# Chiave del ponte usata da tutti i test: fissa e nota, invece di quella
-# generata a caso all'avvio.
+# Vecchia chiave condivisa: non deve piu' autenticare nessun telefono.
 CHIAVE = "chiave-di-prova-del-ponte"
 
 
@@ -68,12 +67,11 @@ def mobile(fake_ollama, tmp_path, monkeypatch):
     )
     monkeypatch.setattr(mobile_mod, "_client", upstream_client)
 
-    # La chiave del ponte: fissata qui invece di lasciarla generare, cosi' i
-    # test la conoscono. Viaggia come intestazione, che e' il terzo modo
-    # previsto (query, cookie, header) ed e' quello comodo per uno script.
-    monkeypatch.setenv(mobile_mod.TOKEN_ENV, CHIAVE)
+    from server.mobile_control import pairing
+    code, _ = pairing().create()
+    credential = pairing().claim(code, "Android")
 
-    with TestClient(mobile_mod.app, headers={"X-Harness-Token": CHIAVE}) as test_client:
+    with TestClient(mobile_mod.app, cookies={mobile_mod.COOKIE: credential}) as test_client:
         test_client.mobile = mobile_mod
         test_client.server = server_main
         yield test_client
@@ -372,6 +370,10 @@ def test_health_reports_unreachable_upstream(mobile):
     import httpx as _httpx
 
     spento = _httpx.AsyncClient(base_url="http://127.0.0.1:1/")
+    original_auth = mobile.mobile.device_authorized
+    async def authorized(_credential):
+        return True
+    mobile.mobile.device_authorized = authorized
     mobile.mobile._client = spento
     try:
         data = mobile.get("/api/mobile/health").json()
@@ -379,12 +381,17 @@ def test_health_reports_unreachable_upstream(mobile):
         assert data["detail"]
     finally:
         mobile.mobile._client = None
+        mobile.mobile.device_authorized = original_auth
 
 
 def test_api_error_is_a_clear_502_when_upstream_is_down(mobile):
     import httpx as _httpx
 
     spento = _httpx.AsyncClient(base_url="http://127.0.0.1:1/")
+    original_auth = mobile.mobile.device_authorized
+    async def authorized(_credential):
+        return True
+    mobile.mobile.device_authorized = authorized
     mobile.mobile._client = spento
     try:
         response = mobile.get("/api/sessions")
@@ -392,6 +399,7 @@ def test_api_error_is_a_clear_502_when_upstream_is_down(mobile):
         assert "run.py" in response.json()["detail"]
     finally:
         mobile.mobile._client = None
+        mobile.mobile.device_authorized = original_auth
 
 
 # ---------------------------------------------------------------------------
@@ -486,7 +494,12 @@ def test_proxy_api_forwards_method_path_query_body_and_headers(monkeypatch):
         transport=httpx.ASGITransport(app=upstream_spia),
         base_url="http://principale/",
     )
-    monkeypatch.setenv(mobile_mod.TOKEN_ENV, CHIAVE)
+    async def authorized(_credential):
+        return True
+    monkeypatch.setattr(mobile_mod, "device_authorized", authorized)
+    async def no_registration():
+        pass
+    monkeypatch.setattr(mobile_mod, "register_bridge", no_registration)
     try:
         with TestClient(mobile_mod.app) as client:
             risposta = client.post(
@@ -522,66 +535,26 @@ def test_proxy_api_forwards_method_path_query_body_and_headers(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_senza_chiave_il_ponte_non_apre(mobile):
-    """Il ponte ascolta su 0.0.0.0: dietro c'e' un agente che esegue comandi
-    sul computer di casa. Senza chiave non deve rispondere niente -- nemmeno
-    la pagina, nemmeno un file statico, nemmeno l'elenco delle chat."""
-    for percorso in ("/", "/static/app.js", "/api/sessions"):
-        risposta = mobile.get(percorso, headers={"X-Harness-Token": "sbagliata"})
+def test_senza_cookie_il_ponte_non_apre(mobile):
+    mobile.cookies.clear()
+    for percorso in ("/", "/static/app.js", "/api/sessions", "/manifest.webmanifest"):
+        risposta = mobile.get(percorso, headers={"X-Harness-Token": CHIAVE})
         assert risposta.status_code == 401, percorso
 
 
-def test_la_chiave_nell_indirizzo_lascia_un_cookie(mobile):
-    """Un gesto solo: si apre il link con ?k=, e da li' in poi il telefono
-    entra da solo -- le fetch della pagina non portano la query."""
-    aperta = mobile.get(f"/?k={CHIAVE}", headers={"X-Harness-Token": "sbagliata"})
-    assert aperta.status_code == 200
-    assert mobile.cookies.get(mobile.mobile.COOKIE) == CHIAVE
-
-    # Ora vale il cookie, anche con l'intestazione sbagliata.
-    dopo = mobile.get("/api/sessions", headers={"X-Harness-Token": "sbagliata"})
-    assert dopo.status_code == 200
+def test_la_vecchia_chiave_non_associa_un_dispositivo(mobile):
+    mobile.cookies.clear()
+    for percorso in (f"/?k={CHIAVE}", f"/api/sessions?k={CHIAVE}"):
+        assert mobile.get(percorso).status_code == 401
+    assert not mobile.cookies
 
 
-# ---------------------------------------------------------------------------
-# Installabile: chiave stabile e manifest che se la porta dietro
-# ---------------------------------------------------------------------------
-
-
-def test_la_chiave_non_cambia_fra_un_avvio_e_l_altro(tmp_path, monkeypatch):
-    """Il difetto che rendeva l'app non installabile.
-
-    L'indirizzo che si apre dal telefono contiene la chiave. Se ne nasce una
-    nuova ad ogni avvio, l'icona aggiunta alla schermata home punta a un
-    indirizzo scaduto: si installa oggi e domani da 401. La chiave si genera
-    una volta sola e si salva nelle preferenze.
-    """
-    from core import settings as settings_mod
-    from server import mobile as mobile_mod
-
-    monkeypatch.delenv(mobile_mod.TOKEN_ENV, raising=False)
-    monkeypatch.setattr(settings_mod, "SETTINGS_FILE", tmp_path / "impostazioni.json")
-
-    prima = mobile_mod.token()
-    assert prima, "una chiave ci deve essere"
-    assert settings_mod.load_settings()["mobile_token"] == prima, "e va salvata"
-
-    # Riavvio: ambiente pulito, stesse preferenze -> stessa chiave.
-    monkeypatch.delenv(mobile_mod.TOKEN_ENV, raising=False)
-    assert mobile_mod.token() == prima
-
-
-def test_il_manifest_porta_la_chiave_nello_start_url(mobile):
-    """Quello che rende l'icona sulla schermata home un'app che si apre.
-
-    Il manifest e' servito dal processo, non dal disco: la chiave si sa solo a
-    server avviato, e senza di lei ``start_url`` aprirebbe un 401 ogni volta
-    che il cookie e' scaduto o e' stato ripulito.
-    """
+def test_il_manifest_non_contiene_credenziali(mobile):
     risposta = mobile.get("/manifest.webmanifest")
     assert risposta.status_code == 200
     dati = risposta.json()
-    assert dati["start_url"] == f"/?k={CHIAVE}"
+    assert dati["start_url"] == "/"
+    assert mobile.cookies.get(mobile.mobile.COOKIE) not in risposta.text
     assert dati["scope"] == "/"
     assert dati["display"] == "standalone"
     # Le icone servono ad Android per l'installazione: se il ritaglio a cerchio

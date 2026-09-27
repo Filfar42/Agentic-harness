@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html lang="it">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>Accesso · Harness</title>
+<style>
+  :root { color-scheme: dark; font-family: system-ui, sans-serif; background: #11181b; color: #e8edeb; }
+  body { margin: 0; min-height: 100dvh; display: grid; place-items: center; }
+  main { max-width: 360px; padding: 32px; }
+  h1 { font-size: 26px; letter-spacing: -.6px; }
+  p { line-height: 1.6; color: #afbfbb; }
+  button { border: 0; border-radius: 12px; padding: 14px 20px; font: inherit;
+    font-weight: 600; background: #a3dbc9; color: #10261f; cursor: pointer; }
+  button:disabled { opacity: .5; cursor: default; }
+</style>
+<main>
+  <h1 id="title">Verifica dell’associazione</h1>
+  <p id="status" role="status" aria-live="polite">Ricollegamento al desktop…</p>
+  <button id="retry" type="button" disabled>Riprova</button>
+  <noscript>Attiva JavaScript per verificare l’associazione del telefono.</noscript>
+</main>
+<script>
+  const title = document.getElementById('title');
+  const status = document.getElementById('status');
+  const retry = document.getElementById('retry');
+  async function resume() {
+    retry.disabled = true;
+    try {
+      const response = await fetch('/api/mobile/session', {
+        method: 'POST', credentials: 'same-origin', cache: 'no-store',
+      });
+      if (response.ok) {
+        location.replace('/');
+        return;
+      }
+      if (response.status === 401) {
+        title.textContent = 'Associazione richiesta';
+        status.textContent = 'Apri questo indirizzo nello stesso browser usato per l’associazione. '
+          + 'Se hai usato la modalità privata o il lettore QR con un browser temporaneo, '
+          + 'revoca l’associazione da Impostazioni → Mobile e ripetila nel browser normale.';
+      } else {
+        title.textContent = 'Collegamento non disponibile';
+        status.textContent = 'Verifica che il desktop sia acceso e collegato alla stessa rete, poi riprova.';
+      }
+    } catch {
+      title.textContent = 'Collegamento non disponibile';
+      status.textContent = 'Controlla la connessione e riprova.';
+    } finally {
+      retry.disabled = false;
+    }
+  }
+  retry.onclick = resume;
+  resume();
+</script>
+</html>
