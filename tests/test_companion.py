@@ -451,6 +451,7 @@ def desktop(js: quickjs.Context) -> quickjs.Context:
       function renderNotes() {}
       function renderPreview() {}
       function renderHistory() {}
+      function allineaProgettoDellaChat() {}
       function resetUsage() {}
       function applyStats() {}
       function attachStream(id) { attached.push(id); }
@@ -607,7 +608,9 @@ def mobile(js: quickjs.Context) -> quickjs.Context:
       var opened = [];
       function openChat(id) { opened.push(id); }
     """)
-    _load_functions(js, "web_mobile/app.js", "renderSessions")
+    # La riga sta in ``rigaChat``: la stessa per le libere e per le chat dei
+    # progetti, raggruppate sopra.
+    _load_functions(js, "web_mobile/app.js", "rigaChat", "renderSessions")
     js.eval("renderSessions([{id: 'first', title: 'Primo'}, {id: 'second', title: 'Secondo'}]);")
     return js
 

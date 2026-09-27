@@ -1,0 +1,617 @@
+/* Progetti — colonna di sinistra, schermata del progetto, finestre, gocce.
+ *
+ * Solo i token di style.css: il tema scuro viene da se'. Le classi hanno il
+ * prefisso pr- come quelle delle impostazioni hanno imp-: si riconosce a
+ * colpo d'occhio a quale file appartiene una regola. La geometria delle
+ * schede e' quella del cruscotto (bordo, raggio 14, niente ombra), cosi' la
+ * schermata del progetto e la colonna di destra sembrano la stessa famiglia. */
+
+:root {
+  /* Sei tinte per riconoscere i progetti a colpo d'occhio nella colonna. Sono
+     tinte e non colori pieni: stanno sotto il testo, e la lettera sopra deve
+     restare leggibile. */
+  --pr-t0: #0b7169;
+  --pr-t1: #4c5fc7;
+  --pr-t2: #a26a12;
+  --pr-t3: #b8465f;
+  --pr-t4: #2f7d4f;
+  --pr-t5: #7b55bf;
+  /* I tipi della memoria: una tinta per tipo, per il pallino e basta. */
+  --pr-decisione: var(--accent);
+  --pr-convenzione: #4c5fc7;
+  --pr-fatto: #72868a;
+  --pr-scartato: #b8465f;
+  --pr-aperto: #a26a12;
+}
+html[data-theme="dark"] {
+  --pr-t0: #68d5c4;
+  --pr-t1: #97a6ff;
+  --pr-t2: #e8be6a;
+  --pr-t3: #ff9eb4;
+  --pr-t4: #7ad6ad;
+  --pr-t5: #c3a6ff;
+  --pr-convenzione: #97a6ff;
+  --pr-fatto: #a5b8bd;
+  --pr-scartato: #ff9eb4;
+  --pr-aperto: #e8be6a;
+}
+
+/* ---------- colonna di sinistra ---------- */
+
+.progetti-sec {
+  flex: 0 0 var(--progetti-h, 50%); min-height: 0;
+  display: flex; flex-direction: column;
+}
+.progetti-label { border-top: 1px solid var(--border); padding-top: 10px; align-items: center; }
+.pr-label-azione {
+  margin-left: auto; width: 22px; height: 22px; border-radius: 6px;
+  display: grid; place-items: center; color: var(--text-faint);
+}
+.pr-label-azione:hover { color: var(--accent); background: var(--accent-soft); }
+#progetti { flex: 1 1 auto; min-height: 0; overflow-y: auto; padding: 0 6px 8px; }
+
+.pr-vuoto-colonna {
+  margin: 4px 8px 8px; padding: 12px 12px 13px;
+  border: 1px dashed var(--border-strong); border-radius: 10px;
+  font-size: 12px; line-height: 1.5; color: var(--text-muted);
+}
+.pr-vuoto-colonna strong { display: block; color: var(--text); font-weight: 600; margin-bottom: 2px; }
+.pr-vuoto-colonna button { margin-top: 8px; }
+
+.pr-nodo { position: relative; }
+.pr-riga { position: relative; display: flex; align-items: center; border-radius: 8px; }
+.pr-riga:hover, .pr-riga:focus-within { background: var(--hover-bg); }
+.pr-riga.attiva { background: var(--selected-bg); }
+.pr-riga.attiva::before {
+  content: ''; position: absolute; left: 2px; top: 50%; transform: translateY(-50%);
+  width: 2.5px; height: 15px; border-radius: 2px; background: var(--accent);
+}
+.pr-freccia {
+  flex: none; width: 18px; height: 26px; margin-left: 4px;
+  display: grid; place-items: center; color: var(--text-faint); border-radius: 5px;
+}
+.pr-freccia:hover { color: var(--text); }
+.pr-freccia .chev { transition: transform var(--motion-ui) var(--ease-out); }
+.pr-nodo.aperto > .pr-riga .pr-freccia .chev { transform: rotate(90deg); }
+.pr-apri {
+  flex: 1; min-width: 0; display: flex; align-items: center; gap: 8px;
+  padding: 5px 4px 5px 2px; text-align: left; font-size: 13px; color: var(--text-muted);
+}
+.pr-riga:hover .pr-apri, .pr-riga.attiva .pr-apri { color: var(--text); }
+.pr-riga.attiva .pr-apri { font-weight: 500; }
+.pr-nome { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pr-conto { flex: none; font-size: 10.5px; color: var(--text-faint); font-variant-numeric: tabular-nums; }
+.pr-riga.mancante .pr-nome { color: var(--text-faint); text-decoration: line-through; text-decoration-thickness: 1px; }
+.pr-riga.mancante .pr-avatar { opacity: 0.5; }
+
+/* La lettera del progetto. La tinta viene dal nome (``data-tinta``), cosi' lo
+   stesso progetto ha lo stesso colore ovunque: colonna, testata, goccia. */
+.pr-avatar {
+  --t: var(--pr-t0);
+  flex: none; width: 18px; height: 18px; border-radius: 5px;
+  display: grid; place-items: center;
+  font-size: 10.5px; font-weight: 700; line-height: 1;
+  color: var(--t); background: color-mix(in srgb, var(--t) 15%, var(--surface));
+  border: 1px solid color-mix(in srgb, var(--t) 28%, transparent);
+}
+[data-tinta="1"] { --t: var(--pr-t1); }
+[data-tinta="2"] { --t: var(--pr-t2); }
+[data-tinta="3"] { --t: var(--pr-t3); }
+[data-tinta="4"] { --t: var(--pr-t4); }
+[data-tinta="5"] { --t: var(--pr-t5); }
+.pr-avatar.grande { width: 44px; height: 44px; border-radius: 12px; font-size: 20px; }
+
+.pr-ramo { margin: 1px 0 5px 17px; padding-left: 8px; border-left: 1px solid var(--border); }
+.pr-ramo .session { font-size: 12.5px; padding-top: 4px; padding-bottom: 4px; }
+.pr-ramo-vuoto { padding: 4px 8px 6px; font-size: 11.5px; color: var(--text-faint); }
+
+/* Il ⋯ delle righe: compare al passaggio, come prima la ×. Un menu e non una
+   ×: cancellare era un clic solo, senza conferma, su un bersaglio da 18px. */
+.pr-piu {
+  flex: none; width: 22px; height: 22px; margin-right: 3px; border-radius: 6px;
+  display: grid; place-items: center; color: var(--text-faint);
+  opacity: 0;
+}
+.pr-riga:hover .pr-piu, .session:hover .pr-piu, .pr-piu[aria-expanded="true"],
+.pr-riga:focus-within .pr-piu, .session:focus-within .pr-piu, .pr-piu:focus-visible { opacity: 1; }
+.pr-piu:hover { color: var(--text); background: color-mix(in srgb, var(--text) 8%, transparent); }
+@media (hover: none) { .pr-piu { opacity: 1; } }
+
+/* Il titolo si rinomina sul posto. */
+.pr-rinomina {
+  flex: 1; min-width: 0; font: inherit; font-size: 13px; color: var(--text);
+  background: var(--surface); border: 1px solid var(--focus-ring); border-radius: 6px;
+  padding: 2px 6px; outline: none;
+}
+
+.pr-archiviate {
+  display: inline-flex; align-items: center; gap: 5px; margin: 6px 4px 4px; padding: 3px 6px;
+  font-size: 11.5px; color: var(--text-faint); border-radius: 6px;
+}
+.pr-archiviate:hover { color: var(--text); background: var(--hover-bg); }
+.pr-archiviate .chev { transition: transform var(--motion-ui) var(--ease-out); }
+.pr-archiviate[aria-expanded="true"] .chev { transform: rotate(90deg); }
+.session.archiviata .session-title { color: var(--text-faint); }
+
+/* ---------- menu contestuale ---------- */
+
+.pr-menu {
+  position: fixed; z-index: 70; min-width: 196px; max-width: 280px;
+  padding: 5px; border-radius: 11px;
+  background: var(--surface); border: 1px solid var(--border-strong);
+  box-shadow: 0 14px 34px rgba(6, 20, 24, 0.16), 0 2px 6px rgba(6, 20, 24, 0.08);
+  animation: surface-enter var(--motion-ui) var(--ease-out) both;
+}
+.pr-menu[hidden] { display: none; }
+html[data-theme="dark"] .pr-menu { box-shadow: 0 14px 34px rgba(0, 0, 0, 0.5); }
+.pr-menu-voce {
+  display: flex; align-items: center; gap: 9px; width: 100%;
+  padding: 6px 9px; border-radius: 7px; text-align: left;
+  font-size: 13px; color: var(--text);
+}
+.pr-menu-voce svg { flex: none; width: 15px; height: 15px; color: var(--text-muted); }
+.pr-menu-voce:hover, .pr-menu-voce:focus-visible { background: var(--hover-bg); outline: none; }
+.pr-menu-voce.pericolo { color: var(--err); }
+.pr-menu-voce.pericolo svg { color: var(--err); }
+.pr-menu-voce:disabled { opacity: 0.5; cursor: default; background: none; }
+.pr-menu-sep { height: 1px; margin: 4px 6px; background: var(--border); }
+.pr-menu-titolo {
+  padding: 6px 9px 3px; font-size: 10.5px; font-weight: 600; letter-spacing: 0.06em;
+  text-transform: uppercase; color: var(--text-faint);
+}
+.pr-menu-voce .pr-avatar { width: 16px; height: 16px; font-size: 9.5px; }
+.pr-menu-voce .spunta { margin-left: auto; color: var(--accent); }
+
+/* ---------- la goccia del progetto in alto ---------- */
+
+.pr-chip {
+  display: inline-flex; align-items: center; gap: 7px; flex: none; max-width: 220px;
+  padding: 4px 10px 4px 5px; border-radius: 999px;
+  border: 1px solid var(--border); background: var(--surface);
+  font-size: 12.5px; font-weight: 500; color: var(--text);
+}
+.pr-chip[hidden] { display: none; }
+.pr-chip:hover { border-color: var(--accent); background: var(--accent-soft); }
+.pr-chip .pr-avatar { width: 18px; height: 18px; }
+.pr-chip-nome { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* ---------- la schermata del progetto ---------- */
+
+/* Sulla schermata del progetto la colonna di destra sparisce: le sue schede
+   parlano di una conversazione, e qui non ce n'e' una. Il cruscotto del
+   progetto prende tutta la larghezza. */
+#app.pr-home-attiva { grid-template-columns: var(--sidebar-w) minmax(0, 1fr); }
+#app.pr-home-attiva.no-sidebar { grid-template-columns: minmax(0, 1fr); }
+#app.pr-home-attiva #panel, #app.pr-home-attiva #panel-grip { display: none; }
+
+#progetto-col { flex: 1; min-width: 0; overflow-y: auto; container-type: inline-size; }
+#progetto-col[hidden] { display: none; }
+.pr-home { max-width: 1120px; margin: 0 auto; padding: 34px 32px 48px; }
+
+.pr-testa { display: flex; align-items: flex-start; gap: 16px; }
+.pr-titoli { flex: 1; min-width: 0; }
+.pr-titoli h1 {
+  margin: 0; font-size: 26px; line-height: 1.2; font-weight: 650; letter-spacing: -0.02em;
+  overflow-wrap: anywhere;
+}
+.pr-descr {
+  margin: 5px 0 0; font-size: 14px; line-height: 1.55; color: var(--text-muted);
+  white-space: pre-wrap; overflow-wrap: anywhere;
+}
+.pr-meta {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 6px 14px; margin-top: 10px;
+  font-size: 12px; color: var(--text-faint);
+}
+.pr-meta > * { display: inline-flex; align-items: center; gap: 5px; }
+.pr-meta svg { width: 13px; height: 13px; flex: none; }
+.pr-cartella {
+  max-width: 420px; font-family: var(--mono); font-size: 11.5px; color: var(--text-muted);
+  padding: 1px 6px; margin: -1px -6px; border-radius: 6px;
+}
+.pr-cartella span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pr-cartella:hover { color: var(--accent); background: var(--accent-soft); }
+.pr-etichetta {
+  font-size: 10.5px; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase;
+  padding: 1px 6px; border-radius: 5px; border: 1px solid var(--border-strong); color: var(--text-muted);
+}
+.pr-azioni { display: flex; gap: 6px; flex: none; }
+.pr-bottone {
+  display: inline-flex; align-items: center; gap: 7px; height: 32px; padding: 0 12px;
+  border-radius: 9px; border: 1px solid var(--control-border); background: var(--surface);
+  font-size: 13px; font-weight: 500; color: var(--text);
+}
+.pr-bottone svg { width: 15px; height: 15px; flex: none; color: var(--text-muted); }
+.pr-bottone:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); background: var(--accent-soft); }
+.pr-bottone:hover:not(:disabled) svg { color: var(--accent); }
+.pr-bottone.solo-icona { width: 32px; padding: 0; justify-content: center; }
+.pr-bottone.primario { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
+.pr-bottone.primario svg { color: var(--on-accent); }
+.pr-bottone.primario:hover:not(:disabled) { background: var(--accent-hover); color: var(--on-accent); }
+.pr-bottone.primario:hover:not(:disabled) svg { color: var(--on-accent); }
+.pr-bottone.pericolo { color: var(--err); }
+.pr-bottone.pericolo:hover:not(:disabled) {
+  border-color: var(--err); color: var(--err); background: color-mix(in srgb, var(--err) 8%, var(--surface));
+}
+.pr-bottone:disabled { opacity: 0.5; cursor: default; }
+.pr-bottone.piccolo { height: 26px; padding: 0 9px; font-size: 12px; border-radius: 7px; }
+.pr-bottone.piccolo svg { width: 13px; height: 13px; }
+
+/* La casella della chat nuova: la stessa del composer vero, in piccolo. */
+.pr-composer {
+  display: flex; align-items: flex-end; gap: 8px; margin: 24px 0 22px;
+  padding: 10px 10px 10px 14px; border-radius: 14px;
+  border: 1px solid var(--control-border); background: var(--surface); box-shadow: var(--shadow-sm);
+  transition: border-color var(--motion-ui) var(--ease-out), box-shadow var(--motion-ui) var(--ease-out);
+}
+.pr-composer:focus-within { border-color: var(--focus-ring); box-shadow: 0 0 0 2px var(--focus-ring), var(--shadow-sm); }
+.pr-composer textarea {
+  flex: 1; min-width: 0; min-height: 26px; max-height: 220px; resize: none;
+  border: 0; outline: none; background: none; padding: 3px 0;
+  font-size: 14.5px; line-height: 1.55; color: var(--text);
+}
+.pr-invia {
+  flex: none; width: 34px; height: 34px; border-radius: 10px;
+  display: grid; place-items: center; background: var(--accent); color: var(--on-accent);
+}
+.pr-invia:hover:not(:disabled) { background: var(--accent-hover); }
+.pr-invia:disabled { opacity: 0.4; cursor: default; }
+.pr-composer-nota { margin: -14px 0 20px 4px; font-size: 11.5px; color: var(--text-faint); }
+
+/* Due colonne di schede che scendono ognuna per conto suo: la memoria cresce
+   in altezza, e una griglia a righe allineate lascerebbe buchi sotto le
+   schede corte. Sotto gli 860px di colonna diventano una sola, nell'ordine
+   in cui si leggono: dove eravamo, cosa si e' stabilito, le chat, il resto. */
+.pr-griglia { display: flex; gap: 16px; align-items: flex-start; }
+.pr-colonna { flex: 1 1 0; min-width: 0; display: flex; flex-direction: column; gap: 16px; }
+.pr-colonna.larga { flex-grow: 1.15; }
+@container (max-width: 860px) {
+  .pr-griglia { flex-direction: column; align-items: stretch; }
+  .pr-colonna { display: contents; }
+  .pr-scheda[data-scheda="riprendi"] { order: 1; }
+  .pr-scheda[data-scheda="memoria"] { order: 2; }
+  .pr-scheda[data-scheda="chat"] { order: 3; }
+  .pr-scheda[data-scheda="istruzioni"] { order: 4; }
+  .pr-scheda[data-scheda="libreria"] { order: 5; }
+  .pr-home { padding: 24px 18px 40px; }
+  .pr-testa { flex-wrap: wrap; }
+}
+
+.pr-scheda {
+  background: var(--surface); border: 1px solid var(--border); border-radius: 14px;
+  padding: 14px 16px 15px; min-width: 0;
+}
+.pr-scheda-testa { display: flex; align-items: center; gap: 8px; margin: -2px 0 10px; }
+.pr-scheda-testa h2 { margin: 0; font-size: 13.5px; font-weight: 650; letter-spacing: -0.005em; }
+.pr-conto-mono {
+  font-family: var(--mono); font-size: 11px; color: var(--text-faint); font-variant-numeric: tabular-nums;
+}
+.pr-scheda-testa .spinta { flex: 1; }
+.pr-sottotitolo { margin: -6px 0 10px; font-size: 12px; color: var(--text-faint); }
+.pr-sottotitolo a, .pr-link {
+  color: var(--accent); cursor: pointer; font-size: inherit; padding: 0; background: none;
+}
+.pr-link { display: inline-flex; align-items: center; gap: 4px; margin-top: 8px; font-size: 12px; font-weight: 500; }
+.pr-link:hover, .pr-sottotitolo a:hover { text-decoration: underline; }
+.pr-vuoto { font-size: 12.5px; line-height: 1.55; color: var(--text-faint); padding: 2px 0; }
+.pr-vuoto strong { color: var(--text-muted); font-weight: 600; }
+.pr-avviso {
+  margin: 0 0 10px; padding: 7px 10px; border-radius: 9px; font-size: 12px; line-height: 1.5;
+  background: var(--tint-warn); color: var(--text-muted); border: 1px solid color-mix(in srgb, var(--warn) 25%, transparent);
+}
+
+/* Riprendi da qui */
+.pr-riprendi-titolo {
+  display: flex; align-items: center; gap: 8px; width: 100%; text-align: left;
+  font-size: 14.5px; font-weight: 600; color: var(--text);
+}
+.pr-riprendi-titolo span:first-child { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pr-riprendi-titolo:hover span:first-child { color: var(--accent); }
+.pr-stato {
+  flex: none; display: inline-flex; align-items: center; gap: 5px;
+  padding: 1px 8px 1px 7px; border-radius: 999px; font-size: 11px; font-weight: 500;
+  border: 1px solid var(--border); color: var(--text-muted); background: var(--surface-alt);
+}
+.pr-stato i { width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+.pr-stato.ok { color: var(--ok); background: var(--tint-ok); border-color: color-mix(in srgb, var(--ok) 30%, transparent); }
+.pr-stato.warn { color: var(--warn); background: var(--tint-warn); border-color: color-mix(in srgb, var(--warn) 30%, transparent); }
+.pr-stato.vivo { color: var(--accent); background: var(--accent-soft); border-color: var(--accent-border); }
+.pr-stato.vivo i { animation: pulse 1.3s ease-in-out infinite; }
+.pr-stato.err { color: var(--err); border-color: color-mix(in srgb, var(--err) 30%, transparent); }
+.pr-quando { margin-top: 2px; font-size: 12px; color: var(--text-faint); }
+.pr-citazione {
+  margin: 10px 0 0; padding: 8px 11px; border-radius: 9px; background: var(--bg-subtle);
+  font-size: 13px; line-height: 1.55; color: var(--text-muted);
+  display: -webkit-box; -webkit-line-clamp: 4; -webkit-box-orient: vertical; overflow: hidden;
+}
+.pr-sottoblocco { margin-top: 12px; }
+.pr-sottoblocco-titolo {
+  display: flex; align-items: baseline; gap: 8px; margin-bottom: 5px;
+  font-size: 11px; font-weight: 600; letter-spacing: 0.05em; text-transform: uppercase; color: var(--text-faint);
+}
+.pr-barra { position: relative; flex: 1; height: 5px; border-radius: 3px; background: var(--hover-bg); overflow: hidden; align-self: center; }
+.pr-barra span { position: absolute; inset: 0 auto 0 0; background: var(--accent); border-radius: 3px; }
+.pr-punti { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 3px; }
+.pr-punti li { display: flex; gap: 8px; font-size: 13px; line-height: 1.45; color: var(--text); }
+.pr-punti li::before {
+  content: ''; flex: none; width: 8px; height: 8px; margin-top: 5px; border-radius: 50%;
+  border: 1.5px solid var(--text-faint);
+}
+.pr-punti li.doing::before { border-color: var(--accent); background: var(--accent); }
+.pr-punti li.aperto::before { border-color: var(--pr-aperto); border-style: dashed; }
+.pr-riprendi-azioni { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 14px; }
+
+/* Memoria */
+.pr-filtri { display: flex; flex-wrap: wrap; gap: 5px; margin: 0 0 10px; }
+.pr-filtro {
+  display: inline-flex; align-items: center; gap: 5px; padding: 2px 9px; border-radius: 999px;
+  font-size: 11.5px; color: var(--text-muted); border: 1px solid var(--border);
+}
+.pr-filtro b { font-weight: 500; color: var(--text-faint); font-variant-numeric: tabular-nums; }
+.pr-filtro:hover { border-color: var(--border-strong); color: var(--text); }
+.pr-filtro[aria-pressed="true"] { background: var(--selected-bg); border-color: var(--accent-border); color: var(--text); }
+.pr-tipo-segno { width: 7px; height: 7px; border-radius: 50%; flex: none; background: var(--c, var(--pr-fatto)); }
+[data-tipo="decisione"] { --c: var(--pr-decisione); }
+[data-tipo="convenzione"] { --c: var(--pr-convenzione); }
+[data-tipo="fatto"] { --c: var(--pr-fatto); }
+[data-tipo="scartato"] { --c: var(--pr-scartato); }
+[data-tipo="aperto"] { --c: var(--pr-aperto); }
+
+.pr-gruppo + .pr-gruppo { margin-top: 12px; }
+.pr-gruppo-titolo {
+  display: flex; align-items: center; gap: 6px; margin: 0 0 4px;
+  font-size: 11px; font-weight: 600; letter-spacing: 0.05em; text-transform: uppercase; color: var(--text-faint);
+}
+.pr-voce {
+  position: relative; display: flex; gap: 8px; align-items: flex-start;
+  padding: 6px 8px; margin: 0 -8px; border-radius: 8px;
+}
+.pr-voce:hover, .pr-voce:focus-within { background: var(--bg-subtle); }
+.pr-voce .pr-tipo-segno { margin-top: 6px; }
+.pr-voce-corpo { flex: 1; min-width: 0; }
+.pr-voce-testo { font-size: 13px; line-height: 1.5; color: var(--text); overflow-wrap: anywhere; }
+.pr-voce-meta { margin-top: 1px; font-size: 11px; color: var(--text-faint); display: flex; flex-wrap: wrap; gap: 3px 8px; }
+.pr-voce-meta button { color: inherit; font-size: inherit; }
+.pr-voce-meta button:hover { color: var(--accent); text-decoration: underline; }
+.pr-autore { display: inline-flex; align-items: center; gap: 3px; }
+.pr-autore.utente { color: var(--accent); }
+.pr-voce-azioni { display: flex; gap: 2px; opacity: 0; flex: none; }
+.pr-voce:hover .pr-voce-azioni, .pr-voce:focus-within .pr-voce-azioni { opacity: 1; }
+@media (hover: none) { .pr-voce-azioni { opacity: 1; } }
+.pr-mini {
+  width: 24px; height: 24px; border-radius: 6px; display: grid; place-items: center; color: var(--text-faint);
+}
+.pr-mini svg { width: 14px; height: 14px; }
+.pr-mini:hover { color: var(--text); background: color-mix(in srgb, var(--text) 8%, transparent); }
+.pr-mini.pericolo:hover { color: var(--err); background: color-mix(in srgb, var(--err) 10%, transparent); }
+.pr-voce.nuova { animation: pr-lampo 2.4s var(--ease-out) both; }
+@keyframes pr-lampo {
+  0%, 30% { background: color-mix(in srgb, var(--accent) 14%, transparent); }
+  100% { background: transparent; }
+}
+.pr-voce-conferma {
+  display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-top: 5px;
+  font-size: 12px; color: var(--text-muted);
+}
+
+/* Modulo di una voce (aggiunta e correzione) */
+.pr-modulo {
+  display: flex; flex-direction: column; gap: 7px; padding: 10px; margin: 0 0 10px;
+  border-radius: 10px; border: 1px solid var(--border-strong); background: var(--bg-subtle);
+}
+.pr-voce .pr-modulo { margin: 0; flex: 1; }
+.pr-modulo textarea, .pr-campo input, .pr-campo textarea, .pr-modulo select, .pr-campo select {
+  width: 100%; font: inherit; font-size: 13px; color: var(--text); line-height: 1.5;
+  background: var(--surface); border: 1px solid var(--control-border); border-radius: 8px;
+  padding: 6px 9px; outline: none; resize: vertical;
+}
+.pr-modulo select, .pr-campo select { width: auto; padding: 4px 8px; }
+.pr-modulo :is(textarea, select):focus-visible, .pr-campo :is(input, textarea, select):focus-visible {
+  border-color: var(--focus-ring); box-shadow: 0 0 0 1px var(--focus-ring); outline: none;
+}
+.pr-modulo-piede { display: flex; align-items: center; gap: 6px; }
+.pr-contatore { margin-left: auto; font-family: var(--mono); font-size: 11px; color: var(--text-faint); }
+.pr-contatore.oltre { color: var(--err); }
+
+/* Conversazioni */
+.pr-cerca {
+  display: flex; align-items: center; gap: 6px; height: 28px; padding: 0 8px; margin-left: auto;
+  width: 180px; max-width: 45%; border-radius: 8px; background: var(--hover-bg);
+  border: 1px solid transparent; color: var(--text-faint);
+}
+.pr-cerca:focus-within { border-color: var(--focus-ring); background: var(--surface); }
+.pr-cerca input { flex: 1; min-width: 0; border: 0; outline: none; background: none; font-size: 12.5px; color: var(--text); }
+.pr-cerca input::-webkit-search-cancel-button { display: none; }
+.pr-chat-elenco { display: flex; flex-direction: column; margin: 0 -8px; }
+.pr-chat {
+  position: relative; display: flex; align-items: center; gap: 8px; border-radius: 9px;
+}
+.pr-chat:hover, .pr-chat:focus-within { background: var(--bg-subtle); }
+.pr-chat-apri {
+  flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 1px;
+  padding: 7px 4px 7px 10px; text-align: left;
+}
+.pr-chat-titolo {
+  display: flex; align-items: center; gap: 7px;
+  font-size: 13.5px; color: var(--text); min-width: 0;
+}
+.pr-chat-titolo span:first-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pr-chat-meta { font-size: 11.5px; color: var(--text-faint); }
+.pr-chat .pr-piu { margin-right: 6px; }
+.pr-chat:hover .pr-piu, .pr-chat:focus-within .pr-piu { opacity: 1; }
+.pr-chat.archiviata .pr-chat-titolo { color: var(--text-muted); }
+.pr-piede-scheda { margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--border); }
+
+/* Istruzioni */
+.pr-istruzioni-testo {
+  font-size: 13px; line-height: 1.6; color: var(--text); white-space: pre-wrap; overflow-wrap: anywhere;
+  max-height: 11.5em; overflow: hidden; position: relative;
+}
+.pr-istruzioni-testo.tutto { max-height: none; }
+.pr-istruzioni-testo.tagliato::after {
+  content: ''; position: absolute; inset: auto 0 0 0; height: 2.4em;
+  background: linear-gradient(transparent, var(--surface));
+}
+
+/* Libreria */
+.pr-libreria { list-style: none; margin: 0 -8px; padding: 0; }
+.pr-libreria button {
+  display: flex; align-items: baseline; gap: 9px; width: 100%; padding: 5px 8px; border-radius: 8px; text-align: left;
+}
+.pr-libreria button:hover { background: var(--bg-subtle); }
+.pr-libreria .n { flex: none; font-family: var(--mono); font-size: 11px; color: var(--text-faint); width: 2.6em; }
+.pr-libreria .t { flex: 1; min-width: 0; font-size: 13px; color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* Scheletro di caricamento: righe grigie al posto del testo, non uno spinner
+   in mezzo alla pagina. */
+.pr-scheletro { display: flex; flex-direction: column; gap: 8px; }
+.pr-scheletro span {
+  display: block; height: 11px; border-radius: 6px; background: var(--hover-bg);
+  animation: pr-respiro 1.3s ease-in-out infinite;
+}
+.pr-scheletro span:nth-child(2) { width: 82%; }
+.pr-scheletro span:nth-child(3) { width: 64%; }
+@keyframes pr-respiro { 50% { opacity: 0.45; } }
+
+.pr-errore-pagina { max-width: 560px; margin: 80px auto; text-align: center; padding: 0 24px; }
+.pr-errore-pagina h2 { margin: 0 0 6px; font-size: 18px; }
+.pr-errore-pagina p { margin: 0 0 16px; color: var(--text-muted); font-size: 13.5px; }
+
+/* ---------- finestre (nuovo progetto, impostazioni, libreria) ---------- */
+
+.pr-velo {
+  position: fixed; inset: 0; z-index: 60; display: flex; align-items: center; justify-content: center;
+  padding: 24px; background: rgba(8, 18, 22, 0.52); backdrop-filter: blur(3px);
+  animation: imp-velo-entra var(--motion-ui) var(--ease-out) both;
+}
+.pr-velo[hidden] { display: none; }
+html[data-theme="dark"] .pr-velo { background: rgba(0, 0, 0, 0.58); }
+.pr-finestra {
+  width: min(560px, 100%); max-height: min(760px, 100%); display: flex; flex-direction: column;
+  background: var(--bg); color: var(--text); border: 1px solid var(--border); border-radius: 16px;
+  box-shadow: 0 28px 70px rgba(6, 20, 24, 0.30), 0 3px 10px rgba(6, 20, 24, 0.10);
+  overflow: hidden; animation: imp-entra 220ms var(--ease-out) both;
+}
+.pr-finestra.larga { width: min(760px, 100%); }
+html[data-theme="dark"] .pr-finestra { box-shadow: 0 28px 70px rgba(0, 0, 0, 0.55); }
+.pr-finestra-testa { display: flex; align-items: flex-start; gap: 12px; padding: 20px 22px 6px; }
+.pr-finestra-testa h2 { margin: 0; font-size: 17px; font-weight: 650; letter-spacing: -0.015em; }
+.pr-finestra-testa p { margin: 3px 0 0; font-size: 12.5px; color: var(--text-muted); line-height: 1.5; }
+.pr-finestra-testa .spinta { flex: 1; min-width: 0; }
+.pr-chiudi { flex: none; width: 30px; height: 30px; border-radius: 8px; display: grid; place-items: center; color: var(--text-muted); }
+.pr-chiudi:hover { background: var(--hover-bg); color: var(--text); }
+.pr-finestra-corpo { flex: 1; min-height: 0; overflow-y: auto; padding: 12px 22px 18px; display: flex; flex-direction: column; gap: 14px; }
+.pr-finestra-piede {
+  display: flex; align-items: center; gap: 8px; padding: 12px 22px; border-top: 1px solid var(--border);
+  background: var(--bg-subtle);
+}
+.pr-finestra-piede .spinta { flex: 1; }
+.pr-errore { font-size: 12.5px; color: var(--err); line-height: 1.45; }
+.pr-errore:empty { display: none; }
+
+.pr-campo { display: flex; flex-direction: column; gap: 5px; }
+.pr-campo > label, .pr-campo-titolo { font-size: 12.5px; font-weight: 600; color: var(--text); }
+.pr-campo-aiuto { font-size: 11.5px; color: var(--text-faint); line-height: 1.45; }
+.pr-campo .facoltativo { font-weight: 400; color: var(--text-faint); }
+.pr-campo input[aria-invalid="true"] { border-color: var(--err); }
+.pr-riga-campo { display: flex; gap: 6px; }
+.pr-riga-campo input { flex: 1; min-width: 0; font-family: var(--mono); font-size: 12px; }
+.pr-anteprima-percorso {
+  font-family: var(--mono); font-size: 11.5px; color: var(--text-muted); overflow-wrap: anywhere;
+  padding: 6px 9px; border-radius: 8px; background: var(--bg-subtle); border: 1px dashed var(--border-strong);
+}
+.pr-segmenti {
+  display: inline-flex; padding: 3px; gap: 2px; border-radius: 10px; background: var(--hover-bg); align-self: flex-start;
+}
+.pr-segmenti button {
+  padding: 4px 12px; border-radius: 8px; font-size: 12.5px; font-weight: 500; color: var(--text-muted);
+}
+.pr-segmenti button[aria-checked="true"] { background: var(--surface); color: var(--text); box-shadow: var(--shadow-sm); }
+.pr-interruttore { display: flex; gap: 11px; align-items: flex-start; cursor: pointer; }
+.pr-interruttore input { margin-top: 3px; accent-color: var(--accent); width: 15px; height: 15px; flex: none; }
+.pr-interruttore strong { display: block; font-size: 13px; font-weight: 600; }
+.pr-interruttore span { font-size: 12px; color: var(--text-muted); line-height: 1.5; }
+.pr-avanzate { border-top: 1px solid var(--border); padding-top: 12px; }
+.pr-avanzate > summary {
+  cursor: pointer; list-style: none; display: flex; align-items: center; gap: 6px;
+  font-size: 12px; font-weight: 600; letter-spacing: 0.05em; text-transform: uppercase; color: var(--text-faint);
+}
+.pr-avanzate > summary::-webkit-details-marker { display: none; }
+.pr-avanzate > summary .chev { transition: transform var(--motion-ui) var(--ease-out); }
+.pr-avanzate[open] > summary .chev { transform: rotate(90deg); }
+.pr-avanzate-corpo { display: flex; flex-direction: column; gap: 14px; padding-top: 12px; }
+.pr-zona-rischio {
+  display: flex; align-items: center; gap: 12px; padding: 11px 12px; border-radius: 10px;
+  border: 1px solid color-mix(in srgb, var(--err) 30%, var(--border));
+}
+.pr-zona-rischio div { flex: 1; min-width: 0; font-size: 12px; color: var(--text-muted); line-height: 1.5; }
+.pr-zona-rischio strong { display: block; color: var(--text); font-size: 13px; }
+
+.pr-lettura {
+  font-size: 13.5px; line-height: 1.65; color: var(--text);
+}
+.pr-lettura pre { white-space: pre-wrap; }
+
+/* ---------- la goccia della memoria in chat ---------- */
+
+.pr-goccia {
+  margin-top: 10px; border-radius: 10px; border: 1px solid var(--border);
+  background: var(--surface); font-size: 12.5px;
+}
+.pr-goccia > summary {
+  display: flex; align-items: center; gap: 8px; padding: 6px 10px; cursor: pointer; list-style: none;
+  color: var(--text-muted);
+}
+.pr-goccia > summary::-webkit-details-marker { display: none; }
+.pr-goccia > summary .chev { transition: transform var(--motion-ui) var(--ease-out); flex: none; }
+.pr-goccia[open] > summary .chev { transform: rotate(90deg); }
+.pr-goccia-segno {
+  flex: none; width: 16px; height: 16px; border-radius: 5px; display: grid; place-items: center;
+  background: var(--accent-soft); color: var(--accent);
+}
+.pr-goccia-segno svg { width: 11px; height: 11px; }
+.pr-goccia b { font-weight: 600; color: var(--text); }
+.pr-goccia .num { font-family: var(--mono); font-size: 11.5px; color: var(--accent); }
+.pr-goccia.muta > summary { cursor: default; }
+.pr-goccia.muta .pr-goccia-segno { background: var(--hover-bg); color: var(--text-faint); }
+.pr-goccia-corpo { padding: 2px 12px 10px 34px; display: flex; flex-direction: column; gap: 5px; }
+.pr-goccia-riga { display: flex; gap: 8px; line-height: 1.5; color: var(--text); }
+.pr-goccia-riga .op { flex: none; width: 12px; font-family: var(--mono); font-weight: 600; }
+.pr-goccia-riga .op.piu { color: var(--ok); }
+.pr-goccia-riga .op.tilde { color: var(--accent); }
+.pr-goccia-riga .op.meno { color: var(--err); }
+.pr-goccia-riga .tipo { color: var(--text-faint); }
+.pr-goccia-riga del { color: var(--text-faint); }
+.pr-goccia-prima { display: block; font-size: 11.5px; color: var(--text-faint); }
+.pr-goccia-vivo { display: flex; align-items: center; gap: 8px; margin-top: 10px; font-size: 12.5px; color: var(--text-muted); }
+.pr-goccia-vivo i {
+  width: 12px; height: 12px; border-radius: 50%; border: 2px solid var(--accent-border);
+  border-top-color: var(--accent); animation: pr-gira 0.8s linear infinite;
+}
+@keyframes pr-gira { to { transform: rotate(360deg); } }
+
+/* ---------- memoria nel pannello di destra ---------- */
+
+#pr-mem-card[hidden] { display: none; }
+#pr-mem-voci { display: flex; flex-direction: column; gap: 6px; }
+.pr-mem-riga { display: flex; gap: 7px; font-size: 12px; line-height: 1.45; color: var(--text); }
+.pr-mem-riga .pr-tipo-segno { margin-top: 5px; }
+.pr-mem-riga.nuova { animation: pr-lampo 2.4s var(--ease-out) both; border-radius: 5px; }
+.pr-mem-altre { font-size: 11.5px; color: var(--text-faint); }
+
+@media (prefers-reduced-motion: reduce) {
+  .pr-voce.nuova, .pr-mem-riga.nuova { animation: none; }
+}
+
+/* Le icone senza dimensione propria prendono quella del loro bottone. */
+.pr-invia svg { width: 16px; height: 16px; }
+.pr-chiudi svg { width: 16px; height: 16px; }
+.pr-piu svg { width: 14px; height: 14px; }
+.pr-cerca svg { width: 13px; height: 13px; flex: none; }
+.pr-chat-elenco > .pr-vuoto { padding: 2px 8px; margin: 0; }
+.pr-percorso-inline { font-family: var(--mono); font-size: 11.5px; color: var(--text); overflow-wrap: anywhere; }
+/* Su una finestra stretta la goccia del progetto tiene solo la lettera: il
+   nome sta nel suggerimento, e il modello e la cartella accanto servono di piu'. */
+@media (max-width: 900px) {
+  .pr-chip { padding: 3px; }
+  .pr-chip-nome { display: none; }
+}

@@ -310,34 +310,34 @@ def test_la_pagina_smette_di_essere_la_fonte_viva_quando_lo_stream_finisce():
     assert "showSession(payload);" in riallinea
 
 
-def test_il_confine_fra_conversazioni_e_vault_si_trascina():
-    """Quanto spazio meritino i vault dipende da quanti ne hai.
+def test_il_confine_fra_conversazioni_e_progetti_si_trascina():
+    """Quanto spazio meritino i progetti dipende da quanti ne hai.
 
-    Con le chat annidate sotto ogni vault la meta' fissa e' una scelta che va
-    bene a nessuno: chi ha un vault solo vuole vedere le conversazioni, chi ne
-    ha sei vuole il contrario. La maniglia e' la ``.col-grip`` girata di 90
-    gradi -- un solo gesto da imparare per tutti e quattro i divisori.
+    Con le chat annidate sotto ogni progetto la meta' fissa e' una scelta che
+    va bene a nessuno: chi ha un progetto solo vuole vedere le conversazioni,
+    chi ne ha sei vuole il contrario. La maniglia e' la ``.col-grip`` girata di
+    90 gradi -- un solo gesto da imparare per tutti e quattro i divisori.
     """
     html = (WEB / "index.html").read_text(encoding="utf-8")
-    css = (WEB / "style.css").read_text(encoding="utf-8")
+    css = (WEB / "style.css").read_text(encoding="utf-8") + (WEB / "progetti.css").read_text(encoding="utf-8")
     js = (WEB / "app.js").read_text(encoding="utf-8")
 
     # Sta **fra** i due elenchi, non sopra o sotto entrambi.
-    assert html.index('id="sessions"') < html.index('id="vaults-grip"')
-    assert html.index('id="vaults-grip"') < html.index('id="vaults-sec"')
+    assert html.index('id="sessions"') < html.index('id="progetti-grip"')
+    assert html.index('id="progetti-grip"') < html.index('id="progetti-sec"')
 
     assert "cursor: ns-resize" in css
-    assert "flex: 0 0 var(--vaults-h" in css
+    assert "flex: 0 0 var(--progetti-h" in css
     # Il cursore non torna freccia uscendo dagli 8px della maniglia.
     assert "body.resizing-rows" in css
 
     # Nessuno dei due lati si puo' annullare: un divisorio che puo' far
     # sparire una meta' e' un interruttore travestito.
-    corpo = js[js.index("function setVaultsHeight("):]
+    corpo = js[js.index("function setProgettiHeight("):]
     corpo = corpo[: corpo.index("\n}")]
-    assert "VAULTS_H_MIN" in corpo and "CONVERSAZIONI_H_MIN" in corpo
+    assert "PROGETTI_H_MIN" in corpo and "CONVERSAZIONI_H_MIN" in corpo
     # E la misura sopravvive al ricaricamento.
-    assert "localStorage.setItem(VAULTS_H_KEY" in corpo
+    assert "localStorage.setItem(PROGETTI_H_KEY" in corpo
 
 
 # ---------------------------------------------------------------------------

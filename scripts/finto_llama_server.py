@@ -111,9 +111,26 @@ async def chat(request: Request) -> Any:
             "usage": {"prompt_tokens": 100, "completion_tokens": 3}})
     tools = corpo.get("tools")
     passo = _passo(messaggi) if tools else 99
+    ultimo = str((messaggi[-1] if messaggi else {}).get("content") or "")
+    if "<aggiorna_memoria_del_progetto" in ultimo:
+        # La memoria del progetto a fine turno (core/memoria_progetto.py): una
+        # risposta JSON, senza pensiero e senza chiamate.
+        passo = MEMORIA
     prompt = _prompt_token(messaggi, tools)
     return StreamingResponse(_stream(passo, prompt, bool(corpo.get("return_progress"))),
                              media_type="text/event-stream")
+
+
+# Il passo finto della memoria del progetto: non e' un numero di tool.
+MEMORIA = -1
+RISPOSTA_MEMORIA = json.dumps({"operazioni": [
+    {"azione": "aggiungi", "tipo": "decisione",
+     "testo": "Il parser chiude le graffe annidate con una pila di livelli, non con le regex."},
+    {"azione": "aggiungi", "tipo": "convenzione",
+     "testo": "I test del parser stanno in test_parser.py e si lanciano con pytest -q."},
+    {"azione": "aggiungi", "tipo": "aperto",
+     "testo": "Mancano i test sui file con a capo CRLF."},
+]}, ensure_ascii=False)
 
 
 def _chunk(delta: dict[str, Any] | None = None, finish: str | None = None,
@@ -183,7 +200,10 @@ def _stream(passo: int, prompt: int, progresso: bool) -> Iterator[str]:
             yield _chunk({"tool_calls": [{"index": indice, "function": {
                 "arguments": testo[i:i + a_pezzi]}}]}, timings=timings())
 
-    if passo == 0:
+    if passo == MEMORIA:
+        yield from rispondi(RISPOSTA_MEMORIA)
+        fine = "stop"
+    elif passo == 0:
         yield from pensa(160)
         yield from chiama(0, "list_files", {"subfolder": "."})
         fine = "tool_calls"

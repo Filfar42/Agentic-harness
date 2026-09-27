@@ -28,7 +28,25 @@
     <button id="btn-new" class="icon-btn" title="Nuova chat">+</button>
   </header>
   <div id="conn-banner" class="banner hidden"></div>
-  <ul id="session-list" class="session-list"></ul>
+  <!-- Un solo scorrimento per due elenchi: prima i progetti, ognuno con le
+       sue chat a richiesta e la sua memoria in sola lettura, poi le
+       conversazioni libere. -->
+  <div id="elenco" class="elenco">
+    <div id="progetti-mobile" class="progetti-mobile"></div>
+    <div id="libere-titolo" class="gruppo-titolo hidden">Conversazioni</div>
+    <ul id="session-list" class="session-list"></ul>
+  </div>
+</div>
+
+<!-- La memoria di un progetto: si legge dal telefono, si scrive dal desktop. -->
+<div id="memoria-foglio" class="memoria-foglio hidden" role="dialog" aria-modal="true" aria-labelledby="memoria-titolo">
+  <div class="memoria-pannello">
+    <div class="memoria-testa">
+      <div><b id="memoria-titolo">Memoria</b><span id="memoria-conto"></span></div>
+      <button id="memoria-chiudi" class="icon-btn" type="button" title="Chiudi" aria-label="Chiudi">&#10005;</button>
+    </div>
+    <div id="memoria-elenco" class="memoria-elenco"></div>
+  </div>
 </div>
 
 <!-- Conversazione -->
@@ -40,6 +58,8 @@
       <!-- Modello e workspace della chat: solo lettura. Su un telefono non
            c'e' posto per dei selettori, e la scelta resta al desktop. -->
       <div class="chat-meta">
+        <!-- Il progetto della chat: toccandolo si legge la sua memoria. -->
+        <button id="chat-progetto" class="chat-progetto" type="button" hidden></button>
         <span id="chat-model"></span>
         <span class="meta-sep" hidden>·</span>
         <span id="chat-workspace"></span>

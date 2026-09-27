@@ -408,14 +408,190 @@ function nascondiAttivita() {
 
 async function loadSessions() {
   try {
-    // tutte=1: il telefono non ha i vault, quindi non ha nemmeno un modo di
-    // arrivare alle loro chat se il server gliele toglie dall'elenco.
-    const data = await api("/api/sessions?tutte=1");
+    // tutte=1: tutte le chat, con il progetto di ciascuna. Il raggruppamento
+    // lo fa il telefono: la colonna del desktop non c'e', e un elenco solo
+    // e' l'unico modo di arrivare dappertutto.
+    const [data, elenco] = await Promise.all([
+      api("/api/sessions?tutte=1"),
+      api("/api/progetti").catch(() => ({ progetti: [] })),
+    ]);
+    progettiNoti = elenco.progetti || [];
     renderSessions(data.sessions || []);
     setBanner(null);
   } catch (err) {
     setBanner(`Server principale non raggiungibile: ${err.message}`);
   }
+}
+
+// ---------------------------------------------------------------- progetti --
+//
+// Un progetto e' una cartella con le sue chat e una memoria che passa
+// dall'una all'altra (core/progetto.py). Sul telefono si vede, si apre e si
+// legge; la memoria si corregge dal desktop.
+
+let progettiNoti = [];
+const progettiAperti = new Set();
+const TIPI_MEMORIA = [
+  ["decisione", "Decisioni"], ["convenzione", "Convenzioni"], ["fatto", "Fatti"],
+  ["scartato", "Strade scartate"], ["aperto", "Lavori aperti"],
+];
+
+function iniziale(nome) {
+  const s = String(nome || "").trim();
+  return s ? [...s][0].toUpperCase() : "·";
+}
+
+function rigaChat(s) {
+  const li = document.createElement("li");
+  li.dataset.id = s.id;
+  li.tabIndex = 0;
+  li.setAttribute('role', 'button');
+
+  const title = document.createElement("div");
+  title.className = "session-title";
+  title.textContent = s.title || "(senza titolo)";
+  if (s.running) {
+    const badge = document.createElement("span");
+    badge.className = "badge-running";
+    badge.textContent = "in corso";
+    title.appendChild(badge);
+  }
+
+  const meta = document.createElement("div");
+  meta.className = "session-meta";
+  meta.textContent = fmtDate(s.updated_at);
+
+  li.append(title, meta);
+  li.addEventListener("click", () => openChat(s.id));
+  li.addEventListener('keydown', (event) => {
+    if (event.key === 'Enter' || event.key === ' ') {
+      event.preventDefault();
+      openChat(s.id);
+    }
+  });
+  return li;
+}
+
+function renderProgettiMobile(sessions) {
+  const box = $("progetti-mobile");
+  if (!box) return;
+  box.innerHTML = "";
+  if (!progettiNoti.length) return;
+  const titolo = document.createElement("div");
+  titolo.className = "gruppo-titolo";
+  titolo.textContent = "Progetti";
+  box.appendChild(titolo);
+  for (const p of progettiNoti) {
+    const sue = sessions.filter((s) => s.progetto && s.progetto.path === p.path);
+    // Aperto di serie il progetto con una chat al lavoro: e' quello che si
+    // cerca guardando il telefono.
+    if (sue.some((s) => s.running)) progettiAperti.add(p.path);
+    const aperto = progettiAperti.has(p.path);
+    const sezione = document.createElement("section");
+    sezione.className = "progetto-m" + (aperto ? " aperto" : "") + (p.esiste === false ? " mancante" : "");
+
+    const testa = document.createElement("div");
+    testa.className = "progetto-m-testa";
+    const apri = document.createElement("button");
+    apri.type = "button";
+    apri.className = "progetto-m-apri";
+    apri.setAttribute("aria-expanded", aperto ? "true" : "false");
+    const lettera = document.createElement("span");
+    lettera.className = "progetto-m-lettera";
+    lettera.textContent = iniziale(p.nome);
+    const nome = document.createElement("span");
+    nome.className = "progetto-m-nome";
+    nome.textContent = p.nome;
+    const conto = document.createElement("span");
+    conto.className = "progetto-m-conto";
+    conto.textContent = String(sue.length);
+    apri.append(lettera, nome, conto);
+    apri.addEventListener("click", () => {
+      if (progettiAperti.has(p.path)) progettiAperti.delete(p.path);
+      else progettiAperti.add(p.path);
+      renderProgettiMobile(sessions);
+    });
+    const mem = document.createElement("button");
+    mem.type = "button";
+    mem.className = "progetto-m-mem";
+    mem.textContent = `Memoria ${(p.memoria || []).length}`;
+    mem.addEventListener("click", () => apriMemoria(p));
+    testa.append(apri, mem);
+    sezione.appendChild(testa);
+
+    if (aperto) {
+      const lista = document.createElement("ul");
+      lista.className = "session-list annidata";
+      sue.forEach((s) => lista.appendChild(rigaChat(s)));
+      if (!sue.length) {
+        const vuoto = document.createElement("li");
+        vuoto.className = "vuoto";
+        vuoto.textContent = "Nessuna conversazione.";
+        lista.appendChild(vuoto);
+      }
+      sezione.appendChild(lista);
+      if (p.esiste !== false) {
+        const nuova = document.createElement("button");
+        nuova.type = "button";
+        nuova.className = "progetto-m-nuova";
+        nuova.textContent = "+ Nuova chat nel progetto";
+        nuova.addEventListener("click", () => nuovaChatNelProgetto(p));
+        sezione.appendChild(nuova);
+      }
+    }
+    box.appendChild(sezione);
+  }
+}
+
+async function nuovaChatNelProgetto(p) {
+  try {
+    // Aprire il progetto sposta la cartella di lavoro: e' lo stesso gesto del
+    // desktop, e la chat nuova nasce li'.
+    await jsonPost("/api/progetti/open", { path: p.path });
+    const payload = await jsonPost("/api/sessions", {});
+    await loadSessions();
+    openChat(payload.session_id);
+  } catch (err) { toast(err.message); }
+}
+
+function apriMemoria(p) {
+  const memoria = p.memoria || [];
+  $("memoria-titolo").textContent = `Memoria · ${p.nome}`;
+  $("memoria-conto").textContent = `${memoria.length}`;
+  const box = $("memoria-elenco");
+  box.innerHTML = "";
+  if (!memoria.length) {
+    const vuoto = document.createElement("p");
+    vuoto.className = "memoria-vuota";
+    vuoto.textContent = "Ancora vuota: la scrive l'harness alla fine dei turni in cui si lavora. "
+      + "Si corregge dal desktop, nella schermata del progetto.";
+    box.appendChild(vuoto);
+  }
+  for (const [tipo, etichetta] of TIPI_MEMORIA) {
+    const voci = memoria.filter((v) => v.tipo === tipo);
+    if (!voci.length) continue;
+    const titolo = document.createElement("div");
+    titolo.className = `memoria-gruppo tipo-${tipo}`;
+    titolo.textContent = etichetta;
+    box.appendChild(titolo);
+    for (const v of voci) {
+      const riga = document.createElement("div");
+      riga.className = `memoria-voce tipo-${tipo}`;
+      const testo = document.createElement("div");
+      testo.textContent = v.testo;
+      const meta = document.createElement("div");
+      meta.className = "memoria-meta";
+      const autore = { harness: "automatica", modello: "dal modello", utente: "tua" }[v.autore] || v.autore;
+      meta.textContent = [autore, v.titolo_chat ? `da «${v.titolo_chat}»` : ""].filter(Boolean).join(" · ");
+      riga.append(testo, meta);
+      box.appendChild(riga);
+    }
+  }
+  $("memoria-foglio").classList.remove("hidden");
+}
+
+function chiudiMemoria() {
+  $("memoria-foglio").classList.add("hidden");
 }
 
 function setBanner(text) {
@@ -428,36 +604,12 @@ function setBanner(text) {
 function renderSessions(sessions) {
   const list = $("session-list");
   list.innerHTML = "";
-  for (const s of sessions) {
-    const li = document.createElement("li");
-    li.dataset.id = s.id;
-    li.tabIndex = 0;
-    li.setAttribute('role', 'button');
-
-    const title = document.createElement("div");
-    title.className = "session-title";
-    title.textContent = s.title || "(senza titolo)";
-    if (s.running) {
-      const badge = document.createElement("span");
-      badge.className = "badge-running";
-      badge.textContent = "in corso";
-      title.appendChild(badge);
-    }
-
-    const meta = document.createElement("div");
-    meta.className = "session-meta";
-    meta.textContent = fmtDate(s.updated_at);
-
-    li.append(title, meta);
-    li.addEventListener("click", () => openChat(s.id));
-    li.addEventListener('keydown', (event) => {
-      if (event.key === 'Enter' || event.key === ' ') {
-        event.preventDefault();
-        openChat(s.id);
-      }
-    });
-    list.appendChild(li);
-  }
+  // Qui le libere; quelle di un progetto stanno nel suo gruppo, sopra.
+  const libere = sessions.filter((s) => !s.progetto && !s.archiviata);
+  for (const s of libere) list.appendChild(rigaChat(s));
+  if (typeof renderProgettiMobile === "function") renderProgettiMobile(sessions);
+  const titolo = $("libere-titolo");
+  if (titolo) titolo.classList.toggle("hidden", !(progettiNoti.length && libere.length));
 }
 
 function fmtDate(iso) {
@@ -512,13 +664,28 @@ async function refreshChat(attachQuestionCard) {
     // se un'apertura da desktop ha cambiato il modello), ma niente clic.
     const modello = String(payload.model || "").trim();
     const ws = String(payload.session_workspace || "").trim();
+    const suo = payload.progetto;
+    const bottone = $("chat-progetto");
+    if (bottone) {
+      bottone.hidden = !suo;
+      if (suo) {
+        bottone.textContent = suo.nome;
+        bottone.title = `Progetto «${suo.nome}»: tocca per leggerne la memoria`;
+        bottone.onclick = () => {
+          const p = progettiNoti.find((x) => x.path === suo.path);
+          apriMemoria(p || { ...suo, memoria: [] });
+        };
+      }
+    }
     $("chat-model").textContent = modello;
-    $("chat-workspace").textContent = ws ? nomeCartella(ws) : "";
+    // Dentro un progetto la cartella e' la sua: la goccia del progetto la dice
+    // gia', e su un telefono lo spazio della riga e' poco.
+    $("chat-workspace").textContent = ws && !suo ? nomeCartella(ws) : "";
     $("chat-workspace").title = ws;
     // Il separatore compare solo se le due informazioni ci sono tutte e due.
     // Qui serve querySelector: $ e' getElementById, non prende le classi.
     const sep = document.querySelector(".chat-meta .meta-sep");
-    if (sep) sep.hidden = !(modello && ws);
+    if (sep) sep.hidden = !(modello && ws && !suo);
   } catch (err) {
     toast(`Lettura fallita: ${err.message}`);
   }
@@ -663,6 +830,10 @@ function renderConversation(messages, pending, withCard) {
         chiudiGruppoPassi();
         addBubble("agent", clean);
       }
+    } else if (m.role === "memoria") {
+      // La memoria del progetto aggiornata a fine turno: una riga, non una bolla.
+      chiudiGruppoPassi();
+      addBubble("nota", notaMemoria(m.esito));
     } else if (m.role === "error") {
       // L'errore che ha chiuso il turno: dal vivo arriva come toast, che
       // sparisce; qui resta scritto nella conversazione.
@@ -695,6 +866,12 @@ function renderConversation(messages, pending, withCard) {
     hideQuestionCard();
   }
   scrollBottom();
+}
+
+function notaMemoria(esito, motivo) {
+  const riassunto = esito && esito.riassunto;
+  if (riassunto && riassunto !== "nessun cambiamento") return `Memoria del progetto aggiornata: ${riassunto}`;
+  return `Memoria del progetto: ${motivo || "niente da aggiungere"}`;
 }
 
 function scrollBottom() {
@@ -993,6 +1170,14 @@ function handleEvent(data) {
     case "metriche":
       applicaMetriche(data);
       break;
+    case "memoria":
+      // L'ultimo passo del turno: l'harness aggiorna la memoria del progetto.
+      if (data.fase === "inizio") mostraAttivita("aggiorna la memoria del progetto");
+      else {
+        addBubble("nota", notaMemoria(data.esito, data.motivo));
+        loadSessions();
+      }
+      break;
     case "plan":
       disegnaRotaia(data.steps || []);
       break;
@@ -1046,7 +1231,7 @@ function bindGlobalEvents() {
     let event;
     try { event = JSON.parse(msg.data); } catch (_) { return; }
 
-    if (event.type === "sessions") { loadSessions(); return; }
+    if (event.type === "sessions" || event.type === "progetto") { loadSessions(); return; }
     if (event.type !== "turn" && event.type !== "question") return;
 
     loadSessions();
@@ -1110,6 +1295,13 @@ $("btn-new").addEventListener("click", async () => {
 });
 
 $("btn-refresh").addEventListener("click", () => refreshChat(true));
+$("memoria-chiudi").addEventListener("click", chiudiMemoria);
+$("memoria-foglio").addEventListener("click", (ev) => {
+  if (ev.target === $("memoria-foglio")) chiudiMemoria();
+});
+document.addEventListener("keydown", (ev) => {
+  if (ev.key === "Escape" && !$("memoria-foglio").classList.contains("hidden")) chiudiMemoria();
+});
 $("goccia-tok").addEventListener("click", () => toast(dettaglioMisure()));
 $("rotaia-piano").addEventListener("click", (ev) => {
   ev.stopPropagation();

@@ -428,6 +428,57 @@ modello richiesto.
 
 ## Storia delle revisioni
 
+**I vault diventano Progetti** (26-27/09/2026, ramo `progetti-2026-09-26`
+sopra `barra-destra-2026-09-26`, versione non ancora numerata) — il progetto
+e' il pezzo principale, la wiki una sua opzione.
+
+Un progetto e' una cartella di lavoro, le chat che ci lavorano dentro e una
+memoria sua. La memoria c'era gia', ma **nessuno la scriveva**: su 81 sessioni
+e 2.890 chiamate a tool, zero `manage_notes` con `ambito='vault'`. Ogni chat
+ripartiva da capo. Ora la scrive l'harness:
+
+- **Quando.** A fine turno, in un progetto, se il turno ha lavorato (ha scritto
+  file, lanciato comandi o chiuso punti del piano). Un turno di sole domande non
+  la tocca.
+- **Come.** Un passo in piu' in coda alla stessa conversazione: stesso system
+  prompt, stesse intestazioni, stessi schemi dei tool, quindi la cache del
+  prefisso si riusa. Niente pensiero, temperatura 0,1, al piu' 700 token. Con
+  due slot llama.cpp va nello slot della conversazione. Il modello risponde con
+  operazioni JSON (`aggiungi`, `modifica`, `togli`, al piu' 6 per giro).
+- **Cosa.** Voci con un tipo (decisione, convenzione, fatto, scartato,
+  aperto), la chat da cui vengono e chi le ha scritte. Quelle scritte o
+  corrette a mano sono dell'utente e l'harness non le tocca.
+- **Dove si vede.** Nella chat, una riga "Memoria del progetto aggiornata +3"
+  apribile; nella colonna di destra, la scheda della memoria. Nel prompt la
+  memoria sta nel blocco di coda, prima delle note della chat e del piano:
+  una voce nuova non invalida il prefisso.
+- Si spegne da **Impostazioni › Contesto e memoria** (`memoria_progetto`).
+
+**La schermata del progetto** e' un cruscotto: testata e composer (una chat
+nuova parte gia' nel progetto), poi le schede **Riprendi da qui** (l'ultima
+chat: piano, checkpoint, ultima risposta), **Memoria** (filtri per tipo,
+provenienza, aggiunta e correzione in riga), **Conversazioni**, **Istruzioni**
+e **Libreria** (`.memoria/`, con lettore). Sotto gli 860 px diventa una
+colonna sola. La creazione e' guidata (cartella esistente o nuova, nome,
+istruzioni, wiki facoltativa) e le impostazioni del progetto hanno una
+finestra loro.
+
+**Chat e progetti si gestiscono**: rinomina in riga, archivio (le archiviate
+stanno in fondo all'elenco, e si riaprono), spostamento dentro e fuori da un
+progetto, con conferma, e rimozione del progetto dall'elenco senza toccare la
+cartella. Rinominare e archiviare non cambiano `updated_at`: l'ordine
+dell'elenco resta quello del lavoro.
+
+**Telefono**: le chat raggruppate per progetto, il nome del progetto sulla
+testata della chat e la memoria in sola lettura.
+
+Rinomina ovunque, con migrazione: `core/progetto.py`, rotte `/api/progetti*`,
+file `.progetto.json` (il `.vault.json` si converte al primo accesso, e le
+note vecchie tengono un id stabile), impostazione `progetti` (`vaults` si
+rinomina alla lettura), `manage_notes ambito='progetto'`, `wiki_search`
+offerto solo se il progetto ha la wiki. Prove: `test_progetto.py`,
+`test_memoria_progetto.py`, `test_progetti_web.py`; 1850 passano.
+
 **Colonna di destra: il cruscotto** (26/09/2026, ramo `barra-destra-2026-09-26`
 sopra `impostazioni-2026-09-26`, versione non ancora numerata) — rifatta da
 capo.

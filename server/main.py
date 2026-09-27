@@ -1642,7 +1642,8 @@ def index() -> Response:
     # erano rimasti fuori, e un menu appena cambiato poteva girare nella
     # versione di prima con niente che lo facesse sospettare.
     for nome in ("app.js", "style.css", "companion.js", "companion.css",
-                 "impostazioni.js", "impostazioni.css", "cruscotto.js", "cruscotto.css"):
+                 "impostazioni.js", "impostazioni.css", "cruscotto.js", "cruscotto.css",
+                 "progetti.js", "progetti.css"):
         html = html.replace(f"/static/{nome}", f"/static/{nome}?v={_impronta(nome)}")
     return Response(
         html,

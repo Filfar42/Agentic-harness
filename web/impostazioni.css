@@ -1,8 +1,8 @@
 /* Impostazioni — finestra con barra laterale.
    Solo i token della palette di style.css: il tema scuro viene da se', e una
    tinta scritta qui a mano sarebbe la prima a restare indietro. Le classi
-   hanno tutte il prefisso imp- perche' .field, .switch e .help vivono ancora
-   nella scheda del vault. */
+   hanno tutte il prefisso imp-, come quelle dei progetti hanno pr-: si
+   riconosce a colpo d'occhio a quale file appartiene una regola. */
 
 /* ---------- velo e finestra ---------- */
 

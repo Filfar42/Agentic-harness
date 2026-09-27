@@ -20,19 +20,36 @@ const state = {
   sessions: [],
   sessionId: null,
   memories: [],
-  vaults: [],
-  // Il vault aperto, se ce n'e' uno. ``vault`` e' la sua scheda (nome,
-  // descrizione, istruzioni, percorso, conteggi); ``vaultHome`` dice se al
-  // posto della chat si sta guardando la sua schermata iniziale. Sono due
-  // cose diverse: dentro un vault si puo' benissimo stare in una chat.
-  vault: null,
-  vaultHome: false,
-  // Albero dei vault nella colonna di sinistra. ``vaultAperti`` sono i
-  // percorsi espansi (l'utente le vuole vedere), ``vaultChat`` le chat di
-  // ciascuno, chieste quando serve e non tutte all'avvio: con sei vault
-  // sarebbero sei letture dell'indice per disegnare sei righe chiuse.
-  vaultAperti: new Set(),
-  vaultChat: {},
+  // I progetti registrati, con identita' e memoria (web/progetti.js).
+  progetti: [],
+  // Il progetto corrente: quello della chat aperta, o quello di cui si sta
+  // guardando la schermata. ``progettoHome`` dice quale delle due: dentro un
+  // progetto si puo' benissimo stare in una chat.
+  progetto: null,
+  progettoHome: false,
+  // Tutto quello che serve alla schermata (chat, archiviate, "Riprendi da
+  // qui", libreria): arriva in una chiamata sola da /api/progetti/home.
+  progettoDati: null,
+  // Albero dei progetti nella colonna di sinistra. ``progettiAperti`` sono i
+  // percorsi espansi, ``progettoChat`` le chat di ciascuno, chieste quando
+  // serve e non tutte all'avvio.
+  progettiAperti: new Set(),
+  progettoChat: {},
+  // Stato della schermata che deve sopravvivere a un ridisegno: filtro della
+  // memoria, voce in modifica (id, o 'nuova'), istruzioni in modifica,
+  // ricerca fra le chat, archiviate aperte.
+  memoriaFiltro: '',
+  memoriaModulo: null,
+  istruzioniInModifica: false,
+  istruzioniTutte: false,
+  libreriaTutta: false,
+  progettoCerca: '',
+  progettoArchiviateAperte: false,
+  // Voci della memoria appena cambiate: si evidenziano per qualche secondo.
+  memoriaNuove: new Set(),
+  // Le conversazioni libere archiviate: il conto per l'etichetta, l'elenco a
+  // richiesta.
+  archiviateLibere: { conto: 0, aperte: false, elenco: [] },
   backend: {},
   stats: {},
   attachments: [],
@@ -59,7 +76,7 @@ const state = {
   history: { msgs: [], offset: 0, total: 0, loading: false },
   preview: null,
   // C'e' qualcosa **dentro** il pannello di anteprima. Non e' la stessa cosa
-  // di "il pannello si vede": sulla schermata iniziale di un vault il
+  // di "il pannello si vede": sulla schermata di un progetto il
   // pannello sparisce, ma quello che c'era dentro resta li' e torna quando si
   // rientra in una chat. Vedi ``sincronizzaAnteprima``.
   previewAperta: false,
@@ -859,6 +876,15 @@ function renderHistory(messages, opzioni = {}) {
       return;
     }
 
+    if (msg.role === 'memoria') {
+      // La memoria del progetto aggiornata a fine turno (core/memoria_progetto.py).
+      // Dopo le gocce dei file, come in diretta: prima il lavoro, poi cosa ne resta.
+      const t = currentTurn();
+      t.showFiles();
+      t.append(nodoMemoria(msg.esito, ''));
+      return;
+    }
+
     if (msg.role === 'error') {
       // L'errore che ha chiuso il turno, salvato dal server (``registra_errore``):
       // la rilettura dal disco a fine turno lo ridisegna invece di cancellarlo.
@@ -1368,6 +1394,11 @@ function handleEvent(event, turn, status, setStatus) {
       break;
     case 'notes':
       renderNotes(event.notes);
+      break;
+    case 'memoria':
+      // L'harness aggiorna la memoria del progetto: un passo in piu' a fine
+      // turno, in coda alla conversazione. Lo disegna web/progetti.js.
+      eventoMemoria(event, turn, setStatus);
       break;
     case 'compacted':
       turn.append(compactedNode(event));
@@ -2081,7 +2112,7 @@ async function openPreview(payload) {
     : '\u25f1';
   state.previewAperta = true;
   // ...ma non per forza visibile adesso: se l'agente apre un'anteprima mentre
-  // si sta guardando la schermata iniziale di un vault, il pannello resta
+  // si sta guardando la schermata di un progetto, il pannello resta
   // fermo e comparira' rientrando in una chat.
   sincronizzaAnteprima();
   aggiornaIntestazione(payload, url);
@@ -2262,48 +2293,48 @@ function setColumnWidth(nome, px) {
   try { localStorage.setItem(c.key, String(larghezza)); } catch { /* modalita' privata */ }
 }
 
-// Altezza della sezione Vault nella colonna di sinistra.
+// Altezza della sezione Progetti nella colonna di sinistra.
 //
 // Il minimo e' l'etichetta piu' il pulsante piu' una riga: sotto quella soglia
-// la sezione non mostra piu' nessun vault e la maniglia diventa un modo di
+// la sezione non mostra piu' nessun progetto e la maniglia diventa un modo di
 // farla sparire per sbaglio. Il massimo lascia in vita l'elenco di sopra per
 // lo stesso motivo -- una maniglia che puo' annullare uno dei due lati non e'
 // un divisorio, e' un interruttore travestito.
-const VAULTS_H_KEY = 'ah-vaults-h';
-const VAULTS_H_MIN = 92;
+const PROGETTI_H_KEY = 'ah-progetti-h';
+const PROGETTI_H_MIN = 92;
 const CONVERSAZIONI_H_MIN = 120;
 
-function setVaultsHeight(px) {
-  const sec = $('#vaults-sec');
+function setProgettiHeight(px) {
+  const sec = $('#progetti-sec');
   const sidebar = $('#sidebar');
   if (!sec || !sidebar) return;
   // Lo spazio contendibile e' quello che resta alla sezione **adesso**: il
   // resto della colonna (marchio, nuova chat, ricerca, footer) non e'
   // ridimensionabile e non deve entrare nel conto.
   const disponibile = sec.getBoundingClientRect().bottom - $('#sessions').getBoundingClientRect().top;
-  const massimo = Math.max(VAULTS_H_MIN, disponibile - CONVERSAZIONI_H_MIN);
-  const altezza = Math.round(Math.min(Math.max(px, VAULTS_H_MIN), massimo));
-  document.documentElement.style.setProperty('--vaults-h', altezza + 'px');
-  try { localStorage.setItem(VAULTS_H_KEY, String(altezza)); } catch { /* modalita' privata */ }
+  const massimo = Math.max(PROGETTI_H_MIN, disponibile - CONVERSAZIONI_H_MIN);
+  const altezza = Math.round(Math.min(Math.max(px, PROGETTI_H_MIN), massimo));
+  document.documentElement.style.setProperty('--progetti-h', altezza + 'px');
+  try { localStorage.setItem(PROGETTI_H_KEY, String(altezza)); } catch { /* modalita' privata */ }
 }
 
-function bindVaultsResize() {
-  const sec = $('#vaults-sec');
-  bindGrip($('#vaults-grip'), {
+function bindProgettiResize() {
+  const sec = $('#progetti-sec');
+  bindGrip($('#progetti-grip'), {
     classe: 'resizing-rows',
     // Il bordo basso della sezione e' fisso (ci sta sotto il footer): l'altezza
     // e' la distanza fra quello e il puntatore.
     larghezza: (e) => sec.getBoundingClientRect().bottom - e.clientY,
-    applica: setVaultsHeight,
+    applica: setProgettiHeight,
     // Meta' e meta', calcolata sullo spazio contendibile di adesso: un numero
     // fisso su una finestra bassa vorrebbe dire l'elenco di sopra schiacciato.
-    ripristina: () => setVaultsHeight(
+    ripristina: () => setProgettiHeight(
       (sec.getBoundingClientRect().bottom - $('#sessions').getBoundingClientRect().top) / 2,
     ),
   });
   let salvata = 0;
-  try { salvata = Number(localStorage.getItem(VAULTS_H_KEY) || 0); } catch { /* privata */ }
-  if (salvata > 0) setVaultsHeight(salvata);
+  try { salvata = Number(localStorage.getItem(PROGETTI_H_KEY) || 0); } catch { /* privata */ }
+  if (salvata > 0) setProgettiHeight(salvata);
 }
 
 function bindColumnResize() {
@@ -2351,26 +2382,26 @@ function bindPreviewResize() {
 /** Decide se il pannello di anteprima si vede, adesso.
  *
  *  Due condizioni, e servono entrambe: che ci sia qualcosa dentro, e che si
- *  stia guardando una conversazione. La schermata iniziale di un vault non e'
+ *  stia guardando una conversazione. La schermata di un progetto non e'
  *  una conversazione -- e' il posto in cui si sceglie quale cominciare -- e
  *  un'anteprima aperta li' e' l'anteprima di **un'altra** chat: la stessa
  *  ragione per cui li' spariscono il piano, le note e i numeri dell'ultima
  *  esecuzione.
  *
  *  Nasconde e basta: non svuota. Un'applicazione avviata dall'agente vive
- *  dentro quell'iframe, e passare dalla home del vault non deve fermarla ne'
- *  farle ricaricare la pagina al ritorno.
+ *  dentro quell'iframe, e passare dalla schermata del progetto non deve
+ *  fermarla ne' farle ricaricare la pagina al ritorno.
  */
 function sincronizzaAnteprima() {
   const pane = $('#preview-pane');
   if (!pane) return;
-  pane.hidden = !(state.previewAperta && !state.vaultHome);
+  pane.hidden = !(state.previewAperta && !state.progettoHome);
 }
 
 function closePreview() {
   const pane = $('#preview-pane');
-  // Il controllo e' su ``previewAperta`` e non su ``pane.hidden``: dentro la
-  // home di un vault il pannello e' gia' nascosto, e uscire di qui senza far
+  // Il controllo e' su ``previewAperta`` e non su ``pane.hidden``: sulla
+  // schermata di un progetto il pannello e' gia' nascosto, e uscire di qui senza far
   // niente lascerebbe l'iframe vivo -- cioe' l'applicazione in esecuzione e
   // la connessione aperta -- per una chat che nel frattempo e' stata chiusa.
   if (!pane || !state.previewAperta) return;
@@ -2420,60 +2451,29 @@ const DOVE_TROVATO = {
 function renderSessions() {
   const root = $('#sessions');
   root.innerHTML = '';
-  // Questo elenco e' **sempre** quello delle conversazioni libere, anche
-  // dentro un vault: le chat di un vault stanno annidate sotto di lui, nella
-  // sezione qui sotto. Prima l'elenco cambiava sotto i piedi -- si apriva un
-  // vault e le conversazioni recenti sparivano -- e l'unico modo di
-  // accorgersene era non ritrovarcene una. Resta il pulsante "esci", che
-  // riguarda il workspace e non l'elenco.
-  const esci = $('#vault-exit');
-  if (esci) {
-    esci.hidden = !state.vault;
-    esci.title = state.vault
-      ? `Esci da "${state.vault.nome}" e torna alla cartella di prima`
-      : '';
-  }
+  // Questo elenco e' **sempre** quello delle conversazioni libere: le chat di
+  // un progetto stanno annidate sotto di lui, nella sezione qui sotto.
+  //
   // Una lista sola, due sorgenti: con la ricerca attiva si disegnano i
-  // risultati, altrimenti le conversazioni. Tenere due funzioni di disegno
-  // vorrebbe dire che il pallino della chat in esecuzione va aggiunto in due
-  // posti -- e prima o poi in uno dei due manchera'.
+  // risultati, altrimenti le conversazioni. Le righe le fa ``rigaSessione``
+  // (web/progetti.js), la stessa dei rami dei progetti: il pallino della chat
+  // in esecuzione e il menu stanno in un posto solo.
   const cercando = !!state.search.q;
   const elenco = cercando ? state.search.results : state.sessions;
   if (cercando && !elenco.length) {
     root.innerHTML = `<div class="search-empty">Nessuna conversazione per «${esc(state.search.q)}».</div>`;
-    return;
+  } else if (!cercando && !elenco.length) {
+    root.innerHTML = '<div class="search-empty">Nessuna conversazione libera.</div>';
   }
   elenco.forEach((item) => {
-    const running = item.running || state.running.has(item.id);
-    const isActive = item.id === state.sessionId;
-    const row = el('button', 'session' + (isActive ? ' active' : '') + (running ? ' running' : ''));
-    row.title = `${item.title}\n${item.n_messages} messaggi · ${(item.updated_at || '').replace('T', ' ')}` +
-      (running ? '\nL\'agente sta lavorando' : '') +
-      (item.pending ? '\nIn attesa di una tua risposta' : '');
-    row.innerHTML =
-      `<span class="session-title">${esc(item.title)}</span>` +
-      (running
-        ? '<span class="session-running" title="L\'agente sta lavorando"></span>'
-        : item.pending
-          ? '<span class="session-pending" title="In attesa di una risposta"></span>'
-          : '') +
-      (item.match_in ? `<span class="session-where">${esc(DOVE_TROVATO[item.match_in] || item.match_in)}</span>` : '') +
-      `<span class="session-meta">${esc(running ? 'attiva' : relTime(item.updated_at))}</span>` +
-      `<span class="session-del" title="Elimina">×</span>` +
-      // L'estratto e' l'unica cosa che spiega perche' una riga trovata "nel
-      // testo" e' li': senza, e' un titolo qualunque in mezzo agli altri.
-      (item.snippet ? `<span class="session-snippet">${marca(item.snippet, state.search.q)}</span>` : '');
-    row.onclick = (event) => {
-      if (event.target.classList.contains('session-del')) {
-        event.stopPropagation();
-        deleteSession(item.id);
-        return;
-      }
-      openSession(item.id);
-    };
-    row.dataset.id = item.id;
-    root.appendChild(row);
+    // L'estratto e' l'unica cosa che spiega perche' una riga trovata "nel
+    // testo" e' li': senza, e' un titolo qualunque in mezzo agli altri.
+    root.appendChild(rigaSessione(item, {
+      snippet: item.snippet ? marca(item.snippet, state.search.q) : '',
+      dove: item.match_in ? (DOVE_TROVATO[item.match_in] || item.match_in) : '',
+    }));
   });
+  if (!cercando) renderArchiviateLibere(root);
 }
 
 /** Mette in cima all'elenco la conversazione che ha appena ricevuto il primo
@@ -2496,15 +2496,14 @@ function aggiungiAllElenco(sessionId, testo) {
     updated_at: new Date().toISOString().slice(0, 19),
     running: true,
   };
-  // Dentro un vault la chat nuova appartiene al suo ramo, non alle libere:
+  // Dentro un progetto la chat nuova appartiene al suo ramo, non alle libere:
   // metterla in cima all'elenco generale la farebbe comparire in un posto in
   // cui, un secondo dopo, il server non la manderebbe piu'.
-  if (state.vault) {
-    const chat = state.vaultChat[state.vault.path];
+  if (state.progetto) {
+    const chat = state.progettoChat[state.progetto.path];
     if (!chat || chat.some((c) => c.id === sessionId)) return;
     chat.unshift(riga);
-    renderVaults();
-    if (state.vaultHome) renderVaultHome();
+    renderProgetti();
     return;
   }
   if (state.sessions.some((s) => s.id === sessionId)) return;
@@ -2515,7 +2514,7 @@ function aggiungiAllElenco(sessionId, testo) {
 function markActive(id) {
   // Sposta l'evidenziazione senza aspettare il server: il click deve
   // sembrare istantaneo anche se la risposta arriva qualche decina di ms dopo.
-  $$('#sessions .session, #vaults .session').forEach((row) => {
+  $$('#sessions .session, #progetti .session').forEach((row) => {
     row.classList.toggle('active', row.dataset.id === id);
   });
 }
@@ -2550,6 +2549,8 @@ async function refreshSessions() {
   try {
     const data = await api('/api/sessions');
     state.sessions = data.sessions;
+    state.archiviateLibere.conto = data.archiviate || 0;
+    if (!state.archiviateLibere.conto) state.archiviateLibere.aperte = false;
     data.sessions.forEach((item) => {
       if (item.running) state.running.add(item.id);
       else state.running.delete(item.id);
@@ -2593,11 +2594,18 @@ function bindGlobalEvents() {
       // veniva, e usarla come ricarica le faceva sparire ad ogni fine turno.
       if (suaChat) riallinea(state.sessionId);
       refreshSessions();
+      // Le chat dei progetti stanno nei rami: anche li' il pallino si spegne.
+      if (event.type === 'turn') refreshProgetti();
     } else if (event.type === 'sessions') {
       // Creazione, cancellazione o nuovo messaggio dall'altro lato: basta
       // l'elenco. Se e' la chat che sto guardando, il 'turn' che segue si
       // occupa di ricaricarne il contenuto.
       refreshSessions();
+      refreshProgetti();
+    } else if (event.type === 'progetto') {
+      // Un progetto e' cambiato: la memoria scritta a fine turno, una voce
+      // corretta dall'altro schermo, il nome.
+      progettoCambiato(event);
     }
   };
 }
@@ -2633,6 +2641,8 @@ async function showSession(payload, { entrando = false } = {}) {
   // chat (fine turno, riallineamento) invece non li tocca: la traccia dal
   // vivo del turno appena finito esiste solo in questa pagina.
   if (conversationChanged && typeof window !== 'undefined') window.Cruscotto?.reset();
+  // Il progetto della chat: la goccia in alto e la memoria a destra.
+  allineaProgettoDellaChat(payload);
   // Il piano arriva dal payload, non dagli eventi: riaprendo una chat vecchia
   // il pannello si ripopola anche se il turno che l'ha scritto e' finito ieri.
   renderPlan(payload.plan);
@@ -2661,16 +2671,15 @@ async function showSession(payload, { entrando = false } = {}) {
 }
 
 async function openSession(id) {
-  // Aprire una conversazione e' il gesto con cui si esce dalla schermata
-  // iniziale del vault: si resta nel vault, ma davanti c'e' una chat.
-  const veniva_dalla_home = state.vaultHome;
-  if (state.vaultHome) mostraVaultHome(false);
+  // Aprire una conversazione e' il gesto con cui si esce dalla schermata del
+  // progetto: si resta nel progetto, ma davanti c'e' una chat.
+  const veniva_dalla_home = state.progettoHome;
+  if (state.progettoHome) mostraProgettoHome(false);
   if (id === state.sessionId) {
     // Stessa chat di prima: non si riapre (aprire e' un gesto che sposta il
-    // workspace e ferma le anteprime), ma il pannello si rilegge. Tornando
-    // dalla schermata del vault le schede erano state nascoste e poi
-    // rimesse com'erano **al momento in cui si era usciti**: se nel frattempo
-    // il turno era andato avanti, il piano mostrato era quello di allora.
+    // workspace e ferma le anteprime), ma il pannello si rilegge: se nel
+    // frattempo il turno era andato avanti, il piano mostrato era quello di
+    // quando si era usciti.
     if (veniva_dalla_home) {
       try {
         const payload = await api(`/api/sessions/${encodeURIComponent(id)}`);
@@ -2696,9 +2705,28 @@ async function openSession(id) {
 
 async function newSession() {
   try {
-    if (state.vaultHome) mostraVaultHome(false);
+    if (state.progettoHome) mostraProgettoHome(false);
     await showSession(await api('/api/sessions', { method: 'POST' }), { entrando: true });
   } catch (error) { toast(error.message); }
+}
+
+/** "Nuova chat" in cima alla colonna: una conversazione **libera**.
+ *
+ *  Le chat di un progetto nascono dalla sua schermata (o dal menu del
+ *  progetto). Da dentro un progetto, quindi, questo pulsante porta fuori:
+ *  nell'ultima cartella libera usata. Senza una cartella libera recente la
+ *  chat nasce dove si e', e lo si dice.
+ */
+async function nuovaChatLibera() {
+  if (state.progetto) {
+    const libera = (state.settings.recent_workspaces || []).find((p) => !prDelPercorso(p));
+    if (libera) {
+      await useWorkspace(libera);
+    } else {
+      toast(`Nessuna cartella libera recente: la chat nasce nel progetto «${state.progetto.nome}»`);
+    }
+  }
+  await newSession();
 }
 
 async function deleteSession(id) {
@@ -3047,12 +3075,17 @@ function toggleWsMenu(aprire) {
 function dopoIlCambio(data, messaggio) {
   state.settings.workspace_dir = data.workspace_dir;
   if (data.recent_workspaces) state.settings.recent_workspaces = data.recent_workspaces;
-  // Cambiare cartella verso un posto che non e' il vault aperto vuol dire
-  // esserne usciti: la scheda a destra non deve restare a descrivere un vault
-  // in cui non si sta piu'. Chi apre un vault riempie ``state.vault`` dopo.
-  if (!data.vault && state.vault && data.workspace_dir !== state.vault.path) {
-    state.vault = null;
-    mostraVaultHome(false);
+  // Cambiare cartella verso un posto che non e' il progetto aperto vuol dire
+  // esserne usciti: la memoria a destra non deve restare a descrivere un
+  // progetto in cui non si sta piu'. Chi apre un progetto lo sa gia'.
+  if (!data.progetto) {
+    const suo = prDelPercorso(data.workspace_dir);
+    if (state.progetto && (!suo || prChiave(suo.path) !== prChiave(state.progetto.path))) {
+      if (state.progettoHome) mostraProgettoHome(false);
+    }
+    state.progetto = suo;
+    renderMemoriaPannello();
+    renderProgettoChip();
   }
   renderHeader();
   refreshSandbox();          // workspace nuovo = container nuovo
@@ -3123,409 +3156,6 @@ function applicaColonne() {
 // Avvio
 // ---------------------------------------------------------------------------
 
-// ---------------------------------------------------------------------------
-// Vault LLM Wiki
-// ---------------------------------------------------------------------------
-// I vault sono workspace organizzati come wiki LLM (raw/ immutabile, wiki/
-// dell'agente, schema CLAUDE.md). Aprirne uno cambia il workspace e mette
-// l'agente in modalita' manutentore; dalla chat normale il tool vault_search
-// li interroga senza spostarsi. La sezione sta in fondo alla colonna di
-// sinistra perche' e' un luogo, non un'impostazione: si apre raramente, ma
-// quando serve deve essere a portata di clic.
-
-async function refreshVaults() {
-  try {
-    const data = await api('/api/vaults');
-    state.vaults = data.vaults || [];
-    renderVaults();
-    // I rami aperti mostrano delle chat: se non si riaggiornano anche loro,
-    // una conversazione appena finita resta "attiva" nell'albero mentre
-    // nell'elenco libero e' gia' tornata normale.
-    const vivi = new Set(state.vaults.map((v) => v.path));
-    [...state.vaultAperti].filter((p) => vivi.has(p)).forEach(caricaChatVault);
-  } catch { /* la sezione resta com'e': non e' critica come le chat */ }
-}
-
-function renderVaults() {
-  const root = $('#vaults');
-  if (!root) return;
-  root.innerHTML = '';
-  if (!state.vaults.length) {
-    root.innerHTML = '<div class="vault-empty">Nessun vault registrato.</div>';
-    return;
-  }
-  state.vaults.forEach((v) => {
-    const aperto = state.vaultAperti.has(v.path);
-    const riga = el('div', 'vault-node' + (aperto ? ' open' : ''));
-
-    // Due bersagli sulla stessa riga, e sono due gesti diversi: la freccia
-    // guarda dentro senza spostare niente, il nome ci entra. Tenerli uno solo
-    // vorrebbe dire o non poter sbirciare le chat di un vault in cui non si
-    // sta, o non poterlo aprire senza prima vederne l'elenco.
-    const freccia = el('button', 'vault-twisty');
-    freccia.setAttribute('aria-expanded', aperto ? 'true' : 'false');
-    freccia.title = aperto ? 'Nascondi le chat' : 'Mostra le chat';
-    freccia.innerHTML = CHEV;
-    freccia.onclick = (e) => { e.stopPropagation(); alternaVault(v.path); };
-
-    const row = el('button', 'vault' + (v.attivo ? ' active' : ''));
-    // Il titolo dice il percorso e la descrizione: nell'elenco c'e' spazio per
-    // il nome e basta, ma il "cos'era questo" deve costare una sosta del
-    // mouse, non l'apertura del vault.
-    row.title = [v.path, v.descrizione, v.wiki ? `${v.pagine} pagine wiki · ${v.fonti} fonti` : '']
-      .filter(Boolean).join('\n');
-    row.innerHTML =
-      `<span class="vault-name">${esc(v.nome)}</span>` +
-      (v.wiki ? '<span class="vault-badge" title="Modalità wiki">w</span>' : '') +
-      `<span class="vault-meta">${v.chat || 0} chat</span>`;
-    row.onclick = () => { state.vaultAperti.add(v.path); openVault({ path: v.path }); };
-
-    const testa = el('div', 'vault-row');
-    testa.appendChild(freccia);
-    testa.appendChild(row);
-    riga.appendChild(testa);
-
-    if (aperto) riga.appendChild(ramoVault(v));
-    root.appendChild(riga);
-  });
-}
-
-/** Le chat di un vault, annidate sotto di lui. */
-function ramoVault(v) {
-  const ramo = el('div', 'vault-branch');
-  const chat = state.vaultChat[v.path];
-  if (!chat) {
-    ramo.innerHTML = '<div class="vault-empty">Carico le conversazioni…</div>';
-    return ramo;
-  }
-  if (!chat.length) {
-    ramo.innerHTML = '<div class="vault-empty">Nessuna conversazione.</div>';
-    return ramo;
-  }
-  chat.forEach((item) => {
-    const running = item.running || state.running.has(item.id);
-    const isActive = item.id === state.sessionId;
-    const riga = el('button', 'session vault-session'
-      + (isActive ? ' active' : '') + (running ? ' running' : ''));
-    riga.title = `${item.title}\n${item.n_messages} messaggi · ${(item.updated_at || '').replace('T', ' ')}`;
-    riga.innerHTML =
-      `<span class="session-title">${esc(item.title)}</span>` +
-      (running ? '<span class="session-running" title="L\'agente sta lavorando"></span>' : '') +
-      `<span class="session-meta">${esc(running ? 'attiva' : relTime(item.updated_at))}</span>`;
-    riga.dataset.id = item.id;
-    riga.onclick = () => apriChatDiVault(v, item.id);
-    ramo.appendChild(riga);
-  });
-  return ramo;
-}
-
-/** Apre o chiude il ramo di un vault, caricandone le chat la prima volta. */
-async function alternaVault(path) {
-  if (state.vaultAperti.has(path)) {
-    state.vaultAperti.delete(path);
-    renderVaults();
-    return;
-  }
-  state.vaultAperti.add(path);
-  renderVaults();                 // subito, con "Carico…": il click risponde
-  await caricaChatVault(path);
-}
-
-async function caricaChatVault(path) {
-  try {
-    const data = await api('/api/vaults/home?path=' + encodeURIComponent(path));
-    state.vaultChat[path] = data.sessions || [];
-    (data.sessions || []).forEach((item) => {
-      if (item.running) state.running.add(item.id);
-      else state.running.delete(item.id);
-    });
-  } catch {
-    state.vaultChat[path] = [];   // il ramo dice "nessuna" invece di restare a caricare
-  }
-  renderVaults();
-  if (state.vaultHome && state.vault && state.vault.path === path) renderVaultHome();
-}
-
-/** Apre una chat che sta dentro un vault, dal ramo della colonna.
- *
- *  Passa da ``openVault`` quando il vault non e' quello corrente: aprire la
- *  chat da sola sposterebbe il workspace ma non l'identita' -- la scheda a
- *  destra e la memoria resterebbero quelle del vault di prima, e sarebbero
- *  quelle che il modello si trova in contesto.
- */
-async function apriChatDiVault(v, id) {
-  if (!state.vault || state.vault.path !== v.path) {
-    await openVault({ path: v.path });
-  }
-  await openSession(id);
-}
-
-// ---------------------------------------------------------------------------
-// Schermata iniziale del vault
-// ---------------------------------------------------------------------------
-// Prende il posto della chat nella stessa colonna. Ci si arriva cliccando il
-// vault; se ne esce aprendo una conversazione o cominciandone una nuova.
-
-function mostraVaultHome(attiva) {
-  state.vaultHome = !!attiva;
-  const casa = $('#vault-col');
-  const chat = $('#chat-col');
-  if (casa) casa.hidden = !attiva;
-  if (chat) chat.hidden = !!attiva;
-  // L'anteprima segue la chat: e' la stessa colonna e la stessa
-  // conversazione. Restava l'unico pezzo di una chat che sopravviveva
-  // all'ingresso in un vault, affiancato a una schermata con cui non
-  // c'entrava niente.
-  sincronizzaAnteprima();
-  // Le schede del pannello destro parlano di una conversazione: sulla
-  // schermata iniziale non c'e' una conversazione di cui parlare, e schede
-  // ferme sui numeri della chat precedente direbbero il falso.
-  //
-  // Le due del vault sono fuori da questo giro perche' hanno una regola
-  // propria: la memoria del vault resta ovunque (parla del posto, e serve
-  // proprio mentre l'agente lavora), la scheda con descrizione e istruzioni
-  // solo nella home -- le decide ``renderVaultCard`` qui sotto.
-  const DEL_VAULT = ['vault-card', 'vault-mem-card'];
-  $$('#panel > .card').forEach((card) => {
-    if (DEL_VAULT.includes(card.id)) return;
-    if (attiva) {
-      // Si salva **prima** di nascondere, o si ricorderebbe 'none' e le schede
-      // non tornerebbero mai piu'. Il piano e le note hanno un display che
-      // dipende dal loro contenuto: non si puo' rimetterle a '' e sperare.
-      if (card.dataset.vaultRestore === undefined) {
-        card.dataset.vaultRestore = card.style.display || '';
-      }
-      card.style.display = 'none';
-    } else if (card.dataset.vaultRestore !== undefined) {
-      card.style.display = card.dataset.vaultRestore;
-      delete card.dataset.vaultRestore;
-    }
-  });
-  renderVaultCard();
-}
-
-function renderVaultCard() {
-  const card = $('#vault-card');
-  if (!card) return;
-  const v = state.vault;
-  // Solo nella home del vault. Descrizione e istruzioni sono l'identita' del
-  // posto -- si leggono e si scrivono quando si arriva, non mentre si parla
-  // con il modello: dentro una chat il pannello di destra deve parlare della
-  // conversazione, e due campi di testo lunghi sopra il piano e le note erano
-  // il modo piu' rapido di non vedere piu' ne' il piano ne' le note.
-  card.style.display = (v && state.vaultHome) ? '' : 'none';
-  // La memoria si disegna comunque: e' l'altra scheda, e ha la regola
-  // opposta. Metterla in fondo, dopo il ritorno anticipato, voleva dire che
-  // uscendo dalla home restava ferma su quella del vault di prima.
-  renderVaultMemory();
-  if (!v || !state.vaultHome) return;
-  // Non si riscrive il campo che ha il fuoco: il salvataggio parte all'uscita
-  // dal campo, ma un ridisegno mentre si scrive sposterebbe il cursore.
-  const scrivi = (sel, valore) => {
-    const node = $(sel);
-    if (node && node !== document.activeElement) node.value = valore || '';
-  };
-  scrivi('#v-nome', v.nome);
-  scrivi('#v-descr', v.descrizione);
-  scrivi('#v-istr', v.istruzioni);
-  const wiki = $('#v-wiki');
-  if (wiki && wiki !== document.activeElement) wiki.checked = !!v.wiki;
-  const path = $('#v-path');
-  if (path) { path.textContent = nomeCartella(v.path); path.title = v.path; }
-  const conteggi = $('#v-wiki-counts');
-  if (conteggi) {
-    conteggi.style.display = v.wiki ? '' : 'none';
-    $('#v-counts').textContent = `${v.pagine} pagine · ${v.fonti} fonti`;
-  }
-}
-
-/** La memoria del vault: si legge e si toglie, non si scrive a mano.
- *
- *  La scrive il modello mentre lavora (``manage_notes ambito='vault'``): qui
- *  serve poterla vedere e cancellare quello che non e' piu' vero. Una nota
- *  sbagliata e' peggio di nessuna nota, e questa resta in contesto per mesi.
- */
-function renderVaultMemory() {
-  const card = $('#vault-mem-card');
-  if (!card) return;
-  const note = (state.vault && state.vault.note) || [];
-  card.style.display = state.vault ? '' : 'none';
-  $('#v-mem-count').textContent = note.length ? String(note.length) : '';
-  const root = $('#v-mem');
-  root.innerHTML = '';
-  if (!note.length) {
-    root.innerHTML = '<div class="empty">Ancora niente. La scrive l\'agente '
-      + 'quando capisce qualcosa che varrà anche nelle prossime chat.</div>';
-    return;
-  }
-  note.forEach((testo) => {
-    const riga = el('div', 'vmem');
-    riga.innerHTML = `<span class="vmem-text">${esc(testo)}</span>`
-      + '<button class="vmem-del" title="Togli dalla memoria del vault">×</button>';
-    riga.querySelector('.vmem-del').onclick = () => togliNotaVault(testo);
-    root.appendChild(riga);
-  });
-}
-
-async function togliNotaVault(testo) {
-  if (!state.vault) return;
-  await salvaVault({ note: (state.vault.note || []).filter((n) => n !== testo) });
-}
-
-function renderVaultHome() {
-  const v = state.vault;
-  if (!v) return;
-  $('#vh-nome').textContent = v.nome;
-  const descr = $('#vh-descr');
-  descr.textContent = v.descrizione || '';
-  descr.hidden = !v.descrizione;
-  $('#vh-input').placeholder = `Nuova conversazione in ${v.nome}…`;
-
-  // Le chat del vault, non ``state.sessions``: quello e' l'elenco delle
-  // conversazioni libere, e da quando i due convivono nella colonna erano
-  // diventati due elenchi diversi con lo stesso nome.
-  const elenco = state.vaultChat[v.path] || [];
-  $('#vh-count').textContent = elenco.length ? String(elenco.length) : '';
-  const root = $('#vh-sessions');
-  root.innerHTML = '';
-  if (!elenco.length) {
-    root.innerHTML = '<div class="vault-empty">Nessuna conversazione, ancora. '
-      + 'Scrivi qui sopra per cominciarne una.</div>';
-    return;
-  }
-  elenco.forEach((item) => {
-    const running = item.running || state.running.has(item.id);
-    const row = el('button', 'vault-chat' + (running ? ' running' : ''));
-    row.innerHTML =
-      `<span class="vault-chat-title">${esc(item.title)}</span>` +
-      `<span class="vault-chat-meta">${item.n_messages} messaggi · ${esc(relTime(item.updated_at))}</span>`;
-    row.onclick = () => openSession(item.id);
-    root.appendChild(row);
-  });
-}
-
-/** Salva un campo della scheda del vault. Scrive in .vault.json, cioe' dentro
- *  la cartella: e' il vault a sapere come si chiama, non le impostazioni. */
-async function salvaVault(patch) {
-  if (!state.vault) return;
-  try {
-    const data = await api('/api/vaults', {
-      method: 'PATCH',
-      body: JSON.stringify({ path: state.vault.path, ...patch }),
-    });
-    state.vault = data.vault;
-    renderVaultCard();
-    if (state.vaultHome) renderVaultHome();
-    renderSessions();
-    refreshVaults();
-  } catch (error) { toast(error.message); }
-}
-
-/** Apre il selettore nativo di cartelle (Esplora risorse su Windows): la
- *  cartella scelta viene registrata e riceve subito la struttura LLM Wiki. */
-async function newVault() {
-  const btn = $('#vault-new');
-  if (btn) btn.disabled = true;
-  try {
-    const data = await api('/api/vaults/pick', { method: 'POST' });
-    if (data.cancelled) { toast('Nessuna cartella selezionata.'); return; }
-    await refreshVaults();
-    toast('Vault "' + data.vault.nome + '" registrato.');
-  } catch (error) { toast(error.message); }
-  finally { if (btn) btn.disabled = false; }
-}
-
-/** Apre un vault: diventa il workspace corrente **e** si mostra la sua
- *  schermata iniziale. Una chiamata sola porta identita' e conversazioni. */
-async function openVault(criterio) {
-  try {
-    const data = await api('/api/vaults/open', {
-      method: 'POST',
-      body: JSON.stringify(criterio),
-    });
-    state.vault = data.vault || null;
-    dopoIlCambio(data, 'Vault: ' + (state.vault ? state.vault.nome : ''));
-    // Le chat del vault non entrano nell'elenco libero: sono il **ramo** del
-    // vault nella colonna, e la stessa lista serve la sua schermata iniziale.
-    // Una lettura sola per due posti che devono dire la stessa cosa.
-    if (state.vault) {
-      if (data.sessions) state.vaultChat[state.vault.path] = data.sessions;
-      state.vaultAperti.add(state.vault.path);
-    }
-    renderSessions();
-    mostraVaultHome(true);
-    renderVaultHome();
-    refreshVaults();
-  } catch (error) { toast(error.message); }
-}
-
-/** Esce dal vault: torna alla cartella di prima e alle conversazioni libere. */
-async function uscireDalVault() {
-  const precedente = (state.settings.recent_workspaces || [])
-    .find((p) => p !== state.settings.workspace_dir);
-  state.vault = null;
-  mostraVaultHome(false);
-  if (precedente) await useWorkspace(precedente);
-  else { await refreshSessions(); refreshVaults(); }
-}
-
-/** Comincia una chat nel vault dalla casella della schermata iniziale.
- *
- *  Non duplica ``send``: crea la conversazione, passa alla vista chat e mette
- *  il testo nel composer vero. Un secondo invio scritto qui sarebbe un secondo
- *  posto in cui ricordarsi degli allegati, della goccia del web e del livello
- *  di pensiero -- e prima o poi in uno dei due mancherebbe qualcosa.
- */
-async function nuovaChatNelVault() {
-  const box = $('#vh-input');
-  const testo = (box.value || '').trim();
-  if (!testo) { box.focus(); return; }
-  box.value = '';
-  await newSession();
-  mostraVaultHome(false);
-  const composer = $('#composer textarea');
-  composer.value = testo;
-  await send();
-}
-
-function bindVaultUI() {
-  const nuovo = $('#vault-new');
-  if (nuovo) nuovo.onclick = newVault;
-
-  const esci = $('#vault-exit');
-  if (esci) esci.onclick = uscireDalVault;
-
-  const invia = $('#vh-send');
-  if (invia) invia.onclick = nuovaChatNelVault;
-  const casella = $('#vh-input');
-  if (casella) {
-    casella.onkeydown = (event) => {
-      if (event.key === 'Enter' && !event.shiftKey) {
-        event.preventDefault();
-        nuovaChatNelVault();
-      }
-    };
-  }
-
-  // I campi si salvano uscendo, non ad ogni tasto: scrivere una descrizione
-  // non deve essere venti richieste e venti riscritture di .vault.json.
-  const campo = (sel, chiave) => {
-    const node = $(sel);
-    if (!node) return;
-    node.onblur = () => {
-      const valore = node.value;
-      if (state.vault && valore !== (state.vault[chiave] || '')) {
-        salvaVault({ [chiave]: valore });
-      }
-    };
-  };
-  campo('#v-nome', 'nome');
-  campo('#v-descr', 'descrizione');
-  campo('#v-istr', 'istruzioni');
-  const wiki = $('#v-wiki');
-  if (wiki) wiki.onchange = () => salvaVault({ wiki: wiki.checked });
-}
-
 async function boot() {
   const data = await api('/api/bootstrap');
   state.settings = data.settings;
@@ -3560,21 +3190,15 @@ async function boot() {
   bindGlobalEvents();
   bindSveglie();
   refreshSandbox();
-  bindVaultUI();
-  // Ricaricando la pagina dentro un vault si torna nella chat di prima, non
-  // sulla schermata iniziale: si stava lavorando, non scegliendo dove. Ma la
-  // scheda a destra e l'etichetta dell'elenco devono sapere dove si e'.
-  await refreshVaults();
-  state.vault = state.vaults.find((v) => v.attivo) || null;
-  // Il ramo del vault in cui si sta parte aperto: ricaricando la pagina
-  // dentro un vault, le sue chat devono essere li' dove le si e' lasciate --
-  // non dietro una freccia da riaprire ogni volta.
-  if (state.vault) {
-    state.vaultAperti.add(state.vault.path);
-    caricaChatVault(state.vault.path);
-  }
-  renderVaultCard();
-  renderSessions();
+  bindProgettiUI();
+  // Ricaricando la pagina dentro un progetto si torna nella chat di prima, non
+  // sulla sua schermata: si stava lavorando, non scegliendo dove. Il ramo del
+  // progetto parte aperto (lo apre ``allineaProgettoDellaChat``), e la
+  // memoria a destra sa dove si e'.
+  await refreshProgetti();
+  allineaProgettoDellaChat(data.session);
+  if (state.progetto) caricaChatProgetto(state.progetto.path);
+  refreshSessions();
   // Scalda il modello mentre l'utente legge la pagina: i 4-15 s di
   // caricamento in VRAM li paghiamo adesso invece che sul primo messaggio.
   // Volutamente senza await: se Ollama e' spento non deve bloccare l'avvio.
@@ -3592,7 +3216,7 @@ async function boot() {
   impMonta();
   bindPreviewResize();
   bindColumnResize();
-  bindVaultsResize();
+  bindProgettiResize();
   bindModelChip();
   $('#ov-close').onclick = closePreview;
   $('#ov-reload').onclick = () => openPreview(state.previewShown);
@@ -3603,7 +3227,7 @@ async function boot() {
 }
 
 function wireUi() {
-  $('#new-chat').onclick = newSession;
+  $('#new-chat').onclick = nuovaChatLibera;
   // Il tema e i due pannelli vivevano solo nel browser: adesso che le
   // impostazioni stanno su disco, seguono l'utente anche da un'altra finestra.
   // localStorage resta per il tema, perche' evita il lampo di tema sbagliato

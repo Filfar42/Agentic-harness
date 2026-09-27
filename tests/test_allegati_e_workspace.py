@@ -243,27 +243,27 @@ def test_la_colonna_di_destra_non_ha_piu_i_riquadri_traslocati():
     assert 'id="ws-browse"' not in pannello
     # Il vecchio riquadro "Consumo" e' diventato il cruscotto (26/09/2026):
     # velocita', turno, contesto, velocita' e contesto. Piano, note e file
-    # toccati restano; le due schede del vault -- identita' e memoria -- sono
-    # **alternative** alle altre: parlano del posto in cui si sta, non della
-    # conversazione, e quando compaiono le altre sono nascoste.
+    # toccati restano. Le due schede del vault -- identita' e memoria -- sono
+    # diventate la schermata del progetto; a destra resta solo la memoria del
+    # progetto, e solo dentro una sua chat.
     assert 'id="usage-block"' not in pannello
     for scheda in ("cr-tachimetro", "cr-turno", "cr-contesto", "cr-dispersione",
-                   "plan-card", "notes-card", "files-card", "vault-card", "vault-mem-card"):
+                   "plan-card", "notes-card", "files-card", "pr-mem-card"):
         assert f'id="{scheda}"' in pannello, scheda
-    assert pannello.count("<h4") == 5            # vault, memoria, piano, note, file
-    assert pannello.count('class="card cr-card"') == 4
-    assert 'id="vault-card" style="display:none"' in pannello
-    assert 'id="vault-mem-card" style="display:none"' in pannello
+    for sparita in ("vault-card", "vault-mem-card"):
+        assert f'id="{sparita}"' not in pannello, sparita
+    assert pannello.count("<h4") == 3            # piano, note, file
+    assert pannello.count('class="card cr-card"') == 5
+    assert '<section class="card cr-card" id="pr-mem-card" aria-label="Memoria del progetto" hidden>' in pannello
 
-    js = (WEB / "app.js").read_text(encoding="utf-8")
-    corpo = js[js.index("function mostraVaultHome("):]
+    # Sulla schermata del progetto la colonna di destra sparisce per intero:
+    # le sue schede parlano di una conversazione, e li' non ce n'e' una.
+    css = (WEB / "progetti.css").read_text(encoding="utf-8")
+    assert "#app.pr-home-attiva #panel" in css
+    js = (WEB / "progetti.js").read_text(encoding="utf-8")
+    corpo = js[js.index("function mostraProgettoHome("):]
     corpo = corpo[: corpo.index("\n}")]
-    assert "DEL_VAULT.includes(card.id)" in corpo, (
-        "le altre schede vanno nascoste quando compaiono quelle del vault"
-    )
-    # E devono tornare: si salva il display **prima** di azzerarlo, o si
-    # ricorderebbe 'none' e il piano non ricomparirebbe mai piu'.
-    assert corpo.index("dataset.vaultRestore =") < corpo.index("card.style.display = 'none'")
+    assert "classList.toggle('pr-home-attiva'" in corpo
 
 
 def test_la_cartella_non_sta_piu_anche_nelle_impostazioni():

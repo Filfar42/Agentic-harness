@@ -31,6 +31,7 @@ try {
 <link rel="stylesheet" href="/static/companion.css">
 <link rel="stylesheet" href="/static/impostazioni.css">
 <link rel="stylesheet" href="/static/cruscotto.css">
+<link rel="stylesheet" href="/static/progetti.css">
 <!-- Raster fallbacks and an adaptive vector mark for modern browsers. -->
 <link rel="icon" type="image/png" sizes="64x64" href="/static/favicon-64.png">
 <link rel="icon" type="image/png" sizes="32x32" href="/static/favicon-32.png">
@@ -62,13 +63,10 @@ try {
       Nuova chat
     </button>
 
-    <!-- L'etichetta dice DOVE si sta guardando: dentro un vault l'elenco è
-         quello del vault, fuori è quello delle chat libere. Un elenco solo, ma
-         non sempre lo stesso: senza l'etichetta l'unico modo di sapere quale
-         dei due si ha davanti sarebbe non ritrovarci una chat. -->
+    <!-- Le conversazioni libere: quelle fuori da ogni progetto. Le chat di un
+         progetto stanno sotto di lui, nella sezione Progetti qui sotto. -->
     <div class="section-label" id="sessions-label">
       <span id="sessions-label-text">Conversazioni</span>
-      <button class="section-back" id="vault-exit" hidden title="Torna alle conversazioni libere">esci</button>
     </div>
     <!-- La ricerca sta in cima all'elenco e non dietro un pulsante: con
          quaranta conversazioni dal titolo che comincia tutto uguale ("Nel
@@ -84,26 +82,31 @@ try {
              autocomplete="off" spellcheck="false">
       <button class="search-clear" id="search-clear" title="Pulisci (Esc)" hidden>×</button>
     </div>
+    <!-- In fondo all'elenco, le libere archiviate: un'etichetta sola, e sotto
+         le righe a richiesta (web/progetti.js, renderArchiviateLibere).
+         Archiviare non e' cancellare, e deve restare un gesto reversibile. -->
     <div id="sessions"></div>
 
     <!-- Il confine fra i due elenchi si trascina: quanto spazio meritino i
-         vault dipende da quanti ne hai e da quante chat tieni aperte sotto,
-         e non è una cosa che si possa decidere una volta per tutte da qui.
+         progetti dipende da quanti ne hai e da quante chat tieni aperte sotto.
          Stessa grammatica delle maniglie verticali, ruotata: invisibile a
          riposo, doppio clic per tornare a metà e metà. -->
-    <div class="row-grip" id="vaults-grip"
-         title="Trascina per dare più o meno spazio ai vault (doppio clic: metà e metà)"></div>
+    <div class="row-grip" id="progetti-grip"
+         title="Trascina per dare più o meno spazio ai progetti (doppio clic: metà e metà)"></div>
 
-    <!-- Un vault è un posto di lavoro: nome, descrizione, cartella e le chat
-         che ci sono state fatte dentro. Cliccarne uno apre la sua schermata
-         iniziale, non solo il workspace. La modalità manutentore-wiki è
-         diventata una proprietà del vault, non la sua definizione. -->
-    <div class="vaults-sec" id="vaults-sec">
-      <div class="section-label vaults-label">Vault</div>
-      <div class="vault-add">
-        <button class="vault-new" id="vault-new" title="Scegli la cartella con Esplora risorse">+ Nuovo vault</button>
+    <!-- Un progetto è un posto di lavoro: nome, cartella, le chat fatte lì
+         dentro e una memoria che vale per tutte. Cliccarne uno apre la sua
+         schermata; la freccia mostra le chat senza spostarsi. -->
+    <div class="progetti-sec" id="progetti-sec">
+      <div class="section-label progetti-label">
+        <span>Progetti</span>
+        <button class="pr-label-azione" id="progetto-nuovo" type="button"
+                title="Nuovo progetto" aria-label="Nuovo progetto">
+          <svg width="12" height="12" viewBox="0 0 14 14" fill="none" stroke="currentColor"
+               stroke-width="1.7" stroke-linecap="round"><path d="M7 2.5v9M2.5 7h9"/></svg>
+        </button>
       </div>
-      <div id="vaults"></div>
+      <div id="progetti" role="tree" aria-label="Progetti"></div>
     </div>
 
     <div class="sidebar-foot">
@@ -132,6 +135,12 @@ try {
   <main id="main">
     <header id="topbar">
       <button class="icon-btn" id="toggle-sidebar" title="Nascondi la barra laterale">☰</button>
+      <!-- Il progetto della chat aperta: dice dove si è e riporta alla sua
+           schermata. Nascosto per le conversazioni libere. -->
+      <button class="pr-chip" id="progetto-chip" type="button" hidden>
+        <span class="pr-chip-segno" aria-hidden="true"></span>
+        <span class="pr-chip-nome" id="progetto-chip-nome"></span>
+      </button>
       <!-- Chi lavora e su cosa: due righe, due gocce. Ognuna sta dentro la sua
            ancora, che è larga esattamente quanto la goccia — è ciò che permette
            alla tendina di allinearsi al bordo di quello che si sta guardando
@@ -195,32 +204,9 @@ try {
          il risultato senza che nessuno dei due si accorci. Il divisorio si
          trascina. -->
     <div id="main-split">
-      <!-- Schermata iniziale di un vault: prende il posto della chat, non le si
-           affianca. È la stessa colonna, con un contenuto diverso — un posto in
-           cui si arriva, si scrive la prima riga di una chat nuova o si ritrova
-           una vecchia. Nascosta finché non si apre un vault. -->
-      <div id="vault-col" hidden>
-        <div class="vault-home">
-          <header class="vault-head">
-            <h1 id="vh-nome">—</h1>
-            <p class="vault-descr" id="vh-descr"></p>
-          </header>
-
-          <!-- Il campo della chat nuova sta in alto e non in fondo all'elenco:
-               nove volte su dieci si apre un vault per scriverci, non per
-               rileggere. -->
-          <div class="vault-composer">
-            <textarea id="vh-input" rows="3" placeholder="Nuova conversazione in questo vault…"
-                      spellcheck="false"></textarea>
-            <button class="btn primary" id="vh-send">Avvia</button>
-          </div>
-
-          <div class="vault-chats">
-            <div class="section-label">Conversazioni <span class="section-hint" id="vh-count"></span></div>
-            <div id="vh-sessions"></div>
-          </div>
-        </div>
-      </div>
+      <!-- La schermata di un progetto: prende il posto della chat, non le si
+           affianca. La disegna web/progetti.js; qui c'è solo il contenitore. -->
+      <div id="progetto-col" hidden></div>
 
       <div id="chat-col">
         <div id="scroller"><div id="thread"></div></div>
@@ -311,41 +297,19 @@ try {
 
   <!-- ---------------------------- pannello destro ------------------------ -->
   <aside id="panel">
-    <!-- L'identità del vault. Sta in cima e compare solo dentro un vault,
-         perché è la scheda del posto in cui si sta: nome, a cosa serve, come
-         ci si lavora, dov'è. I due testi sono separati di proposito — la
-         descrizione è per te e non arriva mai al modello, le istruzioni sì:
-         una riga scritta di fretta per ritrovare la cartella non deve
-         diventare un ordine che l'agente segue per i mesi successivi. Si
-         salvano uscendo dal campo, dentro .vault.json — cioè nella cartella,
-         così il vault resta sé stesso anche se lo sposti. -->
-    <div class="card" id="vault-card" style="display:none">
-      <h4>Vault</h4>
-      <label class="field-lite" for="v-nome">Nome</label>
-      <input id="v-nome" type="text" maxlength="120" spellcheck="false">
-      <label class="field-lite" for="v-descr">Descrizione <span class="hint-inline">solo per te</span></label>
-      <textarea id="v-descr" rows="2" maxlength="400" placeholder="Cos'è questo posto"></textarea>
-      <label class="field-lite" for="v-istr">Istruzioni <span class="hint-inline">vanno al modello</span></label>
-      <textarea id="v-istr" rows="4" maxlength="2000" placeholder="Come si lavora qui dentro"></textarea>
-      <div class="switch compact">
-        <input type="checkbox" id="v-wiki">
-        <div><label for="v-wiki" style="margin:0">Modalità wiki</label>
-          <div class="help">L'agente diventa il manutentore di una wiki LLM: <code>raw/</code> immutabile, <code>wiki/</code> sua, schema in <code>CLAUDE.md</code>. Accendendola la struttura viene creata.</div></div>
+    <!-- La memoria del progetto, dentro una chat del progetto: quello che le
+         chat si passano. Si legge qui mentre l'agente lavora; si scrive e si
+         corregge dalla schermata del progetto. Nascosta fuori dai progetti. -->
+    <section class="card cr-card" id="pr-mem-card" aria-label="Memoria del progetto" hidden>
+      <button class="cr-head" type="button" data-cr-chiudi="memoria-progetto" aria-expanded="true">
+        <span class="cr-label">Memoria del progetto</span>
+        <span class="cr-meta" id="pr-mem-conto">—</span>
+      </button>
+      <div class="cr-corpo">
+        <div id="pr-mem-voci"></div>
+        <button class="pr-link" id="pr-mem-apri" type="button">Apri il progetto</button>
       </div>
-      <div class="kv"><span>Cartella</span><span class="vault-path" id="v-path" title="">—</span></div>
-      <div class="kv" id="v-wiki-counts" style="display:none"><span>Wiki</span><span id="v-counts">—</span></div>
-    </div>
-
-    <!-- La memoria del vault: quello che l'agente ha capito di QUESTO posto.
-         Tre fogli, e la differenza è quanto vivono: le note della chat muoiono
-         con lei, questa vale per tutte le conversazioni della cartella, le
-         memorie a lungo termine valgono ovunque. La scrive il modello con
-         manage_notes ambito='vault'; qui si legge e si toglie quello che non
-         è più vero — una nota sbagliata è peggio di nessuna nota. -->
-    <div class="card" id="vault-mem-card" style="display:none">
-      <h4>Memoria del vault <span class="plan-count" id="v-mem-count">—</span></h4>
-      <div id="v-mem"></div>
-    </div>
+    </section>
 
     <!-- ============================ cruscotto ============================
          La colonna risponde a tre domande, in quest'ordine: quanto va veloce
@@ -354,7 +318,7 @@ try {
          quando non servivano piu'. Ora arrivano dal vivo (evento `metriche`,
          quattro al secondo, core/cruscotto.py) e li disegna web/cruscotto.js.
          Ogni scheda e' una `.card` figlia diretta di #panel: e' cosi' che la
-         home del vault le nasconde tutte insieme (mostraVaultHome). -->
+         schermata del progetto le nasconde tutte insieme (mostraProgettoHome). -->
 
     <!-- Velocita'. Il numero grande e' la velocita' ADESSO (ultimi 1,5 s di
          generazione, sull'orologio del server quando lo dichiara); sotto, la
@@ -512,12 +476,22 @@ try {
   </div>
 </div>
 
+<!-- Le finestre dei progetti (nuovo progetto, impostazioni del progetto,
+     lettura di una voce della libreria): una sola, riempita da progetti.js. -->
+<div id="pr-velo" class="pr-velo" hidden>
+  <div class="pr-finestra" id="pr-finestra" role="dialog" aria-modal="true" aria-labelledby="pr-finestra-titolo"></div>
+</div>
+<!-- Il menu contestuale di una conversazione o di un progetto. -->
+<div id="pr-menu" class="pr-menu" role="menu" hidden></div>
 <div id="toast"></div>
 <script src="/static/companion.js"></script>
 <!-- Prima di app.js: definisce lo schema e le funzioni del menu, che usano
      quelle di app.js solo quando vengono chiamate. -->
 <script src="/static/impostazioni.js"></script>
 <script src="/static/cruscotto.js"></script>
+<!-- Prima di app.js, come impostazioni.js: le funzioni dei progetti usano
+     quelle di app.js solo quando vengono chiamate. -->
+<script src="/static/progetti.js"></script>
 <script src="/static/app.js"></script>
 </body>
 </html>
