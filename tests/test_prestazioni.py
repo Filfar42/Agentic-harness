@@ -194,14 +194,18 @@ def test_un_successo_cancella_il_fallimento_ricordato(monkeypatch):
 
 def test_la_tendina_di_un_tool_si_costruisce_al_primo_clic():
     """Argomenti e risultato entravano nel DOM anche da tendina chiusa: un
-    ``write_file`` da 34 kB per ogni tool di ogni passo, tutto invisibile."""
-    js = (WEB / "app.js").read_text(encoding="utf-8")
-    corpo = js[js.index("function toolDrawer(") :]
-    corpo = corpo[: corpo.index("\n}\n")]
-    assert "drawer.addEventListener('toggle'" in corpo
-    assert "if (costruita || !drawer.open) return;" in corpo
-    # Il sommario invece si costruisce sempre: e' quello che si vede.
-    assert corpo.index("<summary>") < corpo.index("addEventListener")
+    ``write_file`` da 34 kB per ogni tool di ogni passo, tutto invisibile.
+
+    Le tendine sono diventate righe (web/passi.js), la regola e' rimasta: il
+    dettaglio nasce al primo clic, una volta sola. Il comportamento lo prova
+    tests/test_passi_web.py; qui resta il guardiano sulla forma."""
+    js = (WEB / "passi.js").read_text(encoding="utf-8")
+    corpo = js[js.index("function apribile(") :]
+    corpo = corpo[: corpo.index("\n  }\n")]
+    assert "if (!corpo) {" in corpo
+    assert "corpo = costruisci();" in corpo
+    # Riaprire non ricostruisce: nasconde e mostra lo stesso nodo.
+    assert "corpo.hidden = !corpo.hidden;" in corpo
 
 
 def test_client_e_server_contano_gli_stessi_messaggi():

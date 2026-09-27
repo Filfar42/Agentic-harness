@@ -48,6 +48,11 @@ from fastapi.staticfiles import StaticFiles
 from server.security import browser_request_allowed, API_TOKEN_ENV, API_TOKEN_HEADER, MAX_REQUEST_BYTES
 
 WEB_MOBILE_DIR = Path(__file__).resolve().parent.parent / "web_mobile"
+# I file che il telefono condivide con il desktop: la resa dei passi del
+# lavoro dell'agente (righe dei tool, pensiero, blocchi). Una copia sola, in
+# ``web/``: due copie di "com'e' fatto un passo" erano gia' divergite una volta.
+WEB_DIR = Path(__file__).resolve().parent.parent / "web"
+COMUNI = {"passi.js": "text/javascript", "passi.css": "text/css"}
 
 DEFAULT_UPSTREAM = "http://127.0.0.1:8123"
 
@@ -320,6 +325,22 @@ app.mount(
 )
 
 
+@app.get("/comune/{nome}")
+def comune(nome: str) -> Response:
+    """Un file condiviso con il desktop (``COMUNI``), letto da ``web/``.
+
+    Un elenco chiuso e non una seconda cartella montata: da qui deve uscire
+    quello che il telefono usa, non tutto ``web/``."""
+    tipo = COMUNI.get(nome)
+    if tipo is None:
+        raise HTTPException(404, "File non trovato.")
+    try:
+        corpo = (WEB_DIR / nome).read_bytes()
+    except OSError as exc:
+        raise HTTPException(404, "File non trovato.") from exc
+    return Response(corpo, media_type=f"{tipo}; charset=utf-8")
+
+
 def _asset_version() -> str:
     """Impronta di app.js e style.css: cambia il file, cambia l'URL.
 
@@ -329,9 +350,10 @@ def _asset_version() -> str:
     da sola la cache.
     """
     imprint = hashlib.sha256()
-    for nome in ("app.js", "style.css"):
+    for cartella, nome in ((WEB_MOBILE_DIR, "app.js"), (WEB_MOBILE_DIR, "style.css"),
+                           *((WEB_DIR, n) for n in COMUNI)):
         try:
-            imprint.update((WEB_MOBILE_DIR / nome).read_bytes())
+            imprint.update((cartella / nome).read_bytes())
         except OSError:
             imprint.update(nome.encode())
     return imprint.hexdigest()[:10]
@@ -372,6 +394,8 @@ def index() -> Response:
     versione = _asset_version()
     html = html.replace("/static/app.js", f"/static/app.js?v={versione}")
     html = html.replace("/static/style.css", f"/static/style.css?v={versione}")
+    for nome in COMUNI:
+        html = html.replace(f"/comune/{nome}", f"/comune/{nome}?v={versione}")
     return Response(
         html,
         media_type="text/html",

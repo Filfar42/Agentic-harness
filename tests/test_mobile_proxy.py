@@ -142,6 +142,43 @@ def test_index_and_static_assets_are_served(mobile):
     assert "api/chat" in js.text  # e' il client che parla col principale
 
 
+def test_i_passi_condivisi_arrivano_dal_desktop(mobile):
+    """Righe dei tool, pensiero e blocchi di lavoro sono una copia sola, in
+    web/: il ponte la serve da /comune/, con la stessa impronta degli altri
+    asset, e solo quella -- non tutta la cartella del desktop."""
+    versione = mobile.mobile._asset_version()
+    pagina = mobile.get("/").text
+    assert f'src="/comune/passi.js?v={versione}"' in pagina
+    assert f'href="/comune/passi.css?v={versione}"' in pagina
+
+    js = mobile.get("/comune/passi.js")
+    assert js.status_code == 200
+    assert js.headers["content-type"].startswith("text/javascript")
+    assert "Passi" in js.text
+    css = mobile.get("/comune/passi.css")
+    assert css.status_code == 200
+    assert css.headers["content-type"].startswith("text/css")
+    for estraneo in ("/comune/app.js", "/comune/index.html", "/comune/..%2Fserver%2Fmain.py"):
+        assert mobile.get(estraneo).status_code == 404, estraneo
+
+
+def test_i_frame_del_turno_e_i_messaggi_portano_l_ora(mobile):
+    """Le durate dei blocchi ("Ha lavorato 41 s") si misurano sull'orologio
+    del server: ``t`` sui frame del turno, ``ts`` sui messaggi salvati --
+    compreso quello dell'utente, da cui comincia il primo blocco."""
+    session_id = mobile.post("/api/sessions").json()["session_id"]
+    prima = time.time()
+    mobile.post("/api/chat", json={"session_id": session_id, "prompt": "dimmi due parole"})
+    events = read_sse(mobile.get(f"/api/stream/{session_id}").text)
+    turno = [ev for ev in events if ev["type"] in ("start", "step", "assistant", "done")]
+    assert turno and all(isinstance(ev.get("t"), float) for ev in turno), turno
+    assert all(prima - 1 <= ev["t"] <= time.time() + 1 for ev in turno)
+
+    aperta = mobile.post(f"/api/sessions/{session_id}/open", json={}).json()
+    utente = next(m for m in aperta["messages"] if m["role"] == "user")
+    assert prima - 1 <= utente["ts"] <= time.time() + 1
+
+
 # ---------------------------------------------------------------------------
 # Elenco conversazioni attraverso il ponte
 # ---------------------------------------------------------------------------

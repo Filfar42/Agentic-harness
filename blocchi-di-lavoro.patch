@@ -1,0 +1,3445 @@
+diff --git a/README.md b/README.md
+index 2ee8e8e..0980205 100644
+--- a/README.md
++++ b/README.md
+@@ -428,6 +428,49 @@ modello richiesto.
+ 
+ ## Storia delle revisioni
+ 
++**I passi dell'agente in blocchi di lavoro** (27/09/2026, su `main`, versione
++non ancora numerata) — le card dei tool e del pensiero erano scatole spesse,
++tutte uguali: un turno da sette tool erano undici riquadri (~470 px) prima
++della risposta, e durante il turno ogni "Ragionamento" restava aperto col
++testo intero fino alla fine.
++
++- **Un blocco per ogni tratto di lavoro.** Pensieri e tool consecutivi stanno
++  in un blocco. Vivo dice "Sta lavorando · passo 6 · 31 s" e mostra gli
++  ultimi quattro passi (i vecchi si piegano in "N passi prima"). Chiuso e'
++  una riga sola: "Ha lavorato 41 s · 2 letture · 1 ricerca · 2 modifiche · 2
++  comandi", piu' l'esito dell'ultimo comando; si apre sulla traccia.
++- **Un testo del modello spezza il blocco**: quello che il modello dice
++  resta in chat fra un blocco e l'altro, mai dentro una tendina.
++- **Una riga per passo**, senza bordo: icona, verbo, oggetto ("Legge
++  tools.py") e a destra quello che vale la riga (righe lette, risultati,
++  `+2 −1`, `exit 1 · 3,4 s`). La durata solo sopra il secondo. La riga di un
++  tool nasce a `tool_start`, con la rotellina: prima un `pytest` da un minuto
++  non si vedeva da nessuna parte.
++- **Il pensiero dal vivo** sta in una finestra fissa di quattro righe che
++  sfuma in alto; chiuso, e' la riga con la sua prima frase, e si apre sul
++  testo intero.
++- **Il dettaglio per tipo**, costruito al primo clic: estratto con i numeri di
++  riga veri (read/write), diff (edit, numerato dalla finestra
++  `dopo_la_modifica`), corrispondenze per file (search), terminale con codice
++  di uscita e scorrimento dal fondo (run), errore col suggerimento, e
++  chiave: valore per gli altri. Il JSON grezzo resta a un clic.
++- **Telefono uguale al desktop.** Il componente e' uno, `web/passi.js` +
++  `web/passi.css`, servito al telefono da `/comune/` (`server/mobile.py`);
++  ogni client ci mette solo i suoi colori (`--ps-*`). Il telefono guadagna i
++  dettagli al tocco; dal vivo del pensiero tiene in pagina solo la coda.
++- **Durate sull'orologio del server**: `t` sui frame del turno, `ts` anche sul
++  messaggio dell'utente. Con l'orologio del browser l'arretrato di un
++  riattacco, che arriva in un istante, avrebbe dato durate a zero.
++- Sul tema chiaro `--text-faint` e `--text-muted` sono quasi lo stesso grigio:
++  i dati di contorno delle righe usano `--quiet`.
++
++File: `web/passi.js` e `web/passi.css` (nuovi), `web/app.js` (`makeTurn`
++delega a `Passi.lavoro`; via `toolDrawer`, `TOOL_ICON`, `argPreview`),
++`web/style.css`, `web/index.html`, `web_mobile/app.js`, `web_mobile/style.css`,
++`web_mobile/index.html`, `server/main.py`, `server/mobile.py`. Test:
++`tests/test_passi_web.py` (nuovo, QuickJS con un DOM minimo),
++`test_mobile_passi.py`, `test_mobile_proxy.py`, `test_prestazioni.py`.
++
+ **I vault diventano Progetti** (26-27/09/2026, ramo `progetti-2026-09-26`
+ sopra `barra-destra-2026-09-26`, versione non ancora numerata) — il progetto
+ e' il pezzo principale, la wiki una sua opzione.
+diff --git a/server/main.py b/server/main.py
+index af8df6a..91e7b7c 100644
+--- a/server/main.py
++++ b/server/main.py
+@@ -1003,6 +1003,15 @@ def sse(event_type: str, payload: dict[str, Any]) -> str:
+     return f"data: {json.dumps({'type': event_type, **payload}, ensure_ascii=False)}\n\n"
+ 
+ 
++def ora_del_server() -> float:
++    """``t`` sui frame di un turno: l'ora del server, in secondi.
++
++    Le interfacce ci misurano le durate dei blocchi di lavoro e dei pensieri
++    ("Ha lavorato 41 s"). Con l'orologio del browser sarebbero sbagliate
++    proprio nell'arretrato di un riattacco, che arriva tutto in un istante."""
++    return round(time.time(), 3)
++
++
+ def _e_un_guasto_del_backend(event: Any) -> bool:
+     """Questo errore giustifica di buttare via l'istanza del backend?
+ 
+@@ -1026,7 +1035,7 @@ def _e_un_guasto_del_backend(event: Any) -> bool:
+ def event_to_sse(event: Any) -> str:
+     name = _EVENT_NAMES.get(type(event), "unknown")
+     payload = asdict(event) if is_dataclass(event) else {"value": str(event)}
+-    return sse(name, payload)
++    return sse(name, {**payload, "t": ora_del_server()})
+ 
+ 
+ class EventBus:
+@@ -1347,7 +1356,7 @@ def start_turn(
+ 
+     def work(runner: TurnRunner) -> None:
+         terminal_frame = sse("done", {"reason": "error"})
+-        runner.emit(sse("start", {"session_id": session_id}))
++        runner.emit(sse("start", {"session_id": session_id, "t": ora_del_server()}))
+         # Gli allegati che non sono entrati in contesto si dicono, e si dicono
+         # PRIMA che il modello parli.
+         #
+@@ -1643,7 +1652,7 @@ def index() -> Response:
+     # versione di prima con niente che lo facesse sospettare.
+     for nome in ("app.js", "style.css", "companion.js", "companion.css",
+                  "impostazioni.js", "impostazioni.css", "cruscotto.js", "cruscotto.css",
+-                 "progetti.js", "progetti.css"):
++                 "progetti.js", "progetti.css", "passi.js", "passi.css"):
+         html = html.replace(f"/static/{nome}", f"/static/{nome}?v={_impronta(nome)}")
+     return Response(
+         html,
+@@ -2213,7 +2222,9 @@ def chat(request: ChatRequest) -> dict[str, Any]:
+     if RUNNERS.is_running(session_id):
+         raise HTTPException(409, "Un turno e' gia' in corso in questa conversazione.")
+ 
+-    entry: dict[str, Any] = {"role": "user", "content": prompt}
++    # ``ts`` come sugli altri messaggi: e' l'inizio del primo blocco di lavoro
++    # del turno, e senza la sua durata ridisegnando la chat non si sa.
++    entry: dict[str, Any] = {"role": "user", "content": prompt, "ts": time.time()}
+     agganciati = anchor_attachments(session_id, request.attachments)
+     if agganciati:
+         entry["attachments"] = agganciati
+diff --git a/server/mobile.py b/server/mobile.py
+index ff171b7..b7a82ef 100644
+--- a/server/mobile.py
++++ b/server/mobile.py
+@@ -48,6 +48,11 @@ from fastapi.staticfiles import StaticFiles
+ from server.security import browser_request_allowed, API_TOKEN_ENV, API_TOKEN_HEADER, MAX_REQUEST_BYTES
+ 
+ WEB_MOBILE_DIR = Path(__file__).resolve().parent.parent / "web_mobile"
++# I file che il telefono condivide con il desktop: la resa dei passi del
++# lavoro dell'agente (righe dei tool, pensiero, blocchi). Una copia sola, in
++# ``web/``: due copie di "com'e' fatto un passo" erano gia' divergite una volta.
++WEB_DIR = Path(__file__).resolve().parent.parent / "web"
++COMUNI = {"passi.js": "text/javascript", "passi.css": "text/css"}
+ 
+ DEFAULT_UPSTREAM = "http://127.0.0.1:8123"
+ 
+@@ -320,6 +325,22 @@ app.mount(
+ )
+ 
+ 
++@app.get("/comune/{nome}")
++def comune(nome: str) -> Response:
++    """Un file condiviso con il desktop (``COMUNI``), letto da ``web/``.
++
++    Un elenco chiuso e non una seconda cartella montata: da qui deve uscire
++    quello che il telefono usa, non tutto ``web/``."""
++    tipo = COMUNI.get(nome)
++    if tipo is None:
++        raise HTTPException(404, "File non trovato.")
++    try:
++        corpo = (WEB_DIR / nome).read_bytes()
++    except OSError as exc:
++        raise HTTPException(404, "File non trovato.") from exc
++    return Response(corpo, media_type=f"{tipo}; charset=utf-8")
++
++
+ def _asset_version() -> str:
+     """Impronta di app.js e style.css: cambia il file, cambia l'URL.
+ 
+@@ -329,9 +350,10 @@ def _asset_version() -> str:
+     da sola la cache.
+     """
+     imprint = hashlib.sha256()
+-    for nome in ("app.js", "style.css"):
++    for cartella, nome in ((WEB_MOBILE_DIR, "app.js"), (WEB_MOBILE_DIR, "style.css"),
++                           *((WEB_DIR, n) for n in COMUNI)):
+         try:
+-            imprint.update((WEB_MOBILE_DIR / nome).read_bytes())
++            imprint.update((cartella / nome).read_bytes())
+         except OSError:
+             imprint.update(nome.encode())
+     return imprint.hexdigest()[:10]
+@@ -372,6 +394,8 @@ def index() -> Response:
+     versione = _asset_version()
+     html = html.replace("/static/app.js", f"/static/app.js?v={versione}")
+     html = html.replace("/static/style.css", f"/static/style.css?v={versione}")
++    for nome in COMUNI:
++        html = html.replace(f"/comune/{nome}", f"/comune/{nome}?v={versione}")
+     return Response(
+         html,
+         media_type="text/html",
+diff --git a/tests/test_mobile_passi.py b/tests/test_mobile_passi.py
+index 51060a5..aa97aa9 100644
+--- a/tests/test_mobile_passi.py
++++ b/tests/test_mobile_passi.py
+@@ -1,13 +1,15 @@
+ """I passi del turno sull'interfaccia mobile: cosa si vede mentre l'agente lavora.
+ 
+-Il vincolo, dal telefono: si deve capire **che sta facendo**, non cosa ha
+-letto. Quindi in pagina entrano il verbo e il suo oggetto ("legge tools.py"),
+-mai il contenuto -- ne' il pensiero, ne' il risultato di un tool -- e quando
+-la risposta arriva le righe si richiudono in una tendina sola.
++Il vincolo, dal telefono: si deve capire **che sta facendo** a colpo
++d'occhio. Nella riga entrano il verbo e il suo oggetto ("Legge tools.py"),
++mai il contenuto; il contenuto -- il risultato di un tool, il pensiero
++intero -- entra in pagina solo al tocco sulla riga, e dal vivo del pensiero
++si vedono le ultime quattro righe. Le righe e i blocchi sono quelli del
++desktop (web/passi.js, provato in tests/test_passi_web.py): qui si prova il
++cablaggio del telefono.
+ 
+ Le funzioni pure di ``web_mobile/app.js`` vengono estratte dal sorgente ed
+-eseguite in QuickJS: sono le stesse che disegnano la diretta e la cronologia,
+-quindi provarle qui vale per tutti e due i percorsi.
++eseguite in QuickJS, insieme a web/passi.js che la pagina carica prima.
+ 
+ Serve ``quickjs`` (``pip install quickjs``): senza, i test saltano.
+ """
+@@ -23,6 +25,7 @@ quickjs = pytest.importorskip("quickjs")
+ 
+ WEB_MOBILE = Path(__file__).resolve().parents[1] / "web_mobile"
+ APP_JS = WEB_MOBILE / "app.js"
++PASSI_JS = Path(__file__).resolve().parents[1] / "web" / "passi.js"
+ 
+ 
+ def _funzione(sorgente: str, nome: str) -> str:
+@@ -31,25 +34,17 @@ def _funzione(sorgente: str, nome: str) -> str:
+     return trovata.group(0)
+ 
+ 
+-def _costante(sorgente: str, nome: str) -> str:
+-    trovata = re.search(rf"const {nome} = \{{.*?\n\}};", sorgente, re.DOTALL)
+-    assert trovata, f"costante {nome} non trovata in {APP_JS.name}"
+-    return trovata.group(0)
+-
+-
+ @pytest.fixture()
+ def js() -> quickjs.Context:
+     sorgente = APP_JS.read_text(encoding="utf-8")
+     pezzi = [
+-        _funzione(sorgente, "troncaTesto"),
+-        _funzione(sorgente, "nomeFile"),
+-        _costante(sorgente, "VERBI_TOOL"),
+         _funzione(sorgente, "descriviTool"),
+-        _funzione(sorgente, "toolAndatoBene"),
+         _funzione(sorgente, "durataBreve"),
+         _funzione(sorgente, "rispostaData"),
+     ]
+     ctx = quickjs.Context()
++    # La pagina carica /comune/passi.js prima di app.js (index.html).
++    ctx.eval(PASSI_JS.read_text(encoding="utf-8"))
+     ctx.eval("\n".join(pezzi))
+     return ctx
+ 
+@@ -99,13 +94,18 @@ def test_gli_argomenti_lunghi_si_accorciano(js) -> None:
+ 
+ 
+ def test_il_contenuto_del_risultato_non_entra_mai_nella_riga(js) -> None:
+-    """Del risultato di un tool si tiene una cosa sola: se e' andato male."""
+-    assert js.eval('toolAndatoBene(JSON.stringify({status: "ok"}), undefined)') is True
+-    assert js.eval('toolAndatoBene(JSON.stringify({error: "manca il file"}), undefined)') is False
++    """Del risultato di un tool la riga tiene poco: quante righe, com'e'
++    finito, se e' andato male. Il contenuto no -- quello si apre al tocco."""
++    riga = js.eval(
++        'JSON.stringify(Passi.riga("read_file", {filepath: "a.py"}, '
++        'JSON.stringify({total_lines: 2, content: "SEGRETO\\nALTRO"}), true, 0))'
++    )
++    assert "SEGRETO" not in riga
++    assert js.eval('Passi.riga("read_file", {}, JSON.stringify({error: "manca il file"}), undefined, 0).tono') == "err"
+     # L'esito esplicito del server vince sul contenuto.
+-    assert js.eval('toolAndatoBene(JSON.stringify({status: "ok"}), false)') is False
++    assert js.eval('Passi.riga("read_file", {}, JSON.stringify({status: "ok"}), false, 0).tono') == "err"
+     # Un risultato che non e' JSON non e' un fallimento: e' solo testo.
+-    assert js.eval('toolAndatoBene("output grezzo", undefined)') is True
++    assert js.eval('Passi.riga("read_file", {}, "output grezzo", undefined, 0).tono') == ""
+ 
+ 
+ def test_la_durata_si_legge_a_colpo_d_occhio(js) -> None:
+@@ -144,22 +144,37 @@ def test_la_striscia_dell_attivita_c_e_ed_e_animata() -> None:
+     for atteso in ('id="attivita"', 'id="attivita-testo"', 'id="attivita-tempo"'):
+         assert atteso in html, atteso
+     assert 'aria-live="polite"' in html, "chi non guarda lo schermo deve sentirlo"
+-    for regola in ("@keyframes scorre", "@keyframes battito", "@keyframes pulsa"):
++    for regola in ("@keyframes scorre", "@keyframes battito"):
+         assert regola in css, regola
++    # Il passo in corso gira: la rotellina del tool e il pensiero vivo stanno
++    # nelle righe condivise (web/passi.css).
++    comune = (PASSI_JS.parent / "passi.css").read_text(encoding="utf-8")
++    assert "@keyframes ps-gira" in comune
++    assert "prefers-reduced-motion" in comune
+     # Chi ha chiesto meno animazioni al sistema operativo le ottiene.
+     assert "prefers-reduced-motion" in css
+ 
+ 
+ def test_i_passi_sono_piu_piccoli_e_piu_chiari_del_testo() -> None:
+     """La richiesta era esplicita: tonalita' piu' chiara e carattere piu'
+-    piccolo, perche' i passi sono note a margine, non contenuto."""
++    piccolo, perche' i passi sono note a margine, non contenuto. Le righe sono
++    di web/passi.css; il telefono ne sceglie misura e colori."""
+     css = (WEB_MOBILE / "style.css").read_text(encoding="utf-8")
+-    blocco = re.search(r"\n\.passo \{(.*?)\n\}", css, re.DOTALL)
+-    assert blocco, "manca la regola .passo"
+-    corpo = blocco.group(1)
+-    misura = re.search(r"font-size:\s*([\d.]+)px", corpo)
++    misura = re.search(r"--ps-font:\s*([\d.]+)px", css)
+     assert misura and float(misura.group(1)) < 15, "i passi devono essere piu' piccoli del testo"
+-    assert "var(--testo-dim)" in corpo, "i passi devono essere piu' chiari del testo"
++    assert re.search(r"--ps-medio:\s*var\(--testo-dim\)", css), "i passi devono essere piu' chiari del testo"
++    # Righe che si toccano col dito.
++    altezza = re.search(r"--ps-riga-h:\s*(\d+)px", css)
++    assert altezza and int(altezza.group(1)) >= 40
++    comune = (PASSI_JS.parent / "passi.css").read_text(encoding="utf-8")
++    riga = re.search(r"\n\.ps-riga, \.ps-piega \{(.*?)\n\}", comune, re.DOTALL)
++    assert riga and "var(--ps-medio)" in riga.group(1)
++
++
++def test_la_pagina_carica_i_passi_condivisi_prima_dell_app() -> None:
++    html = (WEB_MOBILE / "index.html").read_text(encoding="utf-8")
++    assert '<link rel="stylesheet" href="/comune/passi.css">' in html
++    assert html.index('src="/comune/passi.js"') < html.index('src="/static/app.js"')
+ 
+ 
+ # ------------------------------------------- la domanda a cui si e' risposto
+@@ -201,76 +216,41 @@ def test_il_telefono_ascolta_il_bus_globale() -> None:
+     assert "if (running && !source) attachStream();" in sorgente
+ 
+ 
+-# --------------------------------------- il sommario dei passi mentre lavora
+-
++# ------------------------------------------ i blocchi di lavoro sul telefono
+ 
+-@pytest.fixture()
+-def js_sommario() -> quickjs.Context:
+-    """La sola funzione sommarioPassi piu' le variabili che legge."""
+-    sorgente = APP_JS.read_text(encoding="utf-8")
+-    ctx = quickjs.Context()
+-    ctx.eval(_funzione(sorgente, "sommarioPassi"))
+-    ctx.eval(_funzione(sorgente, "durataBreve"))
+-    return ctx
+ 
+-
+-def test_il_sommario_vivo_dice_passo_e_strumenti_del_passo(js_sommario) -> None:
+-    """Il testo era 'x passi | y strumenti' col totale del turno: a meta'
+-    lavoro quel numero non torna con le righe aperte sotto. Ora e' 'passo N
+-    · M strumenti' e M conta i tool del SOLO passo corrente."""
+-
+-    ctx = js_sommario
+-    ctx.eval("""
+-var sum = { textContent: "" };
+-gruppoPassi = { querySelector: function (sel) {
+-  return sel === ".passi-sommario" ? sum : null; } };
+-contaTool = 0; inizioTurno = null; contaSecondi = 0;
+-""")
+-    scenari = [(2, 3), (1, 1), (4, 0), (0, 0)]
+-    visti = []
+-    for passi, tool in scenari:
+-        ctx.eval(f"contaPassi = {passi}; contaToolPasso = {tool}; sum.textContent = '';")
+-        ctx.eval("sommarioPassi(false)")
+-        visti.append(ctx.eval("sum.textContent"))
+-
+-    attesi = [
+-        "passo 2 · 3 strumenti",
+-        "passo 1 · 1 strumento",  # il singolare: uno strumento si vede
+-        "passo 4",                # passo senza tool: niente coda vuota
+-        "sta lavorando…",         # nessun passo ancora: resta generico
+-    ]
+-    assert visti == attesi
+-
+-
+-def test_il_sommario_chiuso_parla_per_l_intero_turno(js_sommario) -> None:
+-    """A turno finito la riga resta un riepilogo: totale passi, totale
+-    strumenti e durata. La modifica tocca solo la riga VIVA."""
+-    ctx = js_sommario
+-    ctx.eval("""
+-var sum = { textContent: "" };
+-gruppoPassi = { querySelector: function (sel) {
+-  return sel === ".passi-sommario" ? sum : null; } };
+-contaPassi = 5; contaTool = 9; contaToolPasso = 0;
+-inizioTurno = Date.now() - 95000; contaSecondi = 95;
+-sommarioPassi(true);
+-""")
+-    assert ctx.eval("sum.textContent").startswith("5 passi")
+-    assert "9 strumenti" in ctx.eval("sum.textContent")
+-
+-
+-def test_il_contatore_per_passo_si_resetta_al_giro_nuovo() -> None:
+-    """Se contaToolPasso non riparte da zero a ogni evento step, il numero
+-    cresce per sempre ed e' di nuovo il totale del turno -- il bug di prima."""
++def test_il_telefono_usa_la_regia_dei_blocchi_condivisa() -> None:
++    """Il sommario "passo N · M strumenti" e le righe fatte a mano non ci sono
++    piu': diretta e cronologia passano da Passi.lavoro, la stessa regia del
++    desktop (le sue regole sono provate in tests/test_passi_web.py)."""
+     sorgente = APP_JS.read_text(encoding="utf-8")
+     codice = "\n".join(
+-        riga for riga in sorgente.splitlines() if not riga.lstrip().startswith("//")
++        riga for riga in sorgente.splitlines() if not riga.lstrip().startswith(("//", "*", "/*"))
+     )
+-    # Nasce, si azzera allo start del turno...
+-    assert "let contaToolPasso = 0;" in codice
+-    # ...si azzera a ogni nuovo passo (il caso 'step' dell'event stream)...
+-    assert re.search(r'case\s*"step":[\s\S]{0,200}contaToolPasso = 0', codice)
+-    # ...e cresce solo quando parte davvero un tool.
+-    assert re.search(r'case\s*"tool_start":\s*\{[\s\S]{0,120}contaToolPasso \+= 1', codice)
++    assert "Passi.lavoro(" in codice
++    for evento, chiamata in (
++        ('"step"', "lavoro.segnaPasso("),
++        ('"reasoning"', "lavoro.appendThinking("),
++        ('"tool_start"', "lavoro.avviaTool("),
++        ('"tool_end"', "lavoro.concludiTool("),
++    ):
++        assert re.search(rf"case\s*{evento}:[\s\S]{{0,400}}{re.escape(chiamata)}", codice), evento
++    # Un testo del modello chiude il blocco prima della sua bolla.
++    assert re.search(r'case\s*"content":[\s\S]{0,1600}lavoro\.chiudi\(\);\s*const bubble = liveBubble\(\)', codice)
++    # La cronologia disegna gli stessi blocchi, dai messaggi `tool` salvati.
++    inizio = codice.index("function renderConversation(")
++    corpo = codice[inizio: codice.index("\nfunction ", inizio + 10)]
++    assert "lavoro.concludiTool(" in corpo and "lavoro.pensieroSalvato(" in corpo
++
++
++def test_al_riaggancio_se_ne_vanno_tutti_i_nodi_del_turno_vivo() -> None:
++    """L'arretrato ridisegna il turno da capo: se restasse un blocco chiuso
++    della diretta di prima, il turno si vedrebbe due volte."""
++    sorgente = APP_JS.read_text(encoding="utf-8")
++    corpo = _funzione(sorgente, "pulisciTurnoVivo")
++    assert "[data-turno-vivo]" in corpo
++    assert "nuovoLavoro(true)" in corpo
++    assert "nodo.dataset.turnoVivo" in _funzione(sorgente, "nuovoLavoro")
+ 
+ 
+ # ------------------------------------- modello e workspace nella barra mobile
+diff --git a/tests/test_mobile_proxy.py b/tests/test_mobile_proxy.py
+index d0a540d..d1b4855 100644
+--- a/tests/test_mobile_proxy.py
++++ b/tests/test_mobile_proxy.py
+@@ -142,6 +142,43 @@ def test_index_and_static_assets_are_served(mobile):
+     assert "api/chat" in js.text  # e' il client che parla col principale
+ 
+ 
++def test_i_passi_condivisi_arrivano_dal_desktop(mobile):
++    """Righe dei tool, pensiero e blocchi di lavoro sono una copia sola, in
++    web/: il ponte la serve da /comune/, con la stessa impronta degli altri
++    asset, e solo quella -- non tutta la cartella del desktop."""
++    versione = mobile.mobile._asset_version()
++    pagina = mobile.get("/").text
++    assert f'src="/comune/passi.js?v={versione}"' in pagina
++    assert f'href="/comune/passi.css?v={versione}"' in pagina
++
++    js = mobile.get("/comune/passi.js")
++    assert js.status_code == 200
++    assert js.headers["content-type"].startswith("text/javascript")
++    assert "Passi" in js.text
++    css = mobile.get("/comune/passi.css")
++    assert css.status_code == 200
++    assert css.headers["content-type"].startswith("text/css")
++    for estraneo in ("/comune/app.js", "/comune/index.html", "/comune/..%2Fserver%2Fmain.py"):
++        assert mobile.get(estraneo).status_code == 404, estraneo
++
++
++def test_i_frame_del_turno_e_i_messaggi_portano_l_ora(mobile):
++    """Le durate dei blocchi ("Ha lavorato 41 s") si misurano sull'orologio
++    del server: ``t`` sui frame del turno, ``ts`` sui messaggi salvati --
++    compreso quello dell'utente, da cui comincia il primo blocco."""
++    session_id = mobile.post("/api/sessions").json()["session_id"]
++    prima = time.time()
++    mobile.post("/api/chat", json={"session_id": session_id, "prompt": "dimmi due parole"})
++    events = read_sse(mobile.get(f"/api/stream/{session_id}").text)
++    turno = [ev for ev in events if ev["type"] in ("start", "step", "assistant", "done")]
++    assert turno and all(isinstance(ev.get("t"), float) for ev in turno), turno
++    assert all(prima - 1 <= ev["t"] <= time.time() + 1 for ev in turno)
++
++    aperta = mobile.post(f"/api/sessions/{session_id}/open", json={}).json()
++    utente = next(m for m in aperta["messages"] if m["role"] == "user")
++    assert prima - 1 <= utente["ts"] <= time.time() + 1
++
++
+ # ---------------------------------------------------------------------------
+ # Elenco conversazioni attraverso il ponte
+ # ---------------------------------------------------------------------------
+diff --git a/tests/test_passi_web.py b/tests/test_passi_web.py
+new file mode 100644
+index 0000000..12edf4b
+--- /dev/null
++++ b/tests/test_passi_web.py
+@@ -0,0 +1,525 @@
++"""I passi del lavoro dell'agente in chat: web/passi.js, eseguito in QuickJS.
++
++Il modulo e' condiviso da desktop e telefono, e ha due strati: le funzioni
++pure che dal risultato di un tool ricavano cosa si vede (la riga, il
++dettaglio, il riassunto del blocco), e la regia dei blocchi di lavoro
++(``Passi.lavoro``) che decide dove finisce un passo e quando un blocco si
++chiude. Il primo strato si prova con i dati; il secondo con un DOM minimo,
++quanto basta a contare nodi e a cliccare -- la resa grafica la guarda il
++browser, non questa suite.
++
++Serve ``quickjs`` (e' nelle dipendenze di sviluppo): senza, i test saltano.
++"""
++
++from __future__ import annotations
++
++import json
++from pathlib import Path
++
++import pytest
++
++quickjs = pytest.importorskip("quickjs")
++
++WEB = Path(__file__).resolve().parents[1] / "web"
++PASSI_JS = WEB / "passi.js"
++
++# Un DOM minimo: elementi, testo, classi, attributi, eventi di clic, e una
++# querySelector che capisce i selettori di classe composti (".a.b"). Nient'altro
++# di quello che passi.js usa esiste qui, ed e' voluto: se il modulo cominciasse
++# a dipendere da altro, questi test lo direbbero.
++DOM = r"""
++class Nodo {
++  constructor(tag, tipo) {
++    this.tagName = String(tag).toUpperCase();
++    this.nodeType = tipo || 1;
++    this.childNodes = [];
++    this.parentNode = null;
++    this.dataset = {};
++    this.style = {};
++    this.attributi = {};
++    this.ascoltatori = {};
++    this.hidden = false;
++    this._classi = [];
++    this._testo = '';
++    this._html = '';
++    const self = this;
++    this.classList = {
++      add(c) { if (!self._classi.includes(c)) self._classi.push(c); },
++      remove(c) { self._classi = self._classi.filter((x) => x !== c); },
++      contains(c) { return self._classi.includes(c); },
++      toggle(c, forza) {
++        const si = forza === undefined ? !self._classi.includes(c) : Boolean(forza);
++        if (si) this.add(c); else this.remove(c);
++        return si;
++      },
++    };
++  }
++  get className() { return this._classi.join(' '); }
++  set className(v) { this._classi = String(v || '').split(/\s+/).filter(Boolean); }
++  get textContent() {
++    if (this.nodeType === 3) return this._testo;
++    return this.childNodes.map((n) => n.textContent).join('');
++  }
++  set textContent(v) {
++    if (this.nodeType === 3) { this._testo = String(v); return; }
++    this.childNodes.forEach((n) => { n.parentNode = null; });
++    this.childNodes = [];
++    this._html = '';
++    if (v !== '' && v != null) this.appendChild(documento.createTextNode(String(v)));
++  }
++  set innerHTML(v) { this.textContent = ''; this._html = String(v); }
++  get innerHTML() { return this._html; }
++  get isConnected() {
++    let n = this;
++    while (n.parentNode) n = n.parentNode;
++    return n === documento.body;
++  }
++  appendChild(n) {
++    if (n.parentNode) n.remove();
++    this.childNodes.push(n);
++    n.parentNode = this;
++    return n;
++  }
++  append(...nodi) { nodi.forEach((n) => this.appendChild(n)); }
++  remove() {
++    if (!this.parentNode) return;
++    const fratelli = this.parentNode.childNodes;
++    fratelli.splice(fratelli.indexOf(this), 1);
++    this.parentNode = null;
++  }
++  setAttribute(k, v) { this.attributi[k] = String(v); }
++  getAttribute(k) { return k in this.attributi ? this.attributi[k] : null; }
++  addEventListener(tipo, fn) { (this.ascoltatori[tipo] = this.ascoltatori[tipo] || []).push(fn); }
++  click() { (this.ascoltatori.click || []).forEach((fn) => fn({})); }
++  _combacia(sel) {
++    const classi = sel.split('.').filter(Boolean);
++    return this.nodeType === 1 && classi.every((c) => this._classi.includes(c));
++  }
++  querySelectorAll(sel) {
++    const trovati = [];
++    const visita = (n) => {
++      for (const f of n.childNodes) {
++        if (f._combacia(sel)) trovati.push(f);
++        visita(f);
++      }
++    };
++    visita(this);
++    return trovati;
++  }
++  querySelector(sel) { return this.querySelectorAll(sel)[0] || null; }
++}
++var documento = {
++  createElement: (tag) => new Nodo(tag, 1),
++  createTextNode: (t) => { const n = new Nodo('#text', 3); n._testo = String(t); return n; },
++};
++documento.body = new Nodo('body', 1);
++var intervalli = [];
++var window = {
++  document: documento,
++  setInterval: (fn) => { intervalli.push(fn); return intervalli.length; },
++  clearInterval: () => {},
++};
++var setInterval = window.setInterval;
++var clearInterval = window.clearInterval;
++"""
++
++
++@pytest.fixture()
++def js() -> quickjs.Context:
++    ctx = quickjs.Context()
++    ctx.eval(DOM)
++    ctx.eval(PASSI_JS.read_text(encoding="utf-8"))
++    ctx.eval("var Passi = window.Passi;")
++    return ctx
++
++
++def valuta(ctx: quickjs.Context, espressione: str):
++    """Il valore di un'espressione, passato da JSON: oggetti e liste inclusi."""
++    return json.loads(ctx.eval(f"JSON.stringify({espressione})"))
++
++
++def riga(ctx, nome, args, risultato=None, ok=True, durata=0):
++    risultato_js = "undefined" if risultato is None else json.dumps(json.dumps(risultato))
++    return valuta(ctx, f"Passi.riga({json.dumps(nome)}, {json.dumps(args)}, {risultato_js}, "
++                       f"{json.dumps(ok)}, {json.dumps(durata)})")
++
++
++# ---------------------------------------------------------------------------
++# La riga: verbo e oggetto, e del risultato solo quello che vale la riga
++# ---------------------------------------------------------------------------
++
++
++def test_la_riga_dice_il_verbo_e_il_file_non_il_json(js) -> None:
++    d = riga(js, "read_file", {"filepath": "core/tools.py"},
++             {"filepath": "core/tools.py", "total_lines": 19, "range": "intero file", "content": "x\ny"})
++    assert (d["verbo"], d["oggetto"], d["titolo"]) == ("Legge", "tools.py", "core/tools.py")
++    assert d["meta"] == "19 righe"
++    # Il contenuto del file non entra mai nella riga.
++    assert all("x\ny" not in str(v) for v in d.values())
++
++
++def test_la_riga_di_una_lettura_parziale_dice_quali_righe(js) -> None:
++    d = riga(js, "read_file", {"filepath": "a.py"}, {"range": "1200-1221", "total_lines": 3914})
++    assert d["meta"] == "righe 1200\u20131221"
++    d = riga(js, "read_file", {"filepath": "a.py"}, {"status": "invariato"})
++    assert d["meta"] == "già letto"
++
++
++def test_un_comando_dice_com_e_finito(js) -> None:
++    ok = riga(js, "run_command", {"command": "pytest -q"},
++              {"esito": "ok", "returncode": 0, "duration_s": 3.08}, True, 3.08)
++    assert (ok["meta"], ok["tono"]) == ("ok · 3,1 s", "ok")
++    rosso = riga(js, "run_command", {"command": "pytest -q"},
++                 {"esito": "FALLITO", "returncode": 1, "duration_s": 3.42}, False, 3.42)
++    assert (rosso["meta"], rosso["tono"]) == ("exit 1 · 3,4 s", "err")
++
++
++def test_una_modifica_conta_le_righe_tolte_e_aggiunte(js) -> None:
++    args = {"filepath": "core/agent.py",
++            "old_string": "    def invia(self):\n        if self._spedito is None:\n            x = 1",
++            "new_string": "    def invia(self):\n        if self._primo:\n            self._primo = False\n            x = 1"}
++    d = riga(js, "edit_file", args, {"status": "ok", "replacements": 1})
++    assert (d["piu"], d["meno"]) == ("+2", "\u22121")
++    # Con replace_all le stesse righe cambiano in ogni occorrenza.
++    d = riga(js, "edit_file", args, {"status": "ok", "replacements": 3})
++    assert (d["piu"], d["meno"]) == ("+6", "\u22123")
++
++
++def test_un_errore_del_tool_si_vede_sulla_riga(js) -> None:
++    d = riga(js, "edit_file", {"filepath": "a.py", "old_string": "x", "new_string": "y"},
++             {"error": "'old_string' non trovato in 'a.py'.", "hint": "rileggi"})
++    assert (d["meta"], d["tono"]) == ("errore", "err")
++    assert "non trovato" in d["titolo"]
++    # L'esito esplicito del server vince sul contenuto.
++    assert riga(js, "search_files", {"pattern": "x"}, {"matches": []}, False)["tono"] == "err"
++    # Un risultato che non e' JSON non e' un fallimento: e' solo testo.
++    d = valuta(js, 'Passi.riga("tool_di_domani", {}, "output grezzo", true, 0)')
++    assert d["tono"] == ""
++
++
++def test_un_tool_in_corso_ha_solo_il_verbo(js) -> None:
++    d = riga(js, "run_command", {"command": "pytest -q"})
++    assert (d["verbo"], d["oggetto"], d["meta"], d["tono"]) == ("Esegue", "pytest -q", "", "")
++
++
++def test_un_tool_sconosciuto_non_fa_saltare_la_riga(js) -> None:
++    d = valuta(js, 'Passi.riga("tool_di_domani", {"a": 1}, "{}", true, 0)')
++    assert d["verbo"] == "tool_di_domani"
++    assert valuta(js, "Passi.riga(undefined, undefined, undefined, true, 0)")["verbo"] == "strumento"
++
++
++@pytest.mark.parametrize(
++    ("secondi", "atteso"),
++    [(0.04, ""), (0.4, "0,4 s"), (3.42, "3,4 s"), (41, "41 s"), (125, "2 min 5 s"), (-1, "")],
++)
++def test_la_durata_si_legge_all_italiana(js, secondi, atteso) -> None:
++    """Sotto il decimo di secondo non dice niente: "0.01s" su ogni riga era
++    rumore."""
++    assert js.eval(f"Passi.durata({secondi})") == atteso
++
++
++# ---------------------------------------------------------------------------
++# Il dettaglio, letto per tipo
++# ---------------------------------------------------------------------------
++
++
++def vista(ctx, nome, args, risultato):
++    return valuta(ctx, f"Passi.vista({json.dumps(nome)}, {json.dumps(args)}, "
++                       f"{json.dumps(json.dumps(risultato))})")
++
++
++def test_una_lettura_si_apre_con_i_numeri_di_riga_veri(js) -> None:
++    v = vista(js, "read_file", {"filepath": "a.py"},
++              {"filepath": "a.py", "range": "1200-1202", "total_lines": 3914, "content": "a\nb\nc"})
++    assert v["tipo"] == "estratto"
++    assert [(r["n"], r["t"]) for r in v["righe"]] == [("1200", "a"), ("1201", "b"), ("1202", "c")]
++    assert "righe 1200\u20131202" in v["testa"]
++
++
++def test_dopo_il_taglio_del_tool_i_numeri_si_fermano(js) -> None:
++    """Dopo il segno di smart_truncate le righe non sono piu' quelle del file:
++    numerarle sarebbe dire una riga sbagliata."""
++    contenuto = "uno\ndue\n\n[... contenuto di a.py: omessi 900 caratteri (~30 righe) dal centro. Usa read_file ...]\n\ncoda"
++    v = vista(js, "read_file", {"filepath": "a.py"},
++              {"filepath": "a.py", "range": "intero file", "truncated": True, "content": contenuto})
++    numeri = [r["n"] for r in v["righe"]]
++    assert numeri[:2] == ["1", "2"]
++    assert numeri[-1] == ""
++    assert any(r.get("nota") for r in v["righe"])
++
++
++def test_una_modifica_si_apre_come_diff_numerato(js) -> None:
++    args = {"filepath": "core/agent.py",
++            "old_string": "        if self._spedito is None:\n            self._spedito = testo",
++            "new_string": "        if self._primo:\n            self._primo = False\n            self._spedito = testo"}
++    risultato = {"status": "ok", "filepath": "core/agent.py", "replacements": 1,
++                 "dopo_la_modifica": {"righe": "1211-1216", "testo": (
++                     "1211 |     def invia(self, testo):\n"
++                     "1213 |         if self._primo:\n"
++                     "1214 |             self._primo = False\n"
++                     "1215 |             self._spedito = testo")}}
++    v = vista(js, "edit_file", args, risultato)
++    assert v["tipo"] == "diff"
++    assert [(r["segno"], r["n"]) for r in v["righe"]] == [("-", ""), ("+", "1213"), ("+", "1214"), (" ", "1215")]
++
++
++def test_una_ricerca_si_apre_raggruppata_per_file(js) -> None:
++    v = vista(js, "search_files", {"pattern": "_spedito"},
++              {"pattern": "_spedito", "matches": [
++                  "core/agent.py:1204:        self._spedito = \"\"",
++                  "core/agent.py:1213:>        if self._spedito is None:",
++                  "(nessuna corrispondenza)"]})
++    assert v["tipo"] == "ricerca"
++    assert [(r["file"], r["n"]) for r in v["righe"][:2]] == [("core/agent.py", "1204"), ("core/agent.py", "1213")]
++
++
++def test_un_comando_si_apre_come_terminale(js) -> None:
++    v = vista(js, "run_command", {"command": "pytest -q"},
++              {"command": "pytest -q", "returncode": 1, "stdout": "F.\n1 failed\n\n", "stderr": "boom"})
++    assert (v["tipo"], v["codice"], v["ok"]) == ("terminale", "exit 1", False)
++    assert v["uscita"].startswith("F.\n1 failed")
++    assert v["uscita"].endswith("--- stderr ---\nboom")
++
++
++def test_un_errore_si_apre_col_suggerimento_una_volta_sola(js) -> None:
++    v = vista(js, "edit_file", {"filepath": "a.py"}, {"error": "non trovato", "hint": "copia da piu_vicino"})
++    assert (v["tipo"], v["testo"], v["suggerimento"]) == ("errore", "non trovato", "copia da piu_vicino")
++    assert not v.get("nota")
++
++
++def test_un_tool_senza_vista_sua_si_legge_a_campi(js) -> None:
++    v = vista(js, "manage_plan", {"action": "complete", "step_id": 2}, {"plan": ["a"], "nota": "riga 1\nriga 2"})
++    assert v["tipo"] == "campi"
++    campi = {r["k"]: r["v"] for r in v["righe"]}
++    # Le stringhe restano stringhe: niente \n letterali come nel JSON.
++    assert campi["nota"] == "riga 1\nriga 2"
++    assert campi["action"] == "complete"
++
++
++# ---------------------------------------------------------------------------
++# Il riassunto di un blocco
++# ---------------------------------------------------------------------------
++
++
++def test_il_riassunto_conta_per_tipo_e_dice_l_ultimo_comando(js) -> None:
++    passi = [
++        {"nome": "read_file", "args": {"filepath": "a"}, "risultato": "{}", "ok": True},
++        {"nome": "read_file", "args": {"filepath": "b"}, "risultato": "{}", "ok": True},
++        {"nome": "search_files", "args": {"pattern": "x"}, "risultato": "{}", "ok": True},
++        {"nome": "edit_file", "args": {"filepath": "a"}, "risultato": json.dumps({"error": "no"}), "ok": False},
++        {"nome": "run_command", "args": {"command": "t"}, "risultato": json.dumps({"returncode": 1}), "ok": False},
++        {"nome": "run_command", "args": {"command": "t"}, "risultato": json.dumps({"returncode": 0}), "ok": True},
++        {"nome": "manage_plan", "args": {"action": "complete"}, "risultato": "{}", "ok": True},
++    ]
++    r = valuta(js, f"Passi.riassunto({json.dumps(passi)})")
++    assert r["testo"] == "2 letture · 1 ricerca · 1 modifica · 2 comandi · 1 altra azione"
++    assert (r["comando"], r["errori"]) == ("ok", 1)
++
++
++# ---------------------------------------------------------------------------
++# La frase della striscia del telefono
++# ---------------------------------------------------------------------------
++
++
++@pytest.mark.parametrize(
++    ("nome", "args", "atteso"),
++    [
++        ("read_file", {"filepath": "core/tools.py"}, "legge tools.py"),
++        ("edit_file", {"filepath": "a/b/c/config.py"}, "modifica config.py"),
++        ("list_files", {}, "elenca il workspace"),
++        ("run_command", {"command": "pytest -q"}, "esegue pytest -q"),
++        ("manage_plan", {"action": "complete"}, "piano: complete"),
++    ],
++)
++def test_la_frase_breve_e_quella_del_telefono(js, nome, args, atteso) -> None:
++    assert js.eval(f"Passi.frase({json.dumps(nome)}, {json.dumps(args)})") == atteso
++
++
++def test_l_estratto_del_pensiero_e_la_prima_frase(js) -> None:
++    testo = "Ecco il punto. In __init__ c'e' la stringa vuota, e il resto e' lungo."
++    assert js.eval(f"Passi.estratto({json.dumps(testo)})") == "Ecco il punto. In __init__ c'e' la stringa vuota, e il resto e' lungo."
++    lungo = "parola " * 80
++    assert len(js.eval(f"Passi.estratto({json.dumps(lungo)})")) <= 160
++
++
++# ---------------------------------------------------------------------------
++# Nodi: il dettaglio nasce al primo clic
++# ---------------------------------------------------------------------------
++
++
++def test_il_dettaglio_di_un_tool_si_costruisce_al_primo_clic(js) -> None:
++    """Un write_file da 34 kB non entra nel DOM per non essere guardato: la
++    regola della tendina del desktop dalla v2.36, portata sulle righe."""
++    js.eval("""
++      var p = Passi.passoTool({nome: 'write_file', args: {filepath: 'a.py', content: 'x\\n'.repeat(5000)},
++        risultato: JSON.stringify({status: 'ok', action: 'creato', lines: 5000}), ok: true, durata: 0.01});
++      documento.body.appendChild(p);
++    """)
++    assert js.eval("p.querySelectorAll('ps-corpo').length + p.querySelectorAll('.ps-corpo').length") == 0
++    js.eval("p.querySelector('.ps-riga').click()")
++    assert js.eval("p.querySelectorAll('.ps-corpo').length") == 1
++    assert js.eval("p.querySelector('.ps-riga').getAttribute('aria-expanded')") == "true"
++    # Al massimo MAX_RIGHE righe: il resto sta nel JSON grezzo.
++    assert js.eval("p.querySelectorAll('.ps-ln').length") == 400
++    js.eval("p.querySelector('.ps-riga').click()")
++    assert js.eval("p.querySelector('.ps-corpo').hidden") is True
++    assert js.eval("p.querySelectorAll('.ps-corpo').length") == 1
++
++
++def test_un_tool_in_corso_non_si_apre_e_poi_si_completa(js) -> None:
++    js.eval("""
++      var p = Passi.passoTool({nome: 'run_command', args: {command: 'pytest -q'}, id: 'c1'});
++      p.querySelector('.ps-riga').click();
++    """)
++    assert js.eval("p.classList.contains('corso')") is True
++    assert js.eval("p.querySelectorAll('.ps-corpo').length") == 0
++    js.eval("""Passi.concludiTool(p, {risultato: JSON.stringify({returncode: 0, duration_s: 2.5}),
++                                     ok: true, durata: 2.5});""")
++    assert js.eval("p.classList.contains('corso')") is False
++    assert "ok · 2,5 s" in js.eval("p.querySelector('.ps-meta').textContent")
++
++
++# ---------------------------------------------------------------------------
++# La regia dei blocchi
++# ---------------------------------------------------------------------------
++
++
++@pytest.fixture()
++def lav(js) -> quickjs.Context:
++    js.eval("""
++      var box = documento.createElement('div');
++      documento.body.appendChild(box);
++      var lav = Passi.lavoro({ inserisci: (n) => box.appendChild(n) });
++      function gruppi() { return box.querySelectorAll('.ps-gruppo'); }
++      function testa(i) { return gruppi()[i].querySelector('.ps-testa').textContent; }
++      function tool(nome, id, esito, secondi) {
++        lav.avviaTool({nome, args: {command: 'pytest -q', filepath: 'a.py'}, id});
++        lav.concludiTool({nome, args: {command: 'pytest -q', filepath: 'a.py'}, id,
++          risultato: JSON.stringify(esito), ok: esito.returncode ? false : true, durata: secondi || 0});
++      }
++    """)
++    return js
++
++
++def test_pensiero_e_tool_vanno_nello_stesso_blocco(lav) -> None:
++    lav.eval("""
++      lav.ora(1000); lav.segnaPasso(1);
++      lav.ora(1001); lav.appendThinking('Leggo il test. ');
++      lav.ora(1004); tool('read_file', 'c1', {total_lines: 19});
++      lav.ora(1005); lav.appendThinking('Rilancio.');
++      lav.ora(1009); tool('run_command', 'c2', {returncode: 0, duration_s: 3.1}, 3.1);
++      lav.ora(1010); lav.appendThinking('Verde, rispondo.');
++      lav.ora(1041); lav.chiudi();          // la risposta comincia
++    """)
++    assert lav.eval("gruppi().length") == 1
++    t = lav.eval("testa(0)")
++    assert t.startswith("Ha lavorato 41 s")
++    assert "1 lettura · 1 comando" in t
++    assert "ultimo comando ok" in t
++    # Cinque passi: tre pensieri e due tool.
++    assert lav.eval("gruppi()[0].querySelectorAll('.ps-passo').length") == 5
++    # Il pensiero chiuso dice quanto e' durato, sull'orologio del server.
++    assert lav.eval("gruppi()[0].querySelector('.ps-pensiero').querySelector('.ps-meta').textContent") == "3,0 s"
++
++
++def test_il_pensiero_rimandato_a_fine_passo_non_apre_un_blocco_nuovo(lav) -> None:
++    """A fine passo il server rimanda il pensiero intero (core/agent.py, "Il
++    testo completo, una volta per passo"), anche dopo che la risposta ha gia'
++    chiuso il blocco. Andava al pensiero di quel passo; aprirne uno nuovo
++    avrebbe messo un blocco vuoto sotto la risposta."""
++    lav.eval("""
++      lav.segnaPasso(1);
++      lav.appendThinking('Ho finito. ');
++      lav.chiudi();                                   // la risposta comincia
++      lav.setThinking('Ho finito. Rispondo con il riassunto.');  // il rimando
++    """)
++    assert lav.eval("gruppi().length") == 1
++    assert "Ho finito." in lav.eval("gruppi()[0].querySelector('.ps-estratto').textContent")
++    # Il passo dopo invece apre un blocco nuovo.
++    lav.eval("lav.segnaPasso(2); lav.appendThinking('Altro lavoro.');")
++    assert lav.eval("gruppi().length") == 2
++
++
++def test_un_testo_del_modello_spezza_il_blocco(lav) -> None:
++    lav.eval("""
++      lav.segnaPasso(1); tool('read_file', 'c1', {total_lines: 3});
++      lav.chiudi();                        // "Ora lancio i test."
++      tool('run_command', 'c2', {returncode: 1}, 1.5);
++      lav.chiudi();
++    """)
++    assert lav.eval("gruppi().length") == 2
++    assert "ultimo comando fallito" in lav.eval("testa(1)")
++
++
++def test_il_blocco_vivo_piega_i_passi_vecchi(lav) -> None:
++    lav.eval("""
++      lav.segnaPasso(1);
++      for (let i = 0; i < 7; i++) tool('read_file', 'c' + i, {total_lines: 1});
++    """)
++    assert lav.eval("box.querySelector('.ps-piega').hidden") is False
++    assert "3 passi prima" in lav.eval("box.querySelector('.ps-piega').textContent")
++    assert lav.eval("gruppi()[0].querySelectorAll('.ps-passo').filter((n) => !n.hidden).length") == 4
++    lav.eval("box.querySelector('.ps-piega').click()")
++    assert lav.eval("gruppi()[0].querySelectorAll('.ps-passo').filter((n) => !n.hidden).length") == 7
++    # Chiuso, il blocco e' una riga sola che si apre sulla traccia intera.
++    lav.eval("lav.chiudi(); gruppi()[0].querySelector('.ps-testa').click();")
++    assert lav.eval("gruppi()[0].querySelector('.ps-traccia').hidden") is False
++    assert lav.eval("gruppi()[0].querySelectorAll('.ps-piega').length") == 0
++
++
++def test_la_cronologia_misura_con_i_ts_dei_messaggi(lav) -> None:
++    """Ridisegnando una chat salvata non c'e' un orologio che scorre: i tempi
++    sono i ``ts`` dei messaggi. Il blocco comincia dal messaggio prima."""
++    lav.eval("""
++      lav.pensieroSalvato('Leggo il file.', 100, 104);
++      lav.concludiTool({nome: 'read_file', args: {filepath: 'a.py'}, risultato: '{}', ok: true, durata: 0.01},
++                       {inizio: 104, fine: 104.5});
++      lav.pensieroSalvato('Fatto.', 104.5, 110);
++      lav.chiudi();
++    """)
++    assert lav.eval("testa(0)").startswith("Ha lavorato 10 s")
++    metas = lav.eval("gruppi()[0].querySelectorAll('.ps-pensiero').map((p) => p.querySelector('.ps-meta').textContent).join('|')")
++    assert metas == "4,0 s|5,5 s"
++
++
++def test_senza_ore_il_blocco_non_inventa_durate(lav) -> None:
++    lav.eval("""
++      lav.concludiTool({nome: 'read_file', args: {filepath: 'a.py'}, risultato: '{}', ok: true}, {});
++      lav.chiudi();
++    """)
++    t = lav.eval("testa(0)")
++    assert t.startswith("Ha lavorato")
++    assert " s " not in t.split("·")[0] + " "
++
++
++def test_un_blocco_di_soli_pensieri_dice_ha_pensato(lav) -> None:
++    lav.eval("lav.pensieroSalvato('Rispondo.', 10, 15); lav.chiudi();")
++    assert lav.eval("testa(0)").startswith("Ha pensato 5,0 s")
++
++
++# ---------------------------------------------------------------------------
++# La pagina del desktop
++# ---------------------------------------------------------------------------
++
++
++def test_il_desktop_carica_i_passi_prima_di_app_js_con_l_impronta() -> None:
++    radice = WEB.parent
++    html = (WEB / "index.html").read_text(encoding="utf-8")
++    assert html.index("/static/passi.js") < html.index("/static/app.js")
++    assert "/static/passi.css" in html
++    main = (radice / "server" / "main.py").read_text(encoding="utf-8")
++    elenco = main[main.index('for nome in ("app.js"'):]
++    elenco = elenco[: elenco.index("):")]
++    for nome in ("passi.js", "passi.css"):
++        assert nome in elenco, nome
++
++
++def test_le_vecchie_tendine_dei_tool_non_ci_sono_piu() -> None:
++    """Tool e pensieri passano tutti dai blocchi: nessuna strada laterale che
++    ridisegni la tendina di prima (e il suo JSON) per un caso dimenticato."""
++    app = (WEB / "app.js").read_text(encoding="utf-8")
++    for vecchio in ("function toolDrawer(", "TOOL_ICON", "function argPreview(", "'.think.live'"):
++        assert vecchio not in app, vecchio
++    css = (WEB / "style.css").read_text(encoding="utf-8")
++    for vecchio in (".tool-name", ".tool-json", "\n.think {"):
++        assert vecchio not in css, vecchio
+diff --git a/tests/test_prestazioni.py b/tests/test_prestazioni.py
+index 9cd0815..25dbfc2 100644
+--- a/tests/test_prestazioni.py
++++ b/tests/test_prestazioni.py
+@@ -194,14 +194,18 @@ def test_un_successo_cancella_il_fallimento_ricordato(monkeypatch):
+ 
+ def test_la_tendina_di_un_tool_si_costruisce_al_primo_clic():
+     """Argomenti e risultato entravano nel DOM anche da tendina chiusa: un
+-    ``write_file`` da 34 kB per ogni tool di ogni passo, tutto invisibile."""
+-    js = (WEB / "app.js").read_text(encoding="utf-8")
+-    corpo = js[js.index("function toolDrawer(") :]
+-    corpo = corpo[: corpo.index("\n}\n")]
+-    assert "drawer.addEventListener('toggle'" in corpo
+-    assert "if (costruita || !drawer.open) return;" in corpo
+-    # Il sommario invece si costruisce sempre: e' quello che si vede.
+-    assert corpo.index("<summary>") < corpo.index("addEventListener")
++    ``write_file`` da 34 kB per ogni tool di ogni passo, tutto invisibile.
++
++    Le tendine sono diventate righe (web/passi.js), la regola e' rimasta: il
++    dettaglio nasce al primo clic, una volta sola. Il comportamento lo prova
++    tests/test_passi_web.py; qui resta il guardiano sulla forma."""
++    js = (WEB / "passi.js").read_text(encoding="utf-8")
++    corpo = js[js.index("function apribile(") :]
++    corpo = corpo[: corpo.index("\n  }\n")]
++    assert "if (!corpo) {" in corpo
++    assert "corpo = costruisci();" in corpo
++    # Riaprire non ricostruisce: nasconde e mostra lo stesso nodo.
++    assert "corpo.hidden = !corpo.hidden;" in corpo
+ 
+ 
+ def test_client_e_server_contano_gli_stessi_messaggi():
+diff --git a/web/app.js b/web/app.js
+index a27ba95..1b0c4aa 100644
+--- a/web/app.js
++++ b/web/app.js
+@@ -281,7 +281,7 @@ function isModelPlumbing(text) {
+ }
+ 
+ const PLUMBING_PLACEHOLDER =
+-  '<div class="think">Il modello sta emettendo una chiamata a tool nel canale ' +
++  '<div class="plumbing">Il modello sta emettendo una chiamata a tool nel canale ' +
+   'testuale…<span class="caret"></span></div>';
+ 
+ // ---------------------------------------------------------------------------
+@@ -290,12 +290,6 @@ const PLUMBING_PLACEHOLDER =
+ 
+ const CHEV = '<svg class="chev" width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M3.5 1.5L7 5l-3.5 3.5"/></svg>';
+ 
+-const TOOL_ICON = {
+-  list_files: '▤', read_file: '◧', write_file: '✎', edit_file: '✂',
+-  search_files: '⌕', run_command: '❯', manage_memory: '◈', ask_user_question: '?',
+-  manage_plan: '☰',
+-};
+-
+ const FOLDER_ICON =
+   '<svg viewBox="0 0 14 14" width="11" height="11" fill="none" stroke="currentColor" ' +
+   'stroke-width="1.3" stroke-linejoin="round"><path d="M1.5 3.5h3.6l1.2 1.4h6.2v6.6a1 1 0 0 1-1 1H2.5a1 1 0 0 1-1-1z"/></svg>';
+@@ -377,18 +371,6 @@ function fileChips(files) {
+   return box;
+ }
+ 
+-function argPreview(args) {
+-  if (!args) return '';
+-  for (const key of ['filepath', 'command', 'pattern', 'subfolder', 'action', 'question']) {
+-    if (args[key]) {
+-      const value = String(args[key]);
+-      return value.length > 80 ? value.slice(0, 77) + '…' : value;
+-    }
+-  }
+-  const dump = JSON.stringify(args);
+-  return dump === '{}' ? '' : dump.slice(0, 80);
+-}
+-
+ // ---------------------------------------------------------------------------
+ // Rendering del thread
+ // ---------------------------------------------------------------------------
+@@ -437,58 +419,37 @@ function addUser(text, attachments) {
+   scrollDown(true);
+ }
+ 
+-/** La tendina di una chiamata a tool. Il corpo nasce al primo clic.
++/** Il turno dell'assistente: blocchi di lavoro, risposte, e quello che il
++ * turno lascia (gocce dei file, avvisi, domande).
+  *
+- * Da chiusa una tendina e' una riga, ma il suo contenuto veniva costruito lo
+- * stesso: argomenti e risultato interi, dentro il DOM, per ogni tool di ogni
+- * passo. Un ``write_file`` da 34 kB e un ``search_files`` da 35 kB entravano
+- * in pagina per intero senza che nessuno li guardasse, e riaprendo una chat
+- * erano decine tutte insieme -- lavoro pagato al 100% e usato quasi mai.
++ * Com'era: una tendina per ogni pensiero e una per ogni tool, tutte uguali,
++ * ognuna una scatola con bordo e fondo. Un turno da sette tool erano undici
++ * scatole prima della risposta, e i pensieri restavano aperti fino a fine
++ * turno col testo intero.
+  *
+- * Il ``toggle`` scatta solo su un cambiamento vero dell'attributo ``open``, e
+- * la costruzione avviene una volta sola: aprire e chiudere non ricostruisce.
++ * Com'e': i passi consecutivi (pensieri e tool) stanno in un **blocco di
++ * lavoro** (``Passi.gruppo``, web/passi.js). Vivo, dice "Sta lavorando · passo
++ * 6 · 31 s" e mostra gli ultimi passi, col pensiero in una finestra di quattro
++ * righe; chiuso, e' una riga sola -- "Ha lavorato 41 s · 2 letture · 1
++ * modifica · 2 comandi" -- che si apre sulla traccia. Un testo del modello
++ * **spezza** il blocco: quello che il modello dice resta in chat, fra un
++ * blocco e l'altro, e non finisce mai nascosto dentro una tendina.
++ *
++ * Il tempo e' quello del server: ``t`` sugli eventi dal vivo (server/main.py,
++ * ``sse``), ``ts`` sui messaggi salvati. Con l'orologio del browser le durate
++ * sarebbero sbagliate nell'arretrato di un riattacco, che arriva tutto in un
++ * istante.
+  */
+-function toolDrawer(name, args, result, duration, ok) {
+-  const drawer = el('details', 'drawer' + (ok ? '' : ' failed'));
+-  const preview = argPreview(args);
+-  drawer.innerHTML =
+-    `<summary>${CHEV}` +
+-    `<span class="tool-name">${esc(TOOL_ICON[name] || '◆')} ${esc(name)}</span>` +
+-    (preview ? `<span class="tool-arg grow">${esc(preview)}</span>` : '<span class="grow"></span>') +
+-    `<span class="tool-time">${Number(duration || 0).toFixed(2)}s</span>` +
+-    (ok ? '' : '<span class="tool-time">⚠</span>') +
+-    `</summary>`;
+-  let costruita = false;
+-  drawer.addEventListener('toggle', () => {
+-    if (costruita || !drawer.open) return;
+-    costruita = true;
+-    const corpo = el('div', 'drawer-body');
+-    corpo.innerHTML =
+-      (args && Object.keys(args).length
+-        ? `<div class="tool-label">Argomenti</div><pre class="tool-json">${esc(JSON.stringify(args, null, 2))}</pre>`
+-        : '') +
+-      `<div class="tool-label">Risultato</div><pre class="tool-json">${esc(prettyJson(result))}</pre>`;
+-    drawer.appendChild(corpo);
+-  });
+-  return drawer;
+-}
+-
+-/** Contenitore di un turno dell'assistente: pensiero, risposta, tool. */
+ function makeTurn() {
+   const wrap = el('div', 'msg assistant');
+   thread().appendChild(wrap);
+ 
+-  return {
++  const turn = {
+     wrap,
+     statusNode: null,
+-    // Nodi del segmento corrente. Un "segmento" e' un pensiero + una risposta
+-    // consecutivi; una chiamata a tool lo chiude e ne apre uno nuovo.
+-    _think: null,
+-    _thinkNode: null,
+     _answer: null,
+-    // Il testo accumulato dei due canali. Serve agli incrementi: l'evento
+-    // porta solo il pezzo nuovo, e il pezzo nuovo da solo non si puo' rendere.
+-    _thinkText: '',
++    // Il testo accumulato della risposta: gli incrementi portano solo il
++    // pezzo nuovo, e il markdown non si rende a pezzi.
+     _answerText: '',
+     // File creati o modificati nel turno, in ordine di prima comparsa. Una Map
+     // e non un array: lo stesso file scritto e poi ritoccato tre volte deve
+@@ -502,20 +463,16 @@ function makeTurn() {
+       if (this.statusNode) this.wrap.appendChild(this.statusNode);
+     },
+ 
+-    _ensureThink() {
+-      if (!this._think) {
+-        const drawer = el('details', 'drawer');
+-        drawer.open = true;
+-        drawer.innerHTML =
+-          `<summary>${CHEV}<span class="grow">Ragionamento</span></summary>` +
+-          '<div class="drawer-body"><div class="think live"></div></div>';
+-        this.wrap.appendChild(drawer);
+-        this._think = drawer;
+-        this._thinkNode = $('.think', drawer);
+-        this._bumpStatus();
+-      }
+-      return this._thinkNode;
++    // Pensieri e tool: li smista la regia dei blocchi (web/passi.js).
++    ora(t) { this._lavoro.ora(t); },
++    segnaPasso(n) { this._lavoro.segnaPasso(n); },
++    setThinking(text) { this._lavoro.setThinking(text); },
++    appendThinking(chunk) { this._lavoro.appendThinking(chunk); },
++    pensieroSalvato(text, inizio, fine) { this._lavoro.pensieroSalvato(text, inizio, fine); },
++    avviaTool(event) {
++      this._lavoro.avviaTool({ nome: event.name, args: event.args, id: event.call_id });
+     },
++    concludiTool(dati, tempi) { this._lavoro.concludiTool(dati, tempi); },
+ 
+     _ensureAnswer() {
+       if (!this._answer) {
+@@ -526,24 +483,6 @@ function makeTurn() {
+       return this._answer;
+     },
+ 
+-    // Il pensiero e la risposta arrivano a **incrementi**: l'evento porta
+-    // ``append`` (i soli caratteri nuovi) oppure ``text`` (il testo completo,
+-    // che sostituisce). Vedi il commento su ReasoningDelta in core/agent.py --
+-    // il testo cumulativo ad ogni token era il difetto piu' caro dell'harness.
+-    setThinking(text) {
+-      this._thinkText = text;
+-      this._ensureThink().textContent = text;
+-      scrollDown();
+-    },
+-
+-    appendThinking(chunk) {
+-      this._thinkText = (this._thinkText || '') + chunk;
+-      // Un nodo di testo in coda invece di riscrivere l'intera stringa: su un
+-      // ragionamento da 80 kB la differenza fra le due si vede.
+-      this._ensureThink().insertAdjacentText('beforeend', chunk);
+-      scrollDown();
+-    },
+-
+     appendAnswer(chunk) {
+       // La risposta e' markdown, e il markdown non si rende a pezzi: il testo
+       // si accumula qui e si ridisegna. Il risparmio non e' nel rendering, e'
+@@ -554,12 +493,18 @@ function makeTurn() {
+     setAnswer(text, { final = false } = {}) {
+       this._answerText = String(text ?? '');
+       // Un passo che produce solo tool call non deve creare un nodo risposta
+-      // vuoto: resterebbe piantato SOPRA la tendina del tool e spingerebbe la
+-      // risposta vera del passo successivo fuori dall'ordine cronologico.
++      // vuoto: resterebbe piantato SOPRA il blocco di lavoro e spingerebbe la
++      // risposta vera fuori dall'ordine cronologico.
+       if (!String(text ?? '').trim() && !this._answer) return;
+-      // Durante lo streaming la roba di servizio viene sostituita da un
+-      // segnaposto; a fine turno arriva la versione autorevole gia' ripulita
+-      // dal ciclo agentico, che va renderizzata comunque (anche se vuota).
++      // Una tool call stampata come testo non e' una risposta: non chiude il
++      // blocco (la chiamata la recupera l'harness), lo dice l'intestazione.
++      if (!final && !this._answer && isModelPlumbing(text)) {
++        this._lavoro.nota('scrive una chiamata a tool come testo');
++        return;
++      }
++      // Il modello parla: il blocco di lavoro si chiude qui. Quello che dice
++      // resta in chat, fra un blocco e l'altro -- mai dentro una tendina.
++      this._lavoro.chiudi();
+       const node = this._ensureAnswer();
+       node.innerHTML = (!final && isModelPlumbing(text))
+         ? PLUMBING_PLACEHOLDER
+@@ -567,18 +512,21 @@ function makeTurn() {
+       scrollDown();
+     },
+ 
+-    /** Aggiunge un blocco in coda e apre un nuovo segmento.
++    /** Aggiunge in coda qualcosa che non e' un passo (avviso, domanda, gocce,
++     *  errore): chiude il blocco di lavoro e apre un segmento nuovo.
+      *
+-     * E' il punto che tiene il turno in ordine cronologico: dopo un tool, il
+-     * pensiero e la risposta del passo successivo devono finire SOTTO la
+-     * tendina, non riscrivere quelli del passo precedente piu' in alto.
++     *  E' il punto che tiene il turno in ordine cronologico: dopo, il pensiero
++     *  e la risposta del passo successivo devono finire SOTTO, non riscrivere
++     *  quelli di prima piu' in alto.
+      */
+     append(node) {
++      this._lavoro.chiudi();
++      this._lavoro.dimenticaPasso();
+       this.wrap.appendChild(node);
+-      this._think = this._thinkNode = this._answer = null;
++      this._answer = null;
+       // Il segmento nuovo parte da testo vuoto: gli incrementi del passo
+       // successivo non devono accodarsi a quello di prima.
+-      this._thinkText = this._answerText = '';
++      this._answerText = '';
+       this._bumpStatus();
+       scrollDown();
+     },
+@@ -612,11 +560,7 @@ function makeTurn() {
+     },
+ 
+     finish() {
+-      $$('.think.live', this.wrap).forEach((n) => n.classList.remove('live'));
+-      // Chiude solo le tendine del pensiero: quelle dei tool sono gia' chiuse.
+-      $$('details.drawer', this.wrap).forEach((d) => {
+-        if ($('.think', d)) d.open = false;
+-      });
++      this._lavoro.chiudi();
+     },
+ 
+     isEmpty() {
+@@ -624,10 +568,29 @@ function makeTurn() {
+       // e' fallito, e il motivo e' proprio quello che l'utente deve leggere.
+       // Contarlo come vuoto lo faceva rimuovere a fine stream -- l'errore
+       // "che lampeggia e sparisce".
+-      return !this.wrap.querySelector('details.drawer, .question, .error-box')
++      return !this.wrap.querySelector('.ps-gruppo, .question, .error-box')
+         && !(this._answer && this._answer.textContent.trim());
+     },
+   };
++
++  turn._lavoro = Passi.lavoro({
++    // Un blocco nuovo apre un segmento nuovo: la prossima risposta va sotto
++    // di lui, non a riscrivere quella di prima piu' in alto.
++    inserisci(nodo) {
++      turn.wrap.appendChild(nodo);
++      turn._answer = null;
++      turn._answerText = '';
++      turn._bumpStatus();
++    },
++    // Solo i turni dal vivo hanno la riga di stato, e solo loro contano i
++    // secondi nell'intestazione del blocco.
++    vivo: () => Boolean(turn.statusNode),
++    dopo() {
++      turn._bumpStatus();
++      scrollDown();
++    },
++  });
++  return turn;
+ }
+ 
+ function renderQuestion(question, answered) {
+@@ -806,12 +769,20 @@ function renderHistory(messages, opzioni = {}) {
+   // Le gocce si disegnano quando il turno si chiude, cioe' alla richiesta
+   // successiva dell'utente o alla fine della cronologia: e' lo stesso confine
+   // che in diretta segna l'evento done.
+-  const closeTurn = () => { turn?.showFiles(); turn = null; };
++  const closeTurn = () => { turn?.finish(); turn?.showFiles(); turn = null; };
++  // L'ora del messaggio precedente (``ts``, orologio del server): e' da li'
++  // che il modello ha cominciato a lavorare sul passo dopo. Le durate dei
++  // blocchi e dei pensieri si ricavano cosi'; dove manca -- sessioni salvate
++  // prima che il messaggio dell'utente la portasse -- si tace.
++  let prima = null;
+ 
+   messages.forEach((msg) => {
++    const ts = Number.isFinite(msg.ts) ? msg.ts : null;
++    const inizio = prima;
++    if (ts !== null) prima = ts;
+     if (msg.hidden) return;
+ 
+-    if (msg.role === 'user') { addUser(msg.content, msg.attachments); closeTurn(); return; }
++    if (msg.role === 'user') { closeTurn(); addUser(msg.content, msg.attachments); return; }
+ 
+     if (msg.role === 'assistant') {
+       const [reasoning, answer] = splitThink(msg.content || '');
+@@ -819,7 +790,8 @@ function renderHistory(messages, opzioni = {}) {
+       // risultati arrivano subito dopo e vanno nello stesso blocco.
+       if (!reasoning && !answer) { currentTurn(); return; }
+       const t = currentTurn();
+-      if (reasoning) t.setThinking(reasoning);
++      if (reasoning) t.pensieroSalvato(reasoning, inizio, ts);
++      t.ora(ts);
+       if (answer) t.setAnswer(answer, { final: true });
+       // Il riepilogo chiesto dall'harness a passi esauriti non è una risposta
+       // come le altre: senza dirlo sembrerebbe che il modello si sia fermato
+@@ -838,7 +810,10 @@ function renderHistory(messages, opzioni = {}) {
+         );
+       } else {
+         const t = currentTurn();
+-        t.append(toolDrawer(msg.name, msg.args, msg.content, msg.duration_s, msg.ok !== false));
++        t.concludiTool({
++          nome: msg.name, args: msg.args, risultato: msg.content,
++          ok: msg.ok !== false, durata: msg.duration_s, id: msg.tool_call_id,
++        }, { inizio, fine: ts });
+         t.noteFile(msg.name, msg.args, msg.content, msg.ok !== false);
+       }
+       return;
+@@ -896,11 +871,7 @@ function renderHistory(messages, opzioni = {}) {
+   // a meno che la sessione sia ferma su una domanda: li' il ciclo riprendera'
+   // appena l'utente risponde, e le gocce arriveranno alla fine vera.
+   if (!state.pending) closeTurn();
+-
+-  $$('#thread .msg.assistant').forEach((wrap) => {
+-    $$('.think.live', wrap).forEach((n) => n.classList.remove('live'));
+-    $$('details.drawer', wrap).forEach((d) => { if ($('.think', d)) d.open = false; });
+-  });
++  else turn?.finish();
+   // Risalendo NON si scende: si e' appena aggiunto testo sopra la finestra, e
+   // portare in fondo chi stava leggendo indietro e' esattamente il gesto che
+   // la risalita serve a evitare. Il ripristino della posizione lo fa chi
+@@ -1338,6 +1309,9 @@ function attaccatoAUnoStream() {
+ }
+ 
+ function handleEvent(event, turn, status, setStatus) {
++  // L'ora del server viaggia su ogni frame (server/main.py, ``sse``): le
++  // durate dei blocchi di lavoro si misurano con quella.
++  if (Number.isFinite(event.t)) turn.ora?.(event.t);
+   switch (event.type) {
+     case 'start':
+       setStatus(event.resume ? 'Riprendo…' : 'Il modello sta pensando…');
+@@ -1345,6 +1319,7 @@ function handleEvent(event, turn, status, setStatus) {
+       break;
+     case 'step':
+       setStatus(`Passo ${event.step}/${event.total}`);
++      turn.segnaPasso?.(event.step, event.total);
+       if (typeof window !== 'undefined') window.Cruscotto?.passo(event.step, event.total);
+       break;
+     case 'metriche':
+@@ -1376,10 +1351,14 @@ function handleEvent(event, turn, status, setStatus) {
+       break;
+     case 'tool_start':
+       setStatus(`Eseguo ${event.name}…`);
++      turn.avviaTool?.(event);
+       if (typeof window !== 'undefined') window.Cruscotto?.toolInizio(event.name);
+       break;
+     case 'tool_end': {
+-      turn.addTool(toolDrawer(event.name, event.args, event.result, event.duration_s, event.ok));
++      turn.concludiTool({
++        nome: event.name, args: event.args, risultato: event.result,
++        ok: event.ok, durata: event.duration_s, id: event.call_id,
++      });
+       turn.noteFile(event.name, event.args, event.result, event.ok);
+       forseRicarica(event.name, event.args, event.result, event.ok);
+       if (typeof window !== 'undefined') window.Cruscotto?.toolFine(event.name, event.duration_s);
+diff --git a/web/index.html b/web/index.html
+index 620435c..7ba69ef 100644
+--- a/web/index.html
++++ b/web/index.html
+@@ -32,6 +32,7 @@ try {
+ <link rel="stylesheet" href="/static/impostazioni.css">
+ <link rel="stylesheet" href="/static/cruscotto.css">
+ <link rel="stylesheet" href="/static/progetti.css">
++<link rel="stylesheet" href="/static/passi.css">
+ <!-- Raster fallbacks and an adaptive vector mark for modern browsers. -->
+ <link rel="icon" type="image/png" sizes="64x64" href="/static/favicon-64.png">
+ <link rel="icon" type="image/png" sizes="32x32" href="/static/favicon-32.png">
+@@ -492,6 +493,7 @@ try {
+ <!-- Prima di app.js, come impostazioni.js: le funzioni dei progetti usano
+      quelle di app.js solo quando vengono chiamate. -->
+ <script src="/static/progetti.js"></script>
++<script src="/static/passi.js"></script>
+ <script src="/static/app.js"></script>
+ </body>
+ </html>
+diff --git a/web/passi.css b/web/passi.css
+new file mode 100644
+index 0000000..f9e1e94
+--- /dev/null
++++ b/web/passi.css
+@@ -0,0 +1,207 @@
++/* I passi del lavoro dell'agente (web/passi.js), desktop e telefono.
++ *
++ * Niente riquadri: prima ogni pensiero e ogni tool era una scatola con bordo,
++ * fondo e raggio, ~43 px l'una, tutte uguali. Un turno da sette tool erano
++ * undici scatole prima della risposta. Qui un passo e' una riga, i passi di un
++ * tratto di lavoro stanno su una rotaia sottile, e a lavoro finito il tratto
++ * intero e' una riga sola.
++ *
++ * I colori arrivano dalle variabili --ps-*, che ogni client definisce con i
++ * suoi token (web/style.css, web_mobile/style.css): la geometria e' una, i
++ * valori sono di chi la ospita. */
++
++.ps-gruppo {
++  margin: 4px 0 10px;
++  font-size: var(--ps-font, 13px);
++}
++
++/* ---------- intestazione del blocco ---------- */
++
++.ps-testa {
++  display: flex; align-items: center; gap: 9px;
++  width: calc(100% + 16px); min-height: var(--ps-riga-h, 28px);
++  margin: 0 -8px; padding: 0 8px; border: 0; border-radius: 7px;
++  background: none; color: var(--ps-medio); font: inherit; text-align: left;
++  cursor: pointer; white-space: nowrap;
++}
++.ps-gruppo.vivo > .ps-testa { cursor: default; color: var(--ps-testo); }
++.ps-gruppo:not(.vivo) > .ps-testa:hover { background: var(--ps-hover); }
++.ps-titolo { flex: none; }
++.ps-meta-gruppo {
++  min-width: 0; overflow: hidden; text-overflow: ellipsis;
++  color: var(--ps-tenue); font-variant-numeric: tabular-nums;
++}
++.ps-chev { color: var(--ps-tenue); transition: transform 180ms ease-out; }
++.ps-gruppo.aperto > .ps-testa .ps-chev { transform: rotate(90deg); }
++
++.ps-pill {
++  flex: none; margin-left: auto; display: inline-flex; align-items: center;
++  height: 20px; padding: 0 8px; border-radius: 999px;
++  font-size: 11.5px; font-weight: 500; border: 1px solid transparent;
++}
++.ps-pill-lungo { white-space: pre; }
++.ps-pill::before { content: ""; width: 6px; height: 6px; margin-right: 5px; border-radius: 50%; background: currentColor; }
++.ps-pill.ok { color: var(--ps-ok); border-color: color-mix(in srgb, var(--ps-ok) 35%, transparent); }
++.ps-pill.err { color: var(--ps-err); border-color: color-mix(in srgb, var(--ps-err) 40%, transparent); }
++
++/* ---------- la traccia: rotaia e passi ---------- */
++
++.ps-traccia { position: relative; }
++.ps-traccia[hidden] { display: none; }
++/* La rotaia passa sotto le icone, che hanno il fondo della pagina: si vede
++   fra una e l'altra, non attraverso. Stesso asse dell'icona dell'intestazione,
++   cosi' il blocco aperto scende dalla sua freccia. */
++.ps-traccia::before {
++  content: ""; position: absolute; left: 7.5px; top: 4px; bottom: 10px;
++  width: 1px; background: var(--ps-bordo);
++}
++.ps-passo[hidden], .ps-piega[hidden] { display: none; }
++
++.ps-riga, .ps-piega {
++  position: relative;
++  display: flex; align-items: center; gap: 9px;
++  width: calc(100% + 16px); min-height: var(--ps-riga-h, 28px);
++  margin: 0 -8px; padding: 0 8px; border: 0; border-radius: 7px;
++  background: none; color: var(--ps-medio); font: inherit; text-align: left;
++  cursor: pointer; white-space: nowrap;
++}
++.ps-riga:hover, .ps-piega:hover { background: var(--ps-hover); }
++.ps-piega { color: var(--ps-tenue); font-size: 0.95em; }
++.ps-piega:hover { color: var(--ps-accento); }
++.ps-passo.vivo > .ps-riga, .ps-passo.corso > .ps-riga { cursor: default; color: var(--ps-testo); }
++.ps-passo.vivo > .ps-riga:hover, .ps-passo.corso > .ps-riga:hover { background: none; }
++
++.ps-ico {
++  position: relative; z-index: 1;
++  flex: none; width: 16px; height: 16px; display: grid; place-items: center;
++  border-radius: 50%; background: var(--ps-fondo); color: var(--ps-tenue);
++}
++.ps-riga:hover .ps-ico, .ps-piega:hover .ps-ico, .ps-testa:hover .ps-ico { background: var(--ps-hover); }
++.ps-ico svg { display: block; }
++.ps-ico.err { color: var(--ps-err); }
++.ps-ico.gira svg { color: var(--ps-accento); animation: ps-gira 2.6s linear infinite; }
++.ps-ruota {
++  width: 11px; height: 11px; border-radius: 50%;
++  border: 1.6px solid var(--ps-bordo-forte); border-top-color: var(--ps-accento);
++  animation: ps-gira .7s linear infinite;
++}
++@keyframes ps-gira { to { transform: rotate(360deg); } }
++
++.ps-verbo { flex: none; }
++.ps-oggetto {
++  min-width: 0; overflow: hidden; text-overflow: ellipsis;
++  font-family: var(--ps-mono); font-size: 0.96em; color: var(--ps-testo);
++}
++.ps-estratto {
++  flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis;
++  font-style: italic; color: var(--ps-tenue);
++}
++.ps-meta {
++  flex: none; margin-left: auto; padding-left: 8px;
++  font-size: 0.92em; color: var(--ps-tenue); font-variant-numeric: tabular-nums;
++  display: inline-flex; gap: 5px;
++}
++.ps-meta.ok { color: var(--ps-ok); }
++.ps-meta.err { color: var(--ps-err); }
++.ps-piu { color: var(--ps-ok); }
++.ps-meno { color: var(--ps-err); }
++
++/* ---------- il pensiero dal vivo: quattro righe, non di piu' ---------- */
++
++/* L'altezza e' fissa e il testo sta in fondo: le righe nuove spingono su le
++   vecchie, che sfumano. Il pensiero intero resta leggibile aprendo la riga a
++   passo chiuso. Prima la tendina restava aperta fino a fine turno, una per
++   passo, con tutto il testo: era questo a invadere la chat. */
++.ps-finestra {
++  margin: 0 0 6px 7.5px; padding-left: 16px;
++  border-left: 1px solid var(--ps-accento);
++  height: calc(4 * 1.6em); overflow: hidden;
++  display: flex; flex-direction: column; justify-content: flex-end;
++  font-size: 0.96em; line-height: 1.6; color: var(--ps-medio);
++  -webkit-mask-image: linear-gradient(to bottom, transparent 0, #000 55%);
++  mask-image: linear-gradient(to bottom, transparent 0, #000 55%);
++}
++.ps-finestra-testo { white-space: pre-wrap; word-break: break-word; }
++
++/* ---------- il dettaglio di un passo ---------- */
++
++.ps-corpo { margin: 2px 0 8px 25px; }
++.ps-corpo[hidden] { display: none; }
++.ps-pensiero-testo {
++  font-size: 0.98em; line-height: 1.6; color: var(--ps-medio);
++  border-left: 1px solid var(--ps-bordo-forte); padding: 2px 0 2px 12px;
++  white-space: pre-wrap; word-break: break-word;
++}
++
++.ps-code {
++  border: 1px solid var(--ps-bordo); border-radius: 8px;
++  background: var(--ps-code-bg); overflow: hidden;
++}
++.ps-code-testa {
++  display: flex; align-items: center; gap: 8px; padding: 4px 10px;
++  border-bottom: 1px solid var(--ps-bordo);
++  font-family: var(--ps-mono); font-size: 11.5px; color: var(--ps-tenue);
++  white-space: nowrap;
++}
++.ps-code-titolo { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
++.ps-exit { margin-left: auto; flex: none; }
++.ps-exit.ok { color: var(--ps-ok); }
++.ps-exit.err { color: var(--ps-err); }
++.ps-code-corpo {
++  max-height: 260px; overflow: auto; padding: 4px 0;
++  font-family: var(--ps-mono); font-size: 11.5px; line-height: 1.6;
++}
++.ps-ln { display: flex; width: max-content; min-width: 100%; }
++.ps-ln.piu { background: var(--ps-piu-bg); }
++.ps-ln.meno { background: var(--ps-meno-bg); }
++.ps-ln.contesto .ps-t { color: var(--ps-medio); }
++.ps-ln.nota .ps-t { color: var(--ps-tenue); font-style: italic; }
++.ps-n {
++  flex: none; width: 46px; padding-right: 10px; text-align: right;
++  color: var(--ps-tenue); user-select: none;
++}
++.ps-sg { flex: none; width: 14px; text-align: center; user-select: none; }
++.ps-ln.piu .ps-sg { color: var(--ps-ok); }
++.ps-ln.meno .ps-sg { color: var(--ps-err); }
++.ps-t { white-space: pre; padding: 0 10px 0 2px; color: var(--ps-testo); }
++.ps-ln-file { padding: 4px 10px 1px; color: var(--ps-tenue); }
++.ps-ln-file:not(:first-child) { margin-top: 4px; }
++.ps-hit { background: none; color: var(--ps-accento); font-weight: 600; }
++
++.ps-term { display: flex; flex-direction: column-reverse; }
++.ps-term-testo {
++  margin: 0; padding: 2px 10px; white-space: pre; color: var(--ps-testo);
++  font: inherit;
++}
++
++.ps-errore {
++  padding: 6px 10px; border-radius: 8px;
++  background: color-mix(in srgb, var(--ps-err) 8%, transparent);
++  color: var(--ps-err); line-height: 1.5; white-space: pre-wrap; word-break: break-word;
++}
++.ps-errore-nota { color: var(--ps-medio); margin-top: 3px; }
++
++.ps-campi { display: flex; flex-direction: column; gap: 3px; line-height: 1.5; }
++.ps-campo { display: flex; gap: 10px; }
++.ps-k { flex: none; min-width: 88px; color: var(--ps-tenue); font-family: var(--ps-mono); font-size: 11.5px; padding-top: 1px; }
++.ps-v { min-width: 0; white-space: pre-wrap; word-break: break-word; color: var(--ps-testo); }
++
++.ps-nota { margin-top: 4px; font-size: 11.5px; color: var(--ps-tenue); }
++.ps-piede { display: flex; justify-content: flex-end; margin-top: 4px; }
++.ps-grezzo {
++  border: 0; background: none; padding: 2px 0; cursor: pointer; font: inherit;
++  font-size: 11.5px; color: var(--ps-tenue);
++  text-decoration: underline dotted; text-underline-offset: 3px;
++}
++.ps-grezzo:hover { color: var(--ps-accento); }
++.ps-grezzo-testo {
++  margin: 4px 0 0; padding: 6px 10px; max-height: 220px; overflow: auto;
++  border: 1px solid var(--ps-bordo); border-radius: 8px; background: var(--ps-code-bg);
++  font-family: var(--ps-mono); font-size: 11px; line-height: 1.5; color: var(--ps-medio);
++  white-space: pre-wrap; word-break: break-word;
++}
++.ps-grezzo-testo[hidden] { display: none; }
++
++@media (prefers-reduced-motion: reduce) {
++  .ps-ico.gira svg, .ps-ruota { animation: none; }
++}
+diff --git a/web/passi.js b/web/passi.js
+new file mode 100644
+index 0000000..25c5001
+--- /dev/null
++++ b/web/passi.js
+@@ -0,0 +1,1050 @@
++/* I passi del lavoro dell'agente: come si leggono in chat.
++ *
++ * Un passo e' un pensiero o una chiamata a tool. In chat non stanno piu' uno
++ * per riquadro: stanno in un **blocco di lavoro**, una riga sola a lavoro
++ * finito ("Ha lavorato 41 s · 2 letture · 1 modifica · 2 comandi") che si apre
++ * in una traccia con una riga per passo, e ogni riga si apre sul suo dettaglio
++ * gia' letto per tipo -- l'estratto con i numeri di riga, il diff, il
++ * terminale -- con il JSON grezzo a un clic.
++ *
++ * Perche' un file a parte, condiviso da desktop e telefono: prima i due client
++ * avevano due idee di "com'e' fatto un passo" (il desktop una tendina col nome
++ * del tool e il JSON, il telefono una riga col verbo e basta), e ogni tool
++ * nuovo andava insegnato due volte. Qui c'e' una copia sola. Il desktop lo
++ * carica da /static/passi.js, il telefono da /comune/passi.js (server/mobile.py).
++ *
++ * Due strati, separati apposta:
++ *   - funzioni **pure** (``riga``, ``vista``, ``riassunto``, ``frase``...):
++ *     dal risultato di un tool ricavano dati, non nodi. Le prova la suite in
++ *     QuickJS (tests/test_passi_web.py) senza un browser;
++ *   - costruttori di nodi (``passoTool``, ``passoPensiero``, ``gruppo``): solo
++ *     ``createElement`` e ``textContent`` per tutto quello che viene dal
++ *     modello o dai file. ``innerHTML`` si usa solo per le icone, che sono
++ *     costanti di questo file.
++ *
++ * Il dettaglio di un passo si costruisce **al primo clic**, come faceva la
++ * tendina del desktop dalla v2.36: un ``write_file`` da 34 kB non entra nel DOM
++ * per non essere guardato.
++ */
++(function (radice) {
++  'use strict';
++
++  // -------------------------------------------------------------------------
++  // Icone: tratto a 16 px, colore dal testo. Costanti, mai dati del modello.
++  // -------------------------------------------------------------------------
++
++  const S = '<svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" '
++    + 'stroke-width="1.45" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">';
++  const ICONE = {
++    pensiero: S + '<circle cx="8" cy="8" r="5.5" stroke-dasharray="2.2 2.2"/></svg>',
++    leggi: S + '<path d="M4 1.75h5.25L12.5 5v9.25H4z"/><path d="M9 1.75V5.25h3.5"/></svg>',
++    scrivi: S + '<path d="M4 1.75h5.25L12.5 5v9.25H4z"/><path d="M8.25 7.5v4M6.25 9.5h4"/></svg>',
++    modifica: S + '<path d="M10.6 2.4l3 3-8 8H2.6v-3z"/></svg>',
++    cerca: S + '<circle cx="7" cy="7" r="4.25"/><path d="M10.2 10.2l3.3 3.3"/></svg>',
++    esegui: S + '<path d="M2.5 4l4 4-4 4"/><path d="M8 12.5h5.5"/></svg>',
++    elenca: S + '<path d="M3 4h10M3 8h10M3 12h6"/></svg>',
++    piano: S + '<path d="M2.5 4.2l1.3 1.3 2.2-2.4M2.5 10.7l1.3 1.3 2.2-2.4M8 4.5h5.5M8 11h5.5"/></svg>',
++    note: S + '<path d="M3.5 2h9v12h-9z"/><path d="M6 5.5h4M6 8h4M6 10.5h2.5"/></svg>',
++    memoria: S + '<path d="M8 2.2l1.6 3.3 3.6.5-2.6 2.5.6 3.6L8 10.4l-3.2 1.7.6-3.6-2.6-2.5 3.6-.5z"/></svg>',
++    web: S + '<circle cx="8" cy="8" r="5.8"/><path d="M2.2 8h11.6M8 2.2c1.8 1.7 2.6 3.7 2.6 5.8S9.8 12.1 8 13.8C6.2 12.1 5.4 10.1 5.4 8S6.2 3.9 8 2.2z"/></svg>',
++    anteprima: S + '<rect x="2" y="3" width="12" height="9" rx="1.2"/><path d="M5.5 14h5"/></svg>',
++    esplora: S + '<circle cx="8" cy="8" r="5.8"/><path d="M10.4 5.6l-1.4 3.4-3.4 1.4 1.4-3.4z"/></svg>',
++    domanda: S + '<circle cx="8" cy="8" r="5.8"/><path d="M6.3 6.3a1.8 1.8 0 1 1 2.4 1.7c-.5.2-.7.6-.7 1.1v.4M8 11.4v.1"/></svg>',
++    altro: S + '<circle cx="8" cy="8" r="1.2"/><circle cx="3.8" cy="8" r="1.2"/><circle cx="12.2" cy="8" r="1.2"/></svg>',
++    chev: '<svg viewBox="0 0 10 10" width="10" height="10" fill="none" stroke="currentColor" '
++      + 'stroke-width="1.6" aria-hidden="true"><path d="M3.5 1.5L7 5l-3.5 3.5"/></svg>',
++  };
++
++  // -------------------------------------------------------------------------
++  // Piccoli attrezzi di testo
++  // -------------------------------------------------------------------------
++
++  function tronca(valore, quanti) {
++    const testo = String(valore ?? '').replace(/\s+/g, ' ').trim();
++    if (testo.length <= quanti) return testo;
++    // trimEnd prima dei puntini: "configura il …" sembra un errore di stampa.
++    return `${testo.slice(0, quanti - 1).trimEnd()}…`;
++  }
++
++  function nomeFile(percorso) {
++    const pulito = String(percorso ?? '').replace(/[\\/]+$/, '');
++    const pezzi = pulito.split(/[\\/]/);
++    return pezzi[pezzi.length - 1] || pulito || '?';
++  }
++
++  /** Il risultato di un tool come oggetto: arriva come stringa JSON dal
++   *  server, ma un risultato non-JSON e' solo testo e non un errore. */
++  function analizza(risultato) {
++    if (risultato && typeof risultato === 'object') return risultato;
++    try {
++      const dati = JSON.parse(String(risultato ?? ''));
++      return dati && typeof dati === 'object' && !Array.isArray(dati) ? dati : null;
++    } catch (_) {
++      return null;
++    }
++  }
++
++  /** Durata leggibile, alla italiana: "0,4 s", "3,4 s", "41 s", "2 min 5 s".
++   *  Sotto il decimo di secondo non dice niente a nessuno: stringa vuota. */
++  function durata(secondi) {
++    const s = Number(secondi);
++    if (!Number.isFinite(s) || s < 0.1) return '';
++    if (s < 10) return `${s.toFixed(1).replace('.', ',')} s`;
++    if (s < 60) return `${Math.round(s)} s`;
++    const tot = Math.round(s);
++    return `${Math.floor(tot / 60)} min ${tot % 60} s`;
++  }
++
++  function plurale(n, uno, tanti) {
++    return `${n} ${n === 1 ? uno : tanti}`;
++  }
++
++  /** L'inizio di un pensiero, per la riga chiusa: la prima frase, al massimo
++   *  una riga di testo. Chi vuole il resto apre. */
++  function estratto(testo) {
++    const pulito = String(testo ?? '').replace(/\s+/g, ' ').trim();
++    const frase = pulito.match(/^.{20,}?[.!?](?=\s|$)/);
++    return tronca(frase ? frase[0] : pulito, 160);
++  }
++
++  // -------------------------------------------------------------------------
++  // I tool: icona, verbo, oggetto
++  // -------------------------------------------------------------------------
++
++  const cartella = (a) => (a.subfolder && a.subfolder !== '.' ? ` in ${String(a.subfolder).replace(/\/+$/, '')}/` : '');
++
++  // Il verbo prima dell'oggetto: "Legge tools.py" si capisce in mezzo secondo,
++  // `read_file {"filepath": "core/tools.py"}` no. Del percorso resta il nome
++  // del file (il percorso intero e' il titolo della riga): *cosa*, non *dove*.
++  // ``frase`` e' la stessa cosa in minuscolo e in una stringa sola: e' quella
++  // della striscia di attivita' del telefono ("legge tools.py").
++  const TOOL = {
++    read_file: {
++      icona: 'leggi', verbo: 'Legge', oggetto: (a) => nomeFile(a.filepath), titolo: (a) => a.filepath,
++      frase: (a) => `legge ${nomeFile(a.filepath)}`,
++    },
++    write_file: {
++      icona: 'scrivi', verbo: 'Scrive', oggetto: (a) => nomeFile(a.filepath), titolo: (a) => a.filepath,
++      frase: (a) => `scrive ${nomeFile(a.filepath)}`,
++    },
++    edit_file: {
++      icona: 'modifica', verbo: 'Modifica', oggetto: (a) => nomeFile(a.filepath), titolo: (a) => a.filepath,
++      frase: (a) => `modifica ${nomeFile(a.filepath)}`,
++    },
++    list_files: {
++      icona: 'elenca', verbo: 'Elenca',
++      oggetto: (a) => (a.pattern ? `"${tronca(a.pattern, 40)}"${cartella(a)}`
++        : (a.subfolder && a.subfolder !== '.' ? `${String(a.subfolder).replace(/\/+$/, '')}/` : 'il workspace')),
++      frase: (a) => `elenca ${a.subfolder && a.subfolder !== '.' ? nomeFile(a.subfolder) : 'il workspace'}`,
++    },
++    search_files: {
++      icona: 'cerca', verbo: 'Cerca', oggetto: (a) => `"${tronca(a.pattern, 48)}"${cartella(a)}`,
++      titolo: (a) => a.pattern,
++      frase: (a) => `cerca "${tronca(a.pattern, 22)}"`,
++    },
++    run_command: {
++      icona: 'esegui', verbo: 'Esegue', oggetto: (a) => tronca(a.command, 120), titolo: (a) => a.command,
++      frase: (a) => `esegue ${tronca(a.command, 30)}`,
++    },
++    manage_plan: {
++      icona: 'piano', verbo: 'Piano', oggetto: (a) => azionePiano(a),
++      frase: (a) => `piano: ${a.action || 'aggiorna'}`,
++    },
++    manage_notes: {
++      icona: 'note', verbo: 'Appunti', oggetto: (a) => tronca(a.text ? `${a.action || ''} · ${a.text}` : a.action || '', 80),
++      frase: (a) => `appunti: ${a.action || 'aggiorna'}`,
++    },
++    manage_memory: {
++      icona: 'memoria', verbo: 'Memoria', oggetto: (a) => tronca(a.content ? `${a.action || ''} · ${a.content}` : a.action || '', 80),
++      frase: (a) => `memoria: ${a.action || 'aggiorna'}`,
++    },
++    preview: {
++      icona: 'anteprima', verbo: 'Anteprima', oggetto: (a) => tronca([a.action, a.path || a.command].filter(Boolean).join(' · '), 80),
++      frase: (a) => `anteprima${a.action ? `: ${a.action}` : ''}`,
++    },
++    esplora: {
++      icona: 'esplora', verbo: 'Esplora', oggetto: (a) => tronca(a.compito, 90), titolo: (a) => a.compito,
++      frase: () => 'manda un esploratore',
++    },
++    wiki_search: {
++      icona: 'cerca', verbo: 'Cerca nella wiki', oggetto: (a) => `"${tronca(a.query, 48)}"`,
++      frase: (a) => `cerca nella wiki "${tronca(a.query, 18)}"`,
++    },
++    vault_search: {  // nome di prima di v2.39: resta per le sessioni salvate
++      icona: 'cerca', verbo: 'Cerca nel vault', oggetto: (a) => `"${tronca(a.query, 48)}"`,
++      frase: (a) => `cerca nel vault ${tronca(a.vault, 18)}`,
++    },
++    web_search: {
++      icona: 'web', verbo: 'Cerca sul web', oggetto: (a) => `"${tronca(a.query, 60)}"`,
++      frase: (a) => `cerca sul web "${tronca(a.query, 22)}"`,
++    },
++    ask_user_question: {
++      icona: 'domanda', verbo: 'Chiede', oggetto: (a) => tronca(a.question, 90),
++      frase: () => 'ti fa una domanda',
++    },
++  };
++
++  function azionePiano(a) {
++    const azione = String(a.action || 'aggiorna');
++    if (azione === 'set' && Array.isArray(a.steps)) return `imposta ${plurale(a.steps.length, 'punto', 'punti')}`;
++    if (a.step_id != null && a.step_id !== '') return `${azione} · punto ${a.step_id}`;
++    return azione;
++  }
++
++  function argomenti(args) {
++    return args && typeof args === 'object' ? args : {};
++  }
++
++  /** La frase breve, in minuscolo: "legge tools.py". Un tool sconosciuto
++   *  degrada al suo nome, mai a un'eccezione che fa saltare il disegno. */
++  function frase(nome, args) {
++    const def = TOOL[nome];
++    if (!def) return String(nome || 'strumento');
++    try {
++      return tronca(def.frase(argomenti(args)), 46) || String(nome);
++    } catch (_) {
++      return String(nome);
++    }
++  }
++
++  // -------------------------------------------------------------------------
++  // Il diff di una edit_file, dagli argomenti
++  // -------------------------------------------------------------------------
++
++  /** Le righe cambiate fra ``old_string`` e ``new_string``: via le righe
++   *  uguali in testa e in coda (restano come contesto), il resto e' tolto e
++   *  aggiunto. Non e' un diff di Myers e non serve che lo sia: il frammento di
++   *  una edit_file e' di poche righe. I numeri sono quelli del file DOPO la
++   *  modifica, presi dalla finestra che il tool restituisce
++   *  (``dopo_la_modifica``, core/tools.py:finestra_modifica). */
++  function diff(args, r) {
++    const vecchie = String(args.old_string ?? '').split('\n');
++    const nuove = String(args.new_string ?? '').split('\n');
++    let testa = 0;
++    while (testa < vecchie.length && testa < nuove.length && vecchie[testa] === nuove[testa]) testa += 1;
++    let coda = 0;
++    while (coda < vecchie.length - testa && coda < nuove.length - testa
++      && vecchie[vecchie.length - 1 - coda] === nuove[nuove.length - 1 - coda]) coda += 1;
++
++    const primo = primaRigaNuova(nuove, r);
++    const numero = (i) => (primo ? String(primo + i) : '');
++    const righe = [];
++    for (let i = 0; i < testa; i += 1) righe.push({ n: numero(i), segno: ' ', t: nuove[i] });
++    for (let i = testa; i < vecchie.length - coda; i += 1) righe.push({ n: '', segno: '-', t: vecchie[i] });
++    for (let i = testa; i < nuove.length - coda; i += 1) righe.push({ n: numero(i), segno: '+', t: nuove[i] });
++    for (let i = nuove.length - coda; i < nuove.length; i += 1) righe.push({ n: numero(i), segno: ' ', t: nuove[i] });
++    return {
++      righe,
++      tolte: Math.max(0, vecchie.length - coda - testa),
++      aggiunte: Math.max(0, nuove.length - coda - testa),
++    };
++  }
++
++  function primaRigaNuova(nuove, r) {
++    const finestra = r && r.dopo_la_modifica;
++    const testo = finestra && typeof finestra === 'object' ? finestra.testo : '';
++    if (!testo) return 0;
++    const cercata = String(nuove.find((x) => x.trim()) ?? '').trimEnd();
++    if (!cercata) return 0;
++    const salto = nuove.findIndex((x) => x.trim());
++    for (const riga of String(testo).split('\n')) {
++      const m = riga.match(/^\s*(\d+) \| ?(.*)$/);
++      if (m && m[2].trimEnd() === cercata) return Number(m[1]) - salto;
++    }
++    return 0;
++  }
++
++  // -------------------------------------------------------------------------
++  // La riga di un tool
++  // -------------------------------------------------------------------------
++
++  /** I dati della riga di una chiamata: cosa si vede a tendina chiusa.
++   *
++   *  ``meta`` e' l'informazione del risultato che vale la riga -- quante
++   *  righe, quanti risultati, com'e' finito un comando -- e ``tono`` dice se
++   *  va letta come buona o cattiva notizia. La durata compare solo sopra il
++   *  secondo: "0.01s" su ogni riga era rumore. Senza risultato (il tool sta
++   *  ancora girando) la riga e' quella del verbo e basta. */
++  function riga(nome, args, risultato, ok, secondi) {
++    const a = argomenti(args);
++    const def = TOOL[nome] || { icona: 'altro', verbo: String(nome || 'strumento'), oggetto: () => '' };
++    const r = analizza(risultato);
++    const dati = {
++      icona: def.icona,
++      verbo: def.verbo,
++      oggetto: '',
++      titolo: '',
++      meta: '',
++      tono: '',
++      piu: '',
++      meno: '',
++    };
++    try {
++      dati.oggetto = String(def.oggetto(a) ?? '');
++      dati.titolo = String((def.titolo ? def.titolo(a) : '') || '');
++    } catch (_) { /* argomenti strani: resta il verbo */ }
++    if (risultato === undefined || risultato === null) return dati;
++
++    const tempo = durata(secondi);
++    const errore = r && r.error ? String(r.error) : '';
++    if (nome === 'run_command' && r && !errore) {
++      const codice = r.returncode;
++      const esito = String(r.esito || (codice === 0 ? 'ok' : ''));
++      const fallito = ok === false || (codice != null && codice !== 0);
++      dati.tono = fallito ? 'err' : 'ok';
++      dati.meta = [
++        fallito ? (codice != null ? `exit ${codice}` : esito.toLowerCase() || 'fallito') : 'ok',
++        durata(r.duration_s ?? secondi),
++      ].filter(Boolean).join(' · ');
++      return dati;
++    }
++    if (errore || ok === false) {
++      dati.tono = 'err';
++      dati.meta = 'errore';
++      if (errore) dati.titolo = errore;
++      return dati;
++    }
++    let meta = '';
++    if (r) {
++      if (nome === 'read_file') {
++        if (r.status === 'invariato') meta = 'già letto';
++        else if (r.range && r.range !== 'intero file') meta = `righe ${String(r.range).replace('-', '–')}`;
++        else if (r.total_lines != null) meta = plurale(Number(r.total_lines), 'riga', 'righe');
++      } else if (nome === 'write_file') {
++        const azione = r.action === 'sovrascritto' ? 'riscritto' : (r.action || 'scritto');
++        meta = r.lines != null ? `${azione} · ${plurale(Number(r.lines), 'riga', 'righe')}` : azione;
++      } else if (nome === 'edit_file') {
++        const d = diff(a, r);
++        const volte = Math.max(1, Number(r.replacements) || 1);
++        if (d.aggiunte) dati.piu = `+${d.aggiunte * volte}`;
++        if (d.tolte) dati.meno = `−${d.tolte * volte}`;
++        if (!d.aggiunte && !d.tolte) meta = 'nessun cambiamento';
++      } else if (nome === 'search_files' || nome === 'list_files') {
++        meta = contaRisultati(nome, r);
++      }
++    }
++    dati.meta = [meta, tempo].filter(Boolean).join(' · ');
++    return dati;
++  }
++
++  const VUOTI = /^\((nessuna corrispondenza|nessun file corrisponde|cartella vuota)\)$/;
++
++  function contaRisultati(nome, r) {
++    if (Array.isArray(r.matches)) {
++      const n = r.match_count ?? r.matches.filter((m) => !VUOTI.test(m)).length;
++      return n ? plurale(Number(n), 'risultato', 'risultati') : 'nessun risultato';
++    }
++    if (Array.isArray(r.files)) {
++      const n = r.match_count ?? r.files.filter((m) => !VUOTI.test(m)).length;
++      return n ? plurale(Number(n), 'file', 'file') : 'nessun file';
++    }
++    if (Array.isArray(r.counts)) {
++      const n = r.counts.filter((m) => !VUOTI.test(m)).length;
++      return n ? plurale(n, 'file', 'file') : 'nessun risultato';
++    }
++    if (nome === 'list_files' && r.entries != null) return plurale(Number(r.entries), 'voce', 'voci');
++    return '';
++  }
++
++  // -------------------------------------------------------------------------
++  // Il dettaglio di un tool, letto per tipo
++  // -------------------------------------------------------------------------
++
++  // Oltre, il dettaglio diventerebbe il write_file da 34 kB che la tendina
++  // costruita al primo clic esisteva per non mettere nel DOM. Il resto sta nel
++  // JSON grezzo, che e' un nodo di testo solo.
++  const MAX_RIGHE = 400;
++
++  function numerate(testo, da) {
++    const tutte = String(testo ?? '').split('\n');
++    const righe = [];
++    let n = da;
++    for (const t of tutte.slice(0, MAX_RIGHE)) {
++      // Il segno di smart_truncate (core/textutils.py) interrompe la
++      // numerazione: le righe dopo il taglio non sono piu' quelle del file.
++      if (/^\[\.\.\. .* \.\.\.\]$/.test(t.trim())) {
++        righe.push({ n: '', t: t.trim(), nota: true });
++        n = null;
++        continue;
++      }
++      righe.push({ n: n == null ? '' : String(n), t });
++      if (n != null) n += 1;
++    }
++    return { righe, oltre: Math.max(0, tutte.length - MAX_RIGHE) };
++  }
++
++  /** Il dettaglio di una chiamata, come dati. Ogni tipo dice il suo:
++   *
++   *    estratto  righe numerate (read_file, write_file)
++   *    diff      righe con segno e numero (edit_file)
++   *    ricerca   corrispondenze raggruppate per file (search_files)
++   *    elenco    righe di testo (list_files, search_files a file o conteggi)
++   *    terminale comando, codice di uscita e uscita (run_command)
++   *    errore    il messaggio e il suggerimento del tool
++   *    campi     chiave: valore, per tutti gli altri
++   */
++  function vista(nome, args, risultato) {
++    const a = argomenti(args);
++    const r = analizza(risultato);
++    if (r && r.error) {
++      return { tipo: 'errore', testa: nome, testo: String(r.error), suggerimento: r.hint ? String(r.hint) : '' };
++    }
++    if (nome === 'read_file' && r) {
++      if (r.status === 'invariato') return { tipo: 'campi', testa: r.filepath || a.filepath || '', righe: [{ k: 'nota', v: String(r.note || 'già letto') }] };
++      const da = r.range && r.range !== 'intero file' ? Number(String(r.range).split('-')[0]) || 1 : 1;
++      const { righe, oltre } = numerate(r.content, da);
++      const quale = r.range && r.range !== 'intero file' ? `righe ${String(r.range).replace('-', '–')}` : 'intero file';
++      return {
++        tipo: 'estratto',
++        testa: [r.filepath || a.filepath, quale, r.total_lines != null ? `${r.total_lines} righe` : ''].filter(Boolean).join(' · '),
++        righe,
++        nota: [r.truncated ? 'contenuto tagliato dal tool' : '', oltre ? `altre ${oltre} righe nel JSON grezzo` : ''].filter(Boolean).join(' · '),
++      };
++    }
++    if (nome === 'write_file') {
++      const { righe, oltre } = numerate(a.content, 1);
++      const azione = r && r.action === 'sovrascritto' ? 'riscritto' : (r && r.action) || '';
++      return {
++        tipo: 'estratto',
++        testa: [r && r.filepath ? r.filepath : a.filepath, azione].filter(Boolean).join(' · '),
++        righe,
++        nota: [avvisoSintassi(r), oltre ? `altre ${oltre} righe nel JSON grezzo` : ''].filter(Boolean).join(' · '),
++      };
++    }
++    if (nome === 'edit_file') {
++      const d = diff(a, r);
++      const volte = r && Number(r.replacements) > 1 ? ` · ${r.replacements} sostituzioni` : '';
++      return {
++        tipo: 'diff',
++        testa: `${(r && r.filepath) || a.filepath || ''}${volte}`,
++        righe: d.righe,
++        nota: [r && r.nota_aggancio ? String(r.nota_aggancio) : '', avvisoSintassi(r)].filter(Boolean).join(' · '),
++      };
++    }
++    if (nome === 'search_files' && r && Array.isArray(r.matches)) {
++      const righe = [];
++      for (const m of r.matches.slice(0, MAX_RIGHE)) {
++        const p = String(m).match(/^(.+?):(\d+):([> ]?) ?(.*)$/);
++        if (p) righe.push({ file: p[1], n: p[2], t: p[4], centro: p[3] !== ' ' });
++        else righe.push({ file: '', n: '', t: String(m) });
++      }
++      return { tipo: 'ricerca', testa: `"${a.pattern ?? r.pattern ?? ''}"${cartella(a)}`, cerca: String(a.pattern ?? r.pattern ?? ''), righe, nota: r.nota ? String(r.nota) : '' };
++    }
++    if ((nome === 'search_files' || nome === 'list_files') && r) {
++      const lista = r.files || r.counts || (r.tree != null ? String(r.tree).split('\n') : null);
++      if (lista) {
++        return {
++          tipo: 'elenco',
++          testa: nome === 'list_files' ? (a.subfolder && a.subfolder !== '.' ? a.subfolder : 'workspace') : `"${a.pattern ?? ''}"`,
++          righe: lista.slice(0, MAX_RIGHE).map((t) => ({ t: String(t) })),
++          nota: r.truncated ? 'elenco tagliato dal tool' : '',
++        };
++      }
++    }
++    if (nome === 'run_command' && r) {
++      const uscita = [r.stdout, r.stderr ? `--- stderr ---\n${r.stderr}` : '', r.output && !r.stdout && !r.stderr ? r.output : '']
++        .filter((x) => x && String(x).trim()).join('\n');
++      return {
++        tipo: 'terminale',
++        testa: String(r.command || a.command || ''),
++        codice: r.returncode != null ? `exit ${r.returncode}` : String(r.esito || ''),
++        ok: r.returncode === 0,
++        uscita: uscita.replace(/\s+$/, '') || '(nessuna uscita)',
++      };
++    }
++    return { tipo: 'campi', testa: nome, righe: campi(a, r, risultato) };
++  }
++
++  function avvisoSintassi(r) {
++    const avviso = r && r.avviso_sintassi;
++    if (!avviso) return '';
++    return typeof avviso === 'object'
++      ? `avviso di sintassi${avviso.riga ? ` alla riga ${avviso.riga}` : ''}: ${avviso.messaggio || avviso.msg || ''}`.trim()
++      : `avviso di sintassi: ${avviso}`;
++  }
++
++  /** Chiave: valore, per i tool senza una vista loro. Gli argomenti prima (cosa
++   *  gli e' stato chiesto), poi il risultato. Le stringhe restano stringhe:
++   *  niente ``\n`` letterali come nel JSON. */
++  function campi(a, r, grezzo) {
++    const righe = [];
++    const valore = (v) => (typeof v === 'string' ? v : JSON.stringify(v, null, 2));
++    for (const [k, v] of Object.entries(a)) righe.push({ k, v: valore(v), argomento: true });
++    if (r) for (const [k, v] of Object.entries(r)) righe.push({ k, v: valore(v) });
++    else if (grezzo != null && String(grezzo).trim()) righe.push({ k: 'risultato', v: String(grezzo) });
++    return righe;
++  }
++
++  /** Argomenti e risultato come li ha visti il modello, per chi vuole il
++   *  grezzo. Un nodo di testo solo. */
++  function grezzo(args, risultato) {
++    const r = analizza(risultato);
++    return `Argomenti\n${JSON.stringify(argomenti(args), null, 2)}\n\nRisultato\n`
++      + (r ? JSON.stringify(r, null, 2) : String(risultato ?? ''));
++  }
++
++  // -------------------------------------------------------------------------
++  // Il riassunto di un blocco
++  // -------------------------------------------------------------------------
++
++  const CATEGORIE = [
++    ['leggi', 'lettura', 'letture'],
++    ['cerca', 'ricerca', 'ricerche'],
++    ['web', 'ricerca web', 'ricerche web'],
++    ['modifica', 'modifica', 'modifiche'],
++    ['scrivi', 'file scritto', 'file scritti'],
++    ['esegui', 'comando', 'comandi'],
++    ['elenca', 'elenco', 'elenchi'],
++  ];
++
++  /** "2 letture · 1 ricerca · 2 modifiche · 2 comandi", piu' com'e' andato
++   *  l'ultimo comando e quanti tool sono andati in errore.
++   *
++   *  ``passi``: ``[{nome, ok, risultato}]`` dei soli tool. L'esito dell'ultimo
++   *  comando e' quello che si guarda per primo ("i test sono verdi?"), e si
++   *  dice per quello che e' -- l'ultimo comando -- perche' dal client non si
++   *  sa quale comando fosse una verifica. */
++  function riassunto(passi) {
++    const conta = {};
++    let errori = 0;
++    let comando = null;
++    for (const p of passi) {
++      const def = TOOL[p.nome];
++      const icona = def ? def.icona : 'altro';
++      conta[icona] = (conta[icona] || 0) + 1;
++      const d = riga(p.nome, p.args, p.risultato, p.ok, 0);
++      if (p.nome === 'run_command') comando = d.tono === 'err' ? 'fallito' : 'ok';
++      else if (d.tono === 'err') errori += 1;
++    }
++    const pezzi = [];
++    let noti = 0;
++    for (const [icona, uno, tanti] of CATEGORIE) {
++      if (conta[icona]) { pezzi.push(plurale(conta[icona], uno, tanti)); noti += conta[icona]; }
++    }
++    const altri = passi.length - noti;
++    if (altri) pezzi.push(plurale(altri, 'altra azione', 'altre azioni'));
++    return { testo: pezzi.join(' · '), comando, errori };
++  }
++
++  // -------------------------------------------------------------------------
++  // Nodi
++  // -------------------------------------------------------------------------
++
++  const doc = () => radice.document;
++
++  function nodo(tag, classe, testo) {
++    const n = doc().createElement(tag);
++    if (classe) n.className = classe;
++    if (testo !== undefined && testo !== null) n.textContent = String(testo);
++    return n;
++  }
++
++  function icona(nome) {
++    const n = nodo('span', 'ps-ico');
++    n.innerHTML = ICONE[nome] || ICONE.altro;
++    return n;
++  }
++
++  /** Il contenuto della riga: icona, verbo, oggetto, meta. */
++  function riempiRiga(bottone, d, stato) {
++    bottone.textContent = '';
++    const ico = stato === 'corso' ? nodo('span', 'ps-ico') : icona(d.icona);
++    if (stato === 'corso') ico.appendChild(nodo('span', 'ps-ruota'));
++    if (d.tono === 'err') ico.classList.add('err');
++    bottone.appendChild(ico);
++    bottone.appendChild(nodo('span', 'ps-verbo', d.verbo));
++    if (d.oggetto) bottone.appendChild(nodo('span', 'ps-oggetto', d.oggetto));
++    const meta = nodo('span', 'ps-meta' + (d.tono ? ` ${d.tono}` : ''));
++    if (d.piu) meta.appendChild(nodo('span', 'ps-piu', d.piu));
++    if (d.meno) meta.appendChild(nodo('span', 'ps-meno', d.meno));
++    if (d.meta) meta.appendChild(nodo('span', '', d.meta));
++    bottone.appendChild(meta);
++    bottone.title = d.titolo || [d.verbo, d.oggetto].filter(Boolean).join(' ');
++  }
++
++  function righeCodice(contenitore, righe, conSegno) {
++    for (const r of righe) {
++      const riga = nodo('div', 'ps-ln' + (r.segno === '+' ? ' piu' : r.segno === '-' ? ' meno' : '') + (r.nota ? ' nota' : ''));
++      riga.appendChild(nodo('span', 'ps-n', r.n ?? ''));
++      if (conSegno) riga.appendChild(nodo('span', 'ps-sg', r.segno === ' ' ? '' : r.segno));
++      riga.appendChild(nodo('span', 'ps-t', r.t));
++      contenitore.appendChild(riga);
++    }
++  }
++
++  function scatola(testa, destra) {
++    const box = nodo('div', 'ps-code');
++    const t = nodo('div', 'ps-code-testa');
++    t.appendChild(nodo('span', 'ps-code-titolo', testa));
++    if (destra) t.appendChild(destra);
++    box.appendChild(t);
++    return box;
++  }
++
++  /** Il nodo del dettaglio, da ``vista()``. */
++  function nodoVista(v) {
++    const wrap = nodo('div', 'ps-vista');
++    if (v.tipo === 'estratto' || v.tipo === 'diff') {
++      const box = scatola(v.testa);
++      const corpo = nodo('div', 'ps-code-corpo');
++      righeCodice(corpo, v.righe, v.tipo === 'diff');
++      box.appendChild(corpo);
++      wrap.appendChild(box);
++    } else if (v.tipo === 'ricerca') {
++      const box = scatola(v.testa);
++      const corpo = nodo('div', 'ps-code-corpo');
++      let file = null;
++      for (const r of v.righe) {
++        if (r.file !== file) {
++          file = r.file;
++          if (file) corpo.appendChild(nodo('div', 'ps-ln-file', file));
++        }
++        const riga = nodo('div', 'ps-ln' + (r.centro === false ? ' contesto' : ''));
++        riga.appendChild(nodo('span', 'ps-n', r.n));
++        const t = nodo('span', 'ps-t');
++        evidenzia(t, r.t, v.cerca);
++        riga.appendChild(t);
++        corpo.appendChild(riga);
++      }
++      box.appendChild(corpo);
++      wrap.appendChild(box);
++    } else if (v.tipo === 'elenco') {
++      const box = scatola(v.testa);
++      const corpo = nodo('div', 'ps-code-corpo');
++      for (const r of v.righe) {
++        const riga = nodo('div', 'ps-ln');
++        riga.appendChild(nodo('span', 'ps-t', r.t));
++        corpo.appendChild(riga);
++      }
++      box.appendChild(corpo);
++      wrap.appendChild(box);
++    } else if (v.tipo === 'terminale') {
++      const box = scatola(`$ ${v.testa}`, nodo('span', `ps-exit ${v.ok ? 'ok' : 'err'}`, v.codice));
++      // column-reverse: lo scorrimento parte dal fondo, dove un comando
++      // mette l'errore e il riepilogo dei test.
++      const corpo = nodo('div', 'ps-code-corpo ps-term');
++      corpo.appendChild(nodo('pre', 'ps-term-testo', v.uscita));
++      box.appendChild(corpo);
++      wrap.appendChild(box);
++    } else if (v.tipo === 'errore') {
++      const box = nodo('div', 'ps-errore');
++      box.appendChild(nodo('div', '', v.testo));
++      if (v.suggerimento) box.appendChild(nodo('div', 'ps-errore-nota', v.suggerimento));
++      wrap.appendChild(box);
++    } else {
++      const box = nodo('div', 'ps-campi');
++      for (const r of v.righe || []) {
++        const riga = nodo('div', 'ps-campo');
++        riga.appendChild(nodo('span', 'ps-k', r.k));
++        riga.appendChild(nodo('span', 'ps-v', r.v));
++        box.appendChild(riga);
++      }
++      if (!(v.righe || []).length) box.appendChild(nodo('span', 'ps-v', '(niente)'));
++      wrap.appendChild(box);
++    }
++    if (v.nota) wrap.appendChild(nodo('div', 'ps-nota', v.nota));
++    return wrap;
++  }
++
++  function evidenzia(contenitore, testo, cercato) {
++    const t = String(testo ?? '');
++    let i = -1;
++    try {
++      i = cercato ? t.search(new RegExp(cercato)) : -1;
++    } catch (_) {
++      i = cercato ? t.indexOf(cercato) : -1;
++    }
++    let lungo = 0;
++    if (i >= 0) {
++      try { lungo = (t.slice(i).match(new RegExp(cercato)) || [''])[0].length; } catch (_) { lungo = cercato.length; }
++    }
++    if (i < 0 || !lungo) { contenitore.textContent = t; return; }
++    contenitore.appendChild(doc().createTextNode(t.slice(0, i)));
++    contenitore.appendChild(nodo('mark', 'ps-hit', t.slice(i, i + lungo)));
++    contenitore.appendChild(doc().createTextNode(t.slice(i + lungo)));
++  }
++
++  function apribile(passo, bottone, costruisci) {
++    let corpo = null;
++    bottone.setAttribute('aria-expanded', 'false');
++    bottone.addEventListener('click', () => {
++      if (!corpo) {
++        corpo = costruisci();
++        if (!corpo) return;
++        passo.appendChild(corpo);
++      } else {
++        corpo.hidden = !corpo.hidden;
++      }
++      const aperto = !corpo.hidden;
++      bottone.setAttribute('aria-expanded', aperto ? 'true' : 'false');
++      passo.classList.toggle('aperto', aperto);
++    });
++  }
++
++  /** Un passo di tool: la riga, e il dettaglio al primo clic.
++   *
++   *  ``dati``: ``{nome, args, risultato, ok, durata, id}``. Senza
++   *  ``risultato`` il passo nasce "in corso" (evento tool_start) e si chiude
++   *  con ``concludiTool``. */
++  function passoTool(dati) {
++    const passo = nodo('div', 'ps-passo ps-tool');
++    if (dati.id) passo.dataset.call = String(dati.id);
++    passo._ps = { ...dati };
++    const bottone = nodo('button', 'ps-riga');
++    bottone.type = 'button';
++    passo.appendChild(bottone);
++    const inCorso = dati.risultato === undefined;
++    riempiRiga(bottone, riga(dati.nome, dati.args, dati.risultato, dati.ok, dati.durata), inCorso ? 'corso' : '');
++    if (inCorso) passo.classList.add('corso');
++    apribile(passo, bottone, () => {
++      const d = passo._ps;
++      if (d.risultato === undefined) return null;   // ancora in corso: niente da aprire
++      const corpo = nodo('div', 'ps-corpo');
++      corpo.appendChild(nodoVista(vista(d.nome, d.args, d.risultato)));
++      const piede = nodo('div', 'ps-piede');
++      const link = nodo('button', 'ps-grezzo', 'JSON grezzo');
++      link.type = 'button';
++      let pre = null;
++      link.addEventListener('click', () => {
++        if (!pre) {
++          pre = nodo('pre', 'ps-grezzo-testo', grezzo(d.args, d.risultato));
++          corpo.appendChild(pre);
++        } else {
++          pre.hidden = !pre.hidden;
++        }
++        link.textContent = pre.hidden ? 'JSON grezzo' : 'nascondi JSON';
++      });
++      piede.appendChild(link);
++      corpo.appendChild(piede);
++      return corpo;
++    });
++    return passo;
++  }
++
++  function concludiTool(passo, dati) {
++    Object.assign(passo._ps, dati);
++    passo.classList.remove('corso');
++    const d = passo._ps;
++    riempiRiga(passo.querySelector('.ps-riga'), riga(d.nome, d.args, d.risultato, d.ok, d.durata), '');
++  }
++
++  // Quanto testo tiene la finestra del pensiero dal vivo. Si vedono quattro
++  // righe; il resto sta nella stringa, e si legge aprendo il pensiero chiuso.
++  const CODA_FINESTRA = 1200;
++
++  /** Un passo di pensiero. Nasce vivo, con la finestra di quattro righe che
++   *  scorre; ``chiudi`` lo riduce alla riga con l'inizio del testo, che si
++   *  apre sul testo intero. */
++  function passoPensiero() {
++    const passo = nodo('div', 'ps-passo ps-pensiero vivo');
++    const bottone = nodo('button', 'ps-riga');
++    bottone.type = 'button';
++    const ico = icona('pensiero');
++    ico.classList.add('gira');
++    bottone.appendChild(ico);
++    bottone.appendChild(nodo('span', 'ps-verbo', 'Sta pensando'));
++    const meta = nodo('span', 'ps-meta');
++    bottone.appendChild(meta);
++    passo.appendChild(bottone);
++    const finestra = nodo('div', 'ps-finestra');
++    const testoFinestra = nodo('div', 'ps-finestra-testo');
++    finestra.appendChild(testoFinestra);
++    passo.appendChild(finestra);
++
++    let testo = '';
++    let chiuso = false;
++    let riassunto = null;
++    const ctl = {
++      nodo: passo,
++      get testo() { return testo; },
++      get chiuso() { return chiuso; },
++      imposta(t) {
++        testo = String(t ?? '');
++        if (!chiuso) testoFinestra.textContent = testo.slice(-CODA_FINESTRA);
++        else if (riassunto) riassunto.textContent = estratto(testo) || '(pensiero vuoto)';
++      },
++      accoda(pezzo) {
++        this.imposta(testo + String(pezzo ?? ''));
++      },
++      tempo(secondi) {
++        if (!chiuso) meta.textContent = durata(secondi);
++      },
++      chiudi(secondi) {
++        if (chiuso) return;
++        chiuso = true;
++        passo.classList.remove('vivo');
++        finestra.remove();
++        bottone.textContent = '';
++        bottone.appendChild(icona('pensiero'));
++        riassunto = nodo('span', 'ps-estratto', estratto(testo) || '(pensiero vuoto)');
++        bottone.appendChild(riassunto);
++        bottone.appendChild(nodo('span', 'ps-meta', durata(secondi)));
++        bottone.title = 'Pensiero';
++        apribile(passo, bottone, () => {
++          const corpo = nodo('div', 'ps-corpo');
++          corpo.appendChild(nodo('div', 'ps-pensiero-testo', testo));
++          return corpo;
++        });
++      },
++    };
++    passo._ctl = ctl;
++    return ctl;
++  }
++
++  /** Il blocco di lavoro: tutti i passi fra due testi del modello.
++   *
++   *  Vivo: intestazione "Sta lavorando · passo 6 · 31 s", i passi in colonna
++   *  e, se sono tanti, i piu' vecchi piegati in "N passi prima". Chiuso: una
++   *  riga sola con durata, conteggi e com'e' andato l'ultimo comando; si apre
++   *  sulla traccia intera. */
++  function gruppo(opzioni = {}) {
++    const box = nodo('div', 'ps-gruppo vivo');
++    const testa = nodo('button', 'ps-testa');
++    testa.type = 'button';
++    testa.setAttribute('aria-expanded', 'true');
++    const segno = nodo('span', 'ps-ico');
++    segno.appendChild(nodo('span', 'ps-ruota'));
++    const titolo = nodo('span', 'ps-titolo', 'Sta lavorando');
++    const meta = nodo('span', 'ps-meta-gruppo');
++    testa.append(segno, titolo, meta);
++    const traccia = nodo('div', 'ps-traccia');
++    const piega = nodo('button', 'ps-piega');
++    piega.type = 'button';
++    piega.hidden = true;
++    traccia.appendChild(piega);
++    box.append(testa, traccia);
++
++    const MOSTRATI_VIVO = opzioni.mostratiVivo ?? 4;
++    const tools = [];
++    let chiuso = false;
++    let spiegato = false;
++
++    const passi = () => [...traccia.childNodes].filter((n) => n !== piega);
++
++    function ripiega() {
++      if (chiuso) return;
++      const tutti = passi();
++      const nascosti = spiegato ? 0 : Math.max(0, tutti.length - MOSTRATI_VIVO);
++      tutti.forEach((n, i) => { n.hidden = i < nascosti; });
++      piega.hidden = nascosti === 0;
++      piega.textContent = '';
++      piega.appendChild(icona('elenca'));
++      piega.appendChild(nodo('span', '', plurale(nascosti, 'passo prima', 'passi prima')));
++    }
++    piega.addEventListener('click', () => { spiegato = true; ripiega(); });
++
++    const ctl = {
++      nodo: box,
++      aggiungi(passo) {
++        traccia.appendChild(passo);
++        ripiega();
++      },
++      segnaTool(dati) { tools.push(dati); },
++      stato(testo) { if (!chiuso) meta.textContent = testo ? `· ${testo}` : ''; },
++      get chiuso() { return chiuso; },
++      vuoto() { return passi().length === 0; },
++      chiudi(secondi) {
++        if (chiuso) return;
++        chiuso = true;
++        box.classList.remove('vivo');
++        passi().forEach((n) => { n.hidden = false; });
++        piega.remove();
++        const r = riassunto(tools);
++        const t = durata(secondi);
++        testa.textContent = '';
++        const chev = nodo('span', 'ps-ico ps-chev');
++        chev.innerHTML = ICONE.chev;
++        testa.appendChild(chev);
++        testa.appendChild(nodo('span', 'ps-titolo',
++          tools.length ? (t ? `Ha lavorato ${t}` : 'Ha lavorato') : (t ? `Ha pensato ${t}` : 'Ha pensato')));
++        const pezzi = [r.testo, r.errori ? plurale(r.errori, 'errore', 'errori') : ''].filter(Boolean);
++        if (pezzi.length) testa.appendChild(nodo('span', 'ps-meta-gruppo', `· ${pezzi.join(' · ')}`));
++        if (r.comando) {
++          // "ultimo comando" si toglie dove manca lo spazio (il telefono):
++          // resta l'esito, che e' la parte che si guarda.
++          const pill = nodo('span', `ps-pill ${r.comando === 'ok' ? 'ok' : 'err'}`);
++          pill.appendChild(nodo('span', 'ps-pill-lungo', 'ultimo comando '));
++          pill.appendChild(doc().createTextNode(r.comando === 'ok' ? 'ok' : 'fallito'));
++          pill.title = r.comando === 'ok' ? "L'ultimo comando del blocco e' finito bene" : "L'ultimo comando del blocco e' fallito";
++          testa.appendChild(pill);
++        }
++        testa.title = pezzi.join(' · ');
++        box.classList.remove('aperto');
++        traccia.hidden = true;
++        testa.setAttribute('aria-expanded', 'false');
++        testa.addEventListener('click', () => {
++          traccia.hidden = !traccia.hidden;
++          box.classList.toggle('aperto', !traccia.hidden);
++          testa.setAttribute('aria-expanded', traccia.hidden ? 'false' : 'true');
++        });
++      },
++    };
++    box._ctl = ctl;
++    return ctl;
++  }
++
++  /** La regia dei blocchi di lavoro di un turno: quando se ne apre uno,
++   *  dove finiscono pensieri e tool, quando si chiude, quanto e' durato.
++   *
++   *  Condivisa perche' e' la parte con le regole sottili, e due copie
++   *  divergerebbero:
++   *    - un testo del modello chiude il blocco (lo decide chi ospita,
++   *      chiamando ``chiudi``); il passo dopo ne apre uno nuovo;
++   *    - a fine passo il server rimanda il pensiero intero (core/agent.py,
++   *      "Il testo completo, una volta per passo"), anche dopo che la risposta
++   *      ha chiuso il blocco: va al pensiero di quel passo, gia' chiuso, e non
++   *      deve aprire un blocco nuovo sotto la risposta;
++   *    - le durate sono sull'orologio del server (``t`` degli eventi, ``ts``
++   *      dei messaggi salvati), mai su quello del browser.
++   *
++   *  ``opzioni.inserisci(nodo)``: mette in pagina un blocco nuovo, in coda.
++   *  ``opzioni.vivo()``: il turno e' dal vivo (conta i secondi).
++   *  ``opzioni.dopo()``: dopo ogni cambiamento visibile (scorrimento). */
++  function lavoro(opzioni = {}) {
++    const inserisci = opzioni.inserisci || (() => {});
++    const vivo = opzioni.vivo || (() => false);
++    const dopo = opzioni.dopo || (() => {});
++    let g = null;
++    let pensiero = null;
++    let pensieroDelPasso = null;
++    let ora = null;
++    let inizioPasso = null;
++    let passo = null;
++    let nota = '';
++    let ticker = null;
++    // L'ora in cui si e' chiuso l'ultimo blocco: se il modello, nello stesso
++    // passo, ha scritto e poi chiamato un tool, il blocco nuovo comincia da
++    // li' e non dall'inizio del passo -- il testo non e' lavoro del blocco.
++    let chiusoAlle = null;
++
++    const fin = (x) => typeof x === 'number' && Number.isFinite(x);
++    const adesso = () => Date.now() / 1000;
++
++    function stato() {
++      if (!g || g.chiuso) return;
++      const pezzi = [];
++      if (passo) pezzi.push(`passo ${passo}`);
++      if (nota) pezzi.push(nota);
++      if (vivo() && fin(g.inizio)) pezzi.push(durata(adesso() - g.inizio));
++      g.stato(pezzi.filter(Boolean).join(' · '));
++      if (pensiero && vivo() && fin(pensiero.inizio)) pensiero.tempo(adesso() - pensiero.inizio);
++    }
++
++    function avviaTicker() {
++      if (ticker || !vivo() || typeof setInterval !== 'function') return;
++      ticker = setInterval(() => {
++        if (!g || !g.nodo.isConnected) { clearInterval(ticker); ticker = null; return; }
++        stato();
++      }, 1000);
++    }
++
++    function blocco(inizio) {
++      if (!g) {
++        g = gruppo();
++        const dalPasso = fin(inizioPasso) ? Math.max(inizioPasso, fin(chiusoAlle) ? chiusoAlle : -Infinity) : null;
++        g.inizio = fin(inizio) ? inizio : (fin(dalPasso) ? dalPasso : ora);
++        g.fine = null;
++        inserisci(g.nodo);
++        avviaTicker();
++        stato();
++      }
++      return g;
++    }
++
++    function chiudiPensiero(fine) {
++      if (!pensiero) return;
++      const p = pensiero;
++      pensiero = null;
++      const f = fin(fine) ? fine : ora;
++      p.chiudi(fin(p.inizio) && fin(f) && f >= p.inizio ? f - p.inizio : null);
++      if (g && fin(f)) g.fine = f;
++    }
++
++    function pensa(inizio) {
++      if (!pensiero) {
++        const b = blocco(inizio);
++        pensiero = passoPensiero();
++        pensiero.inizio = fin(inizio) ? inizio : ora;
++        pensieroDelPasso = pensiero;
++        b.aggiungi(pensiero.nodo);
++        stato();
++      }
++      return pensiero;
++    }
++
++    return {
++      get aperto() { return Boolean(g); },
++      get nodo() { return g ? g.nodo : null; },
++      ora(t) { if (fin(t)) ora = t; },
++      segnaPasso(n) {
++        passo = n;
++        inizioPasso = ora;
++        pensieroDelPasso = null;
++        nota = '';
++        stato();
++      },
++      nota(testo) { nota = String(testo || ''); stato(); },
++      setThinking(testo) {
++        if (!pensiero && pensieroDelPasso) { pensieroDelPasso.imposta(testo); return; }
++        pensa().imposta(testo);
++        dopo();
++      },
++      appendThinking(pezzo) {
++        if (!pensiero && pensieroDelPasso) { pensieroDelPasso.accoda(pezzo); return; }
++        pensa().accoda(pezzo);
++        dopo();
++      },
++      /** Un pensiero intero, da un messaggio salvato: nasce gia' chiuso. */
++      pensieroSalvato(testo, inizio, fine) {
++        pensa(inizio).imposta(testo);
++        chiudiPensiero(fine);
++        pensieroDelPasso = null;
++      },
++      /** Il tool e' partito: la riga c'e' subito, con la rotellina. */
++      avviaTool(dati) {
++        chiudiPensiero();
++        pensieroDelPasso = null;
++        nota = '';
++        blocco().aggiungi(passoTool({ nome: dati.nome, args: dati.args, id: dati.id }));
++        stato();
++        dopo();
++      },
++      /** Il tool ha finito: la sua riga si completa, o nasce (messaggio
++       *  salvato, o tool_start perso). ``tempi``: ``{inizio, fine}`` dei
++       *  messaggi salvati; dal vivo vale l'ora dell'evento. */
++      concludiTool(dati, tempi = {}) {
++        chiudiPensiero(tempi.inizio);
++        pensieroDelPasso = null;
++        const b = blocco(tempi.inizio);
++        const completo = { ...dati, risultato: dati.risultato ?? '' };
++        const vivi = [...b.nodo.querySelectorAll('.ps-passo.corso')];
++        const suo = vivi.find((n) => (dati.id ? n.dataset.call === String(dati.id) : n._ps && n._ps.nome === dati.nome));
++        if (suo) concludiTool(suo, completo);
++        else b.aggiungi(passoTool(completo));
++        b.segnaTool(completo);
++        const f = fin(tempi.fine) ? tempi.fine : ora;
++        if (fin(f)) b.fine = f;
++        dopo();
++      },
++      /** Chiude il blocco aperto: il modello ha parlato, o il turno e' finito. */
++      chiudi(fine) {
++        chiudiPensiero(fine);
++        if (!g) return;
++        const b = g;
++        g = null;
++        if (ticker) { clearInterval(ticker); ticker = null; }
++        const f = fin(fine) ? fine : (fin(b.fine) ? b.fine : ora);
++        chiusoAlle = fin(ora) ? ora : f;
++        b.chiudi(fin(b.inizio) && fin(f) && f >= b.inizio ? f - b.inizio : null);
++      },
++      /** Un nodo che non e' un passo sta per entrare: il pensiero del passo non
++       *  riceve piu' il testo rimandato. */
++      dimenticaPasso() { pensieroDelPasso = null; },
++    };
++  }
++
++  radice.Passi = {
++    ICONE, tronca, nomeFile, analizza, durata, estratto, frase, riga, vista, riassunto, grezzo, diff,
++    icona, nodoVista, passoTool, concludiTool, passoPensiero, gruppo, lavoro,
++  };
++})(typeof window !== 'undefined' ? window : globalThis);
+diff --git a/web/style.css b/web/style.css
+index 7fd272c..7de5a25 100644
+--- a/web/style.css
++++ b/web/style.css
+@@ -484,7 +484,7 @@ body.resizing-rows { --cursore-trascina: ns-resize; }
+   font-size: 12.5px; line-height: 1.6;
+ }
+ 
+-/* ---------- tendine (pensiero e tool) ---------- */
++/* ---------- tendine (riassunto della compattazione) ---------- */
+ 
+ details.drawer {
+   border: 1px solid var(--border); border-radius: 10px;
+@@ -505,17 +505,41 @@ details.drawer > summary .grow {
+ }
+ .drawer-body { padding: 0 11px 9px; }
+ 
+-.tool-name { font-family: var(--mono); font-weight: 600; color: var(--accent); font-size: 12.5px; flex: none; }
+-.tool-arg { font-family: var(--mono); color: var(--text-faint); font-size: 12px; }
+-.tool-time { font-family: var(--mono); font-size: 11px; color: var(--text-faint); flex: none; font-variant-numeric: tabular-nums; }
+-details.drawer.failed { border-color: color-mix(in srgb, var(--err) 40%, var(--border)); }
++/* ---------- blocchi di lavoro (pensieri e tool): web/passi.css ---------- */
+ 
+-.think {
+-  font-size: 13.5px; line-height: 1.62; color: var(--text-muted);
+-  border-left: 2px solid var(--accent-border); padding-left: 11px;
+-  white-space: pre-wrap; word-break: break-word;
+-}
+-.think.live { border-left-color: var(--accent); }
++/* I colori del componente, dai token di questa pagina. --quiet e' il grigio
++   dei dati di contorno (quante righe, quanto e' durato): sul tema chiaro
++   --text-faint e --text-muted sono quasi lo stesso colore (#55686d e
++   #4f646a), e un "attenuato" che non attenua non fa gerarchia. */
++:root {
++  --quiet: #62747a;
++  --ps-testo: var(--text);
++  --ps-medio: var(--text-muted);
++  --ps-tenue: var(--quiet);
++  --ps-bordo: var(--border);
++  --ps-bordo-forte: var(--border-strong);
++  --ps-hover: var(--hover-bg);
++  --ps-fondo: var(--bg);
++  --ps-accento: var(--accent);
++  --ps-ok: var(--ok);
++  --ps-err: var(--err);
++  --ps-code-bg: var(--code-bg);
++  --ps-piu-bg: color-mix(in srgb, var(--ok) 10%, transparent);
++  --ps-meno-bg: color-mix(in srgb, var(--err) 9%, transparent);
++  --ps-mono: var(--mono);
++  --ps-font: 13px;
++  --ps-riga-h: 28px;
++}
++html[data-theme="dark"] { --quiet: #8499a0; }
++
++/* La riga di stato del turno resta per chi usa uno screen reader, ma a
++   schermo la dice gia' l'intestazione del blocco vivo che le sta sopra. */
++.ps-gruppo.vivo + .turn-status {
++  position: absolute; width: 1px; height: 1px; overflow: hidden;
++  clip-path: inset(50%); white-space: nowrap;
++}
++
++.plumbing { font-size: 13px; color: var(--text-muted); }
+ 
+ .caret {
+   display: inline-block; width: 6px; height: 1em; margin-left: 2px;
+@@ -524,14 +548,6 @@ details.drawer.failed { border-color: color-mix(in srgb, var(--err) 40%, var(--b
+ }
+ @keyframes blink { to { visibility: hidden; } }
+ 
+-.tool-json {
+-  font-family: var(--mono); font-size: 11.5px; line-height: 1.55;
+-  background: var(--code-bg); border: 1px solid var(--border); border-radius: 8px;
+-  padding: 8px 10px; max-height: 340px; overflow: auto;
+-  white-space: pre-wrap; word-break: break-word; margin: 4px 0 0;
+-}
+-.tool-label { font-size: 11px; color: var(--text-faint); margin: 7px 0 0; }
+-
+ /* ---------- domanda dell'agente ---------- */
+ 
+ .question {
+diff --git a/web_mobile/app.js b/web_mobile/app.js
+index 52ecc62..198abac 100644
+--- a/web_mobile/app.js
++++ b/web_mobile/app.js
+@@ -15,25 +15,20 @@ let source = null;         // EventSource attivo
+ let pollTimer = null;      // fallback di sincronizzazione
+ let running = false;
+ 
+-// Tendina dei passi del turno in corso: <details> aperto mentre l'agente
+-// lavora, richiuso quando il messaggio arriva. Sullo schermo del telefono un
+-// elenco di passi lungo quanto la conversazione la rende illeggibile: i passi
+-// servono *mentre* succedono, dopo bastano contati.
+-let gruppoPassi = null;
+-let contaPassi = 0;
+-let contaTool = 0;
+-// Strumenti del SOLO passo corrente: il sommario vivo dice "passo N · M
+-// strumenti" e quel M deve tornare con le righe visibili sotto, non col
+-// totale del turno che a metà lavoro non c'entra con quello che si vede.
+-let contaToolPasso = 0;
+-// Quanto e' durato: dall'orologio mentre il turno e' vivo, dalla somma delle
+-// durate dei tool quando si ridisegna una conversazione salvata -- li' il
+-// tempo di parete non esiste piu', e inventarlo sarebbe peggio che tacerlo.
++// I passi del turno -- pensieri e tool -- stanno in blocchi di lavoro, gli
++// stessi del desktop (web/passi.js, servito da /comune/passi.js): vivo, un
++// blocco dice "Sta lavorando · passo 6 · 31 s" e mostra gli ultimi passi col
++// pensiero in una finestra di quattro righe; a lavoro finito e' una riga sola
++// che si apre sulla traccia, e ogni riga si apre sul suo dettaglio. Un testo
++// del modello chiude il blocco: la risposta resta nella sua bolla.
++let lavoro = nuovoLavoro(false);
++// Il passo in corso, dall'evento ``step``: serve a riconoscere la bolla di un
++// passo gia' resa quando l'arretrato di un riaggancio la ripete.
++let passoCorrente = 0;
+ // Il testo della risposta in corso, accumulato: gli eventi ``content``
+ // portano solo il pezzo nuovo, e un pezzo da solo non si puo' ripulire dal
+ // ``<think>`` ne' mostrare.
+ let testoInCorso = "";
+-let contaSecondi = 0;
+ let inizioTurno = 0;
+ let tickAttivita = null;
+ 
+@@ -219,22 +214,14 @@ function jsonPost(path, payload) {
+ 
+ // ------------------------------------------------- che sta facendo adesso --
+ //
+-// Due livelli, e nessuno dei due mostra il contenuto: sullo schermo del
+-// telefono il pensiero e i risultati dei tool sono megabyte di testo che
+-// coprono la conversazione. Serve sapere **che cosa** sta facendo, non che
+-// cosa ha letto.
++// Due livelli:
+ //   1. la striscia sopra il composer: una riga, sempre visibile, animata --
+ //      e' quella che risponde a "sta ancora lavorando o si e' piantato?";
+-//   2. le righe dei passi nella tendina: una riga per passo, piu' piccole e
+-//      piu' chiare del testo, che si richiudono quando la risposta arriva.
+-
+-function troncaTesto(valore, quanti) {
+-  const testo = String(valore ?? "").replace(/\s+/g, " ").trim();
+-  if (testo.length <= quanti) return testo;
+-  // trimEnd prima dei puntini: "configura il …" con lo spazio in mezzo
+-  // sembra un errore di stampa, non un troncamento.
+-  return `${testo.slice(0, quanti - 1).trimEnd()}…`;
+-}
++//   2. i blocchi di lavoro nella conversazione (web/passi.js): righe piccole
++//      e chiare, una per passo. Il contenuto -- il risultato di un tool, il
++//      pensiero intero -- entra in pagina solo al tocco sulla sua riga: sullo
++//      schermo del telefono sono migliaia di caratteri, e dal vivo del
++//      pensiero si vedono solo le ultime quattro righe.
+ 
+ /** L'ultima cartella di un percorso, per la sottoriga della topbar mobile:
+  *  "/work/progetto" -> "progetto". Il percorso intero sta nel title. */
+@@ -243,137 +230,26 @@ function nomeCartella(percorso) {
+   return pezzi[pezzi.length - 1] || "";
+ }
+ 
+-function nomeFile(percorso) {
+-  const pulito = String(percorso ?? "").replace(/[\\/]+$/, "");
+-  const pezzi = pulito.split(/[\\/]/);
+-  return pezzi[pezzi.length - 1] || pulito || "?";
+-}
+-
+-// Il verbo prima dell'oggetto: "legge tools.py" si capisce in mezzo secondo,
+-// `read_file {"filepath": "core/tools.py"}` no. Del percorso resta il nome del
+-// file -- e' la stessa regola delle gocce sul desktop: *cosa*, non *dove*.
+-const VERBI_TOOL = {
+-  list_files: (a) => `elenca ${a.subfolder && a.subfolder !== "." ? nomeFile(a.subfolder) : "il workspace"}`,
+-  read_file: (a) => `legge ${nomeFile(a.filepath)}`,
+-  write_file: (a) => `scrive ${nomeFile(a.filepath)}`,
+-  edit_file: (a) => `modifica ${nomeFile(a.filepath)}`,
+-  search_files: (a) => `cerca "${troncaTesto(a.pattern, 22)}"`,
+-  run_command: (a) => `esegue ${troncaTesto(a.command, 30)}`,
+-  manage_plan: (a) => `piano: ${a.action || "aggiorna"}`,
+-  manage_notes: (a) => `appunti: ${a.action || "aggiorna"}`,
+-  manage_memory: (a) => `memoria: ${a.action || "aggiorna"}`,
+-  preview: (a) => `anteprima${a.action ? `: ${a.action}` : ""}`,
+-  esplora: () => "manda un esploratore",
+-  vault_search: (a) => `cerca nel vault ${troncaTesto(a.vault, 18)}`,
+-  web_search: (a) => `cerca sul web "${troncaTesto(a.query, 22)}"`,
+-  ask_user_question: () => "ti fa una domanda",
+-};
+-
++/** "legge tools.py": la frase della striscia di attivita'. La scrive
++ *  web/passi.js, la stessa che da' il verbo alle righe dei passi. */
+ function descriviTool(nome, args) {
+-  const a = args && typeof args === "object" ? args : {};
+-  const verbo = VERBI_TOOL[nome];
+-  if (!verbo) return String(nome || "strumento");
+-  try {
+-    return troncaTesto(verbo(a), 46) || String(nome);
+-  } catch (_) {
+-    return String(nome);
+-  }
+-}
+-
+-// Il risultato di un tool non si mostra, ma se e' andato male si deve vedere:
+-// e' l'unica informazione del contenuto che vale la riga.
+-function toolAndatoBene(contenuto, esplicito) {
+-  if (esplicito === false) return false;
+-  if (esplicito === true) return true;
+-  try {
+-    return !JSON.parse(String(contenuto ?? "")).error;
+-  } catch (_) {
+-    return true;
+-  }
+-}
+-
+-/** Gli argomenti di una tool call salvata: dal function calling nativo
+- *  arrivano come stringa JSON, dal recupero dal testo come oggetto gia' fatto. */
+-function argomentiDi(call) {
+-  const grezzi = (call.function || {}).arguments ?? call.args ?? call.arguments;
+-  if (grezzi && typeof grezzi === "object") return grezzi;
+-  try {
+-    return JSON.parse(String(grezzi || "{}"));
+-  } catch (_) {
+-    return {};
+-  }
+-}
+-
+-/** La riga del passo che corrisponde a una chiamata, o l'ultima scritta se
+- *  quell'id non c'e' (sessioni salvate da versioni precedenti). */
+-function rigaDellaChiamata(callId) {
+-  if (!gruppoPassi) return null;
+-  if (callId) {
+-    const esatta = gruppoPassi.querySelector(`.passo.tool[data-call="${callId}"]`);
+-    if (esatta) return esatta;
+-  }
+-  const righe = [...gruppoPassi.querySelectorAll(".passo.tool")];
+-  return righe[righe.length - 1] || null;
+-}
+-
+-function apriGruppoPassi() {
+-  if (gruppoPassi && gruppoPassi.isConnected) return gruppoPassi;
+-  const det = document.createElement("details");
+-  det.className = "passi";
+-  det.open = true;
+-  const sum = document.createElement("summary");
+-  sum.className = "passi-sommario";
+-  sum.textContent = "sta lavorando…";
+-  det.appendChild(sum);
+-  $("messages").appendChild(det);
+-  gruppoPassi = det;
+-  return det;
+-}
+-
+-function rigaPasso(testo, tipo) {
+-  const gruppo = apriGruppoPassi();
+-  const riga = document.createElement("div");
+-  riga.className = `passo${tipo ? ` ${tipo}` : ""}`;
+-  riga.textContent = testo;
+-  gruppo.appendChild(riga);
+-  scrollBottom();
+-  return riga;
+-}
+-
+-function sommarioPassi(chiuso) {
+-  if (!gruppoPassi) return;
+-  const sum = gruppoPassi.querySelector(".passi-sommario");
+-  if (!sum) return;
+-  if (!chiuso) {
+-    // "passo N · M strumenti": M e' quello che il passo corrente sta usando,
+-    // non il totale del turno -- deve tornare con le righe aperte sotto.
+-    if (!contaPassi) {
+-      sum.textContent = "sta lavorando…";
+-    } else {
+-      const strumenti = contaToolPasso
+-        ? ` · ${contaToolPasso} ${contaToolPasso === 1 ? "strumento" : "strumenti"}`
+-        : "";
+-      sum.textContent = `passo ${contaPassi}${strumenti}`;
+-    }
+-    return;
+-  }
+-  const pezzi = [`${contaPassi || 1} ${contaPassi === 1 ? "passo" : "passi"}`];
+-  if (contaTool) pezzi.push(`${contaTool} ${contaTool === 1 ? "strumento" : "strumenti"}`);
+-  const secondi = inizioTurno
+-    ? Math.round((Date.now() - inizioTurno) / 1000)
+-    : Math.round(contaSecondi);
+-  if (secondi > 0) pezzi.push(durataBreve(secondi));
+-  sum.textContent = pezzi.join(" · ");
+-}
+-
+-/** Richiude la tendina: e' il gesto che tiene snella la conversazione quando
+- *  il messaggio e' pronto. I passi restano, a un tocco di distanza. */
+-function chiudiGruppoPassi() {
+-  if (!gruppoPassi) return;
+-  gruppoPassi.querySelectorAll(".passo.corso").forEach((r) => r.classList.remove("corso"));
+-  sommarioPassi(true);
+-  gruppoPassi.open = false;
+-  gruppoPassi = null;
++  return Passi.frase(nome, args);
++}
++
++/** La regia dei blocchi per la conversazione aperta. ``vivo``: il turno sta
++ *  girando adesso (conta i secondi). I nodi di un turno vivo portano
++ *  ``data-turno-vivo``: al riaggancio l'arretrato li ridisegna da capo, e i
++ *  vecchi se ne vanno tutti (``pulisciTurnoVivo``). */
++function nuovoLavoro(vivo) {
++  return Passi.lavoro({
++    inserisci(nodo) {
++      if (vivo) nodo.dataset.turnoVivo = "1";
++      $("messages").appendChild(nodo);
++      scrollBottom();
++    },
++    vivo: () => vivo && running,
++    dopo: scrollBottom,
++  });
+ }
+ 
+ function durataBreve(secondi) {
+@@ -623,7 +499,7 @@ function fmtDate(iso) {
+ async function openChat(id) {
+   currentId = id;
+   ultimaFirma = null; // nuova conversazione: il pannello va ricostruito
+-  gruppoPassi = null;
++  lavoro = nuovoLavoro(false);
+   inizioTurno = 0;
+   $("view-list").classList.add("hidden");
+   $("view-chat").classList.remove("hidden");
+@@ -780,29 +656,23 @@ function renderConversation(messages, pending, withCard) {
+   const box = $("messages");
+   box.innerHTML = "";
+   $("chat-title").textContent = "";
+-  // Il DOM e' stato svuotato: qualunque tendina fosse aperta non esiste piu'.
+-  gruppoPassi = null;
+-  contaPassi = 0;
+-  contaTool = 0;
+-  contaSecondi = 0;
+-  // Le tendine che stiamo per ricostruire sono di turni gia' chiusi: il
+-  // cronometro del turno vivo non c'entra e va messo da parte, o i riassunti
+-  // direbbero "3 passi · 41m" contando da quando si e' aperta la pagina.
+-  const cronometro = inizioTurno;
+-  inizioTurno = 0;
+-
+-  // La cronologia si ridisegna con le stesse righe della diretta: i messaggi
+-  // `tool` salvati portano gia' nome, argomenti, esito e durata. Una sola
+-  // idea di "com'e' fatto un passo", non due che poi divergono.
++  // Il DOM e' stato svuotato: la regia dei blocchi riparte da zero, ferma.
++  lavoro = nuovoLavoro(false);
++  // L'ora del messaggio precedente (``ts``, orologio del server): da li' il
++  // modello ha cominciato a lavorare sul passo dopo. Le durate dei blocchi e
++  // dei pensieri si ricavano cosi', le stesse del desktop.
++  let prima = null;
++
++  // La cronologia si ridisegna con gli stessi blocchi della diretta: i
++  // messaggi `tool` salvati portano gia' nome, argomenti, risultato, esito e
++  // durata. Una sola idea di "com'e' fatto un passo", non due che divergono.
+   for (const m of messages) {
++    const ts = Number.isFinite(m.ts) ? m.ts : null;
++    const inizio = prima;
++    if (ts !== null) prima = ts;
+     if (m.role === "user") {
+       if (m.hidden) continue;
+-      // Un messaggio dell'utente apre un turno nuovo: i conti ripartono, o la
+-      // tendina del turno dopo direbbe "31 passi" contandoli tutti dall'inizio.
+-      chiudiGruppoPassi();
+-      contaPassi = 0;
+-      contaTool = 0;
+-      contaSecondi = 0;
++      lavoro.chiudi();
+       const bubble = addBubble("user", m.content || "");
+       const names = (m.attachments || []).map((a) => a.name).filter(Boolean);
+       if (names.length) {
+@@ -813,51 +683,38 @@ function renderConversation(messages, pending, withCard) {
+       }
+     } else if (m.role === "assistant") {
+       const grezzo = String(m.content || "");
+-      const chiamate = m.tool_calls || [];
+-      if (/<think>/.test(grezzo) && chiamate.length) {
+-        contaPassi += 1;
+-        rigaPasso("ragiona", "pensiero");
+-      }
+-      for (const call of chiamate) {
+-        const nome = (call.function || {}).name || call.name;
+-        if (nome === "ask_user_question") continue;
+-        contaTool += 1;
+-        const riga = rigaPasso(descriviTool(nome, argomentiDi(call)), "tool");
+-        if (call.id) riga.dataset.call = call.id;
+-      }
++      const pensiero = [...grezzo.matchAll(/<think>([\s\S]*?)(?:<\/think>|$)/g)]
++        .map((x) => x[1]).join("").trim();
++      if (pensiero) lavoro.pensieroSalvato(pensiero, inizio, ts);
+       const clean = stripThink(grezzo);
+       if (clean) {
+-        chiudiGruppoPassi();
++        lavoro.chiudi();
+         addBubble("agent", clean);
+       }
+     } else if (m.role === "memoria") {
+       // La memoria del progetto aggiornata a fine turno: una riga, non una bolla.
+-      chiudiGruppoPassi();
++      lavoro.chiudi();
+       addBubble("nota", notaMemoria(m.esito));
+     } else if (m.role === "error") {
+       // L'errore che ha chiuso il turno: dal vivo arriva come toast, che
+       // sparisce; qui resta scritto nella conversazione.
+-      chiudiGruppoPassi();
++      lavoro.chiudi();
+       addBubble("agent", m.content || "", "errore");
+     } else if (m.role === "tool") {
+       if (m.name === "ask_user_question") {
+         // Una domanda gia' risposta non e' un passo: e' un pezzo di
+-        // conversazione, e resta in chiaro come sul desktop. Prima spariva del
+-        // tutto appena si rispondeva -- la card se ne andava e nella
+-        // cronologia non restava traccia ne' della domanda ne' della scelta.
+-        chiudiGruppoPassi();
++        // conversazione, e resta in chiaro come sul desktop.
++        lavoro.chiudi();
+         aggiungiScambio((m.args || {}).question || "", rispostaData(m.content));
+         continue;
+       }
+-      // Del risultato entra in pagina una cosa sola: se e' andato male. Si
+-      // appende alla riga della sua chiamata, trovata per id.
+-      contaSecondi += Number(m.duration_s) || 0;
+-      const riga = rigaDellaChiamata(m.tool_call_id);
+-      if (riga && !toolAndatoBene(m.content, m.ok)) riga.classList.add("male");
++      lavoro.concludiTool({
++        nome: m.name, args: m.args, risultato: m.content,
++        ok: m.ok !== false, durata: m.duration_s, id: m.tool_call_id,
++      }, { inizio, fine: ts });
+     }
+   }
+-  chiudiGruppoPassi();
+-  inizioTurno = cronometro;
++  lavoro.chiudi();
+ 
+   if (pending && pending.question) {
+     addBubble("pending", `❓ ${pending.question}`);
+@@ -1030,13 +887,10 @@ function stopStream() {
+  *  scritti refreshChat e nessun frame dell'arretrato li ripete.
+  */
+ function pulisciTurnoVivo() {
+-  document.querySelectorAll(".msg.agent.live").forEach((n) => n.remove());
+-  if (gruppoPassi && gruppoPassi.isConnected) gruppoPassi.remove();
+-  gruppoPassi = null;
++  document.querySelectorAll(".msg.agent.live, [data-turno-vivo]").forEach((n) => n.remove());
++  lavoro = nuovoLavoro(true);
+   testoInCorso = "";
+-  contaPassi = 0;
+-  contaTool = 0;
+-  contaToolPasso = 0;
++  passoCorrente = 0;
+ }
+ 
+ function attachStream() {
+@@ -1075,55 +929,41 @@ function liveBubble() {
+ }
+ 
+ function handleEvent(data) {
++  // L'ora del server viaggia su ogni frame: le durate si misurano con quella.
++  if (Number.isFinite(data.t)) lavoro.ora(data.t);
+   switch (data.type) {
+     case "start":
+       running = true;
+       inizioTurno = Date.now();
+       testoInCorso = "";
+-      contaPassi = 0;
+-      contaTool = 0;
+-      contaToolPasso = 0;
+-      contaSecondi = 0;
++      passoCorrente = 0;
++      lavoro = nuovoLavoro(true);
++      if (Number.isFinite(data.t)) lavoro.ora(data.t);
+       updateComposer();
+-      apriGruppoPassi();
+       mostraAttivita("sta ragionando");
+       break;
+     case "step":
+-      contaPassi = Number(data.step) || contaPassi + 1;
+-      contaToolPasso = 0; // nuovo passo: il contatore per-passo riparte
+-      sommarioPassi(false);
++      passoCorrente = Number(data.step) || passoCorrente + 1;
++      lavoro.segnaPasso(passoCorrente);
+       mostraAttivita("sta ragionando");
+       break;
+-    case "reasoning": {
+-      // Il pensiero non entra in pagina: sono migliaia di caratteri che su un
+-      // telefono seppelliscono la conversazione. Entra il **fatto** che sta
+-      // ragionando, una riga sola per passo.
+-      if (!gruppoPassi || !gruppoPassi.querySelector(`.passo.pensiero[data-passo="${contaPassi}"]`)) {
+-        const riga = rigaPasso("ragiona", "pensiero corso");
+-        riga.dataset.passo = String(contaPassi);
+-      }
++    case "reasoning":
++      // Dal vivo si vedono le ultime quattro righe; il pensiero intero si
++      // legge toccando la sua riga, a passo chiuso.
++      if (data.append) lavoro.appendThinking(data.append);
++      else lavoro.setThinking(data.text ?? "");
+       mostraAttivita("sta ragionando");
+       break;
+-    }
+-    case "tool_start": {
+-      contaTool += 1;
+-      contaToolPasso += 1;
+-      const riga = rigaPasso(descriviTool(data.name, data.args), "tool corso");
+-      if (data.call_id) riga.dataset.call = data.call_id;
+-      gruppoPassi?.querySelectorAll(".passo.pensiero.corso")
+-        .forEach((r) => r.classList.remove("corso"));
+-      sommarioPassi(false);
++    case "tool_start":
++      lavoro.avviaTool({ nome: data.name, args: data.args, id: data.call_id });
+       mostraAttivita(descriviTool(data.name, data.args));
+       break;
+-    }
+-    case "tool_end": {
+-      const riga = rigaDellaChiamata(data.call_id);
+-      if (riga) {
+-        riga.classList.remove("corso");
+-        if (data.ok === false) riga.classList.add("male");
+-      }
++    case "tool_end":
++      lavoro.concludiTool({
++        nome: data.name, args: data.args, risultato: data.result,
++        ok: data.ok, durata: data.duration_s, id: data.call_id,
++      });
+       break;
+-    }
+     case "content": {
+       // L'evento porta ``append`` (i soli caratteri nuovi) oppure ``text`` (il
+       // testo completo, che sostituisce): ne arriva uno solo dei due. Prima
+@@ -1132,18 +972,23 @@ function handleEvent(data) {
+       //
+       // (Storia: qui si leggeva ``data.delta``, che non e' mai esistito: la
+       // risposta restava invisibile fino a fine turno.)
+-      const bubble = liveBubble();
+       const grezzo = data.append
+         ? (testoInCorso += data.append)
+         : (testoInCorso = String(data.text ?? ""));
+       const clean = stripThink(grezzo);
++      const viva = document.querySelector(".msg.agent.live");
++      // Niente bolla vuota: un passo che non dice niente non ne apre una, e
++      // non chiude il blocco di lavoro.
++      if (!clean && !viva) break;
++      // Il modello parla: il blocco di lavoro si chiude qui, e la bolla viene
++      // dopo di lui.
++      lavoro.chiudi();
++      const bubble = liveBubble();
+       // Assegnazione secca, non `if (clean)`: quando il modello passa dal
+       // testo al ragionamento, `stripThink` torna vuoto e la bolla restava con
+       // il testo di prima -- una frase vecchia congelata sotto "sta scrivendo".
+       // Il desktop fa gia' cosi'.
+       scriviFormattato(bubble, clean);
+-      // Il messaggio sta arrivando: i passi hanno finito di servire.
+-      chiudiGruppoPassi();
+       mostraAttivita("sta scrivendo");
+       scrollBottom();
+       break;
+@@ -1153,17 +998,17 @@ function handleEvent(data) {
+       // l'accumulo riparte da zero per il passo successivo.
+       testoInCorso = "";
+       // Un 'assistant' per un passo gia' reso arriva solo dall'arretrato di un
+-      // riaggancio: e' lo stesso testo, e va ignorato. ``pulisciTurnoVivo`` da
+-      // sola non basta -- la bolla chiusa non ha piu' .live, quindi non la
+-      // tocca -- e senza questo l'arretrato ne creerebbe comunque una nuova.
+-      if (document.querySelector(`.msg.agent[data-passo="${contaPassi}"]`)) break;
++      // riaggancio: e' lo stesso testo, e va ignorato.
++      if (document.querySelector(`.msg.agent[data-passo="${passoCorrente}"]`)) break;
++      const clean = stripThink(data.content ?? "");
++      const viva = document.querySelector(".msg.agent.live");
++      if (!clean && !viva) break;
++      lavoro.chiudi();
+       const bubble = liveBubble();
+-      bubble.dataset.passo = String(contaPassi);
++      bubble.dataset.passo = String(passoCorrente);
+       bubble.classList.remove("live");
+-      const clean = stripThink(data.content ?? "");
+       if (clean) scriviFormattato(bubble, clean);
+       if (!clean && !bubble.textContent) bubble.remove();
+-      chiudiGruppoPassi();
+       scrollBottom();
+       break;
+     }
+@@ -1174,6 +1019,7 @@ function handleEvent(data) {
+       // L'ultimo passo del turno: l'harness aggiorna la memoria del progetto.
+       if (data.fase === "inizio") mostraAttivita("aggiorna la memoria del progetto");
+       else {
++        lavoro.chiudi();
+         addBubble("nota", notaMemoria(data.esito, data.motivo));
+         loadSessions();
+       }
+@@ -1184,7 +1030,7 @@ function handleEvent(data) {
+     case "question":
+       // AwaitingUserInput arriva intero dallo stream: domanda, opzioni e
+       // allow_multiple sono gia' nel frame, la card li usa tutti.
+-      chiudiGruppoPassi();
++      lavoro.chiudi();
+       nascondiAttivita();
+       addBubble("pending", `❓ ${data.question ?? ""}`);
+       showQuestionCard(
+@@ -1203,7 +1049,7 @@ function handleEvent(data) {
+       if (data.type === "error" && data.message) toast(data.message);
+       running = false;
+       updateComposer();
+-      chiudiGruppoPassi();
++      lavoro.chiudi();
+       nascondiAttivita();
+       document.querySelectorAll(".msg.live").forEach((el) => el.classList.remove("live"));
+       refreshChat(false).then(loadSessions);
+@@ -1279,7 +1125,7 @@ $("btn-back").addEventListener("click", () => {
+   stopStream();
+   stopPolling();
+   nascondiAttivita();
+-  gruppoPassi = null;
++  lavoro = nuovoLavoro(false);
+   inizioTurno = 0;
+   $("view-chat").classList.add("hidden");
+   $("view-list").classList.remove("hidden");
+diff --git a/web_mobile/index.html b/web_mobile/index.html
+index fd0af47..9cf9e50 100644
+--- a/web_mobile/index.html
++++ b/web_mobile/index.html
+@@ -17,6 +17,7 @@
+      installata. Non e' un file statico: il server ci mette dentro start_url
+      con la chiave, senno' l'icona sulla schermata home aprirebbe un 401. -->
+ <link rel="manifest" href="/manifest.webmanifest">
++<link rel="stylesheet" href="/comune/passi.css">
+ <link rel="stylesheet" href="/static/style.css">
+ </head>
+ <body>
+@@ -121,6 +122,7 @@
+ 
+ <div id="toast" class="toast hidden"></div>
+ 
++<script src="/comune/passi.js"></script>
+ <script src="/static/app.js"></script>
+ </body>
+ </html>
+diff --git a/web_mobile/style.css b/web_mobile/style.css
+index 849dbf4..de4eec7 100644
+--- a/web_mobile/style.css
++++ b/web_mobile/style.css
+@@ -250,81 +250,37 @@ html, body {
+ 
+ /* --------------------------------------------------- i passi del turno */
+ 
+-/* Piu' piccoli e piu' chiari del testo: sono note a margine di quello che sta
+-   succedendo, non contenuto. Nessun risultato, nessun pensiero -- solo il
+-   verbo e il suo oggetto. Quando la risposta arriva la tendina si richiude e
+-   la conversazione torna a essere fatta di messaggi. */
+-.passi {
+-  align-self: stretch;
+-  margin: 2px 0;
+-  padding: 0;
+-  border-left: 2px solid var(--bordo);
+-  padding-left: 10px;
+-}
+-
+-.passi-sommario {
+-  list-style: none;
+-  color: var(--testo-dim);
+-  font-size: 12.5px;
+-  padding: 3px 0;
+-  cursor: default;
+-}
+-/* Il triangolino di default e' minuscolo e fuori posto su iOS: lo si toglie e
+-   se ne disegna uno che ruota all'apertura. */
+-.passi-sommario::-webkit-details-marker { display: none; }
+-.passi-sommario::before {
+-  content: "›";
+-  display: inline-block;
+-  width: 12px;
+-  margin-right: 2px;
+-  transition: transform 180ms ease-out;
+-}
+-.passi[open] > .passi-sommario::before { transform: rotate(90deg); }
+-
+-.passo {
+-  display: flex;
+-  align-items: baseline;
+-  gap: 7px;
+-  padding: 2px 0;
+-  color: var(--testo-dim);
+-  font-size: 12.5px;
+-  line-height: 1.35;
+-  opacity: 0.85;
+-  white-space: nowrap;
+-  overflow: hidden;
+-  text-overflow: ellipsis;
+-}
+-
+-/* Il pallino davanti: dice il tipo di passo senza una parola in piu'. */
+-.passo::before {
+-  content: "";
+-  flex: 0 0 auto;
+-  width: 5px;
+-  height: 5px;
+-  border-radius: 50%;
+-  background: var(--testo-dim);
+-  transform: translateY(-1px);
+-}
+-.passo.pensiero::before { background: transparent; box-shadow: inset 0 0 0 1px var(--testo-dim); }
+-.passo.tool::before { background: var(--accento); opacity: 0.85; }
+-.passo.male { color: var(--errore); }
+-.passo.male::before { background: var(--errore); opacity: 1; }
+-
+-/* Il passo in corso pulsa: e' l'unica riga viva dell'elenco. */
+-.passo.corso {
+-  color: var(--testo);
+-  opacity: 1;
+-}
+-.passo.corso::before {
+-  background: var(--accento);
+-  opacity: 1;
+-  animation: pulsa 1.1s ease-in-out infinite;
+-}
+-
+-@keyframes pulsa {
+-  0%, 100% { transform: translateY(-1px) scale(1); opacity: 1; }
+-  50%      { transform: translateY(-1px) scale(1.9); opacity: 0.75; }
+-}
++/* I blocchi di lavoro sono quelli del desktop (web/passi.css, servito da
++   /comune/passi.css): qui solo i colori e le misure del telefono. Righe da
++   40 px perche' si toccano col dito; piu' piccole e piu' chiare del testo,
++   perche' sono note a margine della conversazione, non contenuto. */
++:root {
++  --ps-testo: var(--testo);
++  --ps-medio: var(--testo-dim);
++  --ps-tenue: #8fa4a8;
++  --ps-bordo: var(--bordo);
++  --ps-bordo-forte: var(--bordo-control);
++  --ps-hover: var(--panel-hover);
++  --ps-fondo: var(--bg);
++  --ps-accento: var(--accento);
++  --ps-ok: var(--ok);
++  --ps-err: var(--errore);
++  --ps-code-bg: #0d1417;
++  --ps-piu-bg: rgba(127, 224, 182, 0.11);
++  --ps-meno-bg: rgba(255, 184, 173, 0.10);
++  --ps-mono: ui-monospace, SFMono-Regular, "Cascadia Mono", Menlo, monospace;
++  --ps-font: 13.5px;
++  --ps-riga-h: 40px;
++}
++
++/* Il blocco prende tutta la larghezza della conversazione, non quella di
++   una bolla: le righe devono stare su una riga sola. */
++.messages > .ps-gruppo { align-self: stretch; margin: 0; }
++.ps-gruppo .ps-riga:active, .ps-gruppo .ps-testa:active { background: var(--panel-hover); }
++.ps-pill-lungo { display: none; }
++/* Il codice si scorre in orizzontale dentro la sua scatola, mai la pagina. */
++.ps-corpo { margin-left: 22px; min-width: 0; }
++.ps-code-corpo { max-height: 240px; }
+ 
+ /* ------------------------------------------------------ striscia attivita' */
+ 
+@@ -393,7 +349,7 @@ html, body {
+   }
+   .attivita { animation: none; }
+   .battito { animation: none; }
+-  .passo.corso::before { animation: none; }
++  .ps-ico.gira svg, .ps-ruota { animation: none; }
+   .msg.live::after { animation: none; }
+   .badge-running { animation: none; }
+ }
+@@ -502,7 +458,7 @@ button.primary:active { background: var(--accento-active); }
+ }
+ 
+ /* Feedback cromatico: nessuna variazione delle misure o della posizione. */
+-button, textarea, .session-list li, .passi-sommario {
++button, textarea, .session-list li {
+   transition: background-color 180ms ease-out, border-color 180ms ease-out,
+     color 180ms ease-out, box-shadow 180ms ease-out;
+ }
+@@ -512,7 +468,7 @@ textarea { caret-color: var(--accento); }
+ textarea::placeholder { color: var(--testo-dim); opacity: 1; }
+ 
+ button:focus-visible, textarea:focus-visible,
+-.session-list li:focus-visible, .passi-sommario:focus-visible {
++.session-list li:focus-visible {
+   outline: 2px solid var(--accento);
+   outline-offset: 3px;
+ }

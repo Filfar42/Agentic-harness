@@ -484,7 +484,7 @@ body.resizing-rows { --cursore-trascina: ns-resize; }
   font-size: 12.5px; line-height: 1.6;
 }
 
-/* ---------- tendine (pensiero e tool) ---------- */
+/* ---------- tendine (riassunto della compattazione) ---------- */
 
 details.drawer {
   border: 1px solid var(--border); border-radius: 10px;
@@ -505,17 +505,41 @@ details.drawer > summary .grow {
 }
 .drawer-body { padding: 0 11px 9px; }
 
-.tool-name { font-family: var(--mono); font-weight: 600; color: var(--accent); font-size: 12.5px; flex: none; }
-.tool-arg { font-family: var(--mono); color: var(--text-faint); font-size: 12px; }
-.tool-time { font-family: var(--mono); font-size: 11px; color: var(--text-faint); flex: none; font-variant-numeric: tabular-nums; }
-details.drawer.failed { border-color: color-mix(in srgb, var(--err) 40%, var(--border)); }
+/* ---------- blocchi di lavoro (pensieri e tool): web/passi.css ---------- */
 
-.think {
-  font-size: 13.5px; line-height: 1.62; color: var(--text-muted);
-  border-left: 2px solid var(--accent-border); padding-left: 11px;
-  white-space: pre-wrap; word-break: break-word;
+/* I colori del componente, dai token di questa pagina. --quiet e' il grigio
+   dei dati di contorno (quante righe, quanto e' durato): sul tema chiaro
+   --text-faint e --text-muted sono quasi lo stesso colore (#55686d e
+   #4f646a), e un "attenuato" che non attenua non fa gerarchia. */
+:root {
+  --quiet: #62747a;
+  --ps-testo: var(--text);
+  --ps-medio: var(--text-muted);
+  --ps-tenue: var(--quiet);
+  --ps-bordo: var(--border);
+  --ps-bordo-forte: var(--border-strong);
+  --ps-hover: var(--hover-bg);
+  --ps-fondo: var(--bg);
+  --ps-accento: var(--accent);
+  --ps-ok: var(--ok);
+  --ps-err: var(--err);
+  --ps-code-bg: var(--code-bg);
+  --ps-piu-bg: color-mix(in srgb, var(--ok) 10%, transparent);
+  --ps-meno-bg: color-mix(in srgb, var(--err) 9%, transparent);
+  --ps-mono: var(--mono);
+  --ps-font: 13px;
+  --ps-riga-h: 28px;
 }
-.think.live { border-left-color: var(--accent); }
+html[data-theme="dark"] { --quiet: #8499a0; }
+
+/* La riga di stato del turno resta per chi usa uno screen reader, ma a
+   schermo la dice gia' l'intestazione del blocco vivo che le sta sopra. */
+.ps-gruppo.vivo + .turn-status {
+  position: absolute; width: 1px; height: 1px; overflow: hidden;
+  clip-path: inset(50%); white-space: nowrap;
+}
+
+.plumbing { font-size: 13px; color: var(--text-muted); }
 
 .caret {
   display: inline-block; width: 6px; height: 1em; margin-left: 2px;
@@ -523,14 +547,6 @@ details.drawer.failed { border-color: color-mix(in srgb, var(--err) 40%, var(--b
   animation: blink 1.05s steps(2, start) infinite;
 }
 @keyframes blink { to { visibility: hidden; } }
-
-.tool-json {
-  font-family: var(--mono); font-size: 11.5px; line-height: 1.55;
-  background: var(--code-bg); border: 1px solid var(--border); border-radius: 8px;
-  padding: 8px 10px; max-height: 340px; overflow: auto;
-  white-space: pre-wrap; word-break: break-word; margin: 4px 0 0;
-}
-.tool-label { font-size: 11px; color: var(--text-faint); margin: 7px 0 0; }
 
 /* ---------- domanda dell'agente ---------- */
 

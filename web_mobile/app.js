@@ -15,25 +15,20 @@ let source = null;         // EventSource attivo
 let pollTimer = null;      // fallback di sincronizzazione
 let running = false;
 
-// Tendina dei passi del turno in corso: <details> aperto mentre l'agente
-// lavora, richiuso quando il messaggio arriva. Sullo schermo del telefono un
-// elenco di passi lungo quanto la conversazione la rende illeggibile: i passi
-// servono *mentre* succedono, dopo bastano contati.
-let gruppoPassi = null;
-let contaPassi = 0;
-let contaTool = 0;
-// Strumenti del SOLO passo corrente: il sommario vivo dice "passo N · M
-// strumenti" e quel M deve tornare con le righe visibili sotto, non col
-// totale del turno che a metà lavoro non c'entra con quello che si vede.
-let contaToolPasso = 0;
-// Quanto e' durato: dall'orologio mentre il turno e' vivo, dalla somma delle
-// durate dei tool quando si ridisegna una conversazione salvata -- li' il
-// tempo di parete non esiste piu', e inventarlo sarebbe peggio che tacerlo.
+// I passi del turno -- pensieri e tool -- stanno in blocchi di lavoro, gli
+// stessi del desktop (web/passi.js, servito da /comune/passi.js): vivo, un
+// blocco dice "Sta lavorando · passo 6 · 31 s" e mostra gli ultimi passi col
+// pensiero in una finestra di quattro righe; a lavoro finito e' una riga sola
+// che si apre sulla traccia, e ogni riga si apre sul suo dettaglio. Un testo
+// del modello chiude il blocco: la risposta resta nella sua bolla.
+let lavoro = nuovoLavoro(false);
+// Il passo in corso, dall'evento ``step``: serve a riconoscere la bolla di un
+// passo gia' resa quando l'arretrato di un riaggancio la ripete.
+let passoCorrente = 0;
 // Il testo della risposta in corso, accumulato: gli eventi ``content``
 // portano solo il pezzo nuovo, e un pezzo da solo non si puo' ripulire dal
 // ``<think>`` ne' mostrare.
 let testoInCorso = "";
-let contaSecondi = 0;
 let inizioTurno = 0;
 let tickAttivita = null;
 
@@ -219,22 +214,14 @@ function jsonPost(path, payload) {
 
 // ------------------------------------------------- che sta facendo adesso --
 //
-// Due livelli, e nessuno dei due mostra il contenuto: sullo schermo del
-// telefono il pensiero e i risultati dei tool sono megabyte di testo che
-// coprono la conversazione. Serve sapere **che cosa** sta facendo, non che
-// cosa ha letto.
+// Due livelli:
 //   1. la striscia sopra il composer: una riga, sempre visibile, animata --
 //      e' quella che risponde a "sta ancora lavorando o si e' piantato?";
-//   2. le righe dei passi nella tendina: una riga per passo, piu' piccole e
-//      piu' chiare del testo, che si richiudono quando la risposta arriva.
-
-function troncaTesto(valore, quanti) {
-  const testo = String(valore ?? "").replace(/\s+/g, " ").trim();
-  if (testo.length <= quanti) return testo;
-  // trimEnd prima dei puntini: "configura il …" con lo spazio in mezzo
-  // sembra un errore di stampa, non un troncamento.
-  return `${testo.slice(0, quanti - 1).trimEnd()}…`;
-}
+//   2. i blocchi di lavoro nella conversazione (web/passi.js): righe piccole
+//      e chiare, una per passo. Il contenuto -- il risultato di un tool, il
+//      pensiero intero -- entra in pagina solo al tocco sulla sua riga: sullo
+//      schermo del telefono sono migliaia di caratteri, e dal vivo del
+//      pensiero si vedono solo le ultime quattro righe.
 
 /** L'ultima cartella di un percorso, per la sottoriga della topbar mobile:
  *  "/work/progetto" -> "progetto". Il percorso intero sta nel title. */
@@ -243,137 +230,26 @@ function nomeCartella(percorso) {
   return pezzi[pezzi.length - 1] || "";
 }
 
-function nomeFile(percorso) {
-  const pulito = String(percorso ?? "").replace(/[\\/]+$/, "");
-  const pezzi = pulito.split(/[\\/]/);
-  return pezzi[pezzi.length - 1] || pulito || "?";
-}
-
-// Il verbo prima dell'oggetto: "legge tools.py" si capisce in mezzo secondo,
-// `read_file {"filepath": "core/tools.py"}` no. Del percorso resta il nome del
-// file -- e' la stessa regola delle gocce sul desktop: *cosa*, non *dove*.
-const VERBI_TOOL = {
-  list_files: (a) => `elenca ${a.subfolder && a.subfolder !== "." ? nomeFile(a.subfolder) : "il workspace"}`,
-  read_file: (a) => `legge ${nomeFile(a.filepath)}`,
-  write_file: (a) => `scrive ${nomeFile(a.filepath)}`,
-  edit_file: (a) => `modifica ${nomeFile(a.filepath)}`,
-  search_files: (a) => `cerca "${troncaTesto(a.pattern, 22)}"`,
-  run_command: (a) => `esegue ${troncaTesto(a.command, 30)}`,
-  manage_plan: (a) => `piano: ${a.action || "aggiorna"}`,
-  manage_notes: (a) => `appunti: ${a.action || "aggiorna"}`,
-  manage_memory: (a) => `memoria: ${a.action || "aggiorna"}`,
-  preview: (a) => `anteprima${a.action ? `: ${a.action}` : ""}`,
-  esplora: () => "manda un esploratore",
-  vault_search: (a) => `cerca nel vault ${troncaTesto(a.vault, 18)}`,
-  web_search: (a) => `cerca sul web "${troncaTesto(a.query, 22)}"`,
-  ask_user_question: () => "ti fa una domanda",
-};
-
+/** "legge tools.py": la frase della striscia di attivita'. La scrive
+ *  web/passi.js, la stessa che da' il verbo alle righe dei passi. */
 function descriviTool(nome, args) {
-  const a = args && typeof args === "object" ? args : {};
-  const verbo = VERBI_TOOL[nome];
-  if (!verbo) return String(nome || "strumento");
-  try {
-    return troncaTesto(verbo(a), 46) || String(nome);
-  } catch (_) {
-    return String(nome);
-  }
+  return Passi.frase(nome, args);
 }
 
-// Il risultato di un tool non si mostra, ma se e' andato male si deve vedere:
-// e' l'unica informazione del contenuto che vale la riga.
-function toolAndatoBene(contenuto, esplicito) {
-  if (esplicito === false) return false;
-  if (esplicito === true) return true;
-  try {
-    return !JSON.parse(String(contenuto ?? "")).error;
-  } catch (_) {
-    return true;
-  }
-}
-
-/** Gli argomenti di una tool call salvata: dal function calling nativo
- *  arrivano come stringa JSON, dal recupero dal testo come oggetto gia' fatto. */
-function argomentiDi(call) {
-  const grezzi = (call.function || {}).arguments ?? call.args ?? call.arguments;
-  if (grezzi && typeof grezzi === "object") return grezzi;
-  try {
-    return JSON.parse(String(grezzi || "{}"));
-  } catch (_) {
-    return {};
-  }
-}
-
-/** La riga del passo che corrisponde a una chiamata, o l'ultima scritta se
- *  quell'id non c'e' (sessioni salvate da versioni precedenti). */
-function rigaDellaChiamata(callId) {
-  if (!gruppoPassi) return null;
-  if (callId) {
-    const esatta = gruppoPassi.querySelector(`.passo.tool[data-call="${callId}"]`);
-    if (esatta) return esatta;
-  }
-  const righe = [...gruppoPassi.querySelectorAll(".passo.tool")];
-  return righe[righe.length - 1] || null;
-}
-
-function apriGruppoPassi() {
-  if (gruppoPassi && gruppoPassi.isConnected) return gruppoPassi;
-  const det = document.createElement("details");
-  det.className = "passi";
-  det.open = true;
-  const sum = document.createElement("summary");
-  sum.className = "passi-sommario";
-  sum.textContent = "sta lavorando…";
-  det.appendChild(sum);
-  $("messages").appendChild(det);
-  gruppoPassi = det;
-  return det;
-}
-
-function rigaPasso(testo, tipo) {
-  const gruppo = apriGruppoPassi();
-  const riga = document.createElement("div");
-  riga.className = `passo${tipo ? ` ${tipo}` : ""}`;
-  riga.textContent = testo;
-  gruppo.appendChild(riga);
-  scrollBottom();
-  return riga;
-}
-
-function sommarioPassi(chiuso) {
-  if (!gruppoPassi) return;
-  const sum = gruppoPassi.querySelector(".passi-sommario");
-  if (!sum) return;
-  if (!chiuso) {
-    // "passo N · M strumenti": M e' quello che il passo corrente sta usando,
-    // non il totale del turno -- deve tornare con le righe aperte sotto.
-    if (!contaPassi) {
-      sum.textContent = "sta lavorando…";
-    } else {
-      const strumenti = contaToolPasso
-        ? ` · ${contaToolPasso} ${contaToolPasso === 1 ? "strumento" : "strumenti"}`
-        : "";
-      sum.textContent = `passo ${contaPassi}${strumenti}`;
-    }
-    return;
-  }
-  const pezzi = [`${contaPassi || 1} ${contaPassi === 1 ? "passo" : "passi"}`];
-  if (contaTool) pezzi.push(`${contaTool} ${contaTool === 1 ? "strumento" : "strumenti"}`);
-  const secondi = inizioTurno
-    ? Math.round((Date.now() - inizioTurno) / 1000)
-    : Math.round(contaSecondi);
-  if (secondi > 0) pezzi.push(durataBreve(secondi));
-  sum.textContent = pezzi.join(" · ");
-}
-
-/** Richiude la tendina: e' il gesto che tiene snella la conversazione quando
- *  il messaggio e' pronto. I passi restano, a un tocco di distanza. */
-function chiudiGruppoPassi() {
-  if (!gruppoPassi) return;
-  gruppoPassi.querySelectorAll(".passo.corso").forEach((r) => r.classList.remove("corso"));
-  sommarioPassi(true);
-  gruppoPassi.open = false;
-  gruppoPassi = null;
+/** La regia dei blocchi per la conversazione aperta. ``vivo``: il turno sta
+ *  girando adesso (conta i secondi). I nodi di un turno vivo portano
+ *  ``data-turno-vivo``: al riaggancio l'arretrato li ridisegna da capo, e i
+ *  vecchi se ne vanno tutti (``pulisciTurnoVivo``). */
+function nuovoLavoro(vivo) {
+  return Passi.lavoro({
+    inserisci(nodo) {
+      if (vivo) nodo.dataset.turnoVivo = "1";
+      $("messages").appendChild(nodo);
+      scrollBottom();
+    },
+    vivo: () => vivo && running,
+    dopo: scrollBottom,
+  });
 }
 
 function durataBreve(secondi) {
@@ -623,7 +499,7 @@ function fmtDate(iso) {
 async function openChat(id) {
   currentId = id;
   ultimaFirma = null; // nuova conversazione: il pannello va ricostruito
-  gruppoPassi = null;
+  lavoro = nuovoLavoro(false);
   inizioTurno = 0;
   $("view-list").classList.add("hidden");
   $("view-chat").classList.remove("hidden");
@@ -780,29 +656,23 @@ function renderConversation(messages, pending, withCard) {
   const box = $("messages");
   box.innerHTML = "";
   $("chat-title").textContent = "";
-  // Il DOM e' stato svuotato: qualunque tendina fosse aperta non esiste piu'.
-  gruppoPassi = null;
-  contaPassi = 0;
-  contaTool = 0;
-  contaSecondi = 0;
-  // Le tendine che stiamo per ricostruire sono di turni gia' chiusi: il
-  // cronometro del turno vivo non c'entra e va messo da parte, o i riassunti
-  // direbbero "3 passi · 41m" contando da quando si e' aperta la pagina.
-  const cronometro = inizioTurno;
-  inizioTurno = 0;
+  // Il DOM e' stato svuotato: la regia dei blocchi riparte da zero, ferma.
+  lavoro = nuovoLavoro(false);
+  // L'ora del messaggio precedente (``ts``, orologio del server): da li' il
+  // modello ha cominciato a lavorare sul passo dopo. Le durate dei blocchi e
+  // dei pensieri si ricavano cosi', le stesse del desktop.
+  let prima = null;
 
-  // La cronologia si ridisegna con le stesse righe della diretta: i messaggi
-  // `tool` salvati portano gia' nome, argomenti, esito e durata. Una sola
-  // idea di "com'e' fatto un passo", non due che poi divergono.
+  // La cronologia si ridisegna con gli stessi blocchi della diretta: i
+  // messaggi `tool` salvati portano gia' nome, argomenti, risultato, esito e
+  // durata. Una sola idea di "com'e' fatto un passo", non due che divergono.
   for (const m of messages) {
+    const ts = Number.isFinite(m.ts) ? m.ts : null;
+    const inizio = prima;
+    if (ts !== null) prima = ts;
     if (m.role === "user") {
       if (m.hidden) continue;
-      // Un messaggio dell'utente apre un turno nuovo: i conti ripartono, o la
-      // tendina del turno dopo direbbe "31 passi" contandoli tutti dall'inizio.
-      chiudiGruppoPassi();
-      contaPassi = 0;
-      contaTool = 0;
-      contaSecondi = 0;
+      lavoro.chiudi();
       const bubble = addBubble("user", m.content || "");
       const names = (m.attachments || []).map((a) => a.name).filter(Boolean);
       if (names.length) {
@@ -813,51 +683,38 @@ function renderConversation(messages, pending, withCard) {
       }
     } else if (m.role === "assistant") {
       const grezzo = String(m.content || "");
-      const chiamate = m.tool_calls || [];
-      if (/<think>/.test(grezzo) && chiamate.length) {
-        contaPassi += 1;
-        rigaPasso("ragiona", "pensiero");
-      }
-      for (const call of chiamate) {
-        const nome = (call.function || {}).name || call.name;
-        if (nome === "ask_user_question") continue;
-        contaTool += 1;
-        const riga = rigaPasso(descriviTool(nome, argomentiDi(call)), "tool");
-        if (call.id) riga.dataset.call = call.id;
-      }
+      const pensiero = [...grezzo.matchAll(/<think>([\s\S]*?)(?:<\/think>|$)/g)]
+        .map((x) => x[1]).join("").trim();
+      if (pensiero) lavoro.pensieroSalvato(pensiero, inizio, ts);
       const clean = stripThink(grezzo);
       if (clean) {
-        chiudiGruppoPassi();
+        lavoro.chiudi();
         addBubble("agent", clean);
       }
     } else if (m.role === "memoria") {
       // La memoria del progetto aggiornata a fine turno: una riga, non una bolla.
-      chiudiGruppoPassi();
+      lavoro.chiudi();
       addBubble("nota", notaMemoria(m.esito));
     } else if (m.role === "error") {
       // L'errore che ha chiuso il turno: dal vivo arriva come toast, che
       // sparisce; qui resta scritto nella conversazione.
-      chiudiGruppoPassi();
+      lavoro.chiudi();
       addBubble("agent", m.content || "", "errore");
     } else if (m.role === "tool") {
       if (m.name === "ask_user_question") {
         // Una domanda gia' risposta non e' un passo: e' un pezzo di
-        // conversazione, e resta in chiaro come sul desktop. Prima spariva del
-        // tutto appena si rispondeva -- la card se ne andava e nella
-        // cronologia non restava traccia ne' della domanda ne' della scelta.
-        chiudiGruppoPassi();
+        // conversazione, e resta in chiaro come sul desktop.
+        lavoro.chiudi();
         aggiungiScambio((m.args || {}).question || "", rispostaData(m.content));
         continue;
       }
-      // Del risultato entra in pagina una cosa sola: se e' andato male. Si
-      // appende alla riga della sua chiamata, trovata per id.
-      contaSecondi += Number(m.duration_s) || 0;
-      const riga = rigaDellaChiamata(m.tool_call_id);
-      if (riga && !toolAndatoBene(m.content, m.ok)) riga.classList.add("male");
+      lavoro.concludiTool({
+        nome: m.name, args: m.args, risultato: m.content,
+        ok: m.ok !== false, durata: m.duration_s, id: m.tool_call_id,
+      }, { inizio, fine: ts });
     }
   }
-  chiudiGruppoPassi();
-  inizioTurno = cronometro;
+  lavoro.chiudi();
 
   if (pending && pending.question) {
     addBubble("pending", `❓ ${pending.question}`);
@@ -1030,13 +887,10 @@ function stopStream() {
  *  scritti refreshChat e nessun frame dell'arretrato li ripete.
  */
 function pulisciTurnoVivo() {
-  document.querySelectorAll(".msg.agent.live").forEach((n) => n.remove());
-  if (gruppoPassi && gruppoPassi.isConnected) gruppoPassi.remove();
-  gruppoPassi = null;
+  document.querySelectorAll(".msg.agent.live, [data-turno-vivo]").forEach((n) => n.remove());
+  lavoro = nuovoLavoro(true);
   testoInCorso = "";
-  contaPassi = 0;
-  contaTool = 0;
-  contaToolPasso = 0;
+  passoCorrente = 0;
 }
 
 function attachStream() {
@@ -1075,55 +929,41 @@ function liveBubble() {
 }
 
 function handleEvent(data) {
+  // L'ora del server viaggia su ogni frame: le durate si misurano con quella.
+  if (Number.isFinite(data.t)) lavoro.ora(data.t);
   switch (data.type) {
     case "start":
       running = true;
       inizioTurno = Date.now();
       testoInCorso = "";
-      contaPassi = 0;
-      contaTool = 0;
-      contaToolPasso = 0;
-      contaSecondi = 0;
+      passoCorrente = 0;
+      lavoro = nuovoLavoro(true);
+      if (Number.isFinite(data.t)) lavoro.ora(data.t);
       updateComposer();
-      apriGruppoPassi();
       mostraAttivita("sta ragionando");
       break;
     case "step":
-      contaPassi = Number(data.step) || contaPassi + 1;
-      contaToolPasso = 0; // nuovo passo: il contatore per-passo riparte
-      sommarioPassi(false);
+      passoCorrente = Number(data.step) || passoCorrente + 1;
+      lavoro.segnaPasso(passoCorrente);
       mostraAttivita("sta ragionando");
       break;
-    case "reasoning": {
-      // Il pensiero non entra in pagina: sono migliaia di caratteri che su un
-      // telefono seppelliscono la conversazione. Entra il **fatto** che sta
-      // ragionando, una riga sola per passo.
-      if (!gruppoPassi || !gruppoPassi.querySelector(`.passo.pensiero[data-passo="${contaPassi}"]`)) {
-        const riga = rigaPasso("ragiona", "pensiero corso");
-        riga.dataset.passo = String(contaPassi);
-      }
+    case "reasoning":
+      // Dal vivo si vedono le ultime quattro righe; il pensiero intero si
+      // legge toccando la sua riga, a passo chiuso.
+      if (data.append) lavoro.appendThinking(data.append);
+      else lavoro.setThinking(data.text ?? "");
       mostraAttivita("sta ragionando");
       break;
-    }
-    case "tool_start": {
-      contaTool += 1;
-      contaToolPasso += 1;
-      const riga = rigaPasso(descriviTool(data.name, data.args), "tool corso");
-      if (data.call_id) riga.dataset.call = data.call_id;
-      gruppoPassi?.querySelectorAll(".passo.pensiero.corso")
-        .forEach((r) => r.classList.remove("corso"));
-      sommarioPassi(false);
+    case "tool_start":
+      lavoro.avviaTool({ nome: data.name, args: data.args, id: data.call_id });
       mostraAttivita(descriviTool(data.name, data.args));
       break;
-    }
-    case "tool_end": {
-      const riga = rigaDellaChiamata(data.call_id);
-      if (riga) {
-        riga.classList.remove("corso");
-        if (data.ok === false) riga.classList.add("male");
-      }
+    case "tool_end":
+      lavoro.concludiTool({
+        nome: data.name, args: data.args, risultato: data.result,
+        ok: data.ok, durata: data.duration_s, id: data.call_id,
+      });
       break;
-    }
     case "content": {
       // L'evento porta ``append`` (i soli caratteri nuovi) oppure ``text`` (il
       // testo completo, che sostituisce): ne arriva uno solo dei due. Prima
@@ -1132,18 +972,23 @@ function handleEvent(data) {
       //
       // (Storia: qui si leggeva ``data.delta``, che non e' mai esistito: la
       // risposta restava invisibile fino a fine turno.)
-      const bubble = liveBubble();
       const grezzo = data.append
         ? (testoInCorso += data.append)
         : (testoInCorso = String(data.text ?? ""));
       const clean = stripThink(grezzo);
+      const viva = document.querySelector(".msg.agent.live");
+      // Niente bolla vuota: un passo che non dice niente non ne apre una, e
+      // non chiude il blocco di lavoro.
+      if (!clean && !viva) break;
+      // Il modello parla: il blocco di lavoro si chiude qui, e la bolla viene
+      // dopo di lui.
+      lavoro.chiudi();
+      const bubble = liveBubble();
       // Assegnazione secca, non `if (clean)`: quando il modello passa dal
       // testo al ragionamento, `stripThink` torna vuoto e la bolla restava con
       // il testo di prima -- una frase vecchia congelata sotto "sta scrivendo".
       // Il desktop fa gia' cosi'.
       scriviFormattato(bubble, clean);
-      // Il messaggio sta arrivando: i passi hanno finito di servire.
-      chiudiGruppoPassi();
       mostraAttivita("sta scrivendo");
       scrollBottom();
       break;
@@ -1153,17 +998,17 @@ function handleEvent(data) {
       // l'accumulo riparte da zero per il passo successivo.
       testoInCorso = "";
       // Un 'assistant' per un passo gia' reso arriva solo dall'arretrato di un
-      // riaggancio: e' lo stesso testo, e va ignorato. ``pulisciTurnoVivo`` da
-      // sola non basta -- la bolla chiusa non ha piu' .live, quindi non la
-      // tocca -- e senza questo l'arretrato ne creerebbe comunque una nuova.
-      if (document.querySelector(`.msg.agent[data-passo="${contaPassi}"]`)) break;
-      const bubble = liveBubble();
-      bubble.dataset.passo = String(contaPassi);
-      bubble.classList.remove("live");
+      // riaggancio: e' lo stesso testo, e va ignorato.
+      if (document.querySelector(`.msg.agent[data-passo="${passoCorrente}"]`)) break;
       const clean = stripThink(data.content ?? "");
+      const viva = document.querySelector(".msg.agent.live");
+      if (!clean && !viva) break;
+      lavoro.chiudi();
+      const bubble = liveBubble();
+      bubble.dataset.passo = String(passoCorrente);
+      bubble.classList.remove("live");
       if (clean) scriviFormattato(bubble, clean);
       if (!clean && !bubble.textContent) bubble.remove();
-      chiudiGruppoPassi();
       scrollBottom();
       break;
     }
@@ -1174,6 +1019,7 @@ function handleEvent(data) {
       // L'ultimo passo del turno: l'harness aggiorna la memoria del progetto.
       if (data.fase === "inizio") mostraAttivita("aggiorna la memoria del progetto");
       else {
+        lavoro.chiudi();
         addBubble("nota", notaMemoria(data.esito, data.motivo));
         loadSessions();
       }
@@ -1184,7 +1030,7 @@ function handleEvent(data) {
     case "question":
       // AwaitingUserInput arriva intero dallo stream: domanda, opzioni e
       // allow_multiple sono gia' nel frame, la card li usa tutti.
-      chiudiGruppoPassi();
+      lavoro.chiudi();
       nascondiAttivita();
       addBubble("pending", `❓ ${data.question ?? ""}`);
       showQuestionCard(
@@ -1203,7 +1049,7 @@ function handleEvent(data) {
       if (data.type === "error" && data.message) toast(data.message);
       running = false;
       updateComposer();
-      chiudiGruppoPassi();
+      lavoro.chiudi();
       nascondiAttivita();
       document.querySelectorAll(".msg.live").forEach((el) => el.classList.remove("live"));
       refreshChat(false).then(loadSessions);
@@ -1279,7 +1125,7 @@ $("btn-back").addEventListener("click", () => {
   stopStream();
   stopPolling();
   nascondiAttivita();
-  gruppoPassi = null;
+  lavoro = nuovoLavoro(false);
   inizioTurno = 0;
   $("view-chat").classList.add("hidden");
   $("view-list").classList.remove("hidden");

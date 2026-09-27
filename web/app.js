@@ -281,7 +281,7 @@ function isModelPlumbing(text) {
 }
 
 const PLUMBING_PLACEHOLDER =
-  '<div class="think">Il modello sta emettendo una chiamata a tool nel canale ' +
+  '<div class="plumbing">Il modello sta emettendo una chiamata a tool nel canale ' +
   'testuale…<span class="caret"></span></div>';
 
 // ---------------------------------------------------------------------------
@@ -289,12 +289,6 @@ const PLUMBING_PLACEHOLDER =
 // ---------------------------------------------------------------------------
 
 const CHEV = '<svg class="chev" width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M3.5 1.5L7 5l-3.5 3.5"/></svg>';
-
-const TOOL_ICON = {
-  list_files: '▤', read_file: '◧', write_file: '✎', edit_file: '✂',
-  search_files: '⌕', run_command: '❯', manage_memory: '◈', ask_user_question: '?',
-  manage_plan: '☰',
-};
 
 const FOLDER_ICON =
   '<svg viewBox="0 0 14 14" width="11" height="11" fill="none" stroke="currentColor" ' +
@@ -377,18 +371,6 @@ function fileChips(files) {
   return box;
 }
 
-function argPreview(args) {
-  if (!args) return '';
-  for (const key of ['filepath', 'command', 'pattern', 'subfolder', 'action', 'question']) {
-    if (args[key]) {
-      const value = String(args[key]);
-      return value.length > 80 ? value.slice(0, 77) + '…' : value;
-    }
-  }
-  const dump = JSON.stringify(args);
-  return dump === '{}' ? '' : dump.slice(0, 80);
-}
-
 // ---------------------------------------------------------------------------
 // Rendering del thread
 // ---------------------------------------------------------------------------
@@ -437,58 +419,37 @@ function addUser(text, attachments) {
   scrollDown(true);
 }
 
-/** La tendina di una chiamata a tool. Il corpo nasce al primo clic.
+/** Il turno dell'assistente: blocchi di lavoro, risposte, e quello che il
+ * turno lascia (gocce dei file, avvisi, domande).
  *
- * Da chiusa una tendina e' una riga, ma il suo contenuto veniva costruito lo
- * stesso: argomenti e risultato interi, dentro il DOM, per ogni tool di ogni
- * passo. Un ``write_file`` da 34 kB e un ``search_files`` da 35 kB entravano
- * in pagina per intero senza che nessuno li guardasse, e riaprendo una chat
- * erano decine tutte insieme -- lavoro pagato al 100% e usato quasi mai.
+ * Com'era: una tendina per ogni pensiero e una per ogni tool, tutte uguali,
+ * ognuna una scatola con bordo e fondo. Un turno da sette tool erano undici
+ * scatole prima della risposta, e i pensieri restavano aperti fino a fine
+ * turno col testo intero.
  *
- * Il ``toggle`` scatta solo su un cambiamento vero dell'attributo ``open``, e
- * la costruzione avviene una volta sola: aprire e chiudere non ricostruisce.
+ * Com'e': i passi consecutivi (pensieri e tool) stanno in un **blocco di
+ * lavoro** (``Passi.gruppo``, web/passi.js). Vivo, dice "Sta lavorando · passo
+ * 6 · 31 s" e mostra gli ultimi passi, col pensiero in una finestra di quattro
+ * righe; chiuso, e' una riga sola -- "Ha lavorato 41 s · 2 letture · 1
+ * modifica · 2 comandi" -- che si apre sulla traccia. Un testo del modello
+ * **spezza** il blocco: quello che il modello dice resta in chat, fra un
+ * blocco e l'altro, e non finisce mai nascosto dentro una tendina.
+ *
+ * Il tempo e' quello del server: ``t`` sugli eventi dal vivo (server/main.py,
+ * ``sse``), ``ts`` sui messaggi salvati. Con l'orologio del browser le durate
+ * sarebbero sbagliate nell'arretrato di un riattacco, che arriva tutto in un
+ * istante.
  */
-function toolDrawer(name, args, result, duration, ok) {
-  const drawer = el('details', 'drawer' + (ok ? '' : ' failed'));
-  const preview = argPreview(args);
-  drawer.innerHTML =
-    `<summary>${CHEV}` +
-    `<span class="tool-name">${esc(TOOL_ICON[name] || '◆')} ${esc(name)}</span>` +
-    (preview ? `<span class="tool-arg grow">${esc(preview)}</span>` : '<span class="grow"></span>') +
-    `<span class="tool-time">${Number(duration || 0).toFixed(2)}s</span>` +
-    (ok ? '' : '<span class="tool-time">⚠</span>') +
-    `</summary>`;
-  let costruita = false;
-  drawer.addEventListener('toggle', () => {
-    if (costruita || !drawer.open) return;
-    costruita = true;
-    const corpo = el('div', 'drawer-body');
-    corpo.innerHTML =
-      (args && Object.keys(args).length
-        ? `<div class="tool-label">Argomenti</div><pre class="tool-json">${esc(JSON.stringify(args, null, 2))}</pre>`
-        : '') +
-      `<div class="tool-label">Risultato</div><pre class="tool-json">${esc(prettyJson(result))}</pre>`;
-    drawer.appendChild(corpo);
-  });
-  return drawer;
-}
-
-/** Contenitore di un turno dell'assistente: pensiero, risposta, tool. */
 function makeTurn() {
   const wrap = el('div', 'msg assistant');
   thread().appendChild(wrap);
 
-  return {
+  const turn = {
     wrap,
     statusNode: null,
-    // Nodi del segmento corrente. Un "segmento" e' un pensiero + una risposta
-    // consecutivi; una chiamata a tool lo chiude e ne apre uno nuovo.
-    _think: null,
-    _thinkNode: null,
     _answer: null,
-    // Il testo accumulato dei due canali. Serve agli incrementi: l'evento
-    // porta solo il pezzo nuovo, e il pezzo nuovo da solo non si puo' rendere.
-    _thinkText: '',
+    // Il testo accumulato della risposta: gli incrementi portano solo il
+    // pezzo nuovo, e il markdown non si rende a pezzi.
     _answerText: '',
     // File creati o modificati nel turno, in ordine di prima comparsa. Una Map
     // e non un array: lo stesso file scritto e poi ritoccato tre volte deve
@@ -502,20 +463,16 @@ function makeTurn() {
       if (this.statusNode) this.wrap.appendChild(this.statusNode);
     },
 
-    _ensureThink() {
-      if (!this._think) {
-        const drawer = el('details', 'drawer');
-        drawer.open = true;
-        drawer.innerHTML =
-          `<summary>${CHEV}<span class="grow">Ragionamento</span></summary>` +
-          '<div class="drawer-body"><div class="think live"></div></div>';
-        this.wrap.appendChild(drawer);
-        this._think = drawer;
-        this._thinkNode = $('.think', drawer);
-        this._bumpStatus();
-      }
-      return this._thinkNode;
+    // Pensieri e tool: li smista la regia dei blocchi (web/passi.js).
+    ora(t) { this._lavoro.ora(t); },
+    segnaPasso(n) { this._lavoro.segnaPasso(n); },
+    setThinking(text) { this._lavoro.setThinking(text); },
+    appendThinking(chunk) { this._lavoro.appendThinking(chunk); },
+    pensieroSalvato(text, inizio, fine) { this._lavoro.pensieroSalvato(text, inizio, fine); },
+    avviaTool(event) {
+      this._lavoro.avviaTool({ nome: event.name, args: event.args, id: event.call_id });
     },
+    concludiTool(dati, tempi) { this._lavoro.concludiTool(dati, tempi); },
 
     _ensureAnswer() {
       if (!this._answer) {
@@ -524,24 +481,6 @@ function makeTurn() {
         this._bumpStatus();
       }
       return this._answer;
-    },
-
-    // Il pensiero e la risposta arrivano a **incrementi**: l'evento porta
-    // ``append`` (i soli caratteri nuovi) oppure ``text`` (il testo completo,
-    // che sostituisce). Vedi il commento su ReasoningDelta in core/agent.py --
-    // il testo cumulativo ad ogni token era il difetto piu' caro dell'harness.
-    setThinking(text) {
-      this._thinkText = text;
-      this._ensureThink().textContent = text;
-      scrollDown();
-    },
-
-    appendThinking(chunk) {
-      this._thinkText = (this._thinkText || '') + chunk;
-      // Un nodo di testo in coda invece di riscrivere l'intera stringa: su un
-      // ragionamento da 80 kB la differenza fra le due si vede.
-      this._ensureThink().insertAdjacentText('beforeend', chunk);
-      scrollDown();
     },
 
     appendAnswer(chunk) {
@@ -554,12 +493,18 @@ function makeTurn() {
     setAnswer(text, { final = false } = {}) {
       this._answerText = String(text ?? '');
       // Un passo che produce solo tool call non deve creare un nodo risposta
-      // vuoto: resterebbe piantato SOPRA la tendina del tool e spingerebbe la
-      // risposta vera del passo successivo fuori dall'ordine cronologico.
+      // vuoto: resterebbe piantato SOPRA il blocco di lavoro e spingerebbe la
+      // risposta vera fuori dall'ordine cronologico.
       if (!String(text ?? '').trim() && !this._answer) return;
-      // Durante lo streaming la roba di servizio viene sostituita da un
-      // segnaposto; a fine turno arriva la versione autorevole gia' ripulita
-      // dal ciclo agentico, che va renderizzata comunque (anche se vuota).
+      // Una tool call stampata come testo non e' una risposta: non chiude il
+      // blocco (la chiamata la recupera l'harness), lo dice l'intestazione.
+      if (!final && !this._answer && isModelPlumbing(text)) {
+        this._lavoro.nota('scrive una chiamata a tool come testo');
+        return;
+      }
+      // Il modello parla: il blocco di lavoro si chiude qui. Quello che dice
+      // resta in chat, fra un blocco e l'altro -- mai dentro una tendina.
+      this._lavoro.chiudi();
       const node = this._ensureAnswer();
       node.innerHTML = (!final && isModelPlumbing(text))
         ? PLUMBING_PLACEHOLDER
@@ -567,18 +512,21 @@ function makeTurn() {
       scrollDown();
     },
 
-    /** Aggiunge un blocco in coda e apre un nuovo segmento.
+    /** Aggiunge in coda qualcosa che non e' un passo (avviso, domanda, gocce,
+     *  errore): chiude il blocco di lavoro e apre un segmento nuovo.
      *
-     * E' il punto che tiene il turno in ordine cronologico: dopo un tool, il
-     * pensiero e la risposta del passo successivo devono finire SOTTO la
-     * tendina, non riscrivere quelli del passo precedente piu' in alto.
+     *  E' il punto che tiene il turno in ordine cronologico: dopo, il pensiero
+     *  e la risposta del passo successivo devono finire SOTTO, non riscrivere
+     *  quelli di prima piu' in alto.
      */
     append(node) {
+      this._lavoro.chiudi();
+      this._lavoro.dimenticaPasso();
       this.wrap.appendChild(node);
-      this._think = this._thinkNode = this._answer = null;
+      this._answer = null;
       // Il segmento nuovo parte da testo vuoto: gli incrementi del passo
       // successivo non devono accodarsi a quello di prima.
-      this._thinkText = this._answerText = '';
+      this._answerText = '';
       this._bumpStatus();
       scrollDown();
     },
@@ -612,11 +560,7 @@ function makeTurn() {
     },
 
     finish() {
-      $$('.think.live', this.wrap).forEach((n) => n.classList.remove('live'));
-      // Chiude solo le tendine del pensiero: quelle dei tool sono gia' chiuse.
-      $$('details.drawer', this.wrap).forEach((d) => {
-        if ($('.think', d)) d.open = false;
-      });
+      this._lavoro.chiudi();
     },
 
     isEmpty() {
@@ -624,10 +568,29 @@ function makeTurn() {
       // e' fallito, e il motivo e' proprio quello che l'utente deve leggere.
       // Contarlo come vuoto lo faceva rimuovere a fine stream -- l'errore
       // "che lampeggia e sparisce".
-      return !this.wrap.querySelector('details.drawer, .question, .error-box')
+      return !this.wrap.querySelector('.ps-gruppo, .question, .error-box')
         && !(this._answer && this._answer.textContent.trim());
     },
   };
+
+  turn._lavoro = Passi.lavoro({
+    // Un blocco nuovo apre un segmento nuovo: la prossima risposta va sotto
+    // di lui, non a riscrivere quella di prima piu' in alto.
+    inserisci(nodo) {
+      turn.wrap.appendChild(nodo);
+      turn._answer = null;
+      turn._answerText = '';
+      turn._bumpStatus();
+    },
+    // Solo i turni dal vivo hanno la riga di stato, e solo loro contano i
+    // secondi nell'intestazione del blocco.
+    vivo: () => Boolean(turn.statusNode),
+    dopo() {
+      turn._bumpStatus();
+      scrollDown();
+    },
+  });
+  return turn;
 }
 
 function renderQuestion(question, answered) {
@@ -806,12 +769,20 @@ function renderHistory(messages, opzioni = {}) {
   // Le gocce si disegnano quando il turno si chiude, cioe' alla richiesta
   // successiva dell'utente o alla fine della cronologia: e' lo stesso confine
   // che in diretta segna l'evento done.
-  const closeTurn = () => { turn?.showFiles(); turn = null; };
+  const closeTurn = () => { turn?.finish(); turn?.showFiles(); turn = null; };
+  // L'ora del messaggio precedente (``ts``, orologio del server): e' da li'
+  // che il modello ha cominciato a lavorare sul passo dopo. Le durate dei
+  // blocchi e dei pensieri si ricavano cosi'; dove manca -- sessioni salvate
+  // prima che il messaggio dell'utente la portasse -- si tace.
+  let prima = null;
 
   messages.forEach((msg) => {
+    const ts = Number.isFinite(msg.ts) ? msg.ts : null;
+    const inizio = prima;
+    if (ts !== null) prima = ts;
     if (msg.hidden) return;
 
-    if (msg.role === 'user') { addUser(msg.content, msg.attachments); closeTurn(); return; }
+    if (msg.role === 'user') { closeTurn(); addUser(msg.content, msg.attachments); return; }
 
     if (msg.role === 'assistant') {
       const [reasoning, answer] = splitThink(msg.content || '');
@@ -819,7 +790,8 @@ function renderHistory(messages, opzioni = {}) {
       // risultati arrivano subito dopo e vanno nello stesso blocco.
       if (!reasoning && !answer) { currentTurn(); return; }
       const t = currentTurn();
-      if (reasoning) t.setThinking(reasoning);
+      if (reasoning) t.pensieroSalvato(reasoning, inizio, ts);
+      t.ora(ts);
       if (answer) t.setAnswer(answer, { final: true });
       // Il riepilogo chiesto dall'harness a passi esauriti non è una risposta
       // come le altre: senza dirlo sembrerebbe che il modello si sia fermato
@@ -838,7 +810,10 @@ function renderHistory(messages, opzioni = {}) {
         );
       } else {
         const t = currentTurn();
-        t.append(toolDrawer(msg.name, msg.args, msg.content, msg.duration_s, msg.ok !== false));
+        t.concludiTool({
+          nome: msg.name, args: msg.args, risultato: msg.content,
+          ok: msg.ok !== false, durata: msg.duration_s, id: msg.tool_call_id,
+        }, { inizio, fine: ts });
         t.noteFile(msg.name, msg.args, msg.content, msg.ok !== false);
       }
       return;
@@ -896,11 +871,7 @@ function renderHistory(messages, opzioni = {}) {
   // a meno che la sessione sia ferma su una domanda: li' il ciclo riprendera'
   // appena l'utente risponde, e le gocce arriveranno alla fine vera.
   if (!state.pending) closeTurn();
-
-  $$('#thread .msg.assistant').forEach((wrap) => {
-    $$('.think.live', wrap).forEach((n) => n.classList.remove('live'));
-    $$('details.drawer', wrap).forEach((d) => { if ($('.think', d)) d.open = false; });
-  });
+  else turn?.finish();
   // Risalendo NON si scende: si e' appena aggiunto testo sopra la finestra, e
   // portare in fondo chi stava leggendo indietro e' esattamente il gesto che
   // la risalita serve a evitare. Il ripristino della posizione lo fa chi
@@ -1338,6 +1309,9 @@ function attaccatoAUnoStream() {
 }
 
 function handleEvent(event, turn, status, setStatus) {
+  // L'ora del server viaggia su ogni frame (server/main.py, ``sse``): le
+  // durate dei blocchi di lavoro si misurano con quella.
+  if (Number.isFinite(event.t)) turn.ora?.(event.t);
   switch (event.type) {
     case 'start':
       setStatus(event.resume ? 'Riprendo…' : 'Il modello sta pensando…');
@@ -1345,6 +1319,7 @@ function handleEvent(event, turn, status, setStatus) {
       break;
     case 'step':
       setStatus(`Passo ${event.step}/${event.total}`);
+      turn.segnaPasso?.(event.step, event.total);
       if (typeof window !== 'undefined') window.Cruscotto?.passo(event.step, event.total);
       break;
     case 'metriche':
@@ -1376,10 +1351,14 @@ function handleEvent(event, turn, status, setStatus) {
       break;
     case 'tool_start':
       setStatus(`Eseguo ${event.name}…`);
+      turn.avviaTool?.(event);
       if (typeof window !== 'undefined') window.Cruscotto?.toolInizio(event.name);
       break;
     case 'tool_end': {
-      turn.addTool(toolDrawer(event.name, event.args, event.result, event.duration_s, event.ok));
+      turn.concludiTool({
+        nome: event.name, args: event.args, risultato: event.result,
+        ok: event.ok, durata: event.duration_s, id: event.call_id,
+      });
       turn.noteFile(event.name, event.args, event.result, event.ok);
       forseRicarica(event.name, event.args, event.result, event.ok);
       if (typeof window !== 'undefined') window.Cruscotto?.toolFine(event.name, event.duration_s);

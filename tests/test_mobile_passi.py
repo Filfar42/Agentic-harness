@@ -1,13 +1,15 @@
 """I passi del turno sull'interfaccia mobile: cosa si vede mentre l'agente lavora.
 
-Il vincolo, dal telefono: si deve capire **che sta facendo**, non cosa ha
-letto. Quindi in pagina entrano il verbo e il suo oggetto ("legge tools.py"),
-mai il contenuto -- ne' il pensiero, ne' il risultato di un tool -- e quando
-la risposta arriva le righe si richiudono in una tendina sola.
+Il vincolo, dal telefono: si deve capire **che sta facendo** a colpo
+d'occhio. Nella riga entrano il verbo e il suo oggetto ("Legge tools.py"),
+mai il contenuto; il contenuto -- il risultato di un tool, il pensiero
+intero -- entra in pagina solo al tocco sulla riga, e dal vivo del pensiero
+si vedono le ultime quattro righe. Le righe e i blocchi sono quelli del
+desktop (web/passi.js, provato in tests/test_passi_web.py): qui si prova il
+cablaggio del telefono.
 
 Le funzioni pure di ``web_mobile/app.js`` vengono estratte dal sorgente ed
-eseguite in QuickJS: sono le stesse che disegnano la diretta e la cronologia,
-quindi provarle qui vale per tutti e due i percorsi.
+eseguite in QuickJS, insieme a web/passi.js che la pagina carica prima.
 
 Serve ``quickjs`` (``pip install quickjs``): senza, i test saltano.
 """
@@ -23,6 +25,7 @@ quickjs = pytest.importorskip("quickjs")
 
 WEB_MOBILE = Path(__file__).resolve().parents[1] / "web_mobile"
 APP_JS = WEB_MOBILE / "app.js"
+PASSI_JS = Path(__file__).resolve().parents[1] / "web" / "passi.js"
 
 
 def _funzione(sorgente: str, nome: str) -> str:
@@ -31,25 +34,17 @@ def _funzione(sorgente: str, nome: str) -> str:
     return trovata.group(0)
 
 
-def _costante(sorgente: str, nome: str) -> str:
-    trovata = re.search(rf"const {nome} = \{{.*?\n\}};", sorgente, re.DOTALL)
-    assert trovata, f"costante {nome} non trovata in {APP_JS.name}"
-    return trovata.group(0)
-
-
 @pytest.fixture()
 def js() -> quickjs.Context:
     sorgente = APP_JS.read_text(encoding="utf-8")
     pezzi = [
-        _funzione(sorgente, "troncaTesto"),
-        _funzione(sorgente, "nomeFile"),
-        _costante(sorgente, "VERBI_TOOL"),
         _funzione(sorgente, "descriviTool"),
-        _funzione(sorgente, "toolAndatoBene"),
         _funzione(sorgente, "durataBreve"),
         _funzione(sorgente, "rispostaData"),
     ]
     ctx = quickjs.Context()
+    # La pagina carica /comune/passi.js prima di app.js (index.html).
+    ctx.eval(PASSI_JS.read_text(encoding="utf-8"))
     ctx.eval("\n".join(pezzi))
     return ctx
 
@@ -99,13 +94,18 @@ def test_gli_argomenti_lunghi_si_accorciano(js) -> None:
 
 
 def test_il_contenuto_del_risultato_non_entra_mai_nella_riga(js) -> None:
-    """Del risultato di un tool si tiene una cosa sola: se e' andato male."""
-    assert js.eval('toolAndatoBene(JSON.stringify({status: "ok"}), undefined)') is True
-    assert js.eval('toolAndatoBene(JSON.stringify({error: "manca il file"}), undefined)') is False
+    """Del risultato di un tool la riga tiene poco: quante righe, com'e'
+    finito, se e' andato male. Il contenuto no -- quello si apre al tocco."""
+    riga = js.eval(
+        'JSON.stringify(Passi.riga("read_file", {filepath: "a.py"}, '
+        'JSON.stringify({total_lines: 2, content: "SEGRETO\\nALTRO"}), true, 0))'
+    )
+    assert "SEGRETO" not in riga
+    assert js.eval('Passi.riga("read_file", {}, JSON.stringify({error: "manca il file"}), undefined, 0).tono') == "err"
     # L'esito esplicito del server vince sul contenuto.
-    assert js.eval('toolAndatoBene(JSON.stringify({status: "ok"}), false)') is False
+    assert js.eval('Passi.riga("read_file", {}, JSON.stringify({status: "ok"}), false, 0).tono') == "err"
     # Un risultato che non e' JSON non e' un fallimento: e' solo testo.
-    assert js.eval('toolAndatoBene("output grezzo", undefined)') is True
+    assert js.eval('Passi.riga("read_file", {}, "output grezzo", undefined, 0).tono') == ""
 
 
 def test_la_durata_si_legge_a_colpo_d_occhio(js) -> None:
@@ -144,22 +144,37 @@ def test_la_striscia_dell_attivita_c_e_ed_e_animata() -> None:
     for atteso in ('id="attivita"', 'id="attivita-testo"', 'id="attivita-tempo"'):
         assert atteso in html, atteso
     assert 'aria-live="polite"' in html, "chi non guarda lo schermo deve sentirlo"
-    for regola in ("@keyframes scorre", "@keyframes battito", "@keyframes pulsa"):
+    for regola in ("@keyframes scorre", "@keyframes battito"):
         assert regola in css, regola
+    # Il passo in corso gira: la rotellina del tool e il pensiero vivo stanno
+    # nelle righe condivise (web/passi.css).
+    comune = (PASSI_JS.parent / "passi.css").read_text(encoding="utf-8")
+    assert "@keyframes ps-gira" in comune
+    assert "prefers-reduced-motion" in comune
     # Chi ha chiesto meno animazioni al sistema operativo le ottiene.
     assert "prefers-reduced-motion" in css
 
 
 def test_i_passi_sono_piu_piccoli_e_piu_chiari_del_testo() -> None:
     """La richiesta era esplicita: tonalita' piu' chiara e carattere piu'
-    piccolo, perche' i passi sono note a margine, non contenuto."""
+    piccolo, perche' i passi sono note a margine, non contenuto. Le righe sono
+    di web/passi.css; il telefono ne sceglie misura e colori."""
     css = (WEB_MOBILE / "style.css").read_text(encoding="utf-8")
-    blocco = re.search(r"\n\.passo \{(.*?)\n\}", css, re.DOTALL)
-    assert blocco, "manca la regola .passo"
-    corpo = blocco.group(1)
-    misura = re.search(r"font-size:\s*([\d.]+)px", corpo)
+    misura = re.search(r"--ps-font:\s*([\d.]+)px", css)
     assert misura and float(misura.group(1)) < 15, "i passi devono essere piu' piccoli del testo"
-    assert "var(--testo-dim)" in corpo, "i passi devono essere piu' chiari del testo"
+    assert re.search(r"--ps-medio:\s*var\(--testo-dim\)", css), "i passi devono essere piu' chiari del testo"
+    # Righe che si toccano col dito.
+    altezza = re.search(r"--ps-riga-h:\s*(\d+)px", css)
+    assert altezza and int(altezza.group(1)) >= 40
+    comune = (PASSI_JS.parent / "passi.css").read_text(encoding="utf-8")
+    riga = re.search(r"\n\.ps-riga, \.ps-piega \{(.*?)\n\}", comune, re.DOTALL)
+    assert riga and "var(--ps-medio)" in riga.group(1)
+
+
+def test_la_pagina_carica_i_passi_condivisi_prima_dell_app() -> None:
+    html = (WEB_MOBILE / "index.html").read_text(encoding="utf-8")
+    assert '<link rel="stylesheet" href="/comune/passi.css">' in html
+    assert html.index('src="/comune/passi.js"') < html.index('src="/static/app.js"')
 
 
 # ------------------------------------------- la domanda a cui si e' risposto
@@ -201,76 +216,41 @@ def test_il_telefono_ascolta_il_bus_globale() -> None:
     assert "if (running && !source) attachStream();" in sorgente
 
 
-# --------------------------------------- il sommario dei passi mentre lavora
+# ------------------------------------------ i blocchi di lavoro sul telefono
 
 
-@pytest.fixture()
-def js_sommario() -> quickjs.Context:
-    """La sola funzione sommarioPassi piu' le variabili che legge."""
-    sorgente = APP_JS.read_text(encoding="utf-8")
-    ctx = quickjs.Context()
-    ctx.eval(_funzione(sorgente, "sommarioPassi"))
-    ctx.eval(_funzione(sorgente, "durataBreve"))
-    return ctx
-
-
-def test_il_sommario_vivo_dice_passo_e_strumenti_del_passo(js_sommario) -> None:
-    """Il testo era 'x passi | y strumenti' col totale del turno: a meta'
-    lavoro quel numero non torna con le righe aperte sotto. Ora e' 'passo N
-    · M strumenti' e M conta i tool del SOLO passo corrente."""
-
-    ctx = js_sommario
-    ctx.eval("""
-var sum = { textContent: "" };
-gruppoPassi = { querySelector: function (sel) {
-  return sel === ".passi-sommario" ? sum : null; } };
-contaTool = 0; inizioTurno = null; contaSecondi = 0;
-""")
-    scenari = [(2, 3), (1, 1), (4, 0), (0, 0)]
-    visti = []
-    for passi, tool in scenari:
-        ctx.eval(f"contaPassi = {passi}; contaToolPasso = {tool}; sum.textContent = '';")
-        ctx.eval("sommarioPassi(false)")
-        visti.append(ctx.eval("sum.textContent"))
-
-    attesi = [
-        "passo 2 · 3 strumenti",
-        "passo 1 · 1 strumento",  # il singolare: uno strumento si vede
-        "passo 4",                # passo senza tool: niente coda vuota
-        "sta lavorando…",         # nessun passo ancora: resta generico
-    ]
-    assert visti == attesi
-
-
-def test_il_sommario_chiuso_parla_per_l_intero_turno(js_sommario) -> None:
-    """A turno finito la riga resta un riepilogo: totale passi, totale
-    strumenti e durata. La modifica tocca solo la riga VIVA."""
-    ctx = js_sommario
-    ctx.eval("""
-var sum = { textContent: "" };
-gruppoPassi = { querySelector: function (sel) {
-  return sel === ".passi-sommario" ? sum : null; } };
-contaPassi = 5; contaTool = 9; contaToolPasso = 0;
-inizioTurno = Date.now() - 95000; contaSecondi = 95;
-sommarioPassi(true);
-""")
-    assert ctx.eval("sum.textContent").startswith("5 passi")
-    assert "9 strumenti" in ctx.eval("sum.textContent")
-
-
-def test_il_contatore_per_passo_si_resetta_al_giro_nuovo() -> None:
-    """Se contaToolPasso non riparte da zero a ogni evento step, il numero
-    cresce per sempre ed e' di nuovo il totale del turno -- il bug di prima."""
+def test_il_telefono_usa_la_regia_dei_blocchi_condivisa() -> None:
+    """Il sommario "passo N · M strumenti" e le righe fatte a mano non ci sono
+    piu': diretta e cronologia passano da Passi.lavoro, la stessa regia del
+    desktop (le sue regole sono provate in tests/test_passi_web.py)."""
     sorgente = APP_JS.read_text(encoding="utf-8")
     codice = "\n".join(
-        riga for riga in sorgente.splitlines() if not riga.lstrip().startswith("//")
+        riga for riga in sorgente.splitlines() if not riga.lstrip().startswith(("//", "*", "/*"))
     )
-    # Nasce, si azzera allo start del turno...
-    assert "let contaToolPasso = 0;" in codice
-    # ...si azzera a ogni nuovo passo (il caso 'step' dell'event stream)...
-    assert re.search(r'case\s*"step":[\s\S]{0,200}contaToolPasso = 0', codice)
-    # ...e cresce solo quando parte davvero un tool.
-    assert re.search(r'case\s*"tool_start":\s*\{[\s\S]{0,120}contaToolPasso \+= 1', codice)
+    assert "Passi.lavoro(" in codice
+    for evento, chiamata in (
+        ('"step"', "lavoro.segnaPasso("),
+        ('"reasoning"', "lavoro.appendThinking("),
+        ('"tool_start"', "lavoro.avviaTool("),
+        ('"tool_end"', "lavoro.concludiTool("),
+    ):
+        assert re.search(rf"case\s*{evento}:[\s\S]{{0,400}}{re.escape(chiamata)}", codice), evento
+    # Un testo del modello chiude il blocco prima della sua bolla.
+    assert re.search(r'case\s*"content":[\s\S]{0,1600}lavoro\.chiudi\(\);\s*const bubble = liveBubble\(\)', codice)
+    # La cronologia disegna gli stessi blocchi, dai messaggi `tool` salvati.
+    inizio = codice.index("function renderConversation(")
+    corpo = codice[inizio: codice.index("\nfunction ", inizio + 10)]
+    assert "lavoro.concludiTool(" in corpo and "lavoro.pensieroSalvato(" in corpo
+
+
+def test_al_riaggancio_se_ne_vanno_tutti_i_nodi_del_turno_vivo() -> None:
+    """L'arretrato ridisegna il turno da capo: se restasse un blocco chiuso
+    della diretta di prima, il turno si vedrebbe due volte."""
+    sorgente = APP_JS.read_text(encoding="utf-8")
+    corpo = _funzione(sorgente, "pulisciTurnoVivo")
+    assert "[data-turno-vivo]" in corpo
+    assert "nuovoLavoro(true)" in corpo
+    assert "nodo.dataset.turnoVivo" in _funzione(sorgente, "nuovoLavoro")
 
 
 # ------------------------------------- modello e workspace nella barra mobile

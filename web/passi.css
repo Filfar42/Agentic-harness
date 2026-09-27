@@ -1,0 +1,207 @@
+/* I passi del lavoro dell'agente (web/passi.js), desktop e telefono.
+ *
+ * Niente riquadri: prima ogni pensiero e ogni tool era una scatola con bordo,
+ * fondo e raggio, ~43 px l'una, tutte uguali. Un turno da sette tool erano
+ * undici scatole prima della risposta. Qui un passo e' una riga, i passi di un
+ * tratto di lavoro stanno su una rotaia sottile, e a lavoro finito il tratto
+ * intero e' una riga sola.
+ *
+ * I colori arrivano dalle variabili --ps-*, che ogni client definisce con i
+ * suoi token (web/style.css, web_mobile/style.css): la geometria e' una, i
+ * valori sono di chi la ospita. */
+
+.ps-gruppo {
+  margin: 4px 0 10px;
+  font-size: var(--ps-font, 13px);
+}
+
+/* ---------- intestazione del blocco ---------- */
+
+.ps-testa {
+  display: flex; align-items: center; gap: 9px;
+  width: calc(100% + 16px); min-height: var(--ps-riga-h, 28px);
+  margin: 0 -8px; padding: 0 8px; border: 0; border-radius: 7px;
+  background: none; color: var(--ps-medio); font: inherit; text-align: left;
+  cursor: pointer; white-space: nowrap;
+}
+.ps-gruppo.vivo > .ps-testa { cursor: default; color: var(--ps-testo); }
+.ps-gruppo:not(.vivo) > .ps-testa:hover { background: var(--ps-hover); }
+.ps-titolo { flex: none; }
+.ps-meta-gruppo {
+  min-width: 0; overflow: hidden; text-overflow: ellipsis;
+  color: var(--ps-tenue); font-variant-numeric: tabular-nums;
+}
+.ps-chev { color: var(--ps-tenue); transition: transform 180ms ease-out; }
+.ps-gruppo.aperto > .ps-testa .ps-chev { transform: rotate(90deg); }
+
+.ps-pill {
+  flex: none; margin-left: auto; display: inline-flex; align-items: center;
+  height: 20px; padding: 0 8px; border-radius: 999px;
+  font-size: 11.5px; font-weight: 500; border: 1px solid transparent;
+}
+.ps-pill-lungo { white-space: pre; }
+.ps-pill::before { content: ""; width: 6px; height: 6px; margin-right: 5px; border-radius: 50%; background: currentColor; }
+.ps-pill.ok { color: var(--ps-ok); border-color: color-mix(in srgb, var(--ps-ok) 35%, transparent); }
+.ps-pill.err { color: var(--ps-err); border-color: color-mix(in srgb, var(--ps-err) 40%, transparent); }
+
+/* ---------- la traccia: rotaia e passi ---------- */
+
+.ps-traccia { position: relative; }
+.ps-traccia[hidden] { display: none; }
+/* La rotaia passa sotto le icone, che hanno il fondo della pagina: si vede
+   fra una e l'altra, non attraverso. Stesso asse dell'icona dell'intestazione,
+   cosi' il blocco aperto scende dalla sua freccia. */
+.ps-traccia::before {
+  content: ""; position: absolute; left: 7.5px; top: 4px; bottom: 10px;
+  width: 1px; background: var(--ps-bordo);
+}
+.ps-passo[hidden], .ps-piega[hidden] { display: none; }
+
+.ps-riga, .ps-piega {
+  position: relative;
+  display: flex; align-items: center; gap: 9px;
+  width: calc(100% + 16px); min-height: var(--ps-riga-h, 28px);
+  margin: 0 -8px; padding: 0 8px; border: 0; border-radius: 7px;
+  background: none; color: var(--ps-medio); font: inherit; text-align: left;
+  cursor: pointer; white-space: nowrap;
+}
+.ps-riga:hover, .ps-piega:hover { background: var(--ps-hover); }
+.ps-piega { color: var(--ps-tenue); font-size: 0.95em; }
+.ps-piega:hover { color: var(--ps-accento); }
+.ps-passo.vivo > .ps-riga, .ps-passo.corso > .ps-riga { cursor: default; color: var(--ps-testo); }
+.ps-passo.vivo > .ps-riga:hover, .ps-passo.corso > .ps-riga:hover { background: none; }
+
+.ps-ico {
+  position: relative; z-index: 1;
+  flex: none; width: 16px; height: 16px; display: grid; place-items: center;
+  border-radius: 50%; background: var(--ps-fondo); color: var(--ps-tenue);
+}
+.ps-riga:hover .ps-ico, .ps-piega:hover .ps-ico, .ps-testa:hover .ps-ico { background: var(--ps-hover); }
+.ps-ico svg { display: block; }
+.ps-ico.err { color: var(--ps-err); }
+.ps-ico.gira svg { color: var(--ps-accento); animation: ps-gira 2.6s linear infinite; }
+.ps-ruota {
+  width: 11px; height: 11px; border-radius: 50%;
+  border: 1.6px solid var(--ps-bordo-forte); border-top-color: var(--ps-accento);
+  animation: ps-gira .7s linear infinite;
+}
+@keyframes ps-gira { to { transform: rotate(360deg); } }
+
+.ps-verbo { flex: none; }
+.ps-oggetto {
+  min-width: 0; overflow: hidden; text-overflow: ellipsis;
+  font-family: var(--ps-mono); font-size: 0.96em; color: var(--ps-testo);
+}
+.ps-estratto {
+  flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis;
+  font-style: italic; color: var(--ps-tenue);
+}
+.ps-meta {
+  flex: none; margin-left: auto; padding-left: 8px;
+  font-size: 0.92em; color: var(--ps-tenue); font-variant-numeric: tabular-nums;
+  display: inline-flex; gap: 5px;
+}
+.ps-meta.ok { color: var(--ps-ok); }
+.ps-meta.err { color: var(--ps-err); }
+.ps-piu { color: var(--ps-ok); }
+.ps-meno { color: var(--ps-err); }
+
+/* ---------- il pensiero dal vivo: quattro righe, non di piu' ---------- */
+
+/* L'altezza e' fissa e il testo sta in fondo: le righe nuove spingono su le
+   vecchie, che sfumano. Il pensiero intero resta leggibile aprendo la riga a
+   passo chiuso. Prima la tendina restava aperta fino a fine turno, una per
+   passo, con tutto il testo: era questo a invadere la chat. */
+.ps-finestra {
+  margin: 0 0 6px 7.5px; padding-left: 16px;
+  border-left: 1px solid var(--ps-accento);
+  height: calc(4 * 1.6em); overflow: hidden;
+  display: flex; flex-direction: column; justify-content: flex-end;
+  font-size: 0.96em; line-height: 1.6; color: var(--ps-medio);
+  -webkit-mask-image: linear-gradient(to bottom, transparent 0, #000 55%);
+  mask-image: linear-gradient(to bottom, transparent 0, #000 55%);
+}
+.ps-finestra-testo { white-space: pre-wrap; word-break: break-word; }
+
+/* ---------- il dettaglio di un passo ---------- */
+
+.ps-corpo { margin: 2px 0 8px 25px; }
+.ps-corpo[hidden] { display: none; }
+.ps-pensiero-testo {
+  font-size: 0.98em; line-height: 1.6; color: var(--ps-medio);
+  border-left: 1px solid var(--ps-bordo-forte); padding: 2px 0 2px 12px;
+  white-space: pre-wrap; word-break: break-word;
+}
+
+.ps-code {
+  border: 1px solid var(--ps-bordo); border-radius: 8px;
+  background: var(--ps-code-bg); overflow: hidden;
+}
+.ps-code-testa {
+  display: flex; align-items: center; gap: 8px; padding: 4px 10px;
+  border-bottom: 1px solid var(--ps-bordo);
+  font-family: var(--ps-mono); font-size: 11.5px; color: var(--ps-tenue);
+  white-space: nowrap;
+}
+.ps-code-titolo { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.ps-exit { margin-left: auto; flex: none; }
+.ps-exit.ok { color: var(--ps-ok); }
+.ps-exit.err { color: var(--ps-err); }
+.ps-code-corpo {
+  max-height: 260px; overflow: auto; padding: 4px 0;
+  font-family: var(--ps-mono); font-size: 11.5px; line-height: 1.6;
+}
+.ps-ln { display: flex; width: max-content; min-width: 100%; }
+.ps-ln.piu { background: var(--ps-piu-bg); }
+.ps-ln.meno { background: var(--ps-meno-bg); }
+.ps-ln.contesto .ps-t { color: var(--ps-medio); }
+.ps-ln.nota .ps-t { color: var(--ps-tenue); font-style: italic; }
+.ps-n {
+  flex: none; width: 46px; padding-right: 10px; text-align: right;
+  color: var(--ps-tenue); user-select: none;
+}
+.ps-sg { flex: none; width: 14px; text-align: center; user-select: none; }
+.ps-ln.piu .ps-sg { color: var(--ps-ok); }
+.ps-ln.meno .ps-sg { color: var(--ps-err); }
+.ps-t { white-space: pre; padding: 0 10px 0 2px; color: var(--ps-testo); }
+.ps-ln-file { padding: 4px 10px 1px; color: var(--ps-tenue); }
+.ps-ln-file:not(:first-child) { margin-top: 4px; }
+.ps-hit { background: none; color: var(--ps-accento); font-weight: 600; }
+
+.ps-term { display: flex; flex-direction: column-reverse; }
+.ps-term-testo {
+  margin: 0; padding: 2px 10px; white-space: pre; color: var(--ps-testo);
+  font: inherit;
+}
+
+.ps-errore {
+  padding: 6px 10px; border-radius: 8px;
+  background: color-mix(in srgb, var(--ps-err) 8%, transparent);
+  color: var(--ps-err); line-height: 1.5; white-space: pre-wrap; word-break: break-word;
+}
+.ps-errore-nota { color: var(--ps-medio); margin-top: 3px; }
+
+.ps-campi { display: flex; flex-direction: column; gap: 3px; line-height: 1.5; }
+.ps-campo { display: flex; gap: 10px; }
+.ps-k { flex: none; min-width: 88px; color: var(--ps-tenue); font-family: var(--ps-mono); font-size: 11.5px; padding-top: 1px; }
+.ps-v { min-width: 0; white-space: pre-wrap; word-break: break-word; color: var(--ps-testo); }
+
+.ps-nota { margin-top: 4px; font-size: 11.5px; color: var(--ps-tenue); }
+.ps-piede { display: flex; justify-content: flex-end; margin-top: 4px; }
+.ps-grezzo {
+  border: 0; background: none; padding: 2px 0; cursor: pointer; font: inherit;
+  font-size: 11.5px; color: var(--ps-tenue);
+  text-decoration: underline dotted; text-underline-offset: 3px;
+}
+.ps-grezzo:hover { color: var(--ps-accento); }
+.ps-grezzo-testo {
+  margin: 4px 0 0; padding: 6px 10px; max-height: 220px; overflow: auto;
+  border: 1px solid var(--ps-bordo); border-radius: 8px; background: var(--ps-code-bg);
+  font-family: var(--ps-mono); font-size: 11px; line-height: 1.5; color: var(--ps-medio);
+  white-space: pre-wrap; word-break: break-word;
+}
+.ps-grezzo-testo[hidden] { display: none; }
+
+@media (prefers-reduced-motion: reduce) {
+  .ps-ico.gira svg, .ps-ruota { animation: none; }
+}

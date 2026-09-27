@@ -428,6 +428,49 @@ modello richiesto.
 
 ## Storia delle revisioni
 
+**I passi dell'agente in blocchi di lavoro** (27/09/2026, su `main`, versione
+non ancora numerata) — le card dei tool e del pensiero erano scatole spesse,
+tutte uguali: un turno da sette tool erano undici riquadri (~470 px) prima
+della risposta, e durante il turno ogni "Ragionamento" restava aperto col
+testo intero fino alla fine.
+
+- **Un blocco per ogni tratto di lavoro.** Pensieri e tool consecutivi stanno
+  in un blocco. Vivo dice "Sta lavorando · passo 6 · 31 s" e mostra gli
+  ultimi quattro passi (i vecchi si piegano in "N passi prima"). Chiuso e'
+  una riga sola: "Ha lavorato 41 s · 2 letture · 1 ricerca · 2 modifiche · 2
+  comandi", piu' l'esito dell'ultimo comando; si apre sulla traccia.
+- **Un testo del modello spezza il blocco**: quello che il modello dice
+  resta in chat fra un blocco e l'altro, mai dentro una tendina.
+- **Una riga per passo**, senza bordo: icona, verbo, oggetto ("Legge
+  tools.py") e a destra quello che vale la riga (righe lette, risultati,
+  `+2 −1`, `exit 1 · 3,4 s`). La durata solo sopra il secondo. La riga di un
+  tool nasce a `tool_start`, con la rotellina: prima un `pytest` da un minuto
+  non si vedeva da nessuna parte.
+- **Il pensiero dal vivo** sta in una finestra fissa di quattro righe che
+  sfuma in alto; chiuso, e' la riga con la sua prima frase, e si apre sul
+  testo intero.
+- **Il dettaglio per tipo**, costruito al primo clic: estratto con i numeri di
+  riga veri (read/write), diff (edit, numerato dalla finestra
+  `dopo_la_modifica`), corrispondenze per file (search), terminale con codice
+  di uscita e scorrimento dal fondo (run), errore col suggerimento, e
+  chiave: valore per gli altri. Il JSON grezzo resta a un clic.
+- **Telefono uguale al desktop.** Il componente e' uno, `web/passi.js` +
+  `web/passi.css`, servito al telefono da `/comune/` (`server/mobile.py`);
+  ogni client ci mette solo i suoi colori (`--ps-*`). Il telefono guadagna i
+  dettagli al tocco; dal vivo del pensiero tiene in pagina solo la coda.
+- **Durate sull'orologio del server**: `t` sui frame del turno, `ts` anche sul
+  messaggio dell'utente. Con l'orologio del browser l'arretrato di un
+  riattacco, che arriva in un istante, avrebbe dato durate a zero.
+- Sul tema chiaro `--text-faint` e `--text-muted` sono quasi lo stesso grigio:
+  i dati di contorno delle righe usano `--quiet`.
+
+File: `web/passi.js` e `web/passi.css` (nuovi), `web/app.js` (`makeTurn`
+delega a `Passi.lavoro`; via `toolDrawer`, `TOOL_ICON`, `argPreview`),
+`web/style.css`, `web/index.html`, `web_mobile/app.js`, `web_mobile/style.css`,
+`web_mobile/index.html`, `server/main.py`, `server/mobile.py`. Test:
+`tests/test_passi_web.py` (nuovo, QuickJS con un DOM minimo),
+`test_mobile_passi.py`, `test_mobile_proxy.py`, `test_prestazioni.py`.
+
 **I vault diventano Progetti** (26-27/09/2026, ramo `progetti-2026-09-26`
 sopra `barra-destra-2026-09-26`, versione non ancora numerata) — il progetto
 e' il pezzo principale, la wiki una sua opzione.

@@ -1003,6 +1003,15 @@ def sse(event_type: str, payload: dict[str, Any]) -> str:
     return f"data: {json.dumps({'type': event_type, **payload}, ensure_ascii=False)}\n\n"
 
 
+def ora_del_server() -> float:
+    """``t`` sui frame di un turno: l'ora del server, in secondi.
+
+    Le interfacce ci misurano le durate dei blocchi di lavoro e dei pensieri
+    ("Ha lavorato 41 s"). Con l'orologio del browser sarebbero sbagliate
+    proprio nell'arretrato di un riattacco, che arriva tutto in un istante."""
+    return round(time.time(), 3)
+
+
 def _e_un_guasto_del_backend(event: Any) -> bool:
     """Questo errore giustifica di buttare via l'istanza del backend?
 
@@ -1026,7 +1035,7 @@ def _e_un_guasto_del_backend(event: Any) -> bool:
 def event_to_sse(event: Any) -> str:
     name = _EVENT_NAMES.get(type(event), "unknown")
     payload = asdict(event) if is_dataclass(event) else {"value": str(event)}
-    return sse(name, payload)
+    return sse(name, {**payload, "t": ora_del_server()})
 
 
 class EventBus:
@@ -1347,7 +1356,7 @@ def start_turn(
 
     def work(runner: TurnRunner) -> None:
         terminal_frame = sse("done", {"reason": "error"})
-        runner.emit(sse("start", {"session_id": session_id}))
+        runner.emit(sse("start", {"session_id": session_id, "t": ora_del_server()}))
         # Gli allegati che non sono entrati in contesto si dicono, e si dicono
         # PRIMA che il modello parli.
         #
@@ -1643,7 +1652,7 @@ def index() -> Response:
     # versione di prima con niente che lo facesse sospettare.
     for nome in ("app.js", "style.css", "companion.js", "companion.css",
                  "impostazioni.js", "impostazioni.css", "cruscotto.js", "cruscotto.css",
-                 "progetti.js", "progetti.css"):
+                 "progetti.js", "progetti.css", "passi.js", "passi.css"):
         html = html.replace(f"/static/{nome}", f"/static/{nome}?v={_impronta(nome)}")
     return Response(
         html,
@@ -2213,7 +2222,9 @@ def chat(request: ChatRequest) -> dict[str, Any]:
     if RUNNERS.is_running(session_id):
         raise HTTPException(409, "Un turno e' gia' in corso in questa conversazione.")
 
-    entry: dict[str, Any] = {"role": "user", "content": prompt}
+    # ``ts`` come sugli altri messaggi: e' l'inizio del primo blocco di lavoro
+    # del turno, e senza la sua durata ridisegnando la chat non si sa.
+    entry: dict[str, Any] = {"role": "user", "content": prompt, "ts": time.time()}
     agganciati = anchor_attachments(session_id, request.attachments)
     if agganciati:
         entry["attachments"] = agganciati
